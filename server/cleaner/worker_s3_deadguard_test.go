@@ -62,7 +62,7 @@ func TestCleanupWorker_S3HealthGuardIsDeadCode(t *testing.T) {
 		"precondition: S3 is demonstrably down for the cleaner's only S3 operation")
 
 	mockDB := new(mockDatabase)
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    resilientS3, // the production wiring, not &mockS3{}
 		cache:                 new(mockCache),

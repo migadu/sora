@@ -69,13 +69,13 @@ var notifySupportedEvents = []imap.NotifyEvent{
 // notifySnapshotEntry is the per-mailbox slice of the account snapshot used
 // for MailboxName/SubscriptionChange diffing and for specifier matching.
 type notifySnapshotEntry struct {
-	name        string
+	name string
+	// key is LOWER(name) as the database computes it, the mailbox's identity
+	// (db.DBMailbox.NameKey). Names are compared by it: lower() depends on the
+	// collation, and no Go case mapping matches it.
+	key         string
 	uidValidity uint32
 	subscribed  bool
-	// superior marks the placeholder of a superior name of a mailbox the
-	// client created (ownCreated), which the account snapshot may never
-	// show (resolveOwnCreated).
-	superior bool
 }
 
 // notifyWatch is the per-session NOTIFY state installed by SetNotify. After
@@ -90,6 +90,12 @@ type notifyWatch struct {
 	// distinguishes the two.
 	selected *imap.NotifyItem
 	delayed  bool
+
+	// nameKeys maps each name the MAILBOXES and SUBTREE specifiers give, and
+	// "INBOX" for INBOXES, to its key, LOWER(name) as the database computed it
+	// when NOTIFY SET ran. Mailboxes are matched to the specifiers by key
+	// (notifySnapshotEntry.key), as the database matches names.
+	nameKeys map[string]string
 
 	// statusMarks holds a per-mailbox high-water modseq for the STATUS fan-in:
 	// mailbox M is reported only when its highest_modseq exceeds statusMarks[M].
@@ -165,10 +171,7 @@ type notifyOwnWindow struct {
 type notifyOwnTree struct {
 	writes int    // in flight
 	gen    uint64 // begun
-	// placeholder is the ID last given a mailbox the client created, which
-	// the next diff replaces by its real one (resolveOwnCreated). They count
-	// down from -1, below any real ID.
-	placeholder int64
+
 }
 
 // notifyOwnMessages records the messages this connection's own APPEND and
@@ -357,9 +360,9 @@ func (s *IMAPSession) pruneOwnStatusWindows(watch *notifyWatch, statusSeq uint64
 // beginOwnTreeChange. Once it has made the change, the command records it,
 // and it calls end when it is done in any case.
 type ownTreeChange struct {
-	s      *IMAPSession
-	watch  *notifyWatch // nil when no NOTIFY watch reports tree events
-	change func(*notifyWatch)
+	s       *IMAPSession
+	watch   *notifyWatch // nil when no NOTIFY watch reports tree events
+	changes []func(*notifyWatch)
 }
 
 // beginOwnTreeChange is called by CREATE, DELETE, RENAME, SUBSCRIBE and
@@ -378,26 +381,24 @@ func (s *IMAPSession) beginOwnTreeChange() *ownTreeChange {
 	return &ownTreeChange{s: s, watch: watch}
 }
 
-// created records that the command created name, and any of its superior
-// names that did not exist.
-func (c *ownTreeChange) created(name string) {
-	c.change = func(watch *notifyWatch) { watch.ownCreated(name) }
+// Results come from committed writer transactions, never a later name lookup.
+func (c *ownTreeChange) created(created ...db.CreatedMailbox) {
+	if c.watch == nil || len(created) == 0 {
+		return
+	}
+	entries := slices.Clone(created)
+	c.s.useMasterDB.Store(true)
+	c.changes = append(c.changes, func(w *notifyWatch) { w.ownCreated(entries...) })
 }
-
-// deleted records that the command deleted name.
-func (c *ownTreeChange) deleted(name string) {
-	c.change = func(watch *notifyWatch) { watch.ownDeleted(name) }
+func (c *ownTreeChange) deleted(id int64) {
+	c.changes = append(c.changes, func(w *notifyWatch) { w.ownDeleted(id) })
 }
-
-// renamed records that the command renamed oldName, and the mailboxes below
-// it, to newName, creating any of its superior names that did not exist.
-func (c *ownTreeChange) renamed(oldName, newName string) {
-	c.change = func(watch *notifyWatch) { watch.ownRenamed(oldName, newName) }
+func (c *ownTreeChange) renamed(names []db.MailboxNameMutation) {
+	entries := slices.Clone(names)
+	c.changes = append(c.changes, func(w *notifyWatch) { w.ownRenamed(entries) })
 }
-
-// subscribed records that the command subscribed or unsubscribed name.
-func (c *ownTreeChange) subscribed(name string, subscribed bool) {
-	c.change = func(watch *notifyWatch) { watch.ownSubscribed(name, subscribed) }
+func (c *ownTreeChange) subscribed(change db.SubscriptionMutation) {
+	c.changes = append(c.changes, func(w *notifyWatch) { w.ownSubscribed(change) })
 }
 
 // end applies the recorded change, if any, to the watch's snapshot, copying
@@ -412,112 +413,63 @@ func (c *ownTreeChange) end() {
 	c.s.notifyMutex.Lock()
 	defer c.s.notifyMutex.Unlock()
 	c.watch.ownTree.writes--
-	if c.change == nil {
+	if len(c.changes) == 0 {
 		return
 	}
 	if c.watch.snapshotShared {
 		c.watch.snapshot = maps.Clone(c.watch.snapshot)
 		c.watch.snapshotShared = false
 	}
-	c.change(c.watch)
-}
-
-// ownCreated applies to the snapshot the creation of name and of those of its
-// superior names it lacks. A new mailbox's ID is not known here, so it gets a
-// placeholder ID until the next diff (resolveOwnCreated). The caller holds
-// notifyMutex, as for the other own* changes below.
-func (watch *notifyWatch) ownCreated(name string) {
-	watch.ownCreatedLevels(name, false)
-}
-
-// ownCreatedLevels gives a placeholder to each level of name that the
-// snapshot lacks: a superior name (notifySnapshotEntry.superior), except the
-// last level of a mailbox the client created when superior is false.
-func (watch *notifyWatch) ownCreatedLevels(name string, superior bool) {
-	delim := string(consts.MailboxDelimiter)
-	levels := strings.Split(name, delim)
-	for i := range levels {
-		level := strings.Join(levels[:i+1], delim)
-		if !watch.snapshotHas(level) {
-			watch.ownTree.placeholder--
-			watch.snapshot[watch.ownTree.placeholder] = notifySnapshotEntry{name: level, superior: superior || i < len(levels)-1}
-		}
+	for _, apply := range c.changes {
+		apply(c.watch)
 	}
 }
 
-// ownDeleted applies to the snapshot the deletion of name.
-func (watch *notifyWatch) ownDeleted(name string) {
-	for id, entry := range watch.snapshot {
-		if strings.EqualFold(entry.name, name) {
-			delete(watch.snapshot, id)
-		}
-	}
-}
-
-// ownRenamed applies to the snapshot the rename of oldName, and of the
-// mailboxes below it, to newName, and the creation of the superior names of
-// newName it lacks.
-func (watch *notifyWatch) ownRenamed(oldName, newName string) {
-	for id, entry := range watch.snapshot {
-		switch {
-		case strings.EqualFold(entry.name, oldName):
-			entry.name = newName
-		case mailboxNameHasPrefix(entry.name, oldName):
-			entry.name = newName + entry.name[len(oldName):]
-		default:
+// Apply only fields this transaction actually wrote, anchored to immutable IDs.
+// Unrecognized or already changed baseline state is left visible conservatively.
+func (watch *notifyWatch) ownCreated(created ...db.CreatedMailbox) {
+	for _, m := range created {
+		if !m.Visible || m.ID <= 0 {
 			continue
 		}
-		watch.snapshot[id] = entry
-	}
-	if i := strings.LastIndex(newName, string(consts.MailboxDelimiter)); i >= 0 {
-		watch.ownCreatedLevels(newName[:i], true)
-	}
-}
-
-// ownSubscribed applies to the snapshot the subscription change of name.
-func (watch *notifyWatch) ownSubscribed(name string, subscribed bool) {
-	for id, entry := range watch.snapshot {
-		if strings.EqualFold(entry.name, name) {
-			entry.subscribed = subscribed
-			watch.snapshot[id] = entry
+		if _, known := watch.snapshot[m.ID]; known {
+			continue
 		}
+		watch.snapshot[m.ID] = notifySnapshotEntry{name: m.Name, key: m.NameKey, uidValidity: m.UIDValidity, subscribed: m.Subscribed}
 	}
 }
-
+func (watch *notifyWatch) ownDeleted(id int64) { delete(watch.snapshot, id) }
+func (watch *notifyWatch) ownRenamed(names []db.MailboxNameMutation) {
+	for _, n := range names {
+		e, known := watch.snapshot[n.ID]
+		if !known || e.name != n.BeforeName || e.key != n.BeforeKey {
+			continue
+		}
+		e.name, e.key = n.AfterName, n.AfterKey
+		// Do not copy later subscription state: a foreign SUBSCRIBE can have
+		// committed before this rename, or after it, without changing the ID.
+		watch.snapshot[n.ID] = e
+	}
+}
+func (watch *notifyWatch) ownSubscribed(change db.SubscriptionMutation) {
+	m := change.Mailbox
+	if !change.Changed || m.ID <= 0 {
+		return
+	}
+	e, known := watch.snapshot[m.ID]
+	if !known || e.name != m.Name || e.key != m.NameKey || e.subscribed == change.Subscribed {
+		return
+	}
+	e.subscribed = change.Subscribed
+	watch.snapshot[m.ID] = e
+}
 func (watch *notifyWatch) snapshotHas(name string) bool {
 	for _, entry := range watch.snapshot {
-		if strings.EqualFold(entry.name, name) {
+		if entry.name == name {
 			return true
 		}
 	}
 	return false
-}
-
-// resolveOwnCreated gives each mailbox in prev that the client created since
-// prev was read (ownCreated) the ID that a mailbox of its name, new to prev, has
-// in cur, along with cur's entry, so the diff does not report it. One that cur
-// lacks, which someone else has deleted or renamed since, keeps its placeholder
-// ID, so the diff reports it gone. A superior name that cur lacks is dropped
-// instead: the snapshot shows only mailboxes the user has the 'l' right on, so
-// it may never have shown that level, such as another user's shared namespace
-// root above the shared mailbox the client created in, which did not change.
-func resolveOwnCreated(prev, cur map[int64]notifySnapshotEntry) {
-	for id, own := range prev {
-		if id >= 0 {
-			continue
-		}
-		resolved := false
-		for curID, entry := range cur {
-			if _, known := prev[curID]; !known && strings.EqualFold(entry.name, own.name) {
-				prev[curID] = entry
-				resolved = true
-				break
-			}
-		}
-		if resolved || own.superior {
-			delete(prev, id)
-		}
-	}
 }
 
 // hasSelectedMessageEvents reports whether the watch requests message events
@@ -578,15 +530,26 @@ func (watch *notifyWatch) wantsNonSelectedMessageEvents() bool {
 // mailbox by all non-selected specifiers. RFC 5465 §6: multiple event groups
 // can apply to the same mailbox and their events accumulate; only
 // SELECTED/SELECTED-DELAYED match the currently selected mailbox, so callers
-// must exclude it for message events. Mailbox names are compared
-// case-insensitively, matching sora's case-insensitive unique mailbox names.
-func (watch *notifyWatch) eventsForMailbox(name string, subscribed bool, sharedRoot string) map[imap.NotifyEvent]bool {
+// must exclude it for message events. The mailbox is matched to the INBOXES,
+// MAILBOXES and SUBTREE specifiers by its key, LOWER(name) as the database
+// computes it (see nameKeys).
+func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sharedRoot string) map[imap.NotifyEvent]bool {
+	nonSelectable := isSharedNamespaceRoot(name, sharedRoot)
 	var events map[imap.NotifyEvent]bool
 	add := func(item *imap.NotifyItem) {
-		if events == nil {
-			events = make(map[imap.NotifyEvent]bool)
-		}
 		for _, ev := range item.Events {
+			// Sora treats the configured shared root as hierarchy-only. Omit
+			// its message events, whose unselected-mailbox responses use STATUS;
+			// retain MailboxName and SubscriptionChange tree events
+			// (RFC 5465 §5.4–§5.5) for the \Noselect container.
+			if nonSelectable && (ev == imap.NotifyEventMessageNew ||
+				ev == imap.NotifyEventMessageExpunge ||
+				ev == imap.NotifyEventFlagChange) {
+				continue
+			}
+			if events == nil {
+				events = make(map[imap.NotifyEvent]bool)
+			}
 			events[ev] = true
 		}
 	}
@@ -598,8 +561,8 @@ func (watch *notifyWatch) eventsForMailbox(name string, subscribed bool, sharedR
 			continue
 		case imap.NotifyMailboxSpecPersonal:
 			// RFC 5465 §6.2: all selectable mailboxes in the personal
-			// namespace(s) — the shared namespace is excluded.
-			if sharedRoot == "" || !mailboxNameHasPrefix(name, sharedRoot) {
+			// namespace(s), as ESEARCH IN (PERSONAL) searches them.
+			if !inSharedNamespace(name, sharedRoot) {
 				add(item)
 			}
 		case imap.NotifyMailboxSpecInboxes:
@@ -607,7 +570,7 @@ func (watch *notifyWatch) eventsForMailbox(name string, subscribed bool, sharedR
 			// can target any personal mailbox, but computing that set is not
 			// tractable per-connection; like Dovecot, sora maps INBOXES to
 			// INBOX.
-			if strings.EqualFold(name, "INBOX") {
+			if root, ok := watch.nameKeys[consts.MailboxInbox]; ok && root != "" && key == root {
 				add(item)
 			}
 		case imap.NotifyMailboxSpecSubscribed:
@@ -615,9 +578,9 @@ func (watch *notifyWatch) eventsForMailbox(name string, subscribed bool, sharedR
 				add(item)
 			}
 		default:
-			for _, root := range item.Mailboxes {
-				if strings.EqualFold(name, root) ||
-					(item.Subtree && mailboxNameHasPrefix(name, root)) {
+			for _, given := range item.Mailboxes {
+				root, ok := watch.nameKeys[given]
+				if ok && root != "" && (key == root || (item.Subtree && notifyKeyBelow(key, root))) {
 					add(item)
 					break
 				}
@@ -625,6 +588,44 @@ func (watch *notifyWatch) eventsForMailbox(name string, subscribed bool, sharedR
 		}
 	}
 	return events
+}
+
+// notifyKeyBelow reports whether key is the key of a mailbox below the one whose
+// key is root. A descendant's key starts with its ancestor's: lower() leaves the
+// hierarchy delimiter alone, as the database relies on when it matches
+// descendants by LOWER(name) LIKE LOWER(prefix) || '%'. It runs for every
+// mailbox on every tick, so it does not build root plus delimiter.
+func notifyKeyBelow(key, root string) bool {
+	return len(key) > len(root) && key[len(root)] == consts.MailboxDelimiter && strings.HasPrefix(key, root)
+}
+
+// resolveNotifyNames sets watch.nameKeys: the database computes the key of each
+// name the specifiers give, in one query, when NOTIFY SET runs.
+func (s *IMAPSession) resolveNotifyNames(ctx context.Context, watch *notifyWatch) error {
+	var names []string
+	for i := range watch.options.Items {
+		item := &watch.options.Items[i]
+		switch item.MailboxSpec {
+		case imap.NotifyMailboxSpecSelected, imap.NotifyMailboxSpecSelectedDelayed,
+			imap.NotifyMailboxSpecPersonal, imap.NotifyMailboxSpecSubscribed:
+		case imap.NotifyMailboxSpecInboxes:
+			names = append(names, consts.MailboxInbox)
+		default:
+			names = append(names, item.Mailboxes...)
+		}
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	keys, err := s.server.rdb.MailboxNameKeysWithRetry(ctx, names)
+	if err != nil {
+		return err
+	}
+	watch.nameKeys = make(map[string]string, len(names))
+	for i, name := range names {
+		watch.nameKeys[name] = keys[i]
+	}
+	return nil
 }
 
 // mailboxNameHasPrefix reports whether name is inside the subtree rooted at
@@ -786,11 +787,15 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 	// Bootstrap the watch: the account snapshot (specifier matching and
 	// tree-event diffing), the fan-in cursor, the MessageNew fetch-atts
 	// high-water mark, and — when the STATUS indicator is present — the
-	// initial STATUS responses, all from at most two queries. A watch
+	// initial STATUS responses. Resolving name-based specifiers adds one query to
+	// the snapshot and statistics queries. A watch
 	// covering only the selected mailbox skips the snapshot entirely.
 	needSelectedStats := selectedID != 0 && watch.selected != nil && watch.selected.MessageNewFetch != nil
 	var bootstrapIDs []int64
 	if watch.wantsNonSelectedItems() {
+		if err := s.resolveNotifyNames(readCtx, watch); err != nil {
+			return s.internalError("failed to resolve NOTIFY mailbox names: %v", err)
+		}
 		snapshot, matchedIDs, err := s.notifySnapshotAndMatches(readCtx, watch, selectedID)
 		if err != nil {
 			return s.internalError("failed to resolve NOTIFY watch: %v", err)
@@ -823,7 +828,7 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 				if !ok {
 					continue
 				}
-				statusOptions := notifyStatusOptions(watch.eventsForMailbox(entry.name, entry.subscribed, sharedRoot), w.CondStoreEnabled())
+				statusOptions := notifyStatusOptions(watch.eventsForMailbox(entry.name, entry.key, entry.subscribed, sharedRoot), w.CondStoreEnabled())
 				if statusOptions == nil {
 					continue
 				}
@@ -893,6 +898,8 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 	// recorded by now is read back from the master.
 	s.notifyMutex.Lock()
 	treeGen, treeIdle := watch.ownTree.gen, watch.ownTree.writes == 0
+	previousSnapshot := watch.snapshot
+	watch.snapshotShared = true
 	statusSeq := watch.ownStatus.seq
 	s.notifyMutex.Unlock()
 
@@ -998,6 +1005,32 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		s.WarnLog("NOTIFY: account snapshot failed", "error", err)
 		return false, nil
 	}
+
+	// Guard against a read-pool failover to a more-lagged replica, whose
+	// sharply smaller view would otherwise be diffed into a storm of false
+	// deletions (and, next tick, false creations). A genuine bulk delete
+	// looks the same, so re-read the account from the primary, which
+	// cannot lag, and go on with its view either way (the STATUS fan-in
+	// of this tick reads from it too). Skipping the tick instead would
+	// keep the previous snapshot, and with it the same verdict, on every
+	// later tick. A session pinned to the primary has read from it
+	// already.
+	if pinned, _ := readCtx.Value(consts.UseMasterDBKey).(bool); !pinned &&
+		previousSnapshot != nil && notifySnapshotLooksStale(previousSnapshot, snapshot) {
+		replicaLen := len(snapshot)
+		readCtx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+		snapshot, matchedIDs, err = s.notifySnapshotAndMatches(readCtx, watch, selectedID)
+		if err != nil {
+			s.WarnLog("NOTIFY: account snapshot shrank sharply and the primary re-read failed; skipping tick",
+				"prev", len(previousSnapshot), "replica", replicaLen, "error", err)
+			return false, nil
+		}
+		if !notifySnapshotLooksStale(previousSnapshot, snapshot) {
+			s.WarnLog("NOTIFY: account snapshot shrank sharply on the read pool, likely replica lag; using the primary's",
+				"prev", len(previousSnapshot), "replica", replicaLen, "primary", len(snapshot))
+		}
+	}
+
 	treeEvents, stale := s.advanceNotifySnapshot(watch, snapshot, treeGen, treeIdle)
 	if stale {
 		return false, nil
@@ -1126,7 +1159,7 @@ func (s *IMAPSession) notifyTick(ctx context.Context, watch *notifyWatch, w *ima
 		if !ok {
 			continue
 		}
-		statusOptions := notifyStatusOptions(watch.eventsForMailbox(entry.name, entry.subscribed, sharedRoot), condStore)
+		statusOptions := notifyStatusOptions(watch.eventsForMailbox(entry.name, entry.key, entry.subscribed, sharedRoot), condStore)
 		if statusOptions == nil {
 			continue
 		}
@@ -1172,13 +1205,14 @@ func (s *IMAPSession) notifySnapshotAndMatches(ctx context.Context, watch *notif
 	for _, m := range mboxes {
 		snapshot[m.ID] = notifySnapshotEntry{
 			name:        m.Name,
+			key:         m.NameKey,
 			uidValidity: m.UIDValidity,
 			subscribed:  m.Subscribed,
 		}
 		if m.ID == selectedID {
 			continue
 		}
-		events := watch.eventsForMailbox(m.Name, m.Subscribed, sharedRoot)
+		events := watch.eventsForMailbox(m.Name, m.NameKey, m.Subscribed, sharedRoot)
 		if !(events[imap.NotifyEventMessageNew] || events[imap.NotifyEventMessageExpunge] || events[imap.NotifyEventFlagChange]) {
 			continue
 		}
@@ -1200,51 +1234,183 @@ func (s *IMAPSession) notifySnapshotAndMatches(ctx context.Context, watch *notif
 	return snapshot, matchedIDs, nil
 }
 
+// notifyCarriedEntry pairs a carried descendant's pre- and post-rename
+// snapshot entries so watches matching either state observe the ancestor
+// rename.
+type notifyCarriedEntry struct {
+	prev notifySnapshotEntry
+	cur  notifySnapshotEntry
+}
+
 // notifyTreeEvent is one detected mailbox-tree change.
 type notifyTreeEvent struct {
 	event   imap.NotifyEvent // MailboxName or SubscriptionChange
 	name    string
+	key     string // LOWER(name) as the database computes it
 	oldName string // for renames
+	// deleted marks a name that refers to no mailbox the client can access
+	// after the change: a deleted mailbox, or the missing parent of a
+	// created or deleted one.
 	deleted bool
-	entry   notifySnapshotEntry
+	// hasChildren reports whether a mailbox the client can access is below
+	// name after the change.
+	hasChildren bool
+	entry       notifySnapshotEntry
+	prev        notifySnapshotEntry
+	hasPrev     bool
+	// carried holds descendants whose rename this ancestor represents. A
+	// watched descendant can make the ancestor relevant even when the
+	// ancestor itself is outside a SUBSCRIBED or explicit mailbox filter.
+	carried []notifyCarriedEntry
 }
 
 // diffNotifySnapshots compares two account snapshots and returns the
 // mailbox-tree changes between them: creations, deletions, renames (same ID,
 // new name) and subscription flips.
 //
+// RFC 5465 §5.4: "If a mailbox is created or deleted, the mailbox itself and
+// its direct parent (whether it is an existing mailbox or not) are considered
+// to be affected", so the parent of each created or deleted mailbox is
+// reported too, once. "When a mailbox is renamed, its children are renamed
+// too. No additional MailboxName events are sent for children in this case":
+// a mailbox whose rename is that of a superior renamed in the same diff is not
+// reported (renamedWithSuperior).
+//
 // Deletions are emitted before creations/renames so that a delete+recreate of
 // a same-named mailbox within one tick (distinct IDs: the old ID vanishes, a
 // new ID appears under the same name) leaves the client with the mailbox
 // present. Emitting the create-then-delete order would leave it believing the
-// name no longer exists.
+// name no longer exists. The parents come last, as they are after all the
+// changes.
+//
+// Names are compared by their keys (notifySnapshotEntry.key), as the database
+// compares them.
 func diffNotifySnapshots(prev, cur map[int64]notifySnapshotEntry) []notifyTreeEvent {
+	// renamed maps the key of the old name of each mailbox renamed in this
+	// diff to its new name.
+	var renamed map[string]string
+	for id, entry := range cur {
+		if old, existed := prev[id]; existed && old.name != entry.name {
+			if renamed == nil {
+				renamed = make(map[string]string)
+			}
+			renamed[old.key] = entry.name
+		}
+	}
+
 	var events []notifyTreeEvent
+	var createdOrDeleted []notifySnapshotEntry
+	var carriedBy map[string][]notifyCarriedEntry
 	for id, old := range prev {
 		if _, exists := cur[id]; !exists {
-			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: old.name, deleted: true, entry: old})
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: old.name, key: old.key, deleted: true, entry: old})
+			createdOrDeleted = append(createdOrDeleted, old)
 		}
 	}
 	for id, entry := range cur {
 		old, existed := prev[id]
+		var superior string
+		if existed && old.name != entry.name {
+			superior = renamedWithSuperior(old, entry.name, renamed)
+			if superior != "" {
+				if carriedBy == nil {
+					carriedBy = make(map[string][]notifyCarriedEntry)
+				}
+				carriedBy[superior] = append(carriedBy[superior], notifyCarriedEntry{prev: old, cur: entry})
+			}
+		}
 		switch {
 		case !existed:
-			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, entry: entry})
-		case old.name != entry.name:
-			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, oldName: old.name, entry: entry})
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, key: entry.key, entry: entry})
+			createdOrDeleted = append(createdOrDeleted, entry)
+		case old.name != entry.name && superior == "":
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, key: entry.key, oldName: old.name, entry: entry, prev: old, hasPrev: true})
 		case old.subscribed != entry.subscribed:
-			events = append(events, notifyTreeEvent{event: imap.NotifyEventSubscriptionChange, name: entry.name, entry: entry})
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventSubscriptionChange, name: entry.name, key: entry.key, entry: entry, prev: old, hasPrev: true})
+		}
+	}
+	if len(events) == 0 {
+		return nil
+	}
+
+	// live holds the mailboxes the client can access by key, and superiors
+	// every key that one of them is below.
+	live := make(map[string]notifySnapshotEntry, len(cur))
+	superiors := make(map[string]bool)
+	for _, entry := range cur {
+		live[entry.key] = entry
+		for i := strings.LastIndexByte(entry.key, consts.MailboxDelimiter); i > 0 && !superiors[entry.key[:i]]; i = strings.LastIndexByte(entry.key[:i], consts.MailboxDelimiter) {
+			superiors[entry.key[:i]] = true
+		}
+	}
+
+	reported := make(map[string]bool, len(events))
+	for _, ev := range events {
+		if ev.event == imap.NotifyEventMailboxName {
+			reported[ev.key] = true
+		}
+	}
+	for _, mbox := range createdOrDeleted {
+		parent, parentKey, ok := notifyParentName(mbox.name, mbox.key)
+		if !ok || reported[parentKey] {
+			continue
+		}
+		reported[parentKey] = true
+		if entry, ok := live[parentKey]; ok {
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: entry.name, key: entry.key, entry: entry})
+		} else {
+			// §5.4: "If, after the event, the mailbox name does not refer
+			// to a mailbox accessible to the client, the \Nonexistent flag
+			// MUST be included."
+			events = append(events, notifyTreeEvent{event: imap.NotifyEventMailboxName, name: parent, key: parentKey, deleted: true})
+		}
+	}
+
+	for i := range events {
+		events[i].hasChildren = superiors[events[i].key]
+		if events[i].oldName != "" {
+			events[i].carried = carriedBy[events[i].name]
 		}
 	}
 	return events
 }
 
+// notifyParentName returns the parent of a mailbox name and the parent's key,
+// cut from the name's key. lower() leaves the hierarchy delimiter alone, as the
+// database relies on when it matches descendants by LOWER(name) LIKE
+// LOWER(prefix) || '%', so the key has the name's levels. ok is false for a
+// name at the top level.
+func notifyParentName(name, key string) (parent, parentKey string, ok bool) {
+	i := strings.LastIndexByte(name, consts.MailboxDelimiter)
+	j := strings.LastIndexByte(key, consts.MailboxDelimiter)
+	if i <= 0 || j <= 0 {
+		return "", "", false
+	}
+	return name[:i], key[:j], true
+}
+
+// renamedWithSuperior returns the new name of the outermost superior whose
+// rename carries old to newName, or empty when this is an independent
+// rename. The outermost matching superior is the one with a reported rename;
+// intermediate carried ancestors are suppressed too. This same depth walk
+// supplies filter metadata without rescanning all mailboxes per parent event.
+// renamed maps the key of each old name to its new name.
+func renamedWithSuperior(old notifySnapshotEntry, newName string, renamed map[string]string) string {
+	var superior string
+	for name, key, ok := notifyParentName(old.name, old.key); ok; name, key, ok = notifyParentName(name, key) {
+		if to, renamedToo := renamed[key]; renamedToo && newName == to+old.name[len(name):] {
+			superior = to
+		}
+	}
+	return superior
+}
+
 // notifySnapshotLooksStale reports whether cur is a sharply smaller view of the
 // account than prev — the signature of a read-pool failover to a more-lagged
-// replica rather than a real bulk deletion. Used to suppress a whole fan-in
-// tick so it does not emit a storm of false \NonExistent (then, next tick,
-// false creation) LIST events. Genuine bulk deletes beyond the threshold are
-// reported when the client next re-LISTs.
+// replica, and also of a genuine bulk delete. The pump then re-reads the
+// account from the primary to tell the two apart, so a lagging replica does
+// not emit a storm of false \NonExistent (then, next tick, false creation)
+// LIST events and a real bulk delete is still reported.
 func notifySnapshotLooksStale(prev, cur map[int64]notifySnapshotEntry) bool {
 	return len(prev) >= 4 && len(cur)*2 < len(prev)
 }
@@ -1255,29 +1421,17 @@ func notifySnapshotLooksStale(prev, cur map[int64]notifySnapshotEntry) bool {
 // tick began (treeIdle false), or has begun since (ownTree.gen moved past
 // treeGen), it returns none and keeps the snapshot for a later tick: cur may
 // then hold an own change not yet applied to the snapshot, or the other way
-// round (notifyOwnTree). stale reports a cur that looks like a lagged
-// replica's (notifySnapshotLooksStale): the snapshot is kept and the tick
-// skipped.
+// round (notifyOwnTree). Replica shrink is validated against the primary
+// before calling this function; a genuine primary deletion must advance.
 func (s *IMAPSession) advanceNotifySnapshot(watch *notifyWatch, cur map[int64]notifySnapshotEntry, treeGen uint64, treeIdle bool) (events []notifyTreeEvent, stale bool) {
 	s.notifyMutex.Lock()
 	defer s.notifyMutex.Unlock()
 	prev := watch.snapshot
 
-	// Guard against a read-pool failover to a more-lagged replica, whose
-	// sharply smaller view would otherwise be diffed into a storm of false
-	// deletions (and, next tick, false creations). Skip the whole tick and
-	// keep the prior snapshot/marks; retry next tick.
-	if prev != nil && notifySnapshotLooksStale(prev, cur) {
-		s.WarnLog("NOTIFY: account snapshot shrank sharply, likely replica lag; skipping tick",
-			"prev", len(prev), "cur", len(cur))
-		return nil, true
-	}
-
 	if watch.wantsTreeEvents() {
 		if !treeIdle || watch.ownTree.gen != treeGen {
 			return nil, false
 		}
-		resolveOwnCreated(prev, cur)
 		events = diffNotifySnapshots(prev, cur)
 	}
 	watch.snapshot, watch.snapshotShared = cur, true
@@ -1289,8 +1443,46 @@ func (s *IMAPSession) advanceNotifySnapshot(watch *notifyWatch, cur map[int64]no
 // against the bootstrap snapshot, so only changes after NOTIFY SET are
 // reported.
 func (s *IMAPSession) notifyWriteTreeEvents(watch *notifyWatch, events []notifyTreeEvent, sharedRoot string, w *imapserver.UpdateWriter) error {
+	// As in LIST, the child attributes go with the CHILDREN capability.
+	children := s.GetCapabilities().Has(imap.CapChildren)
 	for _, ev := range events {
-		if !watch.eventsForMailbox(ev.name, ev.entry.subscribed, sharedRoot)[ev.event] {
+		includeOldName := ev.oldName != ""
+		var interested bool
+		switch ev.event {
+		case imap.NotifyEventMailboxName:
+			interested = watch.eventsForMailbox(ev.name, ev.key, ev.entry.subscribed, sharedRoot)[imap.NotifyEventMailboxName]
+			if !interested && !ev.deleted && ev.hasPrev {
+				interested = watch.eventsForMailbox(ev.prev.name, ev.prev.key, ev.prev.subscribed, sharedRoot)[imap.NotifyEventMailboxName]
+			}
+			if !interested {
+				// A single visible ancestor rename represents its carried
+				// descendants. Keep that rename observable when a descendant
+				// is watched (before or after the rename) even when the
+				// ancestor itself is outside a SUBSCRIBED or explicit filter.
+				for _, child := range ev.carried {
+					if watch.eventsForMailbox(child.cur.name, child.cur.key, child.cur.subscribed, sharedRoot)[imap.NotifyEventMailboxName] ||
+						watch.eventsForMailbox(child.prev.name, child.prev.key, child.prev.subscribed, sharedRoot)[imap.NotifyEventMailboxName] {
+						interested = true
+						break
+					}
+				}
+			}
+			if !interested && !ev.deleted && ev.hasPrev && ev.prev.subscribed != ev.entry.subscribed {
+				// An independent rename whose subscription also changed emits
+				// one MailboxName event in diffNotifySnapshots; report it as a
+				// SubscriptionChange LIST (without OLDNAME) when the watch
+				// only requested SubscriptionChange.
+				interested = watch.eventsForMailbox(ev.name, ev.key, ev.entry.subscribed, sharedRoot)[imap.NotifyEventSubscriptionChange] ||
+					watch.eventsForMailbox(ev.prev.name, ev.prev.key, ev.prev.subscribed, sharedRoot)[imap.NotifyEventSubscriptionChange]
+				includeOldName = false
+			}
+		case imap.NotifyEventSubscriptionChange:
+			interested = watch.eventsForMailbox(ev.name, ev.key, ev.entry.subscribed, sharedRoot)[imap.NotifyEventSubscriptionChange]
+			if !interested && ev.hasPrev {
+				interested = watch.eventsForMailbox(ev.prev.name, ev.prev.key, ev.prev.subscribed, sharedRoot)[imap.NotifyEventSubscriptionChange]
+			}
+		}
+		if !interested {
 			continue
 		}
 		data := &imap.ListData{
@@ -1301,15 +1493,25 @@ func (s *IMAPSession) notifyWriteTreeEvents(watch *notifyWatch, events []notifyT
 			// §5.4: names no longer accessible carry \NonExistent.
 			data.Attrs = append(data.Attrs, imap.MailboxAttrNonExistent)
 		} else {
-			if ev.oldName != "" {
+			if includeOldName {
 				// §5.4: renames announce the new name with OLDNAME (the
-				// writer includes it only for IMAP4rev2-enabled clients).
+				// NOTIFY writer includes it for every client).
 				data.OldName = ev.oldName
 			}
 			if ev.entry.subscribed {
 				// §5.5: \Subscribed if and only if subscribed after the event.
 				data.Attrs = append(data.Attrs, imap.MailboxAttrSubscribed)
 			}
+		}
+		// As in LIST, the configured shared namespace root is always a
+		// non-selectable container, including after its last child is deleted.
+		if isSharedNamespaceRoot(ev.name, sharedRoot) {
+			data.Attrs = append(data.Attrs, imap.MailboxAttrNoSelect)
+		}
+		if children {
+			// §5.4: "The server SHOULD also include \HasChildren or
+			// \HasNoChildren attributes [RFC5258] as appropriate."
+			data.Attrs = append(data.Attrs, childAttr(ev.hasChildren))
 		}
 		if err := w.WriteList(data); err != nil {
 			return err

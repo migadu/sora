@@ -4,14 +4,39 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 )
 
+// testNameKey stands in for the database's LOWER(name) for the names of these
+// tests. The tests of names where Go's case mapping and lower() part ways set
+// the keys as the database computes them.
+func testNameKey(name string) string {
+	return strings.ToLower(name)
+}
+
+// keyedSnapshot gives each entry without a key its testNameKey.
+func keyedSnapshot(snapshot map[int64]notifySnapshotEntry) map[int64]notifySnapshotEntry {
+	for id, entry := range snapshot {
+		if entry.key == "" {
+			entry.key = testNameKey(entry.name)
+			snapshot[id] = entry
+		}
+	}
+	return snapshot
+}
+
+// newTestWatch builds the watch NOTIFY SET would install for items, the names
+// they give keyed by testNameKey.
 func newTestWatch(items ...imap.NotifyItem) *notifyWatch {
-	watch := &notifyWatch{options: &imap.NotifyOptions{Items: items}}
+	watch := &notifyWatch{
+		options:  &imap.NotifyOptions{Items: items},
+		nameKeys: map[string]string{consts.MailboxInbox: testNameKey(consts.MailboxInbox)},
+	}
 	for i := range watch.options.Items {
 		item := &watch.options.Items[i]
 		if item.MailboxSpec == imap.NotifyMailboxSpecSelected ||
@@ -19,8 +44,134 @@ func newTestWatch(items ...imap.NotifyItem) *notifyWatch {
 			watch.selected = item
 			watch.delayed = item.MailboxSpec == imap.NotifyMailboxSpecSelectedDelayed
 		}
+		for _, name := range item.Mailboxes {
+			watch.nameKeys[name] = testNameKey(name)
+		}
 	}
 	return watch
+}
+
+// TestNotifyEventsForMailboxMatchesKeys: the INBOXES, MAILBOXES and SUBTREE
+// specifiers match mailboxes by key, LOWER(name) as the database computes it,
+// never by a Go case mapping of the names (issue #1649). The keys are ICU's.
+func TestNotifyEventsForMailboxMatchesKeys(t *testing.T) {
+	events := []imap.NotifyEvent{imap.NotifyEventMessageNew}
+	watch := func(item imap.NotifyItem, keys map[string]string) *notifyWatch {
+		w := newTestWatch(item)
+		w.nameKeys = keys
+		return w
+	}
+	tests := []struct {
+		name      string
+		watch     *notifyWatch
+		mailbox   string
+		key       string
+		wantMatch bool
+	}{
+		{
+			// U+017F is lower case already: "ſx" and "sx" are two mailboxes
+			// under every collation, which strings.EqualFold matched.
+			name:    "MailboxesLongS",
+			watch:   watch(imap.NotifyItem{Mailboxes: []string{"sx"}, Events: events}, map[string]string{"sx": "sx"}),
+			mailbox: "ſx", key: "ſx",
+		},
+		{
+			// U+212A KELVIN SIGN is three bytes; its key's "k" one.
+			name:    "SubtreeKelvinSign",
+			watch:   watch(imap.NotifyItem{Mailboxes: []string{"Kx"}, Subtree: true, Events: events}, map[string]string{"Kx": "kx"}),
+			mailbox: "Kx/y", key: "kx/y", wantMatch: true,
+		},
+		{
+			// ICU writes a word-final sigma "ς": "ΑΣ" is "ας".
+			name:    "SubtreeFinalSigma",
+			watch:   watch(imap.NotifyItem{Mailboxes: []string{"ας"}, Subtree: true, Events: events}, map[string]string{"ας": "ας"}),
+			mailbox: "ΑΣ/y", key: "ας/y", wantMatch: true,
+		},
+		{
+			// Under ICU "İNBOX" is a mailbox next to the INBOX.
+			name:    "InboxesDottedCapitalI",
+			watch:   watch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: events}, map[string]string{consts.MailboxInbox: "inbox"}),
+			mailbox: "İNBOX", key: "i̇nbox",
+		},
+		{
+			name:    "InboxesInbox",
+			watch:   watch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecInboxes, Events: events}, map[string]string{consts.MailboxInbox: "inbox"}),
+			mailbox: "INBOX", key: "inbox", wantMatch: true,
+		},
+		{
+			// A name PostgreSQL cannot hold has the empty key and names no mailbox.
+			name:    "UnstorableName",
+			watch:   watch(imap.NotifyItem{Mailboxes: []string{"a\x00"}, Subtree: true, Events: events}, map[string]string{"a\x00": ""}),
+			mailbox: "a", key: "a",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := tc.watch.eventsForMailbox(tc.mailbox, tc.key, false, "")[imap.NotifyEventMessageNew]
+			if got != tc.wantMatch {
+				t.Errorf("eventsForMailbox(%q, key %q) matched %v, want %v", tc.mailbox, tc.key, got, tc.wantMatch)
+			}
+		})
+	}
+}
+
+// TestNotifyEventsForMailboxSubtreeDoesNotAllocate: the pump matches every
+// mailbox of the account against the specifiers on each tick, so a SUBTREE that
+// does not match must cost no allocation, as the name match it replaced did not.
+// Building root+"/" per call allocated once a name is longer than the
+// compiler's 32-byte stack buffer for a concatenation.
+func TestNotifyEventsForMailboxSubtreeDoesNotAllocate(t *testing.T) {
+	root := "Archive/2024/Projects/Example Client"
+	watch := newTestWatch(imap.NotifyItem{Mailboxes: []string{root}, Subtree: true, Events: []imap.NotifyEvent{imap.NotifyEventMessageNew}})
+	name := "Archive/2024/Projects/Other Client/Reports"
+	key := testNameKey(name)
+	if n := testing.AllocsPerRun(100, func() {
+		_ = watch.eventsForMailbox(name, key, false, "")
+	}); n != 0 {
+		t.Errorf("eventsForMailbox for a mailbox outside SUBTREE %q allocates %v times per call, want 0", root, n)
+	}
+}
+
+// TestDiffNotifySnapshotsKeysNames: the diff compares names by key, as the
+// database does (issue #1649). The keys are ICU's, under which "İx" and "ix"
+// are two mailboxes and "ΑΣ" and "ας" one.
+func TestDiffNotifySnapshotsKeysNames(t *testing.T) {
+	dotted := notifySnapshotEntry{name: "İx", key: "i̇x"}
+	dottedChild := notifySnapshotEntry{name: "İx/a", key: "i̇x/a"}
+	ix := notifySnapshotEntry{name: "ix", key: "ix"}
+
+	t.Run("NoChildrenOfAnotherMailbox", func(t *testing.T) {
+		events := diffNotifySnapshots(
+			map[int64]notifySnapshotEntry{1: dotted, 2: dottedChild},
+			map[int64]notifySnapshotEntry{1: dotted, 2: dottedChild, 3: ix})
+		if len(events) != 1 || events[0].name != "ix" || events[0].hasChildren {
+			t.Errorf("creating ix next to İx/a: %+v, want ix without children", events)
+		}
+	})
+
+	t.Run("ParentIsTheMailboxOfItsKey", func(t *testing.T) {
+		child := notifySnapshotEntry{name: "ix/c", key: "ix/c"}
+		events := diffNotifySnapshots(
+			map[int64]notifySnapshotEntry{1: ix, 2: dotted},
+			map[int64]notifySnapshotEntry{1: ix, 2: dotted, 3: child})
+		names := make(map[string]notifyTreeEvent)
+		for _, ev := range events {
+			names[ev.name] = ev
+		}
+		if len(events) != 2 || names["ix/c"].name == "" || !names["ix"].hasChildren || names["ix"].deleted {
+			t.Errorf("creating ix/c next to İx: %+v, want ix/c and its parent ix with children", events)
+		}
+	})
+
+	t.Run("RenameCarriesChildOfAnotherSpelling", func(t *testing.T) {
+		// "ας/x" was created below "ΑΣ": RENAME ΑΣ New carries it along.
+		events := diffNotifySnapshots(
+			map[int64]notifySnapshotEntry{1: {name: "ΑΣ", key: "ας"}, 2: {name: "ας/x", key: "ας/x"}},
+			map[int64]notifySnapshotEntry{1: {name: "New", key: "new"}, 2: {name: "New/x", key: "new/x"}})
+		if len(events) != 1 || events[0].name != "New" || events[0].oldName != "ΑΣ" || !events[0].hasChildren {
+			t.Errorf("RENAME ΑΣ New: %+v, want only New (OLDNAME ΑΣ) with children", events)
+		}
+	})
 }
 
 func TestNotifyEventsForMailbox(t *testing.T) {
@@ -47,6 +198,22 @@ func TestNotifyEventsForMailbox(t *testing.T) {
 			mailbox:    "Shared/Team",
 			sharedRoot: "Shared",
 			want:       nil,
+		},
+		{
+			// The root CREATE Shared/Team makes is a \Noselect container of the
+			// shared namespace; RFC 5465 §6.2 takes selectable mailboxes only.
+			name:       "PersonalExcludesSharedNamespaceRoot",
+			watch:      newTestWatch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecPersonal, Events: msgEvents}),
+			mailbox:    "shared",
+			sharedRoot: "Shared",
+			want:       nil,
+		},
+		{
+			name:       "PersonalMatchesSiblingOfSharedRoot",
+			watch:      newTestWatch(imap.NotifyItem{MailboxSpec: imap.NotifyMailboxSpecPersonal, Events: msgEvents}),
+			mailbox:    "SharedDocs",
+			sharedRoot: "Shared",
+			want:       msgEvents,
 		},
 		{
 			name:    "InboxesMatchesOnlyInbox",
@@ -132,7 +299,7 @@ func TestNotifyEventsForMailbox(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			events := tc.watch.eventsForMailbox(tc.mailbox, tc.subscribed, tc.sharedRoot)
+			events := tc.watch.eventsForMailbox(tc.mailbox, testNameKey(tc.mailbox), tc.subscribed, tc.sharedRoot)
 			if len(events) != len(tc.want) {
 				t.Fatalf("eventsForMailbox(%q) = %v, want %v", tc.mailbox, events, tc.want)
 			}
@@ -160,7 +327,7 @@ func TestDiffNotifySnapshots(t *testing.T) {
 		// 3 deleted
 	}
 
-	events := diffNotifySnapshots(prev, cur)
+	events := diffNotifySnapshots(keyedSnapshot(prev), keyedSnapshot(cur))
 
 	byName := make(map[string]notifyTreeEvent)
 	for _, ev := range events {
@@ -181,6 +348,164 @@ func TestDiffNotifySnapshots(t *testing.T) {
 	}
 	if ev := byName["Stable"]; ev.event != imap.NotifyEventSubscriptionChange {
 		t.Errorf("subscription event wrong: %+v", ev)
+	}
+}
+
+// TestDiffNotifySnapshotsAffectedNames checks which names a diff reports for
+// the mailboxes created, deleted and renamed in it. RFC 5465 section 5.4: "If
+// a mailbox is created or deleted, the mailbox itself and its direct parent
+// (whether it is an existing mailbox or not) are considered to be affected."
+// and "When a mailbox is renamed, its children are renamed too. No additional
+// MailboxName events are sent for children in this case."
+func TestDiffNotifySnapshotsAffectedNames(t *testing.T) {
+	// want describes one expected event: its type, whether it carries
+	// \NonExistent, its OLDNAME, and whether the name has children after the
+	// change (\HasChildren or \HasNoChildren).
+	type want struct {
+		event       imap.NotifyEvent
+		deleted     bool
+		oldName     string
+		hasChildren bool
+	}
+	mailboxName := imap.NotifyEventMailboxName
+
+	tests := []struct {
+		name      string
+		prev, cur map[int64]notifySnapshotEntry
+		want      map[string]want
+	}{
+		{
+			// The issue's RENAME Old Attic/Old: Attic is created by the
+			// rename, Old/Kid and Old/Kid/Grand are carried along with Old.
+			name: "RenameCarriesChildrenSilently",
+			prev: map[int64]notifySnapshotEntry{
+				1: {name: "Old"}, 2: {name: "Old/Kid"}, 3: {name: "Old/Kid/Grand"},
+			},
+			cur: map[int64]notifySnapshotEntry{
+				1: {name: "Attic/Old"}, 2: {name: "Attic/Old/Kid"}, 3: {name: "Attic/Old/Kid/Grand"},
+				4: {name: "Attic"},
+			},
+			want: map[string]want{
+				"Attic":     {event: mailboxName, hasChildren: true},
+				"Attic/Old": {event: mailboxName, oldName: "Old", hasChildren: true},
+			},
+		},
+		{
+			// The database renames a child by replacing as many characters
+			// of its name as the old name of the renamed mailbox has, so a
+			// child stored under a differently cased prefix is carried too.
+			name: "RenameCarriesDifferentlyCasedChild",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Old"}, 2: {name: "OLD/Kid"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "New"}, 2: {name: "New/Kid"}},
+			want: map[string]want{
+				"New": {event: mailboxName, oldName: "Old", hasChildren: true},
+			},
+		},
+		{
+			// A child renamed on its own in the same diff is not a child the
+			// parent's rename carried along.
+			name: "ChildRenamedOnItsOwnIsReported",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Old"}, 2: {name: "Old/Mid"}, 3: {name: "Old/Mid/Kid"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "New"}, 2: {name: "Other"}, 3: {name: "Other/Kid"}},
+			want: map[string]want{
+				"New":   {event: mailboxName, oldName: "Old"},
+				"Other": {event: mailboxName, oldName: "Old/Mid", hasChildren: true},
+			},
+		},
+		{
+			// A carried child whose subscription changed in the same diff
+			// still gets its SubscriptionChange.
+			name: "CarriedChildSubscriptionChange",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Old"}, 2: {name: "Old/Kid"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "New"}, 2: {name: "New/Kid", subscribed: true}},
+			want: map[string]want{
+				"New":     {event: mailboxName, oldName: "Old", hasChildren: true},
+				"New/Kid": {event: imap.NotifyEventSubscriptionChange},
+			},
+		},
+		{
+			// The issue's CREATE Parent/Child.
+			name: "CreateReportsExistingParent",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Parent"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "Parent"}, 2: {name: "Parent/Child"}},
+			want: map[string]want{
+				"Parent/Child": {event: mailboxName},
+				"Parent":       {event: mailboxName, hasChildren: true},
+			},
+		},
+		{
+			name: "DeleteReportsExistingParent",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Parent"}, 2: {name: "Parent/Child"}},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "Parent"}},
+			want: map[string]want{
+				"Parent/Child": {event: mailboxName, deleted: true},
+				"Parent":       {event: mailboxName},
+			},
+		},
+		{
+			// A parent the client cannot see (no RFC 4314 'l' right) is
+			// still affected, and carries \NonExistent.
+			name: "CreateReportsInaccessibleParentNonExistent",
+			prev: map[int64]notifySnapshotEntry{},
+			cur:  map[int64]notifySnapshotEntry{2: {name: "Hidden/Child"}},
+			want: map[string]want{
+				"Hidden/Child": {event: mailboxName},
+				"Hidden":       {event: mailboxName, deleted: true, hasChildren: true},
+			},
+		},
+		{
+			name: "ParentReportedOncePerDiff",
+			prev: map[int64]notifySnapshotEntry{1: {name: "Parent", subscribed: true}, 2: {name: "Parent/Gone"}},
+			cur: map[int64]notifySnapshotEntry{
+				1: {name: "Parent", subscribed: true}, 3: {name: "Parent/A"}, 4: {name: "Parent/B"},
+			},
+			want: map[string]want{
+				"Parent/Gone": {event: mailboxName, deleted: true},
+				"Parent/A":    {event: mailboxName},
+				"Parent/B":    {event: mailboxName},
+				"Parent":      {event: mailboxName, hasChildren: true},
+			},
+		},
+		{
+			// CREATE a/b/c creating its superiors: each parent is reported
+			// once, by its own creation.
+			name: "ParentCreatedInSameDiffNotRepeated",
+			prev: map[int64]notifySnapshotEntry{},
+			cur:  map[int64]notifySnapshotEntry{1: {name: "a"}, 2: {name: "a/b"}, 3: {name: "a/b/c"}},
+			want: map[string]want{
+				"a":     {event: mailboxName, hasChildren: true},
+				"a/b":   {event: mailboxName, hasChildren: true},
+				"a/b/c": {event: mailboxName},
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			events := diffNotifySnapshots(keyedSnapshot(tc.prev), keyedSnapshot(tc.cur))
+			got := make(map[string]want, len(events))
+			for _, ev := range events {
+				if _, dup := got[ev.name]; dup {
+					t.Errorf("%q reported more than once: %+v", ev.name, events)
+				}
+				got[ev.name] = want{event: ev.event, deleted: ev.deleted, oldName: ev.oldName, hasChildren: ev.hasChildren}
+			}
+			for name, w := range tc.want {
+				g, ok := got[name]
+				if !ok {
+					t.Errorf("no event for %q, want %+v (got %+v)", name, w, got)
+					continue
+				}
+				if g != w {
+					t.Errorf("event for %q = %+v, want %+v", name, g, w)
+				}
+			}
+			for name, g := range got {
+				if _, ok := tc.want[name]; !ok {
+					t.Errorf("unexpected event for %q: %+v", name, g)
+				}
+			}
+		})
 	}
 }
 
@@ -350,21 +675,38 @@ func treeEventStrings(events []notifyTreeEvent) []string {
 // TestNotifyOwnTreeChanges: a tree change the client made itself, applied to
 // the previous snapshot, is not reported by the diff with the next one (RFC
 // 5465 section 5), while someone else's change before or after it still is.
+func testOwnCreated(id int64, name string, subscribed bool) db.CreatedMailbox {
+	return db.CreatedMailbox{NotifyMailbox: db.NotifyMailbox{ID: id, Name: name, NameKey: testNameKey(name), Subscribed: subscribed}, Visible: true}
+}
+func testOwnRenamed(id int64, before, after string) db.MailboxNameMutation {
+	return db.MailboxNameMutation{ID: id, BeforeName: before, BeforeKey: testNameKey(before), AfterName: after, AfterKey: testNameKey(after)}
+}
+func testOwnSubscribed(id int64, name string, subscribed bool) db.SubscriptionMutation {
+	return db.SubscriptionMutation{Mailbox: db.NotifyMailbox{ID: id, Name: name, NameKey: testNameKey(name)}, Subscribed: subscribed, Changed: true}
+}
+func testSnapshotKeys(s map[int64]notifySnapshotEntry) map[int64]notifySnapshotEntry {
+	for id, e := range s {
+		e.key = testNameKey(e.name)
+		s[id] = e
+	}
+	return s
+}
+
 func TestNotifyOwnTreeChanges(t *testing.T) {
 	type snap = map[int64]notifySnapshotEntry
 	base := func() snap {
-		return snap{
+		return testSnapshotKeys(snap{
 			1: {name: "INBOX", subscribed: true},
 			2: {name: "Old"},
 			3: {name: "Old/Kid"},
 			4: {name: "Gone"},
 			5: {name: "Subbed", subscribed: true},
-		}
+		})
 	}
 	with := func(changes func(s snap)) snap {
 		s := base()
 		changes(s)
-		return s
+		return testSnapshotKeys(s)
 	}
 
 	tests := []struct {
@@ -375,12 +717,14 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 	}{
 		{
 			name: "CREATE",
-			own:  func(w *notifyWatch) { w.ownCreated("Projects") },
+			own:  func(w *notifyWatch) { w.ownCreated(testOwnCreated(10, "Projects", false)) },
 			cur:  with(func(s snap) { s[10] = notifySnapshotEntry{name: "Projects"} }),
 		},
 		{
 			name: "CREATE with a superior name it creates",
-			own:  func(w *notifyWatch) { w.ownCreated("Parent/Child") },
+			own: func(w *notifyWatch) {
+				w.ownCreated(testOwnCreated(10, "Parent", false), testOwnCreated(11, "Parent/Child", false))
+			},
 			cur: with(func(s snap) {
 				s[10] = notifySnapshotEntry{name: "Parent"}
 				s[11] = notifySnapshotEntry{name: "Parent/Child"}
@@ -389,46 +733,46 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 		{
 			// Another user's shared namespace root, which the user cannot see.
 			name: "CREATE below a level the snapshot does not show",
-			own:  func(w *notifyWatch) { w.ownCreated("Shared/Team/Sub") },
+			own:  func(w *notifyWatch) { w.ownCreated(testOwnCreated(10, "Shared/Team/Sub", false)) },
 			cur: with(func(s snap) {
 				s[10] = notifySnapshotEntry{name: "Shared/Team/Sub"}
 			}),
 		},
 		{
 			name: "CREATE under an existing mailbox",
-			own:  func(w *notifyWatch) { w.ownCreated("Old/New") },
+			own:  func(w *notifyWatch) { w.ownCreated(testOwnCreated(10, "Old/New", false)) },
 			cur:  with(func(s snap) { s[10] = notifySnapshotEntry{name: "Old/New"} }),
 		},
 		{
 			name: "CREATE and SUBSCRIBE",
 			own: func(w *notifyWatch) {
-				w.ownCreated("Projects")
-				w.ownSubscribed("Projects", true)
+				w.ownCreated(testOwnCreated(10, "Projects", false))
+				w.ownSubscribed(testOwnSubscribed(10, "Projects", true))
 			},
 			cur: with(func(s snap) { s[10] = notifySnapshotEntry{name: "Projects", subscribed: true} }),
 		},
 		{
 			name: "CREATE, then someone else deletes it",
-			own:  func(w *notifyWatch) { w.ownCreated("Projects") },
+			own:  func(w *notifyWatch) { w.ownCreated(testOwnCreated(10, "Projects", false)) },
 			cur:  base(),
 			want: []string{"-Projects"},
 		},
 		{
 			name: "CREATE and DELETE",
 			own: func(w *notifyWatch) {
-				w.ownCreated("Projects")
-				w.ownDeleted("Projects")
+				w.ownCreated(testOwnCreated(10, "Projects", false))
+				w.ownDeleted(10)
 			},
 			cur: base(),
 		},
 		{
 			name: "DELETE",
-			own:  func(w *notifyWatch) { w.ownDeleted("gone") },
+			own:  func(w *notifyWatch) { w.ownDeleted(4) },
 			cur:  with(func(s snap) { delete(s, 4) }),
 		},
 		{
 			name: "DELETE, then someone else creates it again",
-			own:  func(w *notifyWatch) { w.ownDeleted("Gone") },
+			own:  func(w *notifyWatch) { w.ownDeleted(4) },
 			cur: with(func(s snap) {
 				delete(s, 4)
 				s[10] = notifySnapshotEntry{name: "Gone"}
@@ -438,8 +782,8 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 		{
 			name: "DELETE and CREATE",
 			own: func(w *notifyWatch) {
-				w.ownDeleted("Gone")
-				w.ownCreated("Gone")
+				w.ownDeleted(4)
+				w.ownCreated(testOwnCreated(10, "Gone", false))
 			},
 			cur: with(func(s snap) {
 				delete(s, 4)
@@ -448,7 +792,10 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 		},
 		{
 			name: "RENAME with a child, creating a superior name",
-			own:  func(w *notifyWatch) { w.ownRenamed("Old", "Attic/Old") },
+			own: func(w *notifyWatch) {
+				w.ownCreated(testOwnCreated(10, "Attic", false))
+				w.ownRenamed([]db.MailboxNameMutation{testOwnRenamed(2, "Old", "Attic/Old"), testOwnRenamed(3, "Old/Kid", "Attic/Old/Kid")})
+			},
 			cur: with(func(s snap) {
 				s[2] = notifySnapshotEntry{name: "Attic/Old"}
 				s[3] = notifySnapshotEntry{name: "Attic/Old/Kid"}
@@ -457,7 +804,9 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 		},
 		{
 			name: "RENAME below levels the snapshot does not show",
-			own:  func(w *notifyWatch) { w.ownRenamed("Old", "Shared/Team/Old") },
+			own: func(w *notifyWatch) {
+				w.ownRenamed([]db.MailboxNameMutation{testOwnRenamed(2, "Old", "Shared/Team/Old"), testOwnRenamed(3, "Old/Kid", "Shared/Team/Old/Kid")})
+			},
 			cur: with(func(s snap) {
 				s[2] = notifySnapshotEntry{name: "Shared/Team/Old"}
 				s[3] = notifySnapshotEntry{name: "Shared/Team/Old/Kid"}
@@ -465,14 +814,14 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 		},
 		{
 			name: "RENAME of INBOX creates the new name",
-			own:  func(w *notifyWatch) { w.ownCreated("Saved") },
+			own:  func(w *notifyWatch) { w.ownCreated(testOwnCreated(10, "Saved", false)) },
 			cur:  with(func(s snap) { s[10] = notifySnapshotEntry{name: "Saved"} }),
 		},
 		{
 			name: "SUBSCRIBE and UNSUBSCRIBE",
 			own: func(w *notifyWatch) {
-				w.ownSubscribed("Old", true)
-				w.ownSubscribed("subbed", false)
+				w.ownSubscribed(testOwnSubscribed(2, "Old", true))
+				w.ownSubscribed(testOwnSubscribed(5, "Subbed", false))
 			},
 			cur: with(func(s snap) {
 				s[2] = notifySnapshotEntry{name: "Old", subscribed: true}
@@ -480,8 +829,47 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 			}),
 		},
 		{
+			name: "CREATE does not adopt foreign subscription",
+			own:  func(w *notifyWatch) { w.ownCreated(testOwnCreated(10, "Projects", false)) },
+			cur:  with(func(s snap) { s[10] = notifySnapshotEntry{name: "Projects", subscribed: true} }),
+			want: []string{"Projects sub=true"},
+		},
+		{
+			name: "CREATE does not adopt replacement identity",
+			own:  func(w *notifyWatch) { w.ownCreated(testOwnCreated(10, "Projects", false)) },
+			cur:  with(func(s snap) { s[11] = notifySnapshotEntry{name: "Projects"} }),
+			want: []string{"-Projects", "+Projects"},
+		},
+		{
+			name: "idempotent SUBSCRIBE preserves foreign subscription",
+			own: func(w *notifyWatch) {
+				change := testOwnSubscribed(2, "Old", true)
+				change.Changed = false
+				w.ownSubscribed(change)
+			},
+			cur:  with(func(s snap) { s[2] = notifySnapshotEntry{name: "Old", subscribed: true} }),
+			want: []string{"Old sub=true"},
+		},
+		{
+			name: "RENAME does not adopt foreign subscription",
+			own: func(w *notifyWatch) {
+				w.ownRenamed([]db.MailboxNameMutation{testOwnRenamed(2, "Old", "New"), testOwnRenamed(3, "Old/Kid", "New/Kid")})
+			},
+			cur: with(func(s snap) {
+				s[2] = notifySnapshotEntry{name: "New", subscribed: true}
+				s[3] = notifySnapshotEntry{name: "New/Kid"}
+			}),
+			want: []string{"New sub=true"},
+		},
+		{
+			name: "mismatched prior rename is conservative",
+			own:  func(w *notifyWatch) { w.ownRenamed([]db.MailboxNameMutation{testOwnRenamed(2, "Foreign", "New")}) },
+			cur:  with(func(s snap) { s[2] = notifySnapshotEntry{name: "New"} }),
+			want: []string{"Old>New"},
+		},
+		{
 			name: "someone else's changes next to own ones",
-			own:  func(w *notifyWatch) { w.ownCreated("Projects") },
+			own:  func(w *notifyWatch) { w.ownCreated(testOwnCreated(10, "Projects", false)) },
 			cur: with(func(s snap) {
 				s[10] = notifySnapshotEntry{name: "Projects"}
 				s[11] = notifySnapshotEntry{name: "Marker"}
@@ -495,7 +883,6 @@ func TestNotifyOwnTreeChanges(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			watch := &notifyWatch{snapshot: base()}
 			tc.own(watch)
-			resolveOwnCreated(watch.snapshot, tc.cur)
 			got := treeEventStrings(diffNotifySnapshots(watch.snapshot, tc.cur))
 			want := tc.want
 			slices.Sort(want)
@@ -518,9 +905,9 @@ func TestOwnTreeChangeLeavesTickSnapshotAlone(t *testing.T) {
 		MailboxSpec: imap.NotifyMailboxSpecPersonal,
 		Events:      []imap.NotifyEvent{imap.NotifyEventMessageNew, imap.NotifyEventMailboxName, imap.NotifyEventSubscriptionChange},
 	})
-	watch.snapshot = map[int64]notifySnapshotEntry{1: {name: "INBOX"}, 2: {name: "Old"}}
+	watch.snapshot = testSnapshotKeys(map[int64]notifySnapshotEntry{1: {name: "INBOX"}, 2: {name: "Old"}})
 	s.notifyWatch = watch
-	cur := map[int64]notifySnapshotEntry{1: {name: "INBOX"}, 2: {name: "Old"}, 3: {name: "Gone"}}
+	cur := testSnapshotKeys(map[int64]notifySnapshotEntry{1: {name: "INBOX"}, 2: {name: "Old"}, 3: {name: "Gone"}})
 	want := maps.Clone(cur)
 	if _, stale := s.advanceNotifySnapshot(watch, cur, 0, true); stale {
 		t.Fatal("snapshot taken for stale")
@@ -530,10 +917,10 @@ func TestOwnTreeChangeLeavesTickSnapshotAlone(t *testing.T) {
 	go func() {
 		defer close(done)
 		for _, record := range []func(*ownTreeChange){
-			func(c *ownTreeChange) { c.created("Projects") },
-			func(c *ownTreeChange) { c.renamed("Old", "Older") },
-			func(c *ownTreeChange) { c.subscribed("Older", true) },
-			func(c *ownTreeChange) { c.deleted("Gone") },
+			func(c *ownTreeChange) { c.created(testOwnCreated(10, "Projects", false)) },
+			func(c *ownTreeChange) { c.renamed([]db.MailboxNameMutation{testOwnRenamed(2, "Old", "Older")}) },
+			func(c *ownTreeChange) { c.subscribed(testOwnSubscribed(2, "Older", true)) },
+			func(c *ownTreeChange) { c.deleted(3) },
 		} {
 			own := s.beginOwnTreeChange()
 			record(own)

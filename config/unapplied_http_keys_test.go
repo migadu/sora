@@ -174,7 +174,7 @@ func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 			s.RemoteLookup = &RemoteLookupConfig{Enabled: true, URL: "https://lookup.example.com/$email"}
 		}, proxies},
 		{"auth_rate_limit", func(s *ServerConfig) { s.AuthRateLimit = &AuthRateLimiterConfig{Enabled: true} }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api", "user_api_proxy"}},
-		{"lookup_cache", func(s *ServerConfig) { s.LookupCache = &LookupCacheConfig{Enabled: true} }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_user_api", "user_api_proxy"}},
+		{"lookup_cache", func(s *ServerConfig) { s.LookupCache = &LookupCacheConfig{Enabled: true} }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}},
 
 		// Session timeouts (#290, #1326): the LMTP backend's command_timeout is its
 		// idle timeout, and the LMTP proxy applies absolute_session_timeout only. The

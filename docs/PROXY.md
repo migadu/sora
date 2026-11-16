@@ -64,9 +64,14 @@ a byte pipe. Everything after login (capabilities, IDLE, FETCH) is the backend's
 
 The LMTP proxy does not log in. For each `RCPT TO` it finds the recipient's backend, connects (or
 reuses the connection it holds) and forwards the command. Like the backend, it does not announce
-`DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2); `NOTIFY`,
-`ORCPT`, `RET` and `ENVID` sent anyway are accepted and not forwarded. As on the backend, `MAIL`
-before `LHLO` gets `503 5.5.1`. A later `LHLO`, or a completed `STARTTLS`, starts the session over:
+`DSN`, so the sending MTA issues the notifications a sender asked for (RFC 3461 §5.2.2). As on the
+backend, a `MAIL` or `RCPT` parameter the proxy does not implement gets `555 5.5.4` (RFC 5321
+§4.1.1.11), `NOTIFY`, `ORCPT`, `RET`, `ENVID` and `AUTH` among them. It takes `SIZE`, `SMTPUTF8` and
+`BODY=7BIT` or `BODY=8BITMIME` on `MAIL`, and `XRCPTFORWARD` on `RCPT`, which it forwards. As on
+the backend, a malformed parameter gets `501 5.5.4`: `SMTPUTF8` with a value, or any parameter
+written with `=` and no value (RFC 5321 §4.1.2). A `MAIL`
+refused for a parameter starts no transaction; a refused `RCPT` leaves the transaction open for the
+next recipient. As on the backend, `MAIL` before `LHLO` gets `503 5.5.1`. A later `LHLO`, or a completed `STARTTLS`, starts the session over:
 the transaction in progress ends, and a held backend connection is closed, so the next recipient
 reaches the backend on a new connection (with `remote_use_xclient`, its `XCLIENT HELO=` is the new
 `LHLO` name). After `STARTTLS` the MTA must send `LHLO` again before `MAIL`. The User API proxy
@@ -871,9 +876,12 @@ delete it on a failed backend connection, so an outage does not send one lookup 
 Failures are cached only when definite: a wrong password, or a user who does not exist. Database and
 API outages are not cached.
 
-Administrative password, credential and account changes request cache invalidation. Immediate
-revocation on every node is not guaranteed: a node that misses the change can retain cached
-credentials until they are refreshed or expire. A password changed in the remote lookup API's own system reaches
+Nodes with database access synchronize PostgreSQL credential changes from the primary, normally
+on the next five-second poll, in addition to administrative invalidation gossip. Failed feed or
+cache synchronization suspends hits and fills until recovery; cache misses authenticate on the
+primary. In-flight fills are fenced against invalidation. See
+[AUTHENTICATION.md](AUTHENTICATION.md#12-cached-logins-and-password-changes) for startup, upgrade,
+retention-gap and restore requirements. A password changed in the remote lookup API's own system reaches
 the proxy as entries expire: the old password still works for up to `positive_ttl` for a user who
 used it recently, and the new one may be refused for up to `positive_revalidation_window`.
 
@@ -926,9 +934,14 @@ by the remote lookup, and master logins, never use it. It needs the node to have
 Errors reading the file are logged and the login goes to the database. The cache never fails a
 login by itself.
 
-Administrative password, credential and account changes also request invalidation of this cache.
-Propagation can miss a node, so old cached credentials can remain usable until refresh or expiry;
-the change does not guarantee immediate revocation at every proxy.
+The primary credential-change feed invalidates this cache without depending on gossip reaching
+every node. The cache stays suspended until initial namespace/provenance checks and feed
+synchronization succeed; subsequent synchronization failures disable it again. Credential reads
+and fills use primary data, and a generation fence rejects fills that crossed an invalidation.
+An untracked or different-database cache is cleared before reuse; normal restarts with matching
+provenance can retain warm rows. See
+[AUTHENTICATION.md](AUTHENTICATION.md#12-cached-logins-and-password-changes) for limitations and
+operational requirements.
 
 ### 11.3 On disk
 
@@ -962,10 +975,10 @@ Sora logs `AuthCache: Failed to initialize - continuing without auth cache` and 
 | Key (`[auth_cache]`) | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Turn the cache on. |
-| `path` | `/tmp/sora/auth_cache.db` | The SQLite file. |
-| `max_age` | `24h` | Entries older than this are not used, and are deleted at cleanup. |
+| `path` | `/var/cache/sora/auth_cache.db` | The SQLite file. |
+| `max_age` | `24h` | Entries older than this are not used, and are deleted at cleanup. Capped at seven days, the credential-feed retention. |
 | `purge_unused` | `168h` | Entries not used for this long are deleted at cleanup. |
-| `cleanup_interval` | `1h` | How often cleanup runs. |
+| `cleanup_interval` | `1h` | How often cleanup runs. Must be positive. |
 
 Durations accept `d` for days (`7d`).
 

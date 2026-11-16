@@ -223,6 +223,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	// comment above).
 	// RFC 3501 §2.3.2: \Recent is a session flag and must NOT be stored
 	// persistently.  Preserve only the source message's existing flags.
+	// A source without a message_state row (left by an older build) has none, and its copy gets a row with none.
 	insRows, err := tx.Query(ctx, `
 		WITH src_data AS (
 			SELECT
@@ -231,7 +232,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				m.message_id, m.in_reply_to, m."references",
 				m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
-				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
+				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses, m.header_presence,
 				m.id AS original_id,
 				m.account_id AS src_account_id, m.s3_domain AS src_s3_domain, m.s3_localpart AS src_s3_localpart,
 				d.new_uid,
@@ -248,7 +249,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 				subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 				body_structure, recipients_json, s3_domain, s3_localpart,
-				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 				mailbox_id, mailbox_path, created_modseq, uid
 			)
 			SELECT
@@ -262,7 +263,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				-- the object under the owner's key first, see server/imap/copy.go).
 				CASE WHEN src_account_id = $6 THEN src_s3_domain ELSE $7 END AS s3_domain,
 				CASE WHEN src_account_id = $6 THEN src_s3_localpart ELSE $8 END AS s3_localpart,
-				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 				$1 AS mailbox_id,
 				$2 AS mailbox_path,
 				nextval('messages_modseq'),
@@ -272,10 +273,10 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		),
 		state_inserted AS (
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			SELECT i.id, $1, ms.flags, s.custom_flags_canon, NOW(), nextval('messages_modseq')
+			SELECT i.id, $1, COALESCE(ms.flags, 0), s.custom_flags_canon, NOW(), nextval('messages_modseq')
 			FROM inserted i
 			JOIN src_data s ON s.new_uid = i.uid
-			JOIN message_state ms ON ms.message_id = s.original_id
+			LEFT JOIN message_state ms ON ms.message_id = s.original_id
 			RETURNING message_id
 		)
 		SELECT id FROM inserted ORDER BY uid
@@ -435,16 +436,20 @@ type InsertMessageOptions struct {
 	DeliveryHash string
 	MessageID    string
 	// CustomFlags are handled by splitting options.Flags in InsertMessage
-	Flags                []imap.Flag
-	InternalDate         time.Time
-	Size                 int64
-	Subject              string
-	PlaintextBody        string
-	SentDate             time.Time // the Date: header; zero when none parses (see storedSentDate)
-	InReplyTo            []string
-	References           []string
-	BodyStructure        *imap.BodyStructure
-	Recipients           []helpers.Recipient
+	Flags               []imap.Flag
+	InternalDate        time.Time
+	Size                int64
+	Subject             string
+	PlaintextBody       string
+	SentDate            time.Time // The parsed Date: header; zero when none parses (see storedSentDate)
+	SentDateUnknownZone bool      // The parser explicitly reported no known source zone
+	InReplyTo           []string
+	References          []string
+	BodyStructure       *imap.BodyStructure
+	Recipients          []helpers.Recipient
+	// HeaderPresence is known only for newly ingested final headers. nil preserves
+	// legacy search behavior; COPY/MOVE/restore carry it without reading old bodies.
+	HeaderPresence       *int16
 	PreservedUID         *uint32       // Optional: preserved UID from import
 	PreservedUIDValidity *uint32       // Optional: preserved UIDVALIDITY from import
 	FTSRetention         time.Duration // Optional: skip creating messages_fts_v2 entirely for messages older than this
@@ -532,8 +537,13 @@ const maxSentUTCOffset = 24 * 60 * 60
 // seconds, of the zone it is expressed in. Ingress passes the parsed Date: header in its own
 // zone, so sent_date plus this offset is the header's wall-clock time, whose day the SENT*
 // keys compare (RFC 9051 §6.4.4: "disregarding time and timezone"). nil (NULL, searched by
-// the UTC day) for an offset beyond maxSentUTCOffset.
-func sentUTCOffset(sentDate time.Time) *int32 {
+// the UTC day) for an offset beyond maxSentUTCOffset, and for a date whose zone is unknown
+// (unknownZone, RFC 5322 §3.3 "-0000"): its UTC day is the day it names, and
+// sentDateInHeaderZone gives it back in UTC, so its ENVELOPE date keeps the zone "-0000".
+func sentUTCOffset(sentDate time.Time, unknownZone bool) *int32 {
+	if unknownZone {
+		return nil
+	}
 	_, offset := sentDate.Zone()
 	if offset < -maxSentUTCOffset || offset > maxSentUTCOffset {
 		return nil
@@ -546,9 +556,11 @@ func sentUTCOffset(sentDate time.Time) *int32 {
 // the Date: header it was parsed from, given that row's sent_utc_offset. The ENVELOPE date
 // is formatted from it and must name the header's own day, time of day and zone (RFC 9051
 // §7.5.2: the envelope "is computed by the server by parsing the [RFC5322] header into the
-// component parts"). A row without an offset (written before migration 000060, or with a
-// zone beyond maxSentUTCOffset) is given in UTC rather than in the time.Local pgx decodes a
-// timestamptz into, so the ENVELOPE never depends on the server's TZ.
+// component parts"). A row without an offset (a zone that is unknown, one beyond
+// maxSentUTCOffset, or a row written before migration 000060) is given in UTC rather than
+// in the time.Local pgx decodes a timestamptz into, so the ENVELOPE never depends on the
+// server's TZ. Readers separately record an unknown source zone for a present
+// Date header when offset is NULL; time.Location does not carry that status.
 func sentDateInHeaderZone(sentDate time.Time, offset *int32) time.Time {
 	if offset == nil {
 		return sentDate.UTC()
@@ -811,9 +823,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, delivery_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, delivery_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @delivery_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @date_unknown, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @delivery_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @date_unknown, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses, @header_presence)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -835,7 +847,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"size":            options.Size,
 		"subject":         saneSubject,
 		"sent_date":       sentDate,
-		"sent_utc_offset": sentUTCOffset(sentDate),
+		"sent_utc_offset": sentUTCOffset(sentDate, options.SentDateUnknownZone && !options.SentDate.IsZero()),
 		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
@@ -848,6 +860,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"to_email_sort":   toEmailSort,
 		"cc_email_sort":   ccEmailSort,
 		"extra_addresses": extraAddresses,
+		"header_presence": options.HeaderPresence,
 	}).Scan(&messageRowId)
 
 	if err != nil {
@@ -1188,9 +1201,9 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @date_unknown, @in_reply_to, @references, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @date_unknown, @in_reply_to, @references, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses, @header_presence)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -1211,7 +1224,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		"size":            options.Size,
 		"subject":         saneSubject,
 		"sent_date":       sentDate,
-		"sent_utc_offset": sentUTCOffset(sentDate),
+		"sent_utc_offset": sentUTCOffset(sentDate, options.SentDateUnknownZone && !options.SentDate.IsZero()),
 		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
@@ -1224,6 +1237,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		"to_email_sort":   toEmailSort,
 		"cc_email_sort":   ccEmailSort,
 		"extra_addresses": extraAddresses,
+		"header_presence": options.HeaderPresence,
 	}).Scan(&messageRowId)
 
 	if err != nil {
@@ -1594,9 +1608,9 @@ func (d *Database) InsertMessagesBatch(
 		batch.Queue(`
 			WITH inserted AS (
 				INSERT INTO messages
-					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence)
 				VALUES
-					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $27, $28, $13, $14, $15, $16, $17, nextval('messages_modseq'), $18, $19, $20, $21, $22, $23, $26)
+					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $27, $28, $13, $14, $15, $16, $17, nextval('messages_modseq'), $18, $19, $20, $21, $22, $23, $26, $29)
 				RETURNING id
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -1607,7 +1621,7 @@ func (d *Database) InsertMessagesBatch(
 			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.SentDate,
 			p.SaneInReplyToStr, p.SaneReferencesStr, p.BodyStructureData, p.RecipientsJSON, uploaded, p.SubjectSort,
 			p.FromNameSort, p.FromEmailSort, p.ToNameSort, p.ToEmailSort, p.CcEmailSort,
-			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.SentDate), p.SentDateUnknown,
+			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.SentDate, p.Opt.SentDateUnknownZone && !p.Opt.SentDate.IsZero()), p.SentDateUnknown, p.Opt.HeaderPresence,
 		)
 
 		if !uploaded && p.Upload != nil {

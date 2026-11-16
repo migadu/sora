@@ -592,7 +592,7 @@ if not header :contains "precedence" ["list", "bulk", "junk"] {
 }
 
 func TestHeaderCaseInsensitivity(t *testing.T) {
-	// RFC 5228 §2.6.2.1: Header field names are case-insensitive
+	// RFC 5228 §2.7: header names compare under i;ascii-casemap.
 	// This test verifies that header matching works regardless of case
 	// in both the script and the header map
 	script := `

@@ -371,7 +371,7 @@ func TestS3ImportDoesNotImportWhenTheExistenceCheckFails(t *testing.T) {
 	si.rdb = mock
 
 	_, err = runS3Import(t, si)
-	require.NoError(t, err)
+	require.ErrorContains(t, err, "import completed with 3 failed objects")
 
 	require.Empty(t, mock.inserted, "objects whose existence check failed were imported")
 	require.Zero(t, bucket.gets, "objects whose existence check failed were read from S3")

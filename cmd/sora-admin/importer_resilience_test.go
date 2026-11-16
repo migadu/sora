@@ -71,8 +71,6 @@ func TestImporter_Resilience(t *testing.T) {
 	options := ImporterOptions{
 		DryRun:        false,
 		PreserveFlags: true,
-		ShowProgress:  false,
-		ForceReimport: false,
 		CleanupDB:     true,
 		Dovecot:       true,
 		PreserveUIDs:  true,

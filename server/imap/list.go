@@ -66,20 +66,6 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		return s.internalError("failed to fetch mailboxes: %v", err)
 	}
 
-	// Each mbox.Subscribed is already sourced from the name-based subscriptions
-	// table (migration 000046) by GetMailboxes. We additionally fetch the full
-	// subscribed-name set here so LSUB / LIST (SUBSCRIBED) can also report
-	// subscribed names that have NO live mailbox (RFC 3501 §6.3.6 / RFC 9051
-	// §6.3.7). subscribedSet maps LOWER(name) -> the stored spelling.
-	subNames, err := s.server.rdb.GetSubscribedMailboxNamesWithRetry(readCtx, s.AccountID())
-	if err != nil {
-		return s.internalError("failed to fetch subscriptions: %v", err)
-	}
-	subscribedSet := make(map[string]string, len(subNames))
-	for _, n := range subNames {
-		subscribedSet[strings.ToLower(n)] = n
-	}
-
 	// Build name -> DBMailbox mapping for batch STATUS lookups
 	nameToMailbox := make(map[string]*db.DBMailbox, len(mboxes))
 	for _, mbox := range mboxes {
@@ -100,7 +86,16 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		// and non-existent subscribed names. LSUB arrives here too — the go-imap
 		// layer dispatches it as LIST (SUBSCRIBED RECURSIVEMATCH) and renders the
 		// CHILDINFO parents as \Noselect.
-		l = buildSubscribedList(ref, patterns, options, mboxes, subscribedSet, caps, sharedNamespaceRoot)
+		//
+		// Each mbox.Subscribed is already sourced from the name-based subscriptions
+		// table (migration 000046) by GetMailboxes. The full subscribed-name set is
+		// fetched as well so LSUB / LIST (SUBSCRIBED) can also report subscribed
+		// names that have NO live mailbox (RFC 3501 §6.3.6 / RFC 9051 §6.3.7).
+		subscribed, err := s.server.rdb.GetSubscribedMailboxNamesByKeyWithRetry(readCtx, s.AccountID())
+		if err != nil {
+			return s.internalError("failed to fetch subscriptions: %v", err)
+		}
+		l = buildSubscribedList(ref, patterns, options, mboxes, subscribed, caps, sharedNamespaceRoot)
 	} else {
 		for _, mbox := range mboxes {
 			if !matchesAnyPattern(mbox.Name, ref, patterns) {
@@ -128,7 +123,7 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		var mailboxIDs []int64
 		for i := range l {
 			data := &l[i]
-			if !listEntryWantsStatus(data, options, subscribedSet) {
+			if !listEntryWantsStatus(data, options) {
 				continue
 			}
 			mbox, ok := nameToMailbox[data.Mailbox]
@@ -276,22 +271,24 @@ func hasListOptions(options *imap.ListOptions) bool {
 //   - no STATUS response for mailboxes listed with \Noselect or \NonExistent;
 //   - STATUS responses only for mailboxes that themselves match the selection
 //     options (excluding unsubscribed parents returned solely via RECURSIVEMATCH).
-func listEntryWantsStatus(data *imap.ListData, options *imap.ListOptions, subscribedSet map[string]string) bool {
+//
+// A mailbox matches the SUBSCRIBED selection when it is listed \Subscribed, which
+// it is when the database matched a subscription to it (DBMailbox.Subscribed).
+func listEntryWantsStatus(data *imap.ListData, options *imap.ListOptions) bool {
 	if data == nil || data.Mailbox == "" {
 		return false
 	}
+	subscribed := false
 	for _, attr := range data.Attrs {
 		if strings.EqualFold(string(attr), string(imap.MailboxAttrNoSelect)) ||
 			strings.EqualFold(string(attr), string(imap.MailboxAttrNonExistent)) {
 			return false
 		}
-	}
-	if options != nil && options.SelectSubscribed {
-		if _, ok := subscribedSet[strings.ToLower(data.Mailbox)]; !ok {
-			return false
+		if strings.EqualFold(string(attr), string(imap.MailboxAttrSubscribed)) {
+			subscribed = true
 		}
 	}
-	return true
+	return options == nil || !options.SelectSubscribed || subscribed
 }
 
 // matchesAnyPattern reports whether name matches any of the LIST patterns given
@@ -305,11 +302,11 @@ func matchesAnyPattern(name, ref string, patterns []string) bool {
 	return false
 }
 
-// hasDescendant reports whether any key of names is a proper descendant of
-// lowerName (i.e. lives under "lowerName<delim>…"). The keys of names are
-// already lower-cased, and lowerName must be lower-cased too.
-func hasDescendant[V any](lowerName, delim string, names map[string]V) bool {
-	prefix := lowerName + delim
+// hasDescendant reports whether any key of names is a proper descendant of key
+// (i.e. lives under "key<delim>…"). The keys are names as the database keys them,
+// LOWER(name), never a Go case mapping of a name.
+func hasDescendant[V any](key, delim string, names map[string]V) bool {
+	prefix := key + delim
 	for s := range names {
 		if strings.HasPrefix(s, prefix) {
 			return true
@@ -341,58 +338,68 @@ func childAttr(hasChildren bool) imap.MailboxAttr {
 // Without RECURSIVEMATCH, only subscribed names are returned — plain
 // LIST (SUBSCRIBED) must NOT synthesize non-subscribed parents.
 //
-// subscribedSet maps LOWER(name) -> stored spelling.
+// Names are matched as the database matches them, by LOWER(name) under its
+// collation: mboxes carry it as NameKey, and subscribed maps it to the stored
+// spelling of each subscribed name (GetSubscribedMailboxNamesByKey). A Go case
+// mapping would part ways with it, e.g. strings.ToLower("İx") is "ix" while ICU's
+// lower() keeps the two names apart.
 func buildSubscribedList(ref string, patterns []string, options *imap.ListOptions,
-	mboxes []*db.DBMailbox, subscribedSet map[string]string,
+	mboxes []*db.DBMailbox, subscribed map[string]string,
 	serverCaps imap.CapSet, sharedNamespaceRoot string) []imap.ListData {
 
 	recursive := options.SelectRecursiveMatch
 	delim := string(consts.MailboxDelimiter)
 
-	liveByLower := make(map[string]*db.DBMailbox, len(mboxes))
+	liveByKey := make(map[string]*db.DBMailbox, len(mboxes))
 	for _, m := range mboxes {
-		liveByLower[strings.ToLower(m.Name)] = m
+		liveByKey[m.NameKey] = m
 	}
 
 	// Candidate universe, keyed by LOWER(name) -> display spelling: live
 	// mailboxes, subscribed names, and — for RECURSIVEMATCH — the ancestors of
 	// every subscribed name (so a non-existent parent of a subscribed child can
 	// still be reported with CHILDINFO).
-	candidates := make(map[string]string, len(mboxes)+len(subscribedSet))
+	candidates := make(map[string]string, len(mboxes)+len(subscribed))
 	for _, m := range mboxes {
-		candidates[strings.ToLower(m.Name)] = m.Name
+		candidates[m.NameKey] = m.Name
 	}
-	for lname, disp := range subscribedSet {
-		if _, ok := candidates[lname]; !ok {
-			candidates[lname] = disp
+	for key, name := range subscribed {
+		if _, ok := candidates[key]; !ok {
+			candidates[key] = name
 		}
 	}
 	if recursive {
-		for _, disp := range subscribedSet {
-			parts := strings.Split(disp, delim)
+		// An ancestor's key is the leading levels of the subscribed name's key:
+		// lower() leaves the hierarchy delimiter alone, as the database relies on
+		// when it matches descendants by LOWER(name) LIKE LOWER(prefix) || '%'.
+		for key, name := range subscribed {
+			keyParts := strings.Split(key, delim)
+			parts := strings.Split(name, delim)
+			if len(keyParts) != len(parts) {
+				continue
+			}
 			for i := 1; i < len(parts); i++ {
-				anc := strings.Join(parts[:i], delim)
-				la := strings.ToLower(anc)
-				if _, ok := candidates[la]; !ok {
-					candidates[la] = anc
+				ancKey := strings.Join(keyParts[:i], delim)
+				if _, ok := candidates[ancKey]; !ok {
+					candidates[ancKey] = strings.Join(parts[:i], delim)
 				}
 			}
 		}
 	}
 
 	var l []imap.ListData
-	for lname, name := range candidates {
+	for key, name := range candidates {
 		if !matchesAnyPattern(name, ref, patterns) {
 			continue
 		}
-		_, isSub := subscribedSet[lname]
-		hasSubChild := recursive && hasDescendant(lname, delim, subscribedSet)
+		_, isSub := subscribed[key]
+		hasSubChild := recursive && hasDescendant(key, delim, subscribed)
 		if !isSub && !hasSubChild {
 			continue // not subscribed and no subscribed descendant → not in SUBSCRIBED response
 		}
 
 		var data imap.ListData
-		if m, ok := liveByLower[lname]; ok {
+		if m, ok := liveByKey[key]; ok {
 			md := listMailbox(m, options, serverCaps, sharedNamespaceRoot)
 			if md == nil {
 				continue // filtered out (e.g. SELECT SPECIAL-USE with no special-use)
@@ -420,7 +427,7 @@ func buildSubscribedList(ref string, patterns []string, options *imap.ListOption
 			// mailbox whose parent the user cannot see (§3.5: "\NonExistent
 			// \HasChildren").
 			if options.ReturnChildren {
-				data.Attrs = append(data.Attrs, childAttr(hasDescendant(lname, delim, liveByLower)))
+				data.Attrs = append(data.Attrs, childAttr(hasDescendant(key, delim, liveByKey)))
 			}
 		}
 
@@ -442,7 +449,7 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 	// sharedNamespaceRoot is empty when shared mailboxes are disabled, so a
 	// personal folder that happens to be named like the prefix is not falsely
 	// marked \Noselect.
-	if sharedNamespaceRoot != "" && strings.EqualFold(mbox.Name, sharedNamespaceRoot) {
+	if isSharedNamespaceRoot(mbox.Name, sharedNamespaceRoot) {
 		attributes = append(attributes, imap.MailboxAttrNoSelect)
 	}
 

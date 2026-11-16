@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -243,7 +244,27 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	// Header conditions
 	for _, header := range criteria.Header {
 		lowerValue := strings.ToLower(header.Value)
-		lowerKey := strings.ToLower(header.Key)
+		// A field name is printable US-ASCII (RFC 5322 §2.2): fold its ASCII
+		// letters only. strings.ToLower maps U+0130 to "i" and U+212A to "k",
+		// turning a name no message can have into Message-ID or In-Reply-To.
+		lowerKey := lowerASCII(header.Key)
+		if header.Value == "" {
+			if bit, supported := helpers.HeaderPresenceBit(lowerKey); supported && header.IsHeader {
+				param := nextParam()
+				args[param] = ""
+				old := emptyHeaderLegacyCond(datePrefix, lowerKey, "@"+param)
+				conditions = append(conditions, fmt.Sprintf("CASE WHEN %sheader_presence IS NULL THEN (%s) ELSE (%sheader_presence & %d) <> 0 END", datePrefix, old, datePrefix, bit))
+				continue
+			}
+			if lowerKey == "from" || lowerKey == "to" || lowerKey == "cc" {
+				param := nextParam()
+				args[param] = ""
+				old := addressHeaderCond(datePrefix, lowerKey, "@"+param)
+				known := nonEmptyAddressHeaderCond(datePrefix, lowerKey, "@"+param)
+				conditions = append(conditions, fmt.Sprintf("CASE WHEN %sheader_presence IS NULL THEN (%s) ELSE (%s) END", datePrefix, old, known))
+				continue
+			}
+		}
 		switch lowerKey {
 		case "subject":
 			param := nextParam()
@@ -1741,4 +1762,38 @@ func (db *Database) canonicalizeSearchCriteriaKeywords(ctx context.Context, tx p
 
 	rewrite(criteria)
 	return nil
+}
+
+// emptyHeaderLegacyCond is the accepted pre-presence empty-term predicate. NULL
+// masks retain these historical results exactly; no old bodies are read/backfilled.
+func emptyHeaderLegacyCond(prefix, key, term string) string {
+	switch key {
+	case "from", "to", "cc":
+		return addressHeaderCond(prefix, key, term)
+	case "subject":
+		return substringCond("LOWER("+prefix+"subject)", term)
+	case "message-id":
+		return "COALESCE(" + substringCond(messageIDFieldExpr(prefix+"message_id"), term) + ", FALSE)"
+	case "in-reply-to", "references":
+		col := prefix + "in_reply_to"
+		if key == "references" {
+			col = prefix + `"references"`
+		}
+		return "COALESCE(" + substringCond(msgIDListExpr(col), term) + ", FALSE)"
+	case "bcc", "sender", "reply-to":
+		// These names come from the fixed internal set, not user SQL.
+		return fmt.Sprintf("EXISTS (SELECT 1 FROM jsonb_array_elements(%srecipients_json) r WHERE r->>'type' = '%s' AND (%s OR %s))", prefix, key, substringCond("LOWER(r->>'email')", term), substringCond("LOWER(r->>'name')", term))
+	default:
+		panic("unsupported header presence key")
+	}
+}
+
+func nonEmptyAddressHeaderCond(prefix, key, term string) string {
+	var conds []string
+	for _, col := range addressHeaderSortColumns[key] {
+		conds = append(conds, substringCond("NULLIF("+prefix+col+", '')", term))
+	}
+	section := fmt.Sprintf(`split_part(%sextra_addresses, E'\n', %d)`, prefix, addressHeaderSection[key])
+	conds = append(conds, substringCond("NULLIF("+section+", '')", term))
+	return anyOf(conds)
 }

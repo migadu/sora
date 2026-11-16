@@ -543,7 +543,7 @@ func createDovecotUIDList(t *testing.T, maildirPath string, uidValidity uint32, 
 		uidList.UIDMappings[msg.filename] = msg.uid
 	}
 
-	if err := WriteDovecotUIDList(maildirPath, uidList); err != nil {
+	if err := os.WriteFile(filepath.Join(maildirPath, "dovecot-uidlist"), formatDovecotUIDList(uidList), 0644); err != nil {
 		t.Fatalf("Failed to write dovecot-uidlist to %s: %v", maildirPath, err)
 	}
 }

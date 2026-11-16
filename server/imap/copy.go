@@ -112,7 +112,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		destS3Localpart = localpart
 	}
 
-	// COPY's transaction holds the destination object locks before checking S3 and
+	// COPY's transaction holds account-independent destination body locks before checking S3 and
 	// until its rows commit, as MOVE does. A body staged locally is re-staged instead.
 	type crossAccountObject struct {
 		sourceKey, destKey string

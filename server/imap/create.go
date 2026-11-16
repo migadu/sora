@@ -71,15 +71,12 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 
 	// Prevent creating the shared namespace root explicitly
 	// Users should create "Shared/Something", not just "Shared"
-	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
-		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
-		if strings.EqualFold(name, sharedPrefix) {
-			s.DebugLog("cannot create shared namespace root explicitly", "name", name)
-			return &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeCannot,
-				Text: "Cannot create the shared namespace root directly. Create mailboxes under it instead (e.g., Shared/FolderName)",
-			}
+	if s.server.config != nil && s.server.config.SharedMailboxes.IsNamespaceRoot(name) {
+		s.DebugLog("cannot create shared namespace root explicitly", "name", name)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "Cannot create the shared namespace root directly. Create mailboxes under it instead (e.g., Shared/FolderName)",
 		}
 	}
 
@@ -177,7 +174,11 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 					}
 
 					s.DebugLog("auto-creating parent mailbox", "mailbox", parentPathWithoutDelim)
-					err = s.server.rdb.CreateMailboxWithRetry(ctx, ownerAccountID, parentPathWithoutDelim, currentParentID)
+					state, createErr := s.server.rdb.CreateMailboxReturningStateWithRetry(ctx, ownerAccountID, AccountID, parentPathWithoutDelim, currentParentID, "")
+					err = createErr
+					if createErr == nil {
+						own.created(*state)
+					}
 					if err != nil {
 						// Handle race condition: another session may have created the same parent
 						// mailbox concurrently. If so, just fetch the existing one.
@@ -245,7 +246,8 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 	// without its attribute (RFC 6154), and LIST never observes a transient
 	// attribute-less state. Auto-created parents above do not inherit it.
 	if specialUse != "" {
-		err = s.server.rdb.CreateMailboxWithSpecialUseWithRetry(ctx, ownerAccountID, name, parentMailboxID, specialUse)
+		state, createErr := s.server.rdb.CreateMailboxReturningStateWithRetry(ctx, ownerAccountID, AccountID, name, parentMailboxID, specialUse)
+		err = createErr
 		if err != nil {
 			if errors.Is(err, consts.ErrMailboxSpecialUseInUse) {
 				// Lost the race with the pre-check: another mailbox claimed the
@@ -267,11 +269,12 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 		}
 		s.DebugLog("mailbox created with special-use", "mailbox", name, "special_use", specialUse)
 		s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
-		own.created(name)
+		own.created(*state)
 		return nil
 	}
 
-	err = s.server.rdb.CreateMailboxWithRetry(ctx, ownerAccountID, name, parentMailboxID)
+	state, createErr := s.server.rdb.CreateMailboxReturningStateWithRetry(ctx, ownerAccountID, AccountID, name, parentMailboxID, "")
+	err = createErr
 	if err != nil {
 		// Handle race condition: another session may have created the same mailbox
 		// between our existence check and the actual INSERT.
@@ -287,7 +290,7 @@ func (s *IMAPSession) Create(ctx context.Context, name string, options *imap.Cre
 
 	s.DebugLog("mailbox created", "mailbox", name)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
-	own.created(name)
+	own.created(*state)
 	return nil
 }
 
@@ -367,7 +370,7 @@ func (s *IMAPSession) isRefusedSharedRoot(ctx context.Context, accountID int64, 
 			break
 		}
 		parent = parent[:separator]
-		if strings.EqualFold(parent, strings.TrimSuffix(shared.NamespacePrefix, "/")) || !shared.InNamespace(parent) {
+		if shared.IsNamespaceRoot(parent) || !shared.InNamespace(parent) {
 			break
 		}
 		mbox, err := s.server.rdb.GetSharedMailboxByNameForRightWithRetry(ctx, accountID, parent, db.ACLRightCreate)

@@ -154,7 +154,15 @@ func TestNotifyOwnCreateBelowAnInvisibleLevel(t *testing.T) {
 
 	var lists []string
 	for _, resp := range got {
-		if m := notifyEventRe.FindStringSubmatch(resp); m != nil && m[1] == "LIST" && m[2] != "Shared/Team/Marker" {
+		if m := notifyEventRe.FindStringSubmatch(resp); m != nil && m[1] == "LIST" {
+			if m[2] == "Shared/Team/Marker" {
+				continue
+			}
+			if m[2] == "Shared/Team" && !strings.Contains(resp, `\NonExistent`) {
+				// The foreign Marker creation affects its visible direct parent
+				// too (RFC 5465 §5.4). Neither is this connection's CREATE.
+				continue
+			}
 			lists = append(lists, resp)
 		}
 	}

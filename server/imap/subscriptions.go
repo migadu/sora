@@ -2,9 +2,6 @@ package imap
 
 import (
 	"context"
-	"strings"
-
-	"github.com/migadu/sora/consts"
 )
 
 // Subscribe to a mailbox (RFC 3501 §6.3.6 / RFC 9051 §6.3.7). Subscriptions are
@@ -31,26 +28,12 @@ func (s *IMAPSession) updateSubscriptionStatus(ctx context.Context, mailboxName 
 	AccountID := s.AccountID()
 	release()
 
-	// Default mailboxes are kept permanently subscribed: ignore an unsubscribe of
-	// a default name (preserves the prior SetMailboxSubscribed behavior). Subscribe
-	// of any name — including one with no mailbox — is always persisted.
-	if !subscribe {
-		for _, def := range consts.DefaultMailboxes {
-			if strings.EqualFold(mailboxName, def) {
-				s.DebugLog("ignoring unsubscribe for default mailbox", "mailbox", mailboxName)
-				return nil
-			}
-		}
-	}
-
+	// Subscribe of any name — including one with no mailbox — is always persisted.
+	// Unsubscribe leaves a default mailbox's subscription in place: db.Unsubscribe
+	// keeps it, as only the database can tell which names are a default mailbox's.
 	own := s.beginOwnTreeChange()
 	defer own.end()
-	var err error
-	if subscribe {
-		err = s.server.rdb.SubscribeWithRetry(ctx, AccountID, mailboxName)
-	} else {
-		err = s.server.rdb.UnsubscribeWithRetry(ctx, AccountID, mailboxName)
-	}
+	change, err := s.server.rdb.UpdateSubscriptionReturningStateWithRetry(ctx, AccountID, mailboxName, subscribe)
 	if err != nil {
 		return s.internalError("failed to update subscription status for mailbox '%s': %v", mailboxName, err)
 	}
@@ -61,7 +44,7 @@ func (s *IMAPSession) updateSubscriptionStatus(ctx context.Context, mailboxName 
 	}
 	s.DebugLog("mailbox subscription changed", "mailbox", mailboxName, "action", action)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
-	own.subscribed(mailboxName, subscribe)
+	own.subscribed(change)
 
 	return nil
 }

@@ -13,8 +13,9 @@ import (
 // --- Uploader Worker Wrappers ---
 
 // ExecuteWithS3ObjectLock runs executionFunc while holding the advisory lock keyed by
-// (accountID, contentHash) that the cleaner's S3 deletion takes as well
-// (db.GetS3ObjectLockID). This is not a lock on a physical S3 key shared by accounts.
+// contentHash that the cleaner's S3 deletion takes as well (db.GetS3ObjectLockID).
+// The account does not affect this lock; equal hashes under different S3 keys also
+// coordinate conservatively.
 // sora-admin import rekey holds it while it writes a body's new object and while it
 // deletes the old one.
 // A cross-account IMAP COPY or MOVE takes the same lock in shared mode in its own

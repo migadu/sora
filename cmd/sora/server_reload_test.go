@@ -125,6 +125,29 @@ func TestServerReloadRejectsInvalidExemptNetworks(t *testing.T) {
 	}
 }
 
+// A reload whose master_sasl_allowed_networks has an entry that is not an IP address or
+// CIDR is refused for that server, naming the entry, as a restart would refuse it; the
+// server keeps the config it has (#1675).
+func TestServerReloadRejectsInvalidMasterSASLAllowedNetworks(t *testing.T) {
+	logs := captureReloadLogs(t)
+	running := config.ServerConfig{
+		Type: "imap", Name: "imap", Addr: ":143",
+		MasterSASLUsername: "master", MasterSASLPassword: "secret", MasterSASLAllowedNetworks: []string{"192.0.2.10"},
+	}
+	deps, reloaders := runningDeps(t, running)
+
+	next := running
+	next.MasterSASLAllowedNetworks = []string{"proxy.example.com"}
+	deps.reloadServers(reloadedConfig(next))
+
+	if got := reloaders["imap"].reloaded; len(got) != 0 {
+		t.Fatalf("ReloadConfig got %+v, want no call", got)
+	}
+	if out := logs.String(); !hasLineWith(out, "Skipping reload", "server=imap", "master_sasl_allowed_networks", "proxy.example.com") {
+		t.Errorf("no error naming imap and the invalid master_sasl_allowed_networks entry:\n%s", out)
+	}
+}
+
 // A reload whose enabled remote_lookup the proxy could not build its lookup client from
 // is refused for that server, as a restart would refuse it; the server keeps the config
 // it has (#853).

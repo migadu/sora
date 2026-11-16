@@ -23,15 +23,12 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 
 	// Prevent selecting the shared namespace root
 	// The namespace root (e.g., "Shared") should only be a container, not a selectable mailbox
-	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
-		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
-		if strings.EqualFold(mboxName, sharedPrefix) {
-			s.DebugLog("cannot select shared namespace root", "mailbox", mboxName)
-			return nil, &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeCannot,
-				Text: "The shared namespace root cannot be selected. Select mailboxes under it instead",
-			}
+	if s.server.config != nil && s.server.config.SharedMailboxes.IsNamespaceRoot(mboxName) {
+		s.DebugLog("cannot select shared namespace root", "mailbox", mboxName)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "The shared namespace root cannot be selected. Select mailboxes under it instead",
 		}
 	}
 

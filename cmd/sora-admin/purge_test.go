@@ -453,11 +453,12 @@ func createPurgeTestConfig(t *testing.T) AdminConfig {
 	return AdminConfig{
 		Database: *adminTestDBConfig(t),
 		S3: config.S3Config{
-			Endpoint:   "localhost:9000",
-			AccessKey:  "minioadmin",
-			SecretKey:  "minioadmin",
-			Bucket:     "sora-test",
-			DisableTLS: true,
+			BodyDeletionProtocol: "global-hash-v1",
+			Endpoint:             "localhost:9000",
+			AccessKey:            "minioadmin",
+			SecretKey:            "minioadmin",
+			Bucket:               "sora-test",
+			DisableTLS:           true,
 		},
 	}
 }

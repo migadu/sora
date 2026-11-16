@@ -36,9 +36,8 @@ import (
 type S3ImporterOptions struct {
 	Email             string // Email address to import messages for
 	DryRun            bool
-	BatchSize         int // Number of S3 objects to process in each batch
-	MaxObjects        int // Maximum number of objects to process (0 = unlimited)
-	ShowProgress      bool
+	BatchSize         int           // Number of S3 objects to process in each batch
+	MaxObjects        int           // Maximum number of objects to process (0 = unlimited)
 	ForceReimport     bool          // Import into INBOX even when another mailbox of the account holds the message
 	CleanupDB         bool          // Cleanup temporary database when done
 	ImportDelay       time.Duration // Delay between imports to control rate
@@ -595,7 +594,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	mailHeader := mail.Header{Header: messageContent.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
+	sentDate, sentDateUnknownZone, _ := helpers.ParseDateHeaderWithZone(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -654,23 +653,25 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	// Insert message into database
 	msgID, uid, err := si.rdb.InsertMessageWithRetry(writeCtx,
 		&db.InsertMessageOptions{
-			AccountID:     user.AccountID(),
-			MailboxID:     mailbox.ID,
-			S3Domain:      user.Domain(),
-			S3Localpart:   user.LocalPart(),
-			MailboxName:   mailbox.Name,
-			ContentHash:   contentHash,
-			MessageID:     messageID,
-			InternalDate:  internalDate,
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: actualPlaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			References:    references,
-			BodyStructure: &bodyStructure,
-			Recipients:    recipients,
-			FTSRetention:  si.options.FTSRetention,
+			AccountID:           user.AccountID(),
+			MailboxID:           mailbox.ID,
+			S3Domain:            user.Domain(),
+			S3Localpart:         user.LocalPart(),
+			MailboxName:         mailbox.Name,
+			ContentHash:         contentHash,
+			MessageID:           messageID,
+			InternalDate:        internalDate,
+			Size:                size,
+			Subject:             subject,
+			PlaintextBody:       actualPlaintextBody,
+			SentDate:            sentDate,
+			SentDateUnknownZone: sentDateUnknownZone,
+			InReplyTo:           inReplyTo,
+			References:          references,
+			BodyStructure:       &bodyStructure,
+			Recipients:          recipients,
+			HeaderPresence:      helpers.ExtractHeaderPresence(messageContent.Header),
+			FTSRetention:        si.options.FTSRetention,
 		},
 		db.PendingUpload{
 			InstanceID:  si.options.InstanceID,
@@ -791,6 +792,9 @@ func (si *S3Importer) printSummary() error {
 	if si.lastContinuationToken != "" {
 		fmt.Printf("  Last processed key:   %s\n", si.lastContinuationToken)
 		fmt.Printf("  Resumption token:     %s\n", si.lastContinuationToken)
+	}
+	if si.failedMessages > 0 {
+		return fmt.Errorf("import completed with %d failed objects", si.failedMessages)
 	}
 	return nil
 }

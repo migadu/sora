@@ -458,12 +458,11 @@ func TestOpenAPIOperationsMatchHandlers(t *testing.T) {
 }
 
 // Every request passes allowedHostsMiddleware and authMiddleware before the router looks
-// at its path, so every operation can be refused by them. The spec described a wrong key
-// as 401 "invalid or missing API key" on four operations and documented 403 on none,
-// while the server answers 401 only for a missing or non-Bearer Authorization header,
-// and 403 for a wrong key, the read-only key on a write, or a client outside
-// allowed_hosts. This pins every operation to the statuses and messages the middleware
-// answers with.
+// at its path, so every operation can be refused by them: 401 for a missing or non-Bearer
+// Authorization header or a wrong key, 403 for the read-only key on a write or a client
+// outside allowed_hosts. The spec once documented these on four operations only and 403
+// on none. This pins every operation to the statuses and messages the middleware answers
+// with.
 func TestOpenAPIDocumentsAccessRefusalsOnEveryOperation(t *testing.T) {
 	middleware := accessMiddleware(t)
 	refusals := handlerResponses(t, middleware...)

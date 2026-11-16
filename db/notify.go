@@ -18,6 +18,7 @@ import (
 type NotifyMailbox struct {
 	ID          int64
 	Name        string
+	NameKey     string // LOWER(name) as the database computes it, see DBMailbox.NameKey
 	UIDValidity uint32
 	Subscribed  bool
 	OwnerID     int64
@@ -60,7 +61,7 @@ func (db *Database) GetMailboxNotifySnapshot(ctx context.Context, accountID int6
 			FROM accessible_mailboxes
 			ORDER BY LOWER(name), priority, id
 		)
-		SELECT m.id, m.name, m.uid_validity, m.account_id,
+		SELECT m.id, m.name, LOWER(m.name), m.uid_validity, m.account_id,
 		       (subs.mailbox_name IS NOT NULL) AS subscribed
 		FROM visible_mailboxes m
 		LEFT JOIN subscriptions subs ON subs.account_id = $1 AND LOWER(subs.mailbox_name) = LOWER(m.name)
@@ -76,7 +77,7 @@ func (db *Database) GetMailboxNotifySnapshot(ctx context.Context, accountID int6
 			m           NotifyMailbox
 			uidValidity int64
 		)
-		if err := rows.Scan(&m.ID, &m.Name, &uidValidity, &m.OwnerID, &m.Subscribed); err != nil {
+		if err := rows.Scan(&m.ID, &m.Name, &m.NameKey, &uidValidity, &m.OwnerID, &m.Subscribed); err != nil {
 			return nil, fmt.Errorf("failed to scan notify snapshot row: %w", err)
 		}
 		m.UIDValidity = uint32(uidValidity)

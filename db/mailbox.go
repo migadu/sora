@@ -28,6 +28,12 @@ type DBMailbox struct {
 	SpecialUse  string // RFC 6154 special-use attribute (e.g. "\Sent"); empty if none
 	CreatedAt   time.Time
 	UpdatedAt   time.Time
+
+	// NameKey is LOWER(name) as the database computes it: the mailbox's identity
+	// (unique per owner, migration 000041). lower() depends on the collation, and
+	// no Go case mapping matches it, so names are compared by this key
+	// (MailboxNameKeys gives a client's names theirs). Set by GetMailboxes.
+	NameKey string
 }
 
 func NewDBMailbox(mboxId int64, name string, uidValidity uint32, path string, subscribed, hasChildren bool, createdAt, updatedAt time.Time) DBMailbox {
@@ -95,7 +101,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			ORDER BY LOWER(name), priority, id
 		)
 		SELECT
-			m.id, m.name, m.uid_validity, m.path,
+			m.id, m.name, LOWER(m.name), m.uid_validity, m.path,
 			-- Subscription state from the name-based subscriptions table (migration
 			-- 000046) via a LEFT JOIN: the planner hashes this account's (small)
 			-- subscription set once and probes per mailbox, instead of running a
@@ -137,7 +143,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 		var mailbox DBMailbox
 		var uidValidityInt64 int64
 
-		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
+		if err := rows.Scan(&mailbox.ID, &mailbox.Name, &mailbox.NameKey, &uidValidityInt64, &mailbox.Path, &mailbox.Subscribed, &mailbox.SpecialUse, &mailbox.CreatedAt, &mailbox.UpdatedAt, &mailbox.AccountID, &mailbox.HasChildren); err != nil {
 			return nil, err
 		}
 
@@ -151,6 +157,41 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 	}
 
 	return mailboxes, nil
+}
+
+// MailboxNameKeys returns, in order, the key of each of names: LOWER(name) as the
+// database computes it, the key a name resolves to a mailbox by (DBMailbox.NameKey).
+// lower() depends on the collation and no Go case mapping matches it, so a name a
+// client gives is compared with mailboxes by this key. A name PostgreSQL cannot hold
+// (helpers.MailboxNameStorable) names no mailbox and gets the empty key, which no
+// mailbox has.
+func (db *Database) MailboxNameKeys(ctx context.Context, names []string) ([]string, error) {
+	keys := make([]string, len(names))
+	storable := make([]string, 0, len(names))
+	for _, name := range names {
+		if helpers.MailboxNameStorable(name) {
+			storable = append(storable, name)
+		}
+	}
+	if len(storable) == 0 {
+		return keys, nil
+	}
+
+	var lowered []string
+	if err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT ARRAY(SELECT LOWER(n) FROM unnest($1::text[]) WITH ORDINALITY AS t(n, i) ORDER BY i)
+	`, storable).Scan(&lowered); err != nil {
+		return nil, fmt.Errorf("failed to compute mailbox name keys: %w", err)
+	}
+	if len(lowered) != len(storable) {
+		return nil, fmt.Errorf("computed %d mailbox name keys for %d names", len(lowered), len(storable))
+	}
+	for i, name := range names {
+		if helpers.MailboxNameStorable(name) {
+			keys[i], lowered = lowered[0], lowered[1:]
+		}
+	}
+	return keys, nil
 }
 
 // GetMailboxesCount returns the number of mailboxes for an account
@@ -329,7 +370,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 
 // CreateMailbox creates a mailbox with no RFC 6154 special-use attribute.
 func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64) error {
-	return db.createMailbox(ctx, tx, AccountID, name, parentID, "")
+	return db.createMailbox(ctx, tx, AccountID, name, parentID, "", nil)
 }
 
 // CreateMailboxWithSpecialUse creates a mailbox and assigns an RFC 6154 special-use
@@ -339,10 +380,10 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 // consts.ErrMailboxSpecialUseInUse (mapped to NO [USEATTR] by the caller); a duplicate
 // name surfaces as consts.ErrDBUniqueViolation.
 func (db *Database) CreateMailboxWithSpecialUse(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64, specialUse string) error {
-	return db.createMailbox(ctx, tx, AccountID, name, parentID, specialUse)
+	return db.createMailbox(ctx, tx, AccountID, name, parentID, specialUse, nil)
 }
 
-func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64, specialUse string) error {
+func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64, specialUse string, capture *mailboxCreationCapture) error {
 	// Mailbox names are case-insensitive (Option A): the UNIQUE(account_id,
 	// LOWER(name)) index rejects any case-variant of an existing name. Folding
 	// INBOX additionally guarantees the reserved inbox is stored as the canonical
@@ -419,12 +460,21 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// (CreateMailboxForUser, GetOrCreateMailboxByNameWithRetry) read the existing
 	// mailbox back in it (issue #1396).
 	var mailboxID int64
-	err = tx.QueryRow(ctx, `
+	query := `
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, is_shared, owner_domain, special_use)
 		VALUES ($1, $2, $3, $4, '', $5, $6, $7)
 		ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
-		RETURNING id
-	`, AccountID, name, int64(uidValidity), false, isShared, ownerDomain, specialUseParam).Scan(&mailboxID)
+		RETURNING id`
+	args := []any{AccountID, name, int64(uidValidity), false, isShared, ownerDomain, specialUseParam}
+	scan := []any{&mailboxID}
+	if capture != nil {
+		// The statement's snapshot records initial subscription state. A later
+		// query could already contain another session's post-insert SUBSCRIBE.
+		query += `, LOWER(name), EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id=$8 AND LOWER(s.mailbox_name)=LOWER(mailboxes.name))`
+		args = append(args, capture.viewer)
+		scan = append(scan, &capture.state.NameKey, &capture.state.Subscribed)
+	}
+	err = tx.QueryRow(ctx, query, args...).Scan(scan...)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Distinct from a duplicate special-use attribute below, so the caller can
@@ -474,6 +524,18 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		if err := grantNewSharedMailboxACL(ctx, tx, AccountID, name, mailboxID, sharedParentID, *ownerDomain); err != nil {
 			return err
 		}
+	}
+
+	if capture != nil {
+		capture.state.ID = mailboxID
+		capture.state.Name = name
+		capture.state.UIDValidity = uidValidity
+		capture.state.OwnerID = AccountID
+		visible, err := lockNotifyMailboxForMutation(ctx, tx, capture.viewer, name)
+		if err != nil {
+			return err
+		}
+		capture.state.Visible = visible != nil && visible.ID == mailboxID
 	}
 
 	return nil
@@ -814,10 +876,10 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 
 	// Detach the mailbox's message_state rows in bounded batches, so the DELETE below
 	// has nothing to cascade into. They are detached (mailbox_id = NULL), not deleted:
-	// the ON DELETE CASCADE used to delete them, and RestoreMessages only UPDATEs this
-	// row, so a message restored after a purge came back with no state at all — unread,
-	// keyword-less, and every STORE on it silently updating nothing. Kept, its flags
-	// survive the round trip; the row still goes when the message row itself is reaped
+	// the ON DELETE CASCADE used to delete them, and RestoreMessages takes a restored
+	// message's flags from this row, so a message restored after a purge came back
+	// unread and keyword-less. Kept, its flags survive the round trip; the row still
+	// goes when the message row itself is reaped
 	// (message_state.message_id is ON DELETE CASCADE). The stats triggers skip rows
 	// whose mailbox_id is NULL, and these messages are all expunged by now anyway.
 	detachedState, err := tx.Exec(ctx, `
@@ -1208,7 +1270,7 @@ func (d *Database) GetMailboxMessageCountAndSizeSum(ctx context.Context, mailbox
 // 000046) — this by-ID helper resolves the mailbox's name and writes there, so
 // non-IMAP callers (admin/user API, importer) stay consistent with LSUB/LIST
 // (SUBSCRIBED). Unsubscribing a default mailbox is ignored (defaults stay
-// permanently subscribed).
+// permanently subscribed; Unsubscribe keeps them).
 func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, subscribed bool) error {
 	// First, check if the mailbox exists and belongs to the user.
 	var mboxName string
@@ -1218,16 +1280,6 @@ func (db *Database) SetMailboxSubscribed(ctx context.Context, tx pgx.Tx, mailbox
 			return consts.ErrMailboxNotFound
 		}
 		return fmt.Errorf("failed to fetch mailbox %d for subscription update: %w", mailboxID, err)
-	}
-
-	// Prevent unsubscribing default mailboxes (they stay permanently subscribed).
-	if !subscribed {
-		for _, rootFolder := range consts.DefaultMailboxes {
-			if strings.EqualFold(mboxName, rootFolder) {
-				logger.Debug("Database: ignoring unsubscribe for default mailbox", "mailbox", mboxName)
-				return nil
-			}
-		}
 	}
 
 	if subscribed {
@@ -1269,19 +1321,55 @@ func (db *Database) RenameCrossesSharedBoundary(ctx context.Context, shared conf
 	if !shared.Enabled || mbox.Path == "" {
 		return false, nil
 	}
-	// Each new name as RenameMailbox gives it: the new name in place of the old one.
+	// Each new name as RenameMailbox gives it: the new name in place of the old one's
+	// levels.
+	delimiter := string(consts.MailboxDelimiter)
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		SELECT $3 || SUBSTRING(name FROM LENGTH($4) + 1), COALESCE(is_shared, FALSE)
+		SELECT array_to_string(ARRAY[$3::text] || (string_to_array(name, $5))[$4::int + 1:], $5),
+			COALESCE(is_shared, FALSE)
 		FROM mailboxes
 		WHERE account_id = $1 AND path LIKE $2 || '%' AND deleted_at IS NULL
-	`, mbox.AccountID, mbox.Path, newName, mbox.Name)
+	`, mbox.AccountID, mbox.Path, newName, mailboxNameLevels(mbox.Name, delimiter), delimiter)
 	if err != nil {
 		return false, err
 	}
 	return crossSharedBoundary(rows, &shared)
 }
 
+// mailboxNameLevels is the number of levels of the mailbox name, which a rename
+// replaces with the new name at the front of each descendant's name and
+// subscription. A descendant keeps its levels after that many, not its characters
+// after as many as the old name has: it is linked below its ancestor by LOWER(name),
+// and lower() can change a name's length (under ICU lower('İ') is "i̇", so a child
+// "i̇q/c" sits below "İq", issue #1650). lower() never writes or removes the ASCII
+// delimiter, so both spellings have the same number of levels.
+func mailboxNameLevels(name, delimiter string) int {
+	return strings.Count(name, delimiter) + 1
+}
+
+// isInboxMailboxName reports whether stored, a mailbox name resolved from the database,
+// is "INBOX" in any case of its ASCII letters.
+func isInboxMailboxName(stored string) bool {
+	if len(stored) != len(consts.MailboxInbox) {
+		return false
+	}
+	for i := 0; i < len(stored); i++ {
+		c := stored[i]
+		if 'a' <= c && c <= 'z' {
+			c -= 'a' - 'A'
+		}
+		if c != consts.MailboxInbox[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
+	return db.renameMailbox(ctx, tx, mailboxID, AccountID, newName, newParentID, nil)
+}
+
+func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64, changes *[]MailboxNameMutation) error {
 	// The same names createMailbox refuses: control characters, empty levels and
 	// "." / ".." levels (maildir-export path traversal).
 	if !helpers.MailboxNameValid(newName) {
@@ -1292,16 +1380,20 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Check if user has admin permission (ACL 'a' right) for shared mailboxes
 	// For personal mailboxes, ownership is sufficient
 	var isShared bool
+	var currentName string
 	err := tx.QueryRow(ctx, `
-		SELECT COALESCE(is_shared, FALSE)
+		SELECT COALESCE(is_shared, FALSE), name
 		FROM mailboxes
 		WHERE id = $1 AND (account_id = $2 OR COALESCE(is_shared, FALSE) = TRUE) AND deleted_at IS NULL
-	`, mailboxID, AccountID).Scan(&isShared)
+	`, mailboxID, AccountID).Scan(&isShared, &currentName)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			return consts.ErrMailboxNotFound
 		}
 		return fmt.Errorf("failed to fetch mailbox for rename: %w", err)
+	}
+	if !isShared && isInboxMailboxName(currentName) {
+		return fmt.Errorf("cannot rename INBOX: %w", consts.ErrNotPermitted)
 	}
 
 	// Whether a mailbox is shared (is_shared, owner_domain, its ACL) is settled when
@@ -1355,6 +1447,9 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		}
 		logger.Error("Database: failed to fetch and lock mailbox to rename", "mailbox_id", mailboxID, "err", err)
 		return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+	}
+	if !isShared && isInboxMailboxName(oldName) {
+		return fmt.Errorf("cannot rename INBOX: %w", consts.ErrNotPermitted)
 	}
 
 	// Validate mailbox path is not empty (data corruption check)
@@ -1448,18 +1543,19 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Construct the new path
 	newPath := helpers.GetMailboxPath(newParentPath, mailboxID)
 
+	delimiter := string(consts.MailboxDelimiter)
+	oldLevels := mailboxNameLevels(oldName, delimiter)
+
 	// Before updating, check if any child would conflict with existing mailboxes
 	if hasChildren {
-		delimiter := string(consts.MailboxDelimiter)
-		oldPrefix := oldName + delimiter
-		newPrefix := newName + delimiter
-
 		// Check if any child's new name would conflict with an existing mailbox
+		// outside the subtree being renamed, using the database's LOWER() identity.
 		var conflictCount int
 		err = tx.QueryRow(ctx, `
 			SELECT COUNT(*)
 			FROM mailboxes existing
 			WHERE existing.account_id = $1
+			  AND existing.path NOT LIKE $2 || '%'
 			  AND existing.deleted_at IS NULL
 			  AND EXISTS (
 				SELECT 1 FROM mailboxes child
@@ -1467,16 +1563,65 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 				  AND child.path LIKE $2 || '%'
 				  AND child.path != $2
 				  AND child.deleted_at IS NULL
-				  AND existing.name = $3 || SUBSTRING(child.name FROM LENGTH($4) + 1)
+				  AND LOWER(existing.name) = LOWER(array_to_string(ARRAY[$3::text] || (string_to_array(child.name, $5))[$4::int + 1:], $5))
 			  )
-		`, ownerAccountID, oldPath, newPrefix, oldPrefix).Scan(&conflictCount)
+		`, ownerAccountID, oldPath, newName, oldLevels, delimiter).Scan(&conflictCount)
 		if err != nil {
 			logger.Error("Database: failed to check for conflicting child names", "mailbox_id", mailboxID, "err", err)
 			return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 		}
 		if conflictCount > 0 {
 			logger.Error("Database: rename would create conflicting child names", "mailbox_id", mailboxID, "old_name", oldName, "new_name", newName, "conflicts", conflictCount)
-			return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts)", conflictCount)
+			return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts): %w", conflictCount, consts.ErrMailboxAlreadyExists)
+		}
+	}
+
+	// A depth-changing rename can make a child's new name equal another moving
+	// row's old name. The unique name index is immediate, so a bulk UPDATE may
+	// fail depending on heap order. Capture stable IDs before changing any names:
+	// shortening moves ancestors first, lengthening moves descendants first.
+	// Include deleted descendants just as childUpdate does; the live descendants
+	// have already been stabilized and locked above.
+	childBatches := [][]int64{nil}
+	if hasChildren && oldLevels != mailboxNameLevels(newName, delimiter) {
+		order := "ASC"
+		if oldLevels < mailboxNameLevels(newName, delimiter) {
+			order = "DESC"
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT array_agg(id ORDER BY id)
+			FROM mailboxes
+			WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2
+			GROUP BY cardinality(string_to_array(name, $3))
+			ORDER BY cardinality(string_to_array(name, $3)) `+order,
+			ownerAccountID, oldPath, delimiter)
+		if err != nil {
+			return fmt.Errorf("failed to group child mailboxes for rename: %w", err)
+		}
+		childBatches, err = pgx.CollectRows(rows, pgx.RowTo[[]int64])
+		if err != nil {
+			return fmt.Errorf("failed to collect child mailboxes for rename: %w", err)
+		}
+	}
+
+	var beforeNames map[int64]MailboxNameMutation
+	if changes != nil {
+		beforeNames = make(map[int64]MailboxNameMutation)
+		rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE account_id=$1 AND deleted_at IS NULL AND (id=$2 OR path LIKE $3 || '%')`, ownerAccountID, mailboxID, oldPath)
+		if err != nil {
+			return fmt.Errorf("read locked mailbox names before rename: %w", err)
+		}
+		for rows.Next() {
+			var n MailboxNameMutation
+			if err := rows.Scan(&n.ID, &n.BeforeName, &n.BeforeKey); err != nil {
+				rows.Close()
+				return err
+			}
+			beforeNames[n.ID] = n
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
 		}
 	}
 
@@ -1492,17 +1637,13 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	// Now, update all children of the renamed mailbox if it has any.
 	if hasChildren {
-		delimiter := string(consts.MailboxDelimiter)
-		oldPrefix := oldName + delimiter
-		newPrefix := newName + delimiter
-
 		// The path of children only changes if the mailbox is moved to a new parent. For a simple
-		// rename, only the 'name' of the children needs to be updated. We use concatenation with
-		// SUBSTRING to only replace the prefix, which is safer than a global REPLACE.
+		// rename, only the 'name' of the children needs to be updated: the new name in place of
+		// the old one's levels (see mailboxNameLevels), which is safer than a global REPLACE.
 		const childUpdate = `
 			UPDATE mailboxes
 			SET
-				name = $1 || SUBSTRING(name FROM LENGTH($2) + 1),
+				name = array_to_string(ARRAY[$1::text] || (string_to_array(name, $6))[$2::int + 1:], $6),
 				path = CASE
 					WHEN $3 != $4 THEN $3 || SUBSTRING(path FROM LENGTH($4) + 1)
 					ELSE path
@@ -1511,31 +1652,38 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			WHERE
 				account_id = $5 AND
 				path LIKE $4 || '%' AND path != $4`
-		args := []any{newPrefix, oldPrefix, newPath, oldPath, ownerAccountID}
+		for _, childIDs := range childBatches {
+			query := childUpdate
+			args := []any{newName, oldLevels, newPath, oldPath, ownerAccountID, delimiter}
+			if childIDs != nil {
+				query += " AND id = ANY($7::bigint[])"
+				args = append(args, childIDs)
+			}
 
-		if sharedCfg == nil {
-			_, err = tx.Exec(ctx, childUpdate, args...)
-		} else {
-			// The descendants cross the boundary with the rename (issue #1229). The live
-			// rows this UPDATE renames are classified under the names it gives them, in
-			// the same statement: a mailbox created in or moved into the subtree while
-			// the rename runs is either renamed here, and checked, or keeps its name. A
-			// check that read the subtree in an earlier statement would miss one whose
-			// insert commits between the two.
-			var rows pgx.Rows
-			rows, err = tx.Query(ctx, `WITH renamed AS (`+childUpdate+`
-				RETURNING name, is_shared, deleted_at
-			)
-			SELECT name, COALESCE(is_shared, FALSE) FROM renamed WHERE deleted_at IS NULL`, args...)
-			if err == nil {
-				var crosses bool
-				if crosses, err = crossSharedBoundary(rows, sharedCfg); err == nil && crosses {
-					return consts.ErrMailboxSharedBoundary
+			if sharedCfg == nil {
+				_, err = tx.Exec(ctx, query, args...)
+			} else {
+				// The descendants cross the boundary with the rename (issue #1229). The live
+				// rows this UPDATE renames are classified under the names it gives them, in
+				// the same statement: a mailbox created in or moved into the subtree while
+				// the rename runs is either renamed here, and checked, or keeps its name. A
+				// check that read the subtree in an earlier statement would miss one whose
+				// insert commits between the two.
+				var rows pgx.Rows
+				rows, err = tx.Query(ctx, `WITH renamed AS (`+query+`
+					RETURNING name, is_shared, deleted_at
+				)
+				SELECT name, COALESCE(is_shared, FALSE) FROM renamed WHERE deleted_at IS NULL`, args...)
+				if err == nil {
+					var crosses bool
+					if crosses, err = crossSharedBoundary(rows, sharedCfg); err == nil && crosses {
+						return consts.ErrMailboxSharedBoundary
+					}
 				}
 			}
-		}
-		if err != nil {
-			return fmt.Errorf("failed to update child mailboxes: %w", err)
+			if err != nil {
+				return fmt.Errorf("failed to update child mailboxes: %w", err)
+			}
 		}
 
 	}
@@ -1565,6 +1713,32 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// subscription for a shared-mailbox rename is a separate concern.
 	if err := db.RenameSubscriptions(ctx, tx, AccountID, oldName, newName, string(consts.MailboxDelimiter)); err != nil {
 		return fmt.Errorf("failed to move subscriptions during rename of mailbox %d: %w", mailboxID, err)
+	}
+
+	if changes != nil {
+		ids := make([]int64, 0, len(beforeNames))
+		for id := range beforeNames {
+			ids = append(ids, id)
+		}
+		rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE id=ANY($1) AND deleted_at IS NULL ORDER BY id`, ids)
+		if err != nil {
+			return fmt.Errorf("read transaction's renamed mailbox names: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			var name, key string
+			if err := rows.Scan(&id, &name, &key); err != nil {
+				rows.Close()
+				return err
+			}
+			n := beforeNames[id]
+			n.AfterName, n.AfterKey = name, key
+			*changes = append(*changes, n)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 	}
 
 	return nil

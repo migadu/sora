@@ -10,6 +10,27 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
+// hashFile and readMessage are hashMessageFile and readMessageFile of the file at path,
+// opened directly: the tests of what the import reads from a message file need no
+// maildir around it to open it through (Importer.openMaildirFile).
+func hashFile(path string, maxSize int64) (string, int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	return hashMessageFile(file, maxSize)
+}
+
+func readMessage(path string, maxSize int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readMessageFile(file, maxSize)
+}
+
 // A configured limit above the storage ceiling is clamped before adding the
 // overflow-detection byte. MaxInt64+1 otherwise makes LimitReader return EOF
 // immediately, incorrectly hashing an ordinary message as empty.

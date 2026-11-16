@@ -86,6 +86,13 @@ func (m *mockResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Co
 
 // --- Unused methods for this test, but required by the interface ---
 
+func (m *mockResilientDatabase) GetDatabaseIdentityWithRetry(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return "4a6ea2d2-8d86-4fba-a4e9-c00f11122101", nil
+}
+
 func (m *mockResilientDatabase) GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error) {
 	return 1, nil
 }
@@ -317,12 +324,17 @@ func TestProcessBatch_DBInsertFailure(t *testing.T) {
 		mockRDB.insertMessageShouldFail = true
 		mockRDB.insertMessageError = errors.New("simulated db connection error")
 
-		// 4. Create the Importer instance
+		// 4. Create the Importer instance, over tempDir as its maildir
+		root, err := os.OpenRoot(tempDir)
+		require.NoError(t, err)
+		defer root.Close()
 		importer := &Importer{
-			ctx:      ctx,
-			email:    "test@example.com",
-			rdb:      mockRDB,
-			sqliteDB: sqliteDB,
+			ctx:         ctx,
+			maildirPath: tempDir,
+			root:        root,
+			email:       "test@example.com",
+			rdb:         mockRDB,
+			sqliteDB:    sqliteDB,
 			options: ImporterOptions{
 				TestMode:             true,  // Skip S3 uploads
 				BatchTransactionMode: false, // Safe mode only for unit test

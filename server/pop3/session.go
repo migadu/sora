@@ -45,6 +45,7 @@ var (
 )
 
 type POP3Session struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	server           *POP3Server
 	conn             net.Conn     // Connection to the client
@@ -217,6 +218,7 @@ func (s *POP3Session) loadMessagesIfNeeded(ctx context.Context) error {
 }
 
 func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, password string, isSASL bool) (int64, error) {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 	start := time.Now()
 	defer func() {
 		metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
@@ -937,15 +939,16 @@ func (s *POP3Session) Quit(ctx context.Context) (int, error) {
 }
 
 func (s *POP3Session) SetLanguage(ctx context.Context, lang string) (string, error) {
-	langTag := strings.ToLower(lang)
-	if langTag != "en" && langTag != "*" && langTag != "i-default" {
+	// A language range is ASCII (RFC 4647 section 2.1), matched case-insensitively.
+	isDefault := server.EqualFoldASCII(lang, "i-default")
+	if !isDefault && lang != "*" && !server.EqualFoldASCII(lang, "en") {
 		return "", &pop3server.Error{Message: "Unsupported language"}
 	}
 
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if langTag == "i-default" {
+	if isDefault {
 		s.language = "i-default"
 	} else {
 		s.language = "en"
@@ -1392,7 +1395,7 @@ func (s *POP3Session) startTerminationPoller() {
 	conn := s.conn
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
@@ -142,12 +143,13 @@ func oldObjectDelayFor(writeTimeout time.Duration) time.Duration {
 }
 
 type rekeyOptions struct {
-	DryRun           bool
-	DeleteOldObjects bool // Opt-in only after all mail nodes and readers have drained.
-	BatchSize        int
-	Jobs             int
-	StartAfter       db.ContentObject // resume after this object; the zero value starts at the beginning
-	Progress         io.Writer        // per-batch progress lines; nil for none
+	DryRun               bool
+	BodyDeletionProtocol string // Operator acknowledgement of the drained global body-lock cutover.
+	DeleteOldObjects     bool   // Opt-in only after all mail nodes and readers have drained.
+	BatchSize            int
+	Jobs                 int
+	StartAfter           db.ContentObject // resume after this object; the zero value starts at the beginning
+	Progress             io.Writer        // per-batch progress lines; nil for none
 }
 
 // rekeyReport is what a run found and did. Lists hold S3 keys, with the error where there
@@ -217,6 +219,11 @@ type rekeyRun struct {
 // Every step is idempotent, so a failed or interrupted run is repaired by running again.
 // The report is returned even with an error.
 func rekeyAccount(ctx context.Context, rdb *resilient.ResilientDatabase, store objectStorage, accountID int64, opts rekeyOptions) (*rekeyReport, error) {
+	if opts.DeleteOldObjects && !opts.DryRun {
+		if err := (&config.S3Config{BodyDeletionProtocol: opts.BodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+			return &rekeyReport{Cursor: opts.StartAfter}, err
+		}
+	}
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = 100
 	}
@@ -427,10 +434,13 @@ func (r *rekeyRun) deleteOldObjects(ctx context.Context, wait bool) {
 }
 
 // deleteOldObject deletes old if nothing references it, holding the S3 advisory lock
-// keyed by (r.accountID, old.ContentHash) across the check and delete, as the cleaner
-// does. A restore, COPY or MOVE using that same account/hash key is ordered against it.
-// Another account's claim of the same physical S3 key uses a different advisory lock.
+// keyed by old.ContentHash across the check and delete, as the cleaner does.
+// Restore, COPY/MOVE and upload gates of every account meet on this lock.
 func (r *rekeyRun) deleteOldObject(ctx context.Context, old db.ContentObject) {
+	if err := (&config.S3Config{BodyDeletionProtocol: r.opts.BodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+		r.report.OldLeft = append(r.report.OldLeft, old.Key()+": "+err.Error())
+		return
+	}
 	var referenced, deleted bool
 	err := r.rdb.ExecuteWithS3ObjectLock(ctx, old.ContentHash, r.accountID, func(ctx context.Context) error {
 		var err error
@@ -593,12 +603,13 @@ Examples:
 	}
 	start := time.Now()
 	report, runErr := rekeyAccount(ctx, rdb, s3, accountID, rekeyOptions{
-		DryRun:           *dryRun,
-		DeleteOldObjects: *deleteOld,
-		BatchSize:        *batchSize,
-		Jobs:             *jobs,
-		StartAfter:       cursor,
-		Progress:         os.Stdout,
+		DryRun:               *dryRun,
+		DeleteOldObjects:     *deleteOld,
+		BodyDeletionProtocol: globalConfig.S3.BodyDeletionProtocol,
+		BatchSize:            *batchSize,
+		Jobs:                 *jobs,
+		StartAfter:           cursor,
+		Progress:             os.Stdout,
 	})
 	printRekeyReport(report, *email, *dryRun, time.Since(start))
 	if runErr != nil {

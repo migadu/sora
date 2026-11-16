@@ -23,6 +23,7 @@ import (
 )
 
 type IMAPSession struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	*IMAPUser
 	server      *IMAPServer
@@ -709,7 +710,7 @@ func (s *IMAPSession) startTerminationPoller() {
 	netConn := s.conn.NetConn()
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done
