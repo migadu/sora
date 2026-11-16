@@ -164,7 +164,7 @@ func startSoraLikeLMTPBackend(t *testing.T) *rcptWireBackend {
 // by lmtpproxy (extra/leading/tab whitespace before TO:, quoted "<addr>" or "addr",
 // bare unbracketed addr, and remotelookup alias rewrites) is forwarded to the LMTP
 // backend in canonical "RCPT TO:<recipient>" form with unsupported ESMTP parameters
-// stripped and valid XRCPTFORWARD preserved, without triggering backend 500/501/555
+// refused before routing, then valid forms with XRCPTFORWARD are canonicalized without backend 500/501/555
 // rejections, false 451 4.3.0 replies, or lookupCache eviction.
 func TestRCPTCanonicalForwardingToSoraBackend(t *testing.T) {
 	validXrcpt := "XRCPTFORWARD=" + base64.StdEncoding.EncodeToString([]byte("user=fwd@example.com"))
@@ -312,7 +312,24 @@ func TestRCPTCanonicalForwardingToSoraBackend(t *testing.T) {
 				t.Fatalf("MAIL FROM = %q, want 250", reply)
 			}
 
-			rcptReply := send(tc.rcptCmd)
+			// #1711 refuses unsupported parameters before routing; the same accepted
+			// path spelling must still be canonicalized after that refusal.
+			acceptedCmd := tc.rcptCmd
+			for _, param := range []string{"FOO=1", "NOTIFY=SUCCESS", "NOTIFY=NEVER", "ORCPT=rfc822;user@example.com"} {
+				acceptedCmd = strings.ReplaceAll(acceptedCmd, " "+param, "")
+			}
+			if acceptedCmd != tc.rcptCmd {
+				if reply := send(tc.rcptCmd); !strings.HasPrefix(reply, "555 5.5.4 ") {
+					t.Fatalf("unsupported RCPT %q replied %q, want555", tc.rcptCmd, reply)
+				}
+				if got := backend.rcptLines(); len(got) != 0 {
+					t.Fatalf("refused recipient routed: %v", got)
+				}
+				if _, found := srv.lookupCache.Get(srv.name, tc.wantCachedKey); found {
+					t.Fatal("refused recipient performed a lookup")
+				}
+			}
+			rcptReply := send(acceptedCmd)
 			if !strings.HasPrefix(rcptReply, "250 ") {
 				t.Errorf("RCPT (%q) = %q, want 250 (backend received %v)", tc.rcptCmd, rcptReply, backend.rcptLines())
 			}
