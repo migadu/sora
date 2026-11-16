@@ -84,8 +84,9 @@ Sora starts in this order. A failure in any step ends the process with status 1,
 1. **Flags.** `-version` prints and exits here.
 2. **Config file.** Sora reads and parses the file. Unknown keys and duplicate keys are warnings, not
    errors ([CONFIGURATION.md](CONFIGURATION.md)). Logging is not set up yet, so Sora holds these
-   warnings and writes them to the `[logging]` output at step 6, at its level. If startup stops
-   before step 6, it writes them to standard error.
+   warnings and writes them to the `[logging]` output when it opens (step 6, or step 3 when
+   validation stops startup), at its level. If the file cannot be read or parsed, startup stops
+   here and Sora writes them to standard error.
 3. **Validation.** In this order:
    - Unknown names in `[sieve] enabled_extensions` are a warning.
    - Each `[[server]]` block is validated: a `type`, `name` and `addr`, a known `type`, and no
@@ -102,7 +103,8 @@ Sora starts in this order. A failure in any step ends the process with status 1,
      bind, and `secret_key` the base64 of 32 bytes ([CLUSTER.md](CLUSTER.md)).
    - The other checks of [CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup), such as
      `[relay]`, `[relay.queue]`, `[uploader]` and `[cleanup]`. Every problem found is reported
-     before Sora exits.
+     before Sora exits. To report them, Sora first opens the `[logging]` output as in step 6, so
+     the problems are logged where every other error goes.
 4. **Database endpoints.** A `[database.write]` or `[database.read]` section that is not in the file
    counts as not configured. This is how a proxy-only node runs without a database.
 5. **Global settings.** `bcrypt_cost` and `[sieve] max_execution_time` are applied.
@@ -155,17 +157,18 @@ with status 1. It does not leave the other listeners running.
 
 ### Messages that stop startup
 
-Errors from steps 2 to 9 are written by Sora's error handler. Before step 6 the `[logging]` output
-is not open yet, so they go to standard error, after what Sora logged until then, in this form:
+Errors from steps 2 to 9 are written by Sora's error handler. A config file that cannot be read or
+parsed (step 2) has no `[logging]` output to follow, so that error goes to standard error, after
+what Sora logged until then, in this form:
 
 ```
 [ERROR] 2026/01/15 10:00:00 ERROR: configuration file '<path>' not found: <why>
 [ERROR] 2026/01/15 10:00:00 ERROR: failed to parse configuration file '<path>': <why>
-[ERROR] 2026/01/15 10:00:00 ERROR: invalid configuration - <what>: <why>
 ```
 
-From step 6 on they are ERROR records of the `[logging]` output, in its format, like every other
-error Sora logs. With the console format:
+From step 3 on they are ERROR records of the `[logging]` output, in its format, like every other
+error Sora logs: validation opens that output before it reports what it found. With the console
+format:
 
 ```
 time=2026-01-15T10:00:00.000+01:00 level=ERROR msg="Invalid configuration" field=<what> error=<why>
@@ -179,7 +182,7 @@ show nothing on standard error: look in the log file or in syslog.
 |---|---|---|
 | `configuration file '...' not found` | The file named with `-config` does not exist. | Check the path. |
 | `failed to parse configuration file` | TOML syntax error. The message points at the line. | Fix the syntax. |
-| `invalid configuration - servers: no servers configured` | No `[[server]]` block. | Add one with `type`, `name` and `addr`. |
+| `Invalid configuration` with field `servers` and `no servers configured` | No `[[server]]` block. | Add one with `type`, `name` and `addr`. |
 | `server address is required` (or the name or type) | A `[[server]]` block lacks `addr`, `name` or `type`. | Add the missing key. |
 | `invalid server type` | `type` is misspelled. | Use one of the types in [CONFIGURATION.md](CONFIGURATION.md). |
 | `master_username is set but master_password is empty` | A master user without a password would let anyone in. | Set the password or remove the user. |
@@ -523,9 +526,9 @@ keys. Use it when a log collector parses the lines.
 
 A few things are always written to the process's standard error, whatever `output` says:
 
-- The startup errors that happen before logging is set up ([Startup](#messages-that-stop-startup)),
-  with what Sora logged until then, such as the warnings about unknown or duplicate keys in the
-  config file. When startup gets past that point, those go to the `[logging]` output instead.
+- A config file that cannot be read or parsed ([Startup](#messages-that-stop-startup)), with what
+  Sora logged until then. Once the file is parsed, the warnings about it and the problems validation
+  finds go to the `[logging]` output instead.
 - A Go panic and its stack trace.
 
 Under systemd these are in the journal even when Sora logs to a file. Check both when Sora does not

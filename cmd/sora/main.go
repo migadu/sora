@@ -502,6 +502,14 @@ func loadAndValidateConfig(configPath string, cfg *config.Config, errorHandler *
 	// The whole-file checks are the ones `sora-admin config validate` runs. Report every
 	// problem before exiting, so one restart attempt shows all that is left to fix.
 	if problems := cfg.Validate(); len(problems) > 0 {
+		// The file has been parsed, and Validate does not check [logging]: report the
+		// problems where it says (syslog, a log file, ...), after what start-up held, like
+		// every later start-up failure. Initialize falls back to stderr for an output it
+		// cannot open. A file that cannot be read has no [logging], so ConfigError above
+		// writes to stderr.
+		if _, err := logger.Initialize(cfg.Logging); err != nil {
+			fmt.Fprintf(logger.Stderr(), "SORA: Warning initializing logger: %v\n", err)
+		}
 		for _, p := range problems {
 			errorHandler.ValidationError(p.Section, p.Err)
 		}
