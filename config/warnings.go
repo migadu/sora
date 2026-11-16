@@ -317,7 +317,7 @@ var serverValues = []struct {
 	{"lookup_cache.positive_ttl", lookupCacheServerTypes, lookupCacheValue((*LookupCacheConfig).GetPositiveTTL)},
 	{"lookup_cache.negative_ttl", lookupCacheServerTypes, lookupCacheValue((*LookupCacheConfig).GetNegativeTTL)},
 	{"lookup_cache.cleanup_interval", lookupCacheServerTypes, lookupCacheValue((*LookupCacheConfig).GetCleanupInterval)},
-	{"lookup_cache.positive_revalidation_window", []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api"}, lookupCacheRevalidationValue},
+	{"lookup_cache.positive_revalidation_window", []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}, lookupCacheRevalidationValue},
 }
 
 // maxMessageSizeServerTypes read max_message_size: LMTP, its proxy and Admin API delivery.

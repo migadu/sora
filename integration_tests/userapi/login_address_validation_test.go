@@ -101,8 +101,6 @@ func TestUserAPILogin_NULAndInvalidAddressesAreRefused401AndRateLimited(t *testi
 //     "anna-...@xn--mnchen-3ya.de" credential;
 //   - LoginResponse.Email, JWT claims (email, sub), and /user/auth/refresh all
 //     carry the canonical A-label address;
-//   - s.authCache keys on the canonical address so U-label and A-label logins
-//     share one cache entry;
 //   - Tier-1 rate limiting shares one bucket across U-label and A-label forms.
 func TestUserAPILogin_IDNAndCanonicalEmailNormalization(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
@@ -110,7 +108,7 @@ func TestUserAPILogin_IDNAndCanonicalEmailNormalization(t *testing.T) {
 	ctx := context.Background()
 	const jwtSecret = "test-secret-key-for-testing-only"
 
-	t.Run("U-label login canonical JWT refresh and shared authCache", func(t *testing.T) {
+	t.Run("U-label login canonical JWT refresh with ignored cache config", func(t *testing.T) {
 		rdb := common.SetupTestDatabase(t)
 		stamp := time.Now().UnixNano()
 		unicodeEmail := fmt.Sprintf("anna-%d@münchen.de", stamp)
@@ -209,9 +207,8 @@ func TestUserAPILogin_IDNAndCanonicalEmailNormalization(t *testing.T) {
 			t.Errorf("refresh LoginResponse.Email = %q, want %q", refLoginResp.Email, asciiEmail)
 		}
 
-		// 4. Prove authCache stored the canonical key: replace stored password hash in DB
-		// (without touching updated_at) so only authCache knows `password`, then log in
-		// with the A-label form. A 200 proves both forms share one cache entry.
+		// 4. The A-label form reads the current primary hash too. Enabling the
+		// removed login cache cannot preserve the earlier U-label password.
 		otherHash, err := db.GenerateBcryptHash("different-db-password-456!")
 		if err != nil {
 			t.Fatalf("GenerateBcryptHash: %v", err)
@@ -224,8 +221,12 @@ func TestUserAPILogin_IDNAndCanonicalEmailNormalization(t *testing.T) {
 			"email":    asciiEmail,
 			"password": password,
 		})
-		if cachedResp.StatusCode != http.StatusOK {
-			t.Fatalf("A-label login against cached U-label entry: status %d (%s), want 200", cachedResp.StatusCode, string(cachedRaw))
+		if cachedResp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("A-label old-password login: status %d (%s), want 401", cachedResp.StatusCode, string(cachedRaw))
+		}
+		freshResp, freshRaw := postJSON("/user/auth/login", map[string]string{"email": asciiEmail, "password": "different-db-password-456!"})
+		if freshResp.StatusCode != http.StatusOK {
+			t.Fatalf("A-label current-password login: status %d (%s), want 200", freshResp.StatusCode, string(freshRaw))
 		}
 	})
 
@@ -294,7 +295,7 @@ func TestUserAPILogin_IDNAndCanonicalEmailNormalization(t *testing.T) {
 		}
 	})
 
-	t.Run("padded and cased ASCII login normalizes JWT response and authCache key", func(t *testing.T) {
+	t.Run("padded and cased ASCII login normalizes JWT and rechecks current password", func(t *testing.T) {
 		rdb := common.SetupTestDatabase(t)
 		account := common.CreateTestAccount(t, rdb)
 
@@ -342,15 +343,24 @@ func TestUserAPILogin_IDNAndCanonicalEmailNormalization(t *testing.T) {
 			t.Fatalf("UpdatePasswordWithRetry: %v", err)
 		}
 
-		// Canonical lowercase login must hit the positive cache entry created above.
+		// Canonical lowercase login must not reuse the earlier cached password.
 		b2, _ := json.Marshal(map[string]string{"email": account.Email, "password": account.Password})
 		resp2, err := client.Post(ts.URL+"/user/auth/login", "application/json", bytes.NewReader(b2))
 		if err != nil {
 			t.Fatalf("POST /user/auth/login (canonical): %v", err)
 		}
 		defer resp2.Body.Close()
-		if resp2.StatusCode != http.StatusOK {
-			t.Fatalf("canonical login missed cache entry from padded/uppercase login: status %d, want 200", resp2.StatusCode)
+		if resp2.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("canonical old-password login: status %d, want 401", resp2.StatusCode)
+		}
+		b3, _ := json.Marshal(map[string]string{"email": account.Email, "password": "different-ascii-db-password!"})
+		resp3, err := client.Post(ts.URL+"/user/auth/login", "application/json", bytes.NewReader(b3))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer resp3.Body.Close()
+		if resp3.StatusCode != http.StatusOK {
+			t.Fatalf("canonical current-password login: status%d, want200", resp3.StatusCode)
 		}
 	})
 }

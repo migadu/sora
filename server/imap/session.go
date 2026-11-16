@@ -23,6 +23,7 @@ import (
 )
 
 type IMAPSession struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	*IMAPUser
 	server      *IMAPServer
@@ -116,7 +117,8 @@ type IMAPSession struct {
 	// SetNotify/Close write it on the command goroutine, NotifyPoll reads it
 	// on the pump goroutine (the library stops the pump before SetNotify
 	// runs, so the watch internals are only ever touched by one goroutine,
-	// except notifyWatch.own, which notifyMutex guards as well).
+	// except the snapshot and the own changes commands record on the watch,
+	// which notifyMutex guards as well).
 	notifyMutex sync.Mutex
 	notifyWatch *notifyWatch
 
@@ -708,7 +710,7 @@ func (s *IMAPSession) startTerminationPoller() {
 	netConn := s.conn.NetConn()
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done

@@ -104,6 +104,9 @@ func (s *IMAPSession) Login(ctx context.Context, address, password string) error
 // this, AUTHENTICATE would apply both twice — roughly doubling auth latency and
 // double-counting against the rate limiter relative to LOGIN.
 func (s *IMAPSession) login(ctx context.Context, address, password, authzid string, applyGate bool) error {
+	if applyGate {
+		s.authSessionGeneration = s.server.connTracker.SessionGeneration()
+	}
 	authStart := time.Now()
 
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed

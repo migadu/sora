@@ -159,7 +159,7 @@ func TestTLSCleanShortCertName(t *testing.T) {
 		return cleanTLSCertificates(context.Background(), cfg, cacheDir, false, true)
 	}))
 	want := slices.DeleteFunc(slices.Clone(before), func(k string) bool { return k == "/certs/autocert/cert-test" })
-	if got := stub.keys(); !slices.Equal(got, want) {
+	if got := stub.activeKeys(); !slices.Equal(got, want) {
 		t.Errorf("S3 objects after clean = %v, want %v", got, want)
 	}
 	if _, err := os.Stat(filepath.Join(cacheDir, "test")); err != nil {
@@ -231,7 +231,7 @@ func TestTLSCleanRemovesOnlyTheObjectsOwnLocalCopy(t *testing.T) {
 		return cleanTLSCertificates(context.Background(), cfg, cacheDir, false, true)
 	})
 
-	if got, want := stub.keys(), []string{"/certs/" + currentKey}; !slices.Equal(got, want) {
+	if got, want := stub.activeKeys(), []string{"/certs/" + currentKey}; !slices.Equal(got, want) {
 		t.Errorf("S3 objects after clean = %v, want %v", got, want)
 	}
 	if got, want := localNames(t, cacheDir), []string{"mail.example.com"}; !slices.Equal(got, want) {

@@ -45,6 +45,7 @@ var (
 )
 
 type POP3Session struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	server           *POP3Server
 	conn             net.Conn     // Connection to the client
@@ -217,6 +218,7 @@ func (s *POP3Session) loadMessagesIfNeeded(ctx context.Context) error {
 }
 
 func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, password string, isSASL bool) (int64, error) {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 	start := time.Now()
 	defer func() {
 		metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
@@ -1393,7 +1395,7 @@ func (s *POP3Session) startTerminationPoller() {
 	conn := s.conn
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done
