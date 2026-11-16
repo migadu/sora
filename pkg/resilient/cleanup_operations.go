@@ -118,3 +118,17 @@ func (rd *ResilientDatabase) ExpungeMessagesByIDsWithRetry(ctx context.Context, 
 	}
 	return result.(int64), nil
 }
+
+// ExecuteWithS3BodyCleanup is not retried: its callback can have sent storage
+// requests whose outcome is unknown. Durable intents retain that uncertainty.
+func (rd *ResilientDatabase) ExecuteWithS3BodyCleanup(ctx context.Context, objects []db.UserScopedObjectForCleanup, grace time.Duration, fn func(context.Context, []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error)) (int64, error) {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ExecuteWithS3BodyCleanup(ctx, objects, grace, fn)
+}
+
+// Reconciliation must not replay storage work automatically after an unknown result.
+func (rd *ResilientDatabase) ReconcileS3BodyDeleteIntent(ctx context.Context, hash, operationID string, drained bool, fn func(context.Context, db.S3BodyDeleteIntent, map[string]bool) error) error {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ReconcileS3BodyDeleteIntent(ctx, hash, operationID, drained, fn)
+}
+func (rd *ResilientDatabase) ListS3BodyDeleteIntents(ctx context.Context) ([]db.S3BodyDeleteIntent, error) {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ListS3BodyDeleteIntents(ctx)
+}

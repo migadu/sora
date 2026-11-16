@@ -206,7 +206,7 @@ func TestPurgeKeepsAnObjectAnotherAccountStillReads(t *testing.T) {
 	require.Equal(t, o.a, purged)
 
 	s3 := &keyRecorder{}
-	_, err = PurgeAccount(ctx, o.rdb, s3, o.a)
+	_, err = PurgeAccount(ctx, o.rdb, s3, o.a, "global-hash-v1")
 	require.NoError(t, err)
 
 	assert.NotContains(t, s3.keys, o.key, "the purge deleted the object another account's live row reads")

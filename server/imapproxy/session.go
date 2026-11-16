@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
@@ -28,9 +29,11 @@ import (
 
 // Session represents an IMAP proxy session.
 type Session struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server                *Server
 	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
 	startTLSInProgress    bool                // Protected by mu; asynchronous notices are omitted during negotiation
+	greeted               bool                // The greeting has been written, under mu: before it the implicit-TLS handshake may be pending, and a BYE written then would wait for it or be refused
 	clientConn            net.Conn            // The client transport: listenerConn, or the TLS conn above it after STARTTLS (reassigned under mu)
 	listenerConn          net.Conn            // The accepted connection, never reassigned: its SoraConn carries the JA4, username and timeouts
 	backendConn           net.Conn            // Reassigned on backend connect/error; writes must hold mu (sendGracefulShutdownMessage reads it from the Stop goroutine)
@@ -65,7 +68,7 @@ type Session struct {
 	byePending        string           // a BYE to write as soon as the stream is between responses
 	byeSent           bool             // a BYE was written: none is written again
 	submittedUsername string           // Username exactly as submitted by the client (lookup-cache key)
-	connRejected      bool             // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
+	connRegistered    bool             // connTracker.RegisterConnection accepted this session: close() unregisters only then
 }
 
 // newSession creates a new IMAP proxy session.
@@ -97,7 +100,7 @@ func newSession(s *Server, conn net.Conn) *Session {
 		startTime:    time.Now(),
 		// Generate the session id once, up front, so every log line for this
 		// connection carries it. It's also forwarded to the backend (PROXY v2 TLV /
-		// XCLIENT) and logged there as proxy_session for end-to-end tracing.
+		// ID command) and logged there as proxy_session for end-to-end tracing.
 		sessionID: idgen.New(),
 	}
 }
@@ -143,7 +146,9 @@ func (s *Session) handleConnection() {
 
 	// Send greeting
 	if err := s.sendGreeting(); err != nil {
-		s.ErrorLog("Failed to send greeting", "error", err)
+		if !errors.Is(err, errSessionShuttingDown) {
+			s.ErrorLog("Failed to send greeting", "error", err)
+		}
 		return
 	}
 
@@ -160,7 +165,7 @@ func (s *Session) handleConnection() {
 		}
 
 		// Read command from client
-		line, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth line to prevent memory exhaustion
+		line, err := s.readPreAuthLine() // bound pre-auth line to prevent memory exhaustion
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.DebugLog("client timed out waiting for command")
@@ -177,10 +182,19 @@ func (s *Session) handleConnection() {
 			return
 		}
 
-		line = strings.TrimRight(line, "\r\n")
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 
 		// Use the shared command parser. IMAP commands have tags.
 		tag, command, args, err := server.ParseLine(line, true)
+
+		// LOGIN and ID read the literals in their arguments. Every other
+		// command, and a line that does not parse, is answered without its
+		// arguments being read, but the literals ending its lines still belong
+		// to it: read them first, or they are parsed as the next command.
+		if (err != nil || (command != "LOGIN" && command != "ID")) && s.skipLiterals(line, false) != nil {
+			return
+		}
+
 		if err != nil {
 			// This would be a malformed line, e.g., unclosed quote.
 			// Send a tagged BAD response if we have a tag.
@@ -214,12 +228,29 @@ func (s *Session) handleConnection() {
 		case "LOGIN":
 			// Check insecure_auth: reject LOGIN over non-TLS when insecure_auth is false
 			if !s.server.insecureAuth && !server.ConnIsTLS(s.clientConn) {
-				if s.handleAuthError(fmt.Sprintf("%s NO [PRIVACYREQUIRED] Authentication requires TLS connection", tag)) {
+				if s.skipLiterals(line, false) != nil ||
+					s.handleAuthError(fmt.Sprintf("%s NO [PRIVACYREQUIRED] Authentication requires TLS connection", tag)) {
 					return
 				}
 				continue
 			}
 			authStart := time.Now()
+			// LOGIN has exactly two arguments. A username literal ends this
+			// physical line; its password follows the literal's octets. A
+			// literal is announced immediately before the CRLF: "{N+}" or "{N}"
+			// followed by white space is neither a literal nor an atom.
+			usernameLiteral := len(args) > 0 && strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}")
+			passwordLiteral := len(args) == 2 && strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}")
+			_, _, hasTrailingLiteral := trailingLiteral(line)
+			if strings.Contains(line, "\r") || len(args) > 2 || (usernameLiteral && len(args) > 1) ||
+				(hasTrailingLiteral && !usernameLiteral && !passwordLiteral) ||
+				((usernameLiteral || passwordLiteral) && !strings.HasSuffix(line, "}")) {
+				if s.skipLiterals(line, false) != nil ||
+					s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
+					return
+				}
+				continue
+			}
 			var username, password string
 
 			// Handle literals in LOGIN command
@@ -229,8 +260,9 @@ func (s *Session) handleConnection() {
 				// Check if username is a literal
 				if strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}") {
 					literalSize, nonSync, err := server.ParseLiteral(args[0])
-					if err != nil || literalSize > 8192 {
-						if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in username", tag)) {
+					if err != nil || preAuthLiteralTooBig(literalSize, nonSync) {
+						if s.skipLiterals(line, false) != nil ||
+							s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in username", tag)) {
 							return
 						}
 						continue
@@ -245,26 +277,50 @@ func (s *Session) handleConnection() {
 					// Read literal data
 					literalBuf := make([]byte, literalSize)
 					if _, err := io.ReadFull(s.clientReader, literalBuf); err != nil {
-						if s.handleAuthError(fmt.Sprintf("%s BAD Failed to read username literal", tag)) {
-							return
-						}
-						continue
+						s.handleAuthError(fmt.Sprintf("%s BAD Failed to read username literal", tag))
+						return // The literal boundary is unknown after a partial read.
 					}
 					username = string(literalBuf)
 
 					// Read the rest of the line (should be password or another literal)
-					line, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth line to prevent memory exhaustion
+					line, err := s.readPreAuthLine() // bound pre-auth line to prevent memory exhaustion
 					if err != nil {
 						if err != io.EOF {
 							s.DebugLog("error reading password after username literal", "error", err)
 						}
 						return
 					}
-					line = strings.TrimRight(line, "\r\n")
-					line = strings.TrimSpace(line)
+					rest := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+					if rest == "" {
+						if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
+							return
+						}
+						continue
+					}
 
-					if line == "" {
-						if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+					// RFC 9051 §9: login = "LOGIN" SP userid SP password. After reading the
+					// username literal octets, the continuation line must start with a single
+					// SP followed immediately by the password, without embedded CR or
+					// surrounding whitespace.
+					afterSP, hasLeadingSP := strings.CutPrefix(rest, " ")
+					if !hasLeadingSP || afterSP == "" || strings.Contains(afterSP, "\r") || strings.TrimSpace(afterSP) != afterSP {
+						if s.skipLiterals(rest, false) != nil ||
+							s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
+							return
+						}
+						continue
+					}
+					line = afterSP
+
+					// The remainder must contain just the password. Parse it as
+					// an argument so quoted spaces and escapes stay one value.
+					_, _, passwordArgs, parseErr := server.ParseLine("x LOGIN "+line, true)
+					_, _, hasTrailingLiteral := trailingLiteral(rest)
+					passwordLiteral := strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}")
+					if parseErr != nil || len(passwordArgs) != 1 || (hasTrailingLiteral && !passwordLiteral) ||
+						(passwordLiteral && !strings.HasSuffix(rest, "}")) {
+						if s.skipLiterals(rest, false) != nil ||
+							s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
 							return
 						}
 						continue
@@ -273,8 +329,9 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal
 					if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
 						literalSize, nonSync, err := server.ParseLiteral(line)
-						if err != nil || literalSize > 8192 {
-							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
+						if err != nil || preAuthLiteralTooBig(literalSize, nonSync) {
+							if s.skipLiterals(line, false) != nil ||
+								s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
 							}
 							continue
@@ -289,16 +346,22 @@ func (s *Session) handleConnection() {
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
 						if _, err := io.ReadFull(s.clientReader, literalBuf); err != nil {
-							if s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag)) {
-								return
-							}
-							continue
+							s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag))
+							return // The literal boundary is unknown after a partial read.
 						}
 						password = string(literalBuf)
 
-						// Read CRLF after literal
-						if _, err := server.ReadBoundedLine(s.clientReader, 1024); err != nil && err != io.EOF {
-							s.DebugLog("error reading CRLF after password literal", "error", err)
+						// The password is the final argument: drain any extra
+						// literal before refusing it, never authenticate a prefix.
+						extra, err := s.finishLoginLiteral()
+						if err != nil {
+							return
+						}
+						if extra {
+							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
+								return
+							}
+							continue
 						}
 					} else {
 						password = server.UnquoteString(line)
@@ -310,8 +373,9 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal (username was not)
 					if strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}") {
 						literalSize, nonSync, err := server.ParseLiteral(args[1])
-						if err != nil || literalSize > 8192 {
-							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
+						if err != nil || preAuthLiteralTooBig(literalSize, nonSync) {
+							if s.skipLiterals(line, false) != nil ||
+								s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
 							}
 							continue
@@ -326,31 +390,40 @@ func (s *Session) handleConnection() {
 						// Read literal data
 						literalBuf := make([]byte, literalSize)
 						if _, err := io.ReadFull(s.clientReader, literalBuf); err != nil {
-							if s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag)) {
+							s.handleAuthError(fmt.Sprintf("%s BAD Failed to read password literal", tag))
+							return // The literal boundary is unknown after a partial read.
+						}
+						password = string(literalBuf)
+
+						// The password is the final argument: drain any extra
+						// literal before refusing it, never authenticate a prefix.
+						extra, err := s.finishLoginLiteral()
+						if err != nil {
+							return
+						}
+						if extra {
+							if s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
 								return
 							}
 							continue
 						}
-						password = string(literalBuf)
-
-						// Read CRLF after literal
-						if _, err := server.ReadBoundedLine(s.clientReader, 1024); err != nil && err != io.EOF {
-							s.DebugLog("error reading CRLF after password literal", "error", err)
-						}
 					}
 				} else {
-					if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+					if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
 						return
 					}
 					continue
 				}
 			} else {
-				if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
+				if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
 					return
 				}
 				continue
 			}
 
+			// A missing argument above is BAD ("arguments invalid", RFC 9051
+			// §6.2.3); an empty user name or password given as a string is a
+			// well-formed LOGIN whose credentials are rejected: NO.
 			if username == "" || password == "" {
 				if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
 					return
@@ -409,48 +482,85 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			authStart := time.Now()
-			if len(args) < 1 || strings.ToUpper(args[0]) != "PLAIN" {
+			// RFC 9051 §6.2.2 and §9:
+			//   authenticate = "AUTHENTICATE" SP auth-type [SP initial-resp] *(CRLF base64)
+			//   auth-type    = atom
+			//   initial-resp = (base64 / "=")
+			// A missing mechanism, extra arguments, a non-atom mechanism, or a
+			// trailing literal is "arguments invalid" (BAD); a named mechanism
+			// the proxy does not support is NO.
+			if len(args) < 1 {
+				if s.handleAuthError(fmt.Sprintf("%s BAD AUTHENTICATE requires a mechanism name", tag)) {
+					return
+				}
+				continue
+			}
+			_, _, hasTrailingLiteral := trailingLiteral(line)
+			if len(args) > 2 || hasTrailingLiteral || !isIMAPAtom(args[0]) {
+				if s.handleAuthError(fmt.Sprintf("%s BAD Invalid AUTHENTICATE arguments", tag)) {
+					return
+				}
+				continue
+			}
+
+			var decoded []byte
+			if len(args) == 2 {
+				var ok bool
+				decoded, ok = decodeSASLResponse(args[1], true)
+				if !ok {
+					if s.handleAuthError(fmt.Sprintf("%s BAD Invalid base64 encoding", tag)) {
+						return
+					}
+					continue
+				}
+			}
+			// server.ParseLine trims whitespace (including CR) around the line and
+			// between tokens; reject any bare or duplicate CR remaining in line.
+			if strings.Contains(line, "\r") {
+				if s.handleAuthError(fmt.Sprintf("%s BAD Invalid AUTHENTICATE arguments", tag)) {
+					return
+				}
+				continue
+			}
+
+			if server.ToUpperASCII(args[0]) != "PLAIN" {
 				if s.handleAuthError(fmt.Sprintf("%s NO AUTHENTICATE PLAIN is the only supported mechanism", tag)) {
 					return
 				}
 				continue
 			}
 
-			var saslLine string
-			if len(args) > 1 {
-				// Initial response was provided with the command
-				saslLine = server.UnquoteString(args[1])
-			} else {
+			if len(args) == 1 {
 				// No initial response, send continuation request
 				// (RFC 9051: continue-req = "+" SP ...)
 				s.sendResponse("+ ")
 
 				// Read SASL response from client
-				var err error
-				saslLine, err = server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth SASL response
+				saslLine, err := s.readPreAuthLine() // bound pre-auth SASL response
 				if err != nil {
 					if err != io.EOF {
 						s.DebugLog("error reading SASL response", "error", err)
 					}
 					return // Client connection error, can't continue
 				}
-				// The response to a continuation can also be a quoted string.
-				saslLine = server.UnquoteString(strings.TrimRight(saslLine, "\r\n"))
-			}
+				saslLine = strings.TrimSuffix(strings.TrimSuffix(saslLine, "\n"), "\r")
 
-			if saslLine == "*" {
-				// Client-side cancellation is not an error we should count.
-				s.sendResponse(fmt.Sprintf("%s BAD Authentication cancelled", tag))
-				continue
-			}
-
-			// Decode SASL PLAIN
-			decoded, err := base64.StdEncoding.DecodeString(saslLine)
-			if err != nil {
-				if s.handleAuthError(fmt.Sprintf("%s NO Invalid base64 encoding", tag)) {
-					return
+				if saslLine == "*" {
+					// RFC 9051 §6.2.2: a single "*" in reply to a continuation
+					// request cancels the authentication exchange. Client-side
+					// cancellation is not an error we should count.
+					s.sendResponse(fmt.Sprintf("%s BAD Authentication cancelled", tag))
+					continue
 				}
-				continue
+
+				var ok bool
+				decoded, ok = decodeSASLResponse(saslLine, false)
+				if !ok {
+					if s.handleAuthError(fmt.Sprintf("%s BAD Invalid base64 encoding", tag)) {
+						return
+					}
+					continue
+				}
 			}
 
 			parts := strings.Split(string(decoded), "\x00")
@@ -461,11 +571,15 @@ func (s *Session) handleConnection() {
 				continue
 			}
 
-			// authzID := parts[0] // Not used in proxy
+			authzID := parts[0]
 			authnID := parts[1]
 			password := parts[2]
 
-			if err := s.authenticateUser(authnID, password); err != nil {
+			if err := s.authenticateUserWithAuthzID(authzID, authnID, password); err != nil {
+				if errors.Is(err, errAuthorizationFailed) {
+					s.sendResponse(fmt.Sprintf("%s NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.", tag))
+					continue
+				}
 				s.DebugLog("authentication failed", "error", err)
 				// The rate limiter requests a disconnect via a BYE-typed error;
 				// honor it instead of letting the client keep hammering on the
@@ -529,8 +643,9 @@ func (s *Session) handleConnection() {
 			// physical line, so drain any literal continuation lines here —
 			// otherwise the literal payload is read back as commands and burns
 			// the pre-auth error budget before LOGIN is ever reached.
-			if err := s.drainLiterals(args); err != nil {
-				if s.handleAuthError(fmt.Sprintf("%s BAD %s", tag, err.Error())) {
+			if err := s.skipLiterals(line, true); err != nil {
+				if !errors.Is(err, errSyncLiteralTooBig) ||
+					s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal", tag)) {
 					return
 				}
 				continue
@@ -559,7 +674,7 @@ func (s *Session) handleConnection() {
 			s.sendResponse(fmt.Sprintf("%s OK NOOP completed", tag))
 
 		default:
-			if s.handleAuthError(fmt.Sprintf("%s NO Command not supported before authentication", tag)) {
+			if s.handleAuthError(tag + " " + preAuthCommandError(command, args)) {
 				return
 			}
 			continue
@@ -578,45 +693,252 @@ func (s *Session) handleConnection() {
 	s.startProxy()
 }
 
-// drainLiterals consumes the literal payloads announced by a pre-auth command
-// whose arguments the proxy does not need to inspect (ID). Only the LAST token
-// of a physical line can be a literal announcement; after the literal bytes,
-// the client sends the rest of the command on a fresh line, which may itself
-// end in another literal. For synchronizing literals ({N}) the proxy must send
-// a continuation before the client transmits; for {N+} the data is already in
-// flight. Each literal is bounded to keep the pre-auth path memory-safe.
-func (s *Session) drainLiterals(args []string) error {
-	const maxPreAuthLiteral = 8192
-	for len(args) > 0 {
-		last := args[len(args)-1]
-		if !strings.HasPrefix(last, "{") || !strings.HasSuffix(last, "}") {
+// readPreAuthLine requires a complete physical line before pre-authentication
+// consumes it. ReadBoundedLine also returns partial EOF data without an error;
+// that must not authenticate a prefix or finish a literal command. Keep the
+// existing line bound and bare-LF tolerance local to this proxy unchanged.
+func (s *Session) readPreAuthLine() (string, error) {
+	line, err := server.ReadBoundedLine(s.clientReader, 65536)
+	if err == nil && !strings.HasSuffix(line, "\n") {
+		return "", io.ErrUnexpectedEOF
+	}
+	return line, err
+}
+
+// finishLoginLiteral consumes the final CRLF after a password literal.
+// Anything before the line ending (including whitespace or an extra CR) is
+// invalid; any trailing literals still belong to LOGIN and must be drained
+// before the command can be rejected.
+func (s *Session) finishLoginLiteral() (extra bool, err error) {
+	rest, err := s.readPreAuthLine()
+	if err != nil {
+		return false, err
+	}
+	rest = strings.TrimSuffix(strings.TrimSuffix(rest, "\n"), "\r")
+	if rest == "" {
+		return false, nil
+	}
+	return true, s.skipLiterals(rest, false)
+}
+
+// maxNonSyncLiteral is the most octets a non-synchronizing literal may carry.
+// Before authentication the proxy advertises LITERAL- and IMAP4rev2, and under
+// both a larger one is invalid: "non-synchronizing literals used in any command
+// MUST NOT be larger than 4096 bytes" (RFC 7888 §5; RFC 9051 §4.3).
+const maxNonSyncLiteral = 4096
+
+// maxPreAuthLiteral bounds each synchronizing literal the pre-auth loop reads.
+const maxPreAuthLiteral = 8192
+
+// preAuthLiteralTooBig reports whether the pre-auth loop refuses a literal of
+// size octets: over maxNonSyncLiteral for a non-synchronizing one, over
+// maxPreAuthLiteral for a synchronizing one.
+func preAuthLiteralTooBig(size int, nonSync bool) bool {
+	if nonSync {
+		return size > maxNonSyncLiteral
+	}
+	return size > maxPreAuthLiteral
+}
+
+var (
+	// errSyncLiteralTooBig: skipLiterals sent no continuation request for a
+	// synchronizing literal over maxPreAuthLiteral, so the client sends nothing
+	// more of the command, and the caller rejects it.
+	errSyncLiteralTooBig = errors.New("synchronizing literal too big")
+	// errNonSyncLiteralTooBig: skipLiterals ended the session with BYE over a
+	// non-synchronizing literal over maxNonSyncLiteral.
+	errNonSyncLiteralTooBig = errors.New("non-synchronizing literal too big")
+)
+
+// skipLiterals reads the rest of a command whose arguments the pre-auth loop
+// does not use, given the command's last line read (without CRLF). A line
+// ending in a literal announcement is followed by the literal's octets and then
+// by another line of the same command, which may end in a literal again.
+//
+// The client sends the octets of a non-synchronizing literal "{N+}" without
+// waiting, and the server "MUST treat the specified number of following octets
+// and the following line ... as part of the same command" (RFC 7888 §3), so
+// they are always read: left unread, they would be parsed as further commands.
+// A synchronizing literal "{N}" is read only when sync is set, after a
+// continuation request. Otherwise the client is still waiting for that request,
+// and the response that rejects the command tells it to send no more of it
+// (RFC 9051 §2.2.1).
+//
+// A literal preAuthLiteralTooBig refuses is not read. A non-synchronizing one
+// over the LITERAL- bound is invalid and its octets are already in flight, so
+// the session ends with BYE [TOOBIG] (RFC 7888 §4 and §5) and
+// errNonSyncLiteralTooBig. With sync set, a synchronizing one gets no
+// continuation request and errSyncLiteralTooBig. A read error is returned as is.
+func (s *Session) skipLiterals(line string, sync bool) error {
+	for {
+		size, nonSync, ok := trailingLiteral(line)
+		if !ok || (!nonSync && !sync) {
 			return nil
 		}
-		size, nonSync, err := server.ParseLiteral(last)
-		if err != nil || size > maxPreAuthLiteral {
-			return fmt.Errorf("Invalid literal")
+		if preAuthLiteralTooBig(size, nonSync) {
+			if !nonSync {
+				return errSyncLiteralTooBig
+			}
+			s.DebugLog("non-synchronizing literal over the LITERAL- bound", "size", size)
+			s.sendResponse("* BYE [TOOBIG] Non-synchronizing literal too big")
+			return errNonSyncLiteralTooBig
 		}
 		if !nonSync {
 			s.sendResponse("+ ")
 		}
-		if _, err := io.ReadFull(s.clientReader, make([]byte, size)); err != nil {
-			return fmt.Errorf("Failed to read literal")
+		if _, err := s.clientReader.Discard(size); err != nil {
+			return err
 		}
-		// Rest of the command line after the literal (may end in another literal).
-		rest, err := server.ReadBoundedLine(s.clientReader, 65536)
+		next, err := s.readPreAuthLine()
 		if err != nil {
-			return fmt.Errorf("Failed to read command continuation")
+			return err
 		}
-		rest = strings.TrimSpace(strings.TrimRight(rest, "\r\n"))
-		if rest == "" {
-			return nil
+		line = strings.TrimSuffix(strings.TrimSuffix(next, "\n"), "\r")
+	}
+}
+
+// trailingLiteral reports the literal announced at the end of a command line
+// without its CRLF: "{N}", or "{N+}" for a non-synchronizing one. Only an
+// announcement "immediately preceding the CRLF" is one (RFC 7888 §3; RFC 9051
+// §9: literal = "{" number64 ["+"] "}" CRLF *CHAR8): followed by white space it
+// announces nothing, and the line is the whole command.
+func trailingLiteral(line string) (size int, nonSync, ok bool) {
+	if !strings.HasSuffix(line, "}") {
+		return 0, false, false
+	}
+	start := strings.LastIndexByte(line, '{')
+	if start < 0 {
+		return 0, false, false
+	}
+	digits := line[start+1 : len(line)-1]
+	if strings.HasSuffix(digits, "+") {
+		nonSync = true
+		digits = digits[:len(digits)-1]
+	}
+	if digits == "" {
+		return 0, false, false
+	}
+	// Only the pre-auth bound matters here. Saturate instead of using
+	// Atoi: an all-digit count overflowing int is still an oversized literal,
+	// whose in-flight payload cannot safely become further commands.
+	for _, c := range digits {
+		if c < '0' || c > '9' {
+			return 0, false, false
 		}
-		_, _, args, err = server.ParseLine("x CMD "+rest, true)
-		if err != nil {
-			return fmt.Errorf("Malformed command continuation")
+		if size <= maxPreAuthLiteral {
+			size = size*10 + int(c-'0')
+			if size > maxPreAuthLiteral {
+				size = maxPreAuthLiteral + 1
+			}
 		}
 	}
-	return nil
+	return size, nonSync, true
+}
+
+// isIMAPAtom reports whether s is a non-empty IMAP atom (RFC 9051 §9), matching
+// go-imap's imapwire.IsAtomChar so quoted strings, literals, wildcards, and
+// control characters are rejected as invalid AUTHENTICATE mechanism syntax.
+func isIMAPAtom(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '(', ')', '{', ' ', '%', '*', '"', '\\', ']':
+			return false
+		}
+		if unicode.IsControl(rune(s[i])) {
+			return false
+		}
+	}
+	return true
+}
+
+// decodeSASLResponse decodes an IMAP SASL initial-resp or continuation base64
+// response (RFC 9051 §6.2.2, §9). A single "=" is valid only as initial-resp
+// (zero-length response). Quoted strings are not unquoted, and embedded CR/LF
+// (which Go's base64 decoder silently ignores) are rejected.
+func decodeSASLResponse(s string, initial bool) ([]byte, bool) {
+	if initial && s == "=" {
+		return []byte{}, true
+	}
+	if strings.ContainsAny(s, "\r\n") {
+		return nil, false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(s)
+	if err != nil {
+		return nil, false
+	}
+	return decoded, true
+}
+
+// preAuthRequiredState maps the commands a backend implements that are not
+// valid in the not-authenticated state to their minimum required state.
+// Fixed-state commands use the backend's (go-imap) state wording. ESEARCH
+// uses the authenticated minimum: the backend can require a selected mailbox
+// depending on its IN clause, which this pre-auth rejection does not parse.
+// UID commands are keyed "UID <command>".
+var preAuthRequiredState = map[string]string{
+	"UNAUTHENTICATE": "authenticated",
+	"ENABLE":         "authenticated",
+	"CREATE":         "authenticated",
+	"DELETE":         "authenticated",
+	"RENAME":         "authenticated",
+	"SUBSCRIBE":      "authenticated",
+	"UNSUBSCRIBE":    "authenticated",
+	"STATUS":         "authenticated",
+	"LIST":           "authenticated",
+	"LSUB":           "authenticated",
+	"NAMESPACE":      "authenticated",
+	"GETACL":         "authenticated",
+	"SETACL":         "authenticated",
+	"DELETEACL":      "authenticated",
+	"LISTRIGHTS":     "authenticated",
+	"MYRIGHTS":       "authenticated",
+	"IDLE":           "authenticated",
+	"NOTIFY":         "authenticated",
+	"SELECT":         "authenticated",
+	"EXAMINE":        "authenticated",
+	"APPEND":         "authenticated",
+	"GETMETADATA":    "authenticated",
+	"SETMETADATA":    "authenticated",
+	"ESEARCH":        "authenticated",
+	"CHECK":          "selected",
+	"CLOSE":          "selected",
+	"UNSELECT":       "selected",
+	"EXPUNGE":        "selected",
+	"FETCH":          "selected",
+	"STORE":          "selected",
+	"COPY":           "selected",
+	"MOVE":           "selected",
+	"SEARCH":         "selected",
+	"SORT":           "selected",
+	"THREAD":         "selected",
+	"UID EXPUNGE":    "selected",
+	"UID FETCH":      "selected",
+	"UID STORE":      "selected",
+	"UID COPY":       "selected",
+	"UID MOVE":       "selected",
+	"UID SEARCH":     "selected",
+	"UID SORT":       "selected",
+	"UID THREAD":     "selected",
+}
+
+// preAuthCommandError is the tagged reply text (without the tag) for a command
+// the pre-auth loop does not handle: an unknown command, or one valid only
+// after authentication. Unknown commands receive BAD (RFC 9051 §7.1.3).
+// For a known command in the wrong state, §3 permits BAD or NO; choosing BAD
+// matches the backend's status. The fixed-state commands also use its wording;
+// ESEARCH reports the authenticated minimum rather than parsing its scope.
+func preAuthCommandError(command string, args []string) string {
+	name := command
+	if command == "UID" && len(args) > 0 {
+		name += " " + server.ToUpperASCII(args[0])
+	}
+	if state, ok := preAuthRequiredState[name]; ok {
+		return "BAD [CLIENTBUG] This command is only valid in the " + state + " state"
+	}
+	return "BAD Unknown command"
 }
 
 // handleAuthError increments the error count, sends an error response, and
@@ -642,10 +964,10 @@ func (s *Session) handleAuthError(response string) bool {
 //     baseline behavior; the pre-auth parser accepts them (LOGIN, ID).
 //   - SASL-IR (RFC 4959): AUTHENTICATE PLAIN <initial-response> is accepted;
 //     advertising it saves compliant clients a round trip.
-//   - LITERAL- (RFC 7888): non-synchronizing literals up to 4096 bytes. The
-//     pre-auth path bounds literals at 8 KiB, so LITERAL+ (any size) would be
-//     a promise it cannot keep — a client streaming a large {N+} literal would
-//     get BAD after the bytes are already in flight and desynchronize.
+//   - LITERAL- (RFC 7888): non-synchronizing literals up to 4096 bytes, which
+//     the pre-auth loop enforces (maxNonSyncLiteral; a larger one ends the
+//     session with BYE [TOOBIG]). It reads synchronizing literals up to 8 KiB,
+//     so LITERAL+ (any size) would be a promise it cannot keep.
 //     Credentials and ID values fit comfortably; larger literals fall back to
 //     synchronizing form, which is handled with a continuation.
 //   - AUTH=PLAIN: the only SASL mechanism the proxy accepts. Do NOT list
@@ -735,21 +1057,39 @@ func (s *Session) handleStartTLS(tag string, args []string) bool {
 	s.startTLSInProgress = false
 	s.clientReader = bufio.NewReader(tlsConn)
 	s.clientWriter = bufio.NewWriter(tlsConn)
+	shuttingDown := s.gracefulShutdown
 	s.mu.Unlock()
+	if shuttingDown {
+		s.sendBye("* BYE Server shutting down, please reconnect\r\n")
+		return false
+	}
 	return true
 }
 
-// sendGreeting sends the IMAP greeting.
+var errSessionShuttingDown = errors.New("session shutting down")
+
+// sendGreeting sends the IMAP greeting unless graceful shutdown has already
+// claimed the session.
 func (s *Session) sendGreeting() error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	if s.gracefulShutdown {
+		return errSessionShuttingDown
+	}
 
 	greeting := "* OK [CAPABILITY " + s.preAuthCapabilities() + s.server.additionalCapsSuffix + "] Proxy Ready\r\n"
 	_, err := s.clientWriter.WriteString(greeting)
 	if err != nil {
 		return err
 	}
-	return s.clientWriter.Flush()
+	if err := s.clientWriter.Flush(); err != nil {
+		return err
+	}
+	s.greeted = true
+	return nil
 }
 
 // sendResponse sends a response to the client.
@@ -797,8 +1137,41 @@ func (s *Session) ErrorLog(msg string, keysAndValues ...any) {
 	s.getLogger().ErrorLog(msg, keysAndValues...)
 }
 
+var errAuthorizationFailed = errors.New("authorization failed")
+
+// authorizeIdentity verifies that the authenticated credentials for username
+// (which resolve to resolvedEmail for backend impersonation) are permitted to
+// act as authzID (RFC 4616 section 2). Refused only after credentials check out
+// (RFC 5530 section 3 AUTHORIZATIONFAILED) and before session state, rate-limiter
+// success, or login/connection metrics are recorded.
+func (s *Session) authorizeIdentity(authzID, username, resolvedEmail, method string) error {
+	if authzID != "" && authzID != username && authzID != resolvedEmail {
+		s.username = resolvedEmail
+		s.InfoLog("authorization failed", "address", resolvedEmail, "authzid", authzID, "method", method)
+		return errAuthorizationFailed
+	}
+	return nil
+}
+
 // authenticateUser authenticates the user against the database.
 func (s *Session) authenticateUser(username, password string) error {
+	return s.authenticateUserWithAuthzID("", username, password)
+}
+
+func (s *Session) authenticateUserWithAuthzID(authzID, username, password string) (retErr error) {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
+	cacheGeneration := s.server.lookupCache.Generation()
+
+	defer func() {
+		if retErr != nil {
+			s.submittedUsername = ""
+			s.username = ""
+			s.accountID = 0
+			s.isRemoteLookupAccount = false
+			s.routingInfo = nil
+		}
+	}()
+
 	// Remember the username exactly as submitted: the lookup cache is keyed on
 	// it (every Set below uses it), so invalidation must use the same value —
 	// not the resolved s.username, which can differ for token/master/+detail logins.
@@ -833,6 +1206,11 @@ func (s *Session) authenticateUser(username, password string) error {
 	// bucket by varying the target, leaving the proxy's tenant-wide password unmetered.
 	// Decided here, from the raw identity, so check site and record sites cannot drift.
 	authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
+	// A success is recorded under the master credential's key only for a master
+	// login. The master form with any other password is the base address's own login
+	// (#949), and its success, recorded under the master credential's key, would
+	// clear that key's failed guesses at the master password.
+	successKey := server.AuthSuccessRateLimitKey(username, password, s.server.masterUsername, s.server.masterPassword)
 
 	// Use configured remotelookup timeout instead of hardcoded value
 	// This allows slow networks enough time for initial TLS handshake while reusing connections
@@ -848,7 +1226,7 @@ func (s *Session) authenticateUser(username, password string) error {
 	// meant the delay never fired in exactly the deployment proxies exist for.
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	delayAddr := &server.StringAddr{Addr: realClientIP}
-	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, delayAddr, "IMAP-PROXY"); err != nil {
+	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, delayAddr, "imap_proxy"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
@@ -923,8 +1301,26 @@ func (s *Session) authenticateUser(username, password string) error {
 				// positive_ttl to allow periodic revalidation via remotelookup/database.
 				// This ensures that when a domain moves backends or password changes,
 				// active users eventually pick up the changes.
-				s.DebugLog("cache hit - using cached auth", "username", username, "account_id", cached.AccountID, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
+				s.DebugLog("cache hit - using cached auth", "username", username, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
 				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit").Inc()
+
+				// The resolved address when the entry has one (e.g. "user@example.com" for
+				// "user@TOKEN"); otherwise keep the base address set above, the name the
+				// uncached login routed by. The submitted name would route a +detail or
+				// @SUFFIX login under another key than the uncached one.
+				resolvedEmail := s.username
+				if cached.ActualEmail != "" {
+					resolvedEmail = cached.ActualEmail
+				}
+				if err := s.authorizeIdentity(authzID, username, resolvedEmail, "cache"); err != nil {
+					return err
+				}
+
+				// Check if context is cancelled (server shutting down)
+				if err := s.ctx.Err(); err != nil {
+					s.WarnLog("context cancelled during cache hit", "error", err)
+					return server.ErrServerShuttingDown // Triggers UNAVAILABLE response instead of auth failed
+				}
 
 				s.accountID = cached.AccountID
 				s.isRemoteLookupAccount = cached.FromRemoteLookup
@@ -932,16 +1328,10 @@ func (s *Session) authenticateUser(username, password string) error {
 				// its enforcement and every backend-leg setting the lookup answer carried.
 				s.routingInfo = proxy.RouteFromCache(cached)
 				s.routingInfo.ClientConn = s.listenerConn // Always set current client connection for JA4
-				// The resolved address when the entry has one (e.g. "user@example.com" for
-				// "user@TOKEN"); otherwise s.username keeps the base address set above, the
-				// name the uncached login routed by. The submitted name would route a
-				// +detail or @SUFFIX login under another key than the uncached one.
-				if cached.ActualEmail != "" {
-					s.username = cached.ActualEmail
-				}
+				s.username = resolvedEmail
 
 				// Use actual username (resolved email) for rate limiting and metrics
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// Track domain and user activity using resolved email
@@ -958,12 +1348,6 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Single consolidated log for authentication success
 				s.InfoLog("authentication successful", "cached", true, "method", "cache")
 
-				// Check if context is cancelled (server shutting down)
-				if err := s.ctx.Err(); err != nil {
-					s.WarnLog("context cancelled during cache hit", "error", err)
-					return server.ErrServerShuttingDown // Triggers UNAVAILABLE response instead of auth failed
-				}
-
 				// NOTE: the backend connection is established by
 				// postAuthenticationSetup (the single owner of connectToBackend).
 				// Connecting here as well used to open a second backend
@@ -971,8 +1355,10 @@ func (s *Session) authenticateUser(username, password string) error {
 				return nil
 			} else {
 				// Different password on positive entry - always revalidate
-				// Use configured window: revalidate if entry is older than positiveRevalidationWindow
-				if cached.IsOld(s.server.positiveRevalidationWindow) {
+				// Use configured window: revalidate if entry is older than positiveRevalidationWindow,
+				// or if the two passwords are the master username form's two credentials (#949)
+				if cached.IsOld(s.server.positiveRevalidationWindow) ||
+					proxy.MasterFormOtherCredential(username, password, cached.PasswordDigest, s.server.masterUsername, s.server.masterPassword) {
 					s.DebugLog("cache positive entry - revalidating with different password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.LookupCacheResults.WithLabelValues("imap_proxy", "revalidate_positive_different_pw").Inc()
 					// The database or the remote lookup decides this password, so drop
@@ -1018,15 +1404,22 @@ func (s *Session) authenticateUser(username, password string) error {
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
-				// Wrong master password - fail immediately
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return consts.ErrAuthenticationFailed
+				// Not the master password: the base address's own login, checked below
+				// exactly as under any other suffix, with the same lookup, password
+				// verification and lookup-cache entry, and under the same submitted name
+				// (the lookup service may route or refuse tokens differently). A distinct
+				// reply, a quicker one (#801), or a refusal of the account's own password
+				// (#949) confirms a guessed master username. Its failure is still recorded
+				// under authKey, the master credential's key; only a success is the
+				// account's (successKey).
+				s.DebugLog("master username without the master password, checked like another suffix", "address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = username
+			} else {
+				// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
+				s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = parsedAddr.BaseAddress()
+				masterAuthValidated = true
 			}
-			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
-			s.DebugLog("master username authentication successful, using base address for routing", "base_address", parsedAddr.BaseAddress())
-			usernameForRemoteLookup = parsedAddr.BaseAddress()
-			masterAuthValidated = true
 		} else {
 			// Suffix doesn't match master username - treat as token
 			// Send FULL username (including @TOKEN) to remotelookup for validation
@@ -1082,11 +1475,8 @@ func (s *Session) authenticateUser(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// RemoteLookup returned success - use routing info
-				s.DebugLog("remotelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.DebugLog("remotelookup successful", "master_auth_validated", masterAuthValidated)
 				metrics.RemoteLookupResult.WithLabelValues("imap", "success").Inc()
-				s.accountID = routingInfo.AccountID
-				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
-				s.routingInfo = routingInfo
 
 				// Determine the resolved email for backend impersonation
 				// Use ActualEmail from remotelookup response if available, otherwise derive from username
@@ -1097,17 +1487,6 @@ func (s *Session) authenticateUser(username, password string) error {
 					resolvedEmail = usernameForRemoteLookup // Base address already
 				} else {
 					resolvedEmail = username // Fallback to original
-				}
-				s.username = resolvedEmail // Use for backend impersonation
-
-				// Use resolvedEmail for rate limiting and metrics (the actual user)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
-
-				// For metrics, use resolvedEmail for accurate tracking
-				if addr, err := server.NewAddress(resolvedEmail); err == nil {
-					metrics.TrackDomainConnection("imap_proxy", addr.Domain())
-					metrics.TrackUserActivity("imap_proxy", addr.FullAddress(), "connection", 1)
 				}
 
 				// Cache successful remotelookup authentication
@@ -1121,13 +1500,32 @@ func (s *Session) authenticateUser(username, password string) error {
 					IsNegative:     false,
 				}
 				proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
-				s.server.lookupCache.Set(s.server.name, username, entry)
+				s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, entry)
 
-				// Single consolidated log for authentication success
 				method := "remotelookup"
 				if masterAuthValidated {
 					method = "master"
 				}
+				if err := s.authorizeIdentity(authzID, username, resolvedEmail, method); err != nil {
+					return err
+				}
+
+				s.accountID = routingInfo.AccountID
+				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
+				s.routingInfo = routingInfo
+				s.username = resolvedEmail // Use for backend impersonation
+
+				// Use resolvedEmail for rate limiting and metrics (the actual user)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
+
+				// For metrics, use resolvedEmail for accurate tracking
+				if addr, err := server.NewAddress(resolvedEmail); err == nil {
+					metrics.TrackDomainConnection("imap_proxy", addr.Domain())
+					metrics.TrackUserActivity("imap_proxy", addr.FullAddress(), "connection", 1)
+				}
+
+				// Single consolidated log for authentication success
 				s.InfoLog("authentication successful", "cached", false, "method", method)
 
 				return nil // Authentication complete
@@ -1137,7 +1535,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
+					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "username", username)
 				}
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
@@ -1145,7 +1543,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				// Cache negative result (failed authentication) WITH password hash
 				// This allows us to detect repeated wrong passwords vs different wrong passwords
 				// Always digest the password, even for master auth, to prevent cache bypass
-				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+				s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 					PasswordDigest: lookupcache.NewPasswordDigest(password),
 					Result:         lookupcache.AuthFailed,
 					IsNegative:     true,
@@ -1178,7 +1576,7 @@ func (s *Session) authenticateUser(username, password string) error {
 					if !masterAuthValidated {
 						db.DummyVerifyPassword(password)
 					}
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthUserNotFound,
 						IsNegative:     true,
@@ -1225,12 +1623,12 @@ func (s *Session) authenticateUser(username, password string) error {
 			// temporary failure (NO [UNAVAILABLE]), not a failed login charged to the master
 			// credential. The bare sentinel, because the reply carries the error's text.
 			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "method", "master", "user", address.BaseAddress(), "error", err)
+				s.WarnLog("authentication unavailable", "method", "master", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
 			}
 
-			s.InfoLog("master auth failed - account not found", "user", address.BaseAddress(), "error", err)
+			s.InfoLog("master auth failed - account not found", "error", err)
 			s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 			metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 			return fmt.Errorf("account not found: %w", err)
@@ -1272,7 +1670,7 @@ func (s *Session) authenticateUser(username, password string) error {
 				s.DebugLog("caching definitive auth failure", "username", username)
 				// Cache WITH password hash to detect repeated wrong passwords
 				// Always digest the password, even for master auth, to prevent cache bypass
-				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+				s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 					PasswordDigest: lookupcache.NewPasswordDigest(password),
 					Result:         lookupcache.AuthFailed,
 					IsNegative:     true,
@@ -1290,40 +1688,10 @@ func (s *Session) authenticateUser(username, password string) error {
 		}
 	}
 
-	s.accountID = accountID
-	s.isRemoteLookupAccount = false
-	// A session that reaches DetermineRoute with no routing info has the routing lookup
-	// run for it, which for a user the lookup 404'd moments ago is a second round trip to
-	// the same answer. A lookup-cache hit for this user rebuilds exactly this from the
-	// entry written below, so give the uncached login the same starting point.
-	s.routingInfo = &proxy.UserRoutingInfo{
-		AccountID:          accountID,
-		RemoteUseIDCommand: s.server.remoteUseIDCommand,
-	}
-	// Set username to base address (without master username suffix or +detail)
-	// This is what gets sent to the backend for impersonation
-	s.username = address.BaseAddress()
-	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
-
-	// Track successful authentication.
-	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
-
-	// Track domain and user connection activity for the login event. The user is the base
-	// address, the name a lookup-cache hit replaying this login counts it under.
-	metrics.TrackDomainConnection("imap_proxy", address.Domain())
-	metrics.TrackUserActivity("imap_proxy", address.BaseAddress(), "connection", 1)
-
-	// Single consolidated log for authentication success
-	method := "main_db"
-	if masterAuthValidated {
-		method = "master"
-	}
-	s.InfoLog("authentication successful", "cached", false, "method", method)
-
 	// Cache successful DB authentication
 	// ServerAddress will be determined later by DetermineRoute in connectToBackend
 	// Always digest the password, even for master auth, to prevent cache bypass
-	s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+	s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 		AccountID:      accountID,
 		PasswordDigest: lookupcache.NewPasswordDigest(password),
 		ServerAddress:  "", // Will be populated by affinity/routing in next connection
@@ -1336,6 +1704,41 @@ func (s *Session) authenticateUser(username, password string) error {
 		FromRemoteLookup:   false,
 		IsNegative:         false,
 	})
+
+	resolvedEmail := address.BaseAddress()
+	method := "main_db"
+	if masterAuthValidated {
+		method = "master"
+	}
+	if err := s.authorizeIdentity(authzID, username, resolvedEmail, method); err != nil {
+		return err
+	}
+
+	s.accountID = accountID
+	s.isRemoteLookupAccount = false
+	// A session that reaches DetermineRoute with no routing info has the routing lookup
+	// run for it, which for a user the lookup 404'd moments ago is a second round trip to
+	// the same answer. A lookup-cache hit for this user rebuilds exactly this from the
+	// entry written below, so give the uncached login the same starting point.
+	s.routingInfo = &proxy.UserRoutingInfo{
+		AccountID:          accountID,
+		RemoteUseIDCommand: s.server.remoteUseIDCommand,
+	}
+	// Set username to base address (without master username suffix or +detail)
+	// This is what gets sent to the backend for impersonation
+	s.username = resolvedEmail
+	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
+
+	// Track successful authentication.
+	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
+
+	// Track domain and user connection activity for the login event. The user is the base
+	// address, the name a lookup-cache hit replaying this login counts it under.
+	metrics.TrackDomainConnection("imap_proxy", address.Domain())
+	metrics.TrackUserActivity("imap_proxy", resolvedEmail, "connection", 1)
+
+	// Single consolidated log for authentication success
+	s.InfoLog("authentication successful", "cached", false, "method", method)
 
 	return nil
 }
@@ -1454,7 +1857,7 @@ func (s *Session) connectToBackend() error {
 	// Only an untagged OK greeting is usable: BYE means the backend refuses
 	// service, and PREAUTH would be an already-authenticated connection that
 	// cannot go through our AUTHENTICATE impersonation flow.
-	if !strings.HasPrefix(greeting, "* OK") {
+	if tag, ok := statusOK(greeting); tag != "*" || !ok {
 		s.backendConn.Close()
 		s.ErrorLog("Unexpected backend greeting", "backend", s.serverAddr, "greeting", strings.TrimRight(greeting, "\r\n"))
 		return fmt.Errorf("unexpected backend greeting: %s", strings.TrimRight(greeting, "\r\n"))
@@ -1474,6 +1877,27 @@ func (s *Session) connectToBackend() error {
 	// Clear the read deadline after successful greeting
 	if err := s.backendConn.SetReadDeadline(time.Time{}); err != nil {
 		s.WarnLog("failed to clear read deadline", "error", err)
+	}
+
+	// Send ID command to backend with forwarding parameters if enabled.
+	// This MUST be done before authenticating to the backend, as the ID command
+	// is only valid in the "Not Authenticated" state.
+	useIDCommand := s.server.remoteUseIDCommand
+	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
+	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
+		useIDCommand = s.routingInfo.RemoteUseIDCommand
+	}
+	if useIDCommand {
+		if err := s.sendForwardingParametersToBackend(); errors.Is(err, errIDRefused) {
+			// Go on without them: the tagged reply ended the exchange.
+			s.WarnLog("failed to send forwarding parameters to backend", "error", err)
+		} else if err != nil {
+			// The ID reply was not read to its tagged end (a write or read error, or the
+			// deadline). It may still come, and AUTHENTICATE would read it as its own.
+			s.backendConn.Close()
+			s.ErrorLog("ID exchange with backend failed", "backend", s.serverAddr, "error", err)
+			return fmt.Errorf("ID exchange with backend: %w", err)
+		}
 	}
 
 	return nil
@@ -1534,6 +1958,19 @@ func (s *Session) startTLSWithBackend(tlsConfig *tls.Config, timeout time.Durati
 	return errors.New("no tagged STARTTLS response from backend")
 }
 
+// statusOK returns the tag of a backend response line ("*" when it is untagged) and
+// whether its status is OK. RFC 9051 section 9: the status is a whole atom (greeting =
+// "*" SP (resp-cond-auth / resp-cond-bye) CRLF, response-tagged = tag SP resp-cond-state
+// CRLF, resp-cond-state = ("OK" / "NO" / "BAD") SP resp-text), and "Implementations MUST
+// accept these strings in a case-insensitive fashion". The atom ends at SP or the line
+// end, so OKAY, or OK run into its text, is not OK. The length check keeps the folding
+// ASCII: a multi-byte rune that folds to K (the Kelvin sign) cannot fit.
+func statusOK(line string) (tag string, ok bool) {
+	tag, rest, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
+	status, _, _ := strings.Cut(rest, " ")
+	return tag, len(status) == 2 && strings.EqualFold(status, "OK")
+}
+
 // authenticateToBackend authenticates to the backend using master credentials.
 func (s *Session) authenticateToBackend() (string, error) {
 	// Authenticate to the backend using master credentials in a single step.
@@ -1589,7 +2026,7 @@ func (s *Session) authenticateToBackend() (string, error) {
 		s.WarnLog("failed to clear auth deadline", "error", err)
 	}
 
-	if !strings.HasPrefix(strings.TrimSpace(response), tag+" OK") {
+	if responseTag, ok := statusOK(response); responseTag != tag || !ok {
 		return "", fmt.Errorf("%w: %s", server.ErrBackendAuthFailed, strings.TrimSpace(response))
 	}
 
@@ -1610,21 +2047,6 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 		s.sendResponse(fmt.Sprintf("%s NO [UNAVAILABLE] Backend server temporarily unavailable", clientTag))
 		s.sendResponse("* BYE Backend server unavailable, please try again")
 		return false
-	}
-
-	// Send ID command to backend with forwarding parameters if enabled.
-	// This MUST be done before authenticating to the backend, as the ID command
-	// is only valid in the "Not Authenticated" state.
-	useIDCommand := s.server.remoteUseIDCommand
-	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
-	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
-		useIDCommand = s.routingInfo.RemoteUseIDCommand
-	}
-	if useIDCommand {
-		if err := s.sendForwardingParametersToBackend(); err != nil {
-			s.WarnLog("failed to send forwarding parameters to backend", "error", err)
-			// Continue anyway - forwarding parameters are not critical
-		}
 	}
 
 	// Authenticate to backend with master credentials
@@ -1662,9 +2084,6 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 	// the backend server does the same and replies NO [LIMIT].
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("connection rejected by connection tracker", "error", err)
-		// Mark as rejected so close() does not decrement a slot this session
-		// never held (which would erode the limit for the account).
-		s.connRejected = true
 		s.sendResponse(fmt.Sprintf("%s NO [LIMIT] Too many connections", clientTag))
 		s.sendResponse("* BYE Too many connections")
 		s.mu.Lock()
@@ -1914,9 +2333,13 @@ func (s *Session) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	// Skip unregister when registration was rejected; otherwise we would
-	// decrement a slot this session never held (limit erosion for the account).
-	if s.server.connTracker != nil && !s.connRejected {
+	// Only a session the tracker registered unregisters. The account ID is set
+	// as soon as the client's credentials are accepted, before the backend leg
+	// and the registration: a session whose backend leg failed, or whose
+	// registration was refused, holds no slot, and unregistering it would free
+	// the slot of another session of the account from the same IP.
+	if s.server.connTracker != nil && s.connRegistered {
+		s.connRegistered = false // the slot is released once, however often close() runs
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1932,7 +2355,7 @@ func (s *Session) close() {
 			s.DebugLog("Successfully unregistered connection")
 		}
 	} else {
-		s.DebugLog("Skipping unregister - no connTracker")
+		s.DebugLog("Skipping unregister - not registered with connTracker")
 	}
 
 	if s.clientConn != nil {
@@ -1957,7 +2380,10 @@ func (s *Session) registerConnection() error {
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", s.clientAddr)
+		if err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "IMAP", s.clientAddr); err != nil {
+			return err
+		}
+		s.connRegistered = true
 	}
 	return nil
 }
@@ -1972,7 +2398,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 
 	// Register for kick notifications
 	s.DebugLog("registering session for kick notifications")
-	kickChan := s.server.connTracker.RegisterSession(s.accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(s.accountID, s.authSessionGeneration)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 
 	for {

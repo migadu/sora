@@ -3,6 +3,7 @@ package main
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 )
 
@@ -79,11 +80,11 @@ func TestMetricsAccessGuard(t *testing.T) {
 			wantStatus: http.StatusUnauthorized,
 		},
 		{
-			name:       "wrong token is refused",
+			name:       "wrong token is unauthorized",
 			apiKey:     apiKey,
 			remoteAddr: "10.4.2.1:51000",
 			authHeader: "Bearer wrong-key",
-			wantStatus: http.StatusForbidden,
+			wantStatus: http.StatusUnauthorized,
 		},
 		{
 			// A prefix of the real key must not pass: the comparison is over the
@@ -92,7 +93,7 @@ func TestMetricsAccessGuard(t *testing.T) {
 			apiKey:     apiKey,
 			remoteAddr: "10.4.2.1:51000",
 			authHeader: "Bearer " + apiKey[:len(apiKey)-1],
-			wantStatus: http.StatusForbidden,
+			wantStatus: http.StatusUnauthorized,
 		},
 		{
 			name:       "correct token is accepted",
@@ -153,6 +154,60 @@ func TestMetricsAccessGuard(t *testing.T) {
 			}
 			if want := tt.wantStatus == http.StatusOK; reached != want {
 				t.Errorf("handler reached = %v, want %v", reached, want)
+			}
+		})
+	}
+}
+
+// TestMetricsAccessGuard_BearerChallenge pins the status and WWW-Authenticate challenge
+// of the api_key check. RFC 9110 section 15.5.2 requires a challenge on every 401, and
+// RFC 6750 section 3 on every refusal of a request that "does not include authentication
+// credentials or does not contain an access token that enables access to the protected
+// resource". A wrong token names the reason, error="invalid_token", for which RFC 6750
+// section 3.1 says "The resource SHOULD respond with the HTTP 401 (Unauthorized) status
+// code". A host outside allowed_hosts is refused with 403 before any token is looked at,
+// and no token would change that, so it gets no challenge.
+func TestMetricsAccessGuard_BearerChallenge(t *testing.T) {
+	const apiKey = "s3cr3t-scrape-key"
+	tests := []struct {
+		name          string
+		allowedHosts  []string
+		remoteAddr    string
+		authHeader    string
+		wantStatus    int
+		wantChallenge string
+		wantBody      string
+	}{
+		{name: "missing token", remoteAddr: "10.4.2.1:51000", wantStatus: http.StatusUnauthorized, wantChallenge: `Bearer realm="metrics"`, wantBody: "unauthorized"},
+		{name: "non-bearer scheme", remoteAddr: "10.4.2.1:51000", authHeader: "Basic " + apiKey, wantStatus: http.StatusUnauthorized, wantChallenge: `Bearer realm="metrics"`, wantBody: "unauthorized"},
+		{name: "wrong token", remoteAddr: "10.4.2.1:51000", authHeader: "Bearer wrong-key", wantStatus: http.StatusUnauthorized, wantChallenge: `Bearer realm="metrics", error="invalid_token"`, wantBody: "unauthorized"},
+		{name: "host outside allow-list", allowedHosts: []string{"10.0.0.0/8"}, remoteAddr: "203.0.113.9:51000", authHeader: "Bearer " + apiKey, wantStatus: http.StatusForbidden, wantBody: "forbidden"},
+		{name: "correct token", remoteAddr: "10.4.2.1:51000", authHeader: "Bearer " + apiKey, wantStatus: http.StatusOK, wantBody: "sora_up 1"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var reached bool
+			guard := metricsAccessGuard(tt.allowedHosts, apiKey, okHandler(&reached))
+			req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+			req.RemoteAddr = tt.remoteAddr
+			if tt.authHeader != "" {
+				req.Header.Set("Authorization", tt.authHeader)
+			}
+			rec := httptest.NewRecorder()
+			guard.ServeHTTP(rec, req)
+			if rec.Code != tt.wantStatus {
+				t.Fatalf("status = %d, want %d (body %q)", rec.Code, tt.wantStatus, rec.Body.String())
+			}
+			got := rec.Header().Values("WWW-Authenticate")
+			if tt.wantChallenge == "" {
+				if len(got) != 0 {
+					t.Errorf("WWW-Authenticate = %q, want none", got)
+				}
+			} else if len(got) != 1 || got[0] != tt.wantChallenge {
+				t.Errorf("WWW-Authenticate = %q, want %q", got, tt.wantChallenge)
+			}
+			if body := strings.TrimSpace(rec.Body.String()); body != tt.wantBody {
+				t.Errorf("body = %q, want %q", body, tt.wantBody)
 			}
 		})
 	}

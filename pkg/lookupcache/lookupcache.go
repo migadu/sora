@@ -110,8 +110,10 @@ func (q *expiryQueue) unlink(it *cacheItem) {
 
 // LookupCache provides in-memory caching for authentication results
 type LookupCache struct {
-	mu      sync.RWMutex
-	entries map[string]*cacheItem
+	mu         sync.RWMutex
+	entries    map[string]*cacheItem
+	generation uint64 // invalidation/suspension fence for in-flight fills
+	suspended  bool
 	// positive and negative queue the entries of each TTL class in expiry
 	// order, so the entry that expires first is at one of their fronts.
 	positive, negative expiryQueue
@@ -186,11 +188,15 @@ func (e *CacheEntry) IsOld(duration time.Duration) bool {
 // Authenticate attempts to authenticate using cached data
 // Returns:
 //   - (accountID, true, nil) on cache hit with successful authentication
-//   - (0, false, nil) if not in cache or needs revalidation (caller should check database)
+//   - (0, false, nil) if not in cache or needs revalidation (caller should check database);
+//     a fresh positive entry the password does not match is dropped first
 //   - (0, false, error) on cached authentication failure (caller should NOT check database)
 //
 // Uses password-aware revalidation to detect password changes while preventing rapid brute force attempts
 func (c *LookupCache) Authenticate(address, password string) (accountID int64, found bool, err error) {
+	if c == nil {
+		return 0, false, nil
+	}
 	// Copy the entry and release the lock before doing any expensive work, the same
 	// way Get/GetOrFetch do. Password verification below is bcrypt (~180ms at cost
 	// 12); holding the read lock across it makes every cache write wait it out, and
@@ -198,6 +204,8 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 	// auth path on exactly the reconnect storm this cache exists to absorb.
 	c.mu.RLock()
 	cached, exists := c.entries[address]
+	exists = exists && !c.suspended
+	generation := c.generation
 	var entry CacheEntry
 	if exists {
 		entry = cached.entry
@@ -249,7 +257,16 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 		// User might have changed their password, or they're trying a wrong password.
 		// Either way, we need to check with the database to verify.
 		// Brute force protection is handled by protocol-level rate limiting, not by the cache.
-		logger.Debug("Auth cache: positive entry revalidation allowed (different password)", "address", address, "age", time.Since(entry.CreatedAt))
+		//
+		// The database decides this password, so drop the entry before the caller
+		// asks: a verdict writes a new entry anyway (SetSuccess or SetFailure). An
+		// outage gives none, and the login is answered as a temporary failure that the
+		// rate limiter does not count. Kept, the entry would still sign in its
+		// password, so every guess during the outage would be checked against it,
+		// unseen by the rate limiter, until the entry was older than the revalidation
+		// window. The SQLite auth cache and the proxies drop a missed entry the same way.
+		logger.Debug("Auth cache: positive entry dropped for revalidation (different password)", "address", address, "age", time.Since(entry.CreatedAt))
+		c.Invalidate(address)
 		return 0, false, nil
 	}
 
@@ -261,15 +278,32 @@ func (c *LookupCache) Authenticate(address, password string) (accountID int64, f
 		c.Invalidate(address)
 		return 0, false, nil
 	}
+	c.mu.RLock()
+	current := !c.suspended && generation == c.generation
+	c.mu.RUnlock()
+	if !current {
+		return 0, false, nil
+	}
 	return entry.AccountID, true, nil
 }
 
 // SetSuccess caches a successful authentication result
 func (c *LookupCache) SetSuccess(address string, accountID int64, hashedPassword string, password string) {
+	c.SetSuccessIfGeneration(c.Generation(), address, accountID, hashedPassword, password)
+}
+
+// SetSuccessIfGeneration stores a verdict only if no invalidation crossed its read.
+func (c *LookupCache) SetSuccessIfGeneration(generation uint64, address string, accountID int64, hashedPassword string, password string) bool {
+	if c == nil {
+		return false
+	}
 	digest := NewPasswordDigest(password)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.suspended || c.generation != generation {
+		return false
+	}
 
 	now := time.Now()
 	c.store(address, &CacheEntry{
@@ -280,6 +314,7 @@ func (c *LookupCache) SetSuccess(address string, accountID int64, hashedPassword
 		CreatedAt:      now,
 		ExpiresAt:      now.Add(c.positiveTTL),
 	})
+	return true
 }
 
 // SetFailure caches a failed authentication result (user not found or invalid password)
@@ -290,13 +325,23 @@ func (c *LookupCache) SetSuccess(address string, accountID int64, hashedPassword
 // anything derived from a failed guess (frequently a real password with a typo)
 // would buy nothing and only widen what a memory disclosure yields.
 func (c *LookupCache) SetFailure(address string, result int) {
+	c.SetFailureIfGeneration(c.Generation(), address, result)
+}
+
+func (c *LookupCache) SetFailureIfGeneration(generation uint64, address string, result int) bool {
+	if c == nil {
+		return false
+	}
 	authResult := AuthResult(result)
 	if authResult == AuthSuccess {
-		return // Don't cache success as failure
+		return false // Don't cache success as failure
 	}
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.suspended || c.generation != generation {
+		return false
+	}
 
 	now := time.Now()
 	c.store(address, &CacheEntry{
@@ -305,6 +350,7 @@ func (c *LookupCache) SetFailure(address string, result int) {
 		ExpiresAt:  now.Add(c.negativeTTL),
 		IsNegative: true,
 	})
+	return true
 }
 
 // Invalidate removes a specific entry from the cache (e.g., after password change).
@@ -315,6 +361,7 @@ func (c *LookupCache) Invalidate(address string) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.generation++
 
 	if it, exists := c.entries[address]; exists {
 		c.remove(it)
@@ -339,14 +386,29 @@ func (c *LookupCache) InvalidateUser(serverName, username string) {
 // no account and are left alone: they never let anyone in.
 // Safe to call on a nil receiver (no-op when the cache is disabled).
 func (c *LookupCache) InvalidateAccount(accountID int64) {
-	if c == nil || accountID == 0 {
+	c.InvalidateAccounts([]int64{accountID})
+}
+
+// InvalidateAccounts drops positive entries for the supplied accounts in one pass.
+// Negative entries cannot authorize a login and remain untouched. A nil cache is safe.
+func (c *LookupCache) InvalidateAccounts(accountIDs []int64) {
+	if c == nil || len(accountIDs) == 0 {
+		return
+	}
+	drop := make(map[int64]struct{}, len(accountIDs))
+	for _, id := range accountIDs {
+		if id != 0 {
+			drop[id] = struct{}{}
+		}
+	}
+	if len(drop) == 0 {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
+	c.generation++
 	for _, it := range c.entries {
-		if !it.entry.IsNegative && it.entry.AccountID == accountID {
+		if _, changed := drop[it.entry.AccountID]; changed && !it.entry.IsNegative {
 			c.remove(it)
 		}
 	}
@@ -366,6 +428,9 @@ func (c *LookupCache) queue(e *CacheEntry) *expiryQueue {
 // evicts another entry first.
 // Caller must hold the write lock.
 func (c *LookupCache) store(key string, entry *CacheEntry) {
+	if c.suspended {
+		return
+	}
 	it, exists := c.entries[key]
 	if exists {
 		c.queue(&it.entry).unlink(it)
@@ -534,9 +599,11 @@ func (c *LookupCache) GetStats() (hits, misses uint64, size int, hitRate float64
 func (c *LookupCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.generation++
 
 	c.entries = make(map[string]*cacheItem)
 	c.positive, c.negative = expiryQueue{}, expiryQueue{}
+	c.entriesGauge.Set(0)
 	atomic.StoreUint64(&c.hits, 0)
 	atomic.StoreUint64(&c.misses, 0)
 
@@ -562,6 +629,7 @@ func (c *LookupCache) Get(serverName, username string) (*CacheEntry, bool) {
 
 	c.mu.RLock()
 	it, exists := c.entries[key]
+	exists = exists && !c.suspended
 	var entryCopy CacheEntry
 	if exists {
 		entryCopy = it.entry
@@ -589,13 +657,21 @@ func (c *LookupCache) Get(serverName, username string) (*CacheEntry, bool) {
 // Set stores an entry in the cache.
 // Safe to call on a nil receiver (no-op when the cache is disabled).
 func (c *LookupCache) Set(serverName, username string, entry *CacheEntry) {
+	c.SetIfGeneration(c.Generation(), serverName, username, entry)
+}
+
+// SetIfGeneration stores a lookup result only if its read predates no invalidation.
+func (c *LookupCache) SetIfGeneration(generation uint64, serverName, username string, entry *CacheEntry) bool {
 	if c == nil {
-		return
+		return false
 	}
 	key := makeKey(serverName, username)
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.suspended || c.generation != generation {
+		return false
+	}
 
 	// Determine TTL based on result type if not already set
 	if entry.ExpiresAt.IsZero() {
@@ -610,6 +686,7 @@ func (c *LookupCache) Set(serverName, username string, entry *CacheEntry) {
 	}
 
 	c.store(key, entry)
+	return true
 }
 
 // Refresh extends the TTL of an existing cache entry
@@ -668,6 +745,8 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 	// Try cache first
 	c.mu.RLock()
 	it, exists := c.entries[key]
+	exists = exists && !c.suspended
+	generation := c.generation
 	var entryCopy CacheEntry
 	if exists {
 		entryCopy = it.entry
@@ -686,17 +765,19 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 	metrics.LookupCacheMissesTotal.Inc()
 
 	// Use singleflight to ensure only one fetch per key
-	result, err, shared := c.sfGroup.Do(key, func() (interface{}, error) {
+	result, err, shared := c.sfGroup.Do(fmt.Sprintf("%d:%s", generation, key), func() (interface{}, error) {
 		// Execute the fetch function
 		fetchedEntry, fetchErr := fetchFn()
 		if fetchErr != nil {
 			return nil, fetchErr
 		}
 
-		// Cache the result
+		// Keep GetOrFetch's existing entry/TTL contract; only publication is fenced.
 		c.mu.Lock()
-		defer c.mu.Unlock()
-		c.store(key, fetchedEntry)
+		if !c.suspended && c.generation == generation {
+			c.store(key, fetchedEntry)
+		}
+		c.mu.Unlock()
 
 		return fetchedEntry, nil
 	})
@@ -714,4 +795,49 @@ func (c *LookupCache) GetOrFetch(serverName, username string, fetchFn func() (*C
 	}
 
 	return &entryCopy, false, nil
+}
+
+// Generation is captured before an external lookup, then passed to a guarded fill.
+func (c *LookupCache) Generation() uint64 {
+	if c == nil {
+		return 0
+	}
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.generation
+}
+
+// Suspend disables hits and fills until a successful feed synchronization.
+func (c *LookupCache) Suspend() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.suspended {
+		return
+	}
+	c.generation++
+	c.suspended = true
+	c.entries = make(map[string]*cacheItem)
+	c.positive, c.negative = expiryQueue{}, expiryQueue{}
+	c.entriesGauge.Set(0)
+}
+
+// Resume clears a suspended cache once. Healthy synchronization ticks are no-ops,
+// preserving warm entries; late fills from before either boundary stay fenced.
+func (c *LookupCache) Resume() {
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.suspended {
+		return
+	}
+	c.generation++
+	c.entries = make(map[string]*cacheItem)
+	c.positive, c.negative = expiryQueue{}, expiryQueue{}
+	c.entriesGauge.Set(0)
+	c.suspended = false
 }

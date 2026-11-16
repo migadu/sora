@@ -255,17 +255,14 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	if opts.RemoteLookup.Enabled {
 		remotelookupClient, err := proxy.InitializeRemoteLookup("imap", opts.RemoteLookup, opts.RemotePort)
 		if err != nil {
-			logger.Error("Failed to initialize remotelookup client", "proxy", opts.Name, "error", err)
-			if !opts.RemoteLookup.ShouldLookupLocalUsers() {
-				cancel()
-				return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
-			}
-			logger.Warn("Continuing without remotelookup due to lookup_local_users=true", "proxy", opts.Name)
-		} else {
-			routingLookup = remotelookupClient
-			if opts.Debug {
-				logger.Debug("RemoteLookup client initialized successfully", "proxy", opts.Name)
-			}
+			// Also with lookup_local_users, which adds the database for the users the
+			// lookup does not know and does not make the lookup optional.
+			cancel()
+			return nil, fmt.Errorf("failed to initialize remotelookup client: %w", err)
+		}
+		routingLookup = remotelookupClient
+		if opts.Debug {
+			logger.Debug("RemoteLookup client initialized successfully", "proxy", opts.Name)
 		}
 	}
 
@@ -509,6 +506,15 @@ func (s *Server) Start() error {
 	}
 	s.listenerMu.Unlock()
 
+	// Stop cancels s.ctx before it looks for a listener to close, so a Stop
+	// that ran before the listener existed (cmd/sora calls it from a context
+	// watcher that races Start) found none. Checked once the listener is set,
+	// either Stop closes it or this does: never serve after Stop.
+	if s.ctx.Err() != nil {
+		s.listener.Close()
+		return nil
+	}
+
 	// Start connection limiter cleanup if enabled
 	if s.limiter != nil {
 		s.limiter.StartCleanup(s.ctx)
@@ -620,6 +626,12 @@ func (s *Server) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	}
 }
 
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
+func (s *Server) GetLookupCache() *lookupcache.LookupCache {
+	return s.lookupCache
+}
+
 // GetConnectionTracker returns the connection tracker for testing
 func (s *Server) GetConnectionTracker() *server.ConnectionTracker {
 	return s.connTracker
@@ -679,6 +691,10 @@ func (s *Server) Stop() error {
 		if err := s.lookupCache.Stop(stopCtx); err != nil {
 			logger.Error("Error stopping auth cache", "proxy", s.name, "error", err)
 		}
+	}
+
+	if s.authLimiter != nil {
+		s.authLimiter.Stop()
 	}
 
 	return nil

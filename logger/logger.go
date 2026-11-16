@@ -450,6 +450,12 @@ func Get() *slog.Logger {
 	return slog.Default()
 }
 
+// Initialized reports whether the global logger is set, by Initialize (or by Swap in a
+// test): from then on what is logged goes to the configured output, in its format.
+func Initialized() bool {
+	return globalLogger.Load() != nil
+}
+
 // Swap makes l the global logger and returns the previous one (nil before Initialize),
 // to hand back to Swap. It is for tests that read what a server logs: they cannot rely on
 // where an earlier test's Initialize sent the output.

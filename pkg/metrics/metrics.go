@@ -61,6 +61,13 @@ var (
 		},
 		[]string{"hash_type", "result"},
 	)
+
+	PasswordDummyVerifications = promauto.NewCounter(
+		prometheus.CounterOpts{
+			Name: "sora_password_dummy_verifications_total",
+			Help: "Total number of bcrypt comparisons against the dummy hash, spent by failed logins with no password hash to check so that they cost what a wrong password costs",
+		},
+	)
 )
 
 // Database performance metrics

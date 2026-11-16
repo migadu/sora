@@ -112,3 +112,10 @@ func TestManageSieveProxyUnclassifiedLookupErrorIsATemporaryFailure(t *testing.T
 		})
 	}
 }
+
+// This immutable replay fixture never mutates cache state; guarded fills retain
+// the existing no-op Put behavior while satisfying the mandatory fence contract.
+func (c knownUserAuthCache) Generation() uint64 { return 0 }
+func (c knownUserAuthCache) PutIfGeneration(ctx context.Context, address string, accountID int64, hash string, _ uint64) error {
+	return c.Put(ctx, address, accountID, hash)
+}

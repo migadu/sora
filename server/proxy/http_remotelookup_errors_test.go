@@ -294,10 +294,11 @@ func TestHTTPRemoteLookupNetworkError(t *testing.T) {
 }
 
 // TestHTTPRemoteLookupUnbuildableRequestIsUnavailable (#518): a lookup whose request
-// cannot be built gives no verdict on the user either. $email in the host passes the URL
-// check at startup, but the escaped address ("user%40example.com") is not a valid host,
-// so every request fails before it is sent. That was AuthFailed with an error the
-// proxies did not classify, and they fell back to the database.
+// cannot be built gives no verdict on the user either. With $email in the host the
+// escaped address ("user%40example.com") is not a valid host, so every request fails
+// before it is sent. That was AuthFailed with an error the proxies did not classify,
+// and they fell back to the database. The startup check now rejects such a URL (#655);
+// this client is built without it.
 func TestHTTPRemoteLookupUnbuildableRequestIsUnavailable(t *testing.T) {
 	client := NewHTTPRemoteLookupClient(
 		"https://$email.lookup.example.com/lookup",

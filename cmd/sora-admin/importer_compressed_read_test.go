@@ -49,11 +49,11 @@ func gzipOfSize(t *testing.T, header string, size int64) []byte {
 // decompress to gigabytes (bzip2 streams also concatenate), and Dovecot treats a message
 // its owner APPENDed that starts with a compression magic as compressed. The scan must
 // stop reading a message at the bound the import refuses it at, the import message limit
-// or the upload's 256 MiB decompression bound (decompressIfNeeded), whichever is lower,
+// or the 256 MiB decompression bound (maxDecompressedSize), whichever is lower,
 // and fail it as too large, instead of decompressing and hashing all of it first.
 func TestScanStopsAtTheImportSizeBound(t *testing.T) {
 	const header = "From: a@example.com\r\nSubject: bomb\r\n\r\n"
-	const uploadBound = 256 << 20 // decompressIfNeeded's bound
+	const uploadBound = 256 << 20 // maxDecompressedSize
 
 	scan := func(t *testing.T, onDisk []byte, maxSize int64) (pending int, reasons []string) {
 		t.Helper()

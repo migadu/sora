@@ -51,7 +51,7 @@ func TestIMAP_StoreRestrictedReplacePreservesConcurrentFlags(t *testing.T) {
 				go func() {
 					modifier := ""
 					if conditional {
-						modifier = "(UNCHANGEDSINCE 18446744073709551615) "
+						modifier = "(UNCHANGEDSINCE 9223372036854775807) "
 					}
 					_, tagged := c.do("UID STORE 1 " + modifier + "FLAGS (" + tc.desired + ")")
 					done <- tagged

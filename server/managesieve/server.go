@@ -39,7 +39,10 @@ var (
 	GetSieveCapabilities     = msieve.GetSieveCapabilities
 )
 
-// getProxyProtocolTrustedProxies returns proxy_protocol_trusted_proxies if set, otherwise falls back to trusted_networks
+// getProxyProtocolTrustedProxies returns the hosts trusted to send PROXY headers: the
+// ProxyProtocolTrustedProxies option if set, otherwise trusted_networks. No config key
+// sets that option (there is no proxy_protocol_trusted_proxies, #542), so in a running
+// server PROXY trust is always [servers] trusted_networks.
 func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []string) []string {
 	if len(proxyProtocolTrusted) > 0 {
 		return proxyProtocolTrusted
@@ -377,7 +380,7 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 		OnStartTLS:             serverPkg.BeginStartTLS,
 		OnTLSHandshakeComplete: serverPkg.CompleteStartTLS,
 		Implementation:         "ManageSieve",
-		Greeting:               `"Sora" ManageSieve server ready.`,
+		Greeting:               `"Sora ManageSieve server ready."`, // written verbatim after "OK ": one quoted string (RFC 5804 section 4, response-ok)
 		GreetingStartTLSHint:   true,
 		SieveExtensions:        msieve.GetSieveCapabilities(s.supportedExtensions),
 		MaxScriptSize:          settings.maxScriptSize,
@@ -467,8 +470,14 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 			}
 			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "managesieve", logFunc)
 
-			// Log connection with session context (protocol, remote, session id)
-			session.DebugLog("new connection")
+			// Log connection with session context (protocol, remote, session id), and the
+			// session a managesieve_proxy's PROXY v2 header names (TLV 0xE1): it leads
+			// from the proxy's session=<id> to this session.
+			if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
+				session.InfoLog("connected", "proxy_session", proxyInfo.ProxySessionID)
+			} else {
+				session.InfoLog("connected")
+			}
 
 			// Track session for graceful shutdown
 			s.addSession(session)
@@ -838,7 +847,8 @@ func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 	return nil
 }
 
-// GetLookupCache returns the lookup cache for testing purposes
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
 func (s *ManageSieveServer) GetLookupCache() *lookupcache.LookupCache {
 	return s.lookupCache
 }
@@ -850,31 +860,38 @@ func (s *ManageSieveServer) GetLookupCache() *lookupcache.LookupCache {
 // is no verdict on the password: the database could not be asked, or the stored hash
 // cannot be checked. It is answered as a temporary failure and not counted as a failed
 // login.
-func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password string) (accountID int64, err error) {
+//
+// It logs no result: the session does, once, with its own fields. method says how the
+// password was checked, "cache" (the lookup cache) or "main_db", and reason why the
+// check failed, in the words of the proxies' lines: "user_not_found",
+// "invalid_password", "unverifiable_hash" or "transient_error".
+func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password string) (accountID int64, method, reason string, err error) {
 	// Check context before any work
 	if err := ctx.Err(); err != nil {
-		return 0, err
+		return 0, "main_db", "transient_error", err
 	}
+
+	cacheGeneration := s.lookupCache.Generation()
 
 	// Check cache first if enabled
 	if s.lookupCache != nil {
 		cachedAccountID, found, cacheErr := s.lookupCache.Authenticate(address, password)
 		if cacheErr != nil {
 			// Cached authentication failure - return immediately without querying database
-			logger.Debug("Authentication failed (cached)", "address", address, "cache", "hit")
-			return 0, cacheErr
+			return 0, "cache", "invalid_password", cacheErr
 		}
 		if found {
 			// Cache hit with successful authentication - but check context is still valid
 			if err := ctx.Err(); err != nil {
-				return 0, err
+				return 0, "cache", "transient_error", err
 			}
-			logger.Info("authentication successful", "address", address, "account_id", cachedAccountID, "cached", true, "method", "cache")
-			return cachedAccountID, nil
+			return cachedAccountID, "cache", "", nil
 		}
 		// Cache miss - continue to database
 		logger.Debug("Authentication: cache miss, checking database", "address", address)
 	}
+
+	cacheGeneration = s.lookupCache.Generation()
 
 	// Fetch credentials from database (no caching - we handle that here)
 	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, address)
@@ -882,8 +899,7 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 		if serverPkg.IsTemporaryAuthFailure(err) {
 			// The database could not be asked: no verdict on the credentials, so nothing
 			// is cached and the login is answered as a temporary failure.
-			logger.Warn("authentication unavailable", "address", address, "method", "main_db", "error", err)
-			return 0, err
+			return 0, "main_db", "transient_error", err
 		}
 		// Equalize response timing with the wrong-password path (which runs bcrypt) so an
 		// attacker can't use response time to tell whether the account exists. (security-audit M14)
@@ -893,10 +909,9 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 		// Cache negative result if enabled (user not found)
 		if s.lookupCache != nil {
 			// AuthUserNotFound = 1 (from lookupcache package)
-			s.lookupCache.SetFailure(address, 1)
+			s.lookupCache.SetFailureIfGeneration(cacheGeneration, address, 1)
 		}
-		logger.Info("authentication failed", "address", address, "reason", "user_not_found", "cached", false, "method", "main_db")
-		return 0, err
+		return 0, "main_db", "user_not_found", err
 	}
 
 	// Verify password
@@ -906,29 +921,23 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 			// one: the stored data is at fault, and only an administrator can repair it.
 			// Answered like a database outage, as the proxies do: a temporary failure,
 			// not counted as a failed login (a block earned on it would outlast the
-			// repair), nothing cached. A login cached for this address was verified
-			// against another hash than the one now stored, so it is dropped: while it
-			// stays, every password that misses it is answered here, uncounted, and the
-			// cached one still signs in. VerifyPassword logged why, without the address.
-			s.lookupCache.Invalidate(address)
-			logger.Warn("authentication unavailable", "address", address, "reason", "unverifiable_hash", "method", "main_db", "error", err)
-			return 0, fmt.Errorf("%w: %w", serverPkg.ErrAuthServiceUnavailable, err)
+			// repair), nothing cached. A cached login this password missed was dropped
+			// before the database was asked (LookupCache.Authenticate), so it cannot
+			// answer the next guess. VerifyPassword logged why, without the address.
+			return 0, "main_db", "unverifiable_hash", fmt.Errorf("%w: %w", serverPkg.ErrAuthServiceUnavailable, err)
 		}
 		// Cache negative result for invalid password if enabled
 		// AuthInvalidPassword = 2 (from lookupcache package)
 		if s.lookupCache != nil {
-			s.lookupCache.SetFailure(address, 2)
+			s.lookupCache.SetFailureIfGeneration(cacheGeneration, address, 2)
 		}
-		logger.Info("authentication failed", "address", address, "reason", "invalid_password", "cached", false, "method", "main_db")
-		return 0, err
+		return 0, "main_db", "invalid_password", err
 	}
 
 	// Cache successful authentication if enabled
 	if s.lookupCache != nil {
-		s.lookupCache.SetSuccess(address, accountID, hashedPassword, password)
+		s.lookupCache.SetSuccessIfGeneration(cacheGeneration, address, accountID, hashedPassword, password)
 	}
-
-	logger.Info("authentication successful", "address", address, "account_id", accountID, "cached", false, "method", "main_db")
 
 	// Asynchronously rehash if needed
 	if db.NeedsRehash(hashedPassword) {
@@ -947,10 +956,10 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 				newHashedPassword = string(newHash)
 			}
 
-			// Update password in database
-			if err := s.rdb.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
+			// Upgrade only the account/address/hash actually authenticated.
+			if changed, err := s.rdb.RehashCredentialWithRetry(updateCtx, address, accountID, hashedPassword, newHashedPassword); err != nil {
 				logger.Error("Rehash: Failed to update password", "address", address, "error", err)
-			} else {
+			} else if changed {
 				logger.Info("Rehash: Successfully rehashed and updated password", "address", address)
 				// Invalidate cache entry since password hash changed
 				if s.lookupCache != nil {
@@ -960,5 +969,5 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 		})
 	}
 
-	return accountID, nil
+	return accountID, "main_db", "", nil
 }

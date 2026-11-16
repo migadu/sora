@@ -112,7 +112,7 @@ func TestCleanupWorker_S3DeletesAreBatchedAndOutsideTransactions(t *testing.T) {
 	probeS3 := &s3ProbeStorage{rdb: probeDB}
 	ctx := context.Background()
 
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   probeDB,
 		s3:                    probeS3,
 		cache:                 new(mockCache),

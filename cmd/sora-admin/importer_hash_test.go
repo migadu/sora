@@ -10,6 +10,27 @@ import (
 	"github.com/migadu/sora/helpers"
 )
 
+// hashFile and readMessage are hashMessageFile and readMessageFile of the file at path,
+// opened directly: the tests of what the import reads from a message file need no
+// maildir around it to open it through (Importer.openMaildirFile).
+func hashFile(path string, maxSize int64) (string, int64, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return "", 0, err
+	}
+	defer file.Close()
+	return hashMessageFile(file, maxSize)
+}
+
+func readMessage(path string, maxSize int64) ([]byte, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+	return readMessageFile(file, maxSize)
+}
+
 // A configured limit above the storage ceiling is clamped before adding the
 // overflow-detection byte. MaxInt64+1 otherwise makes LimitReader return EOF
 // immediately, incorrectly hashing an ordinary message as empty.
@@ -77,14 +98,14 @@ func TestImportHashIsDeliveryHash(t *testing.T) {
 				t.Errorf("hashFile size = %d, want the message size %d", size, len(tt.message))
 			}
 
-			// The upload hashes what decompressIfNeeded returns; it must be the same
+			// The upload hashes what readMessage returns; it must be the same
 			// message, or every file is reported as changed since the scan.
-			content, err := decompressIfNeeded(tt.onDisk)
+			content, err := readMessage(path, 0)
 			if err != nil {
-				t.Fatalf("decompressIfNeeded: %v", err)
+				t.Fatalf("readMessage: %v", err)
 			}
 			if string(content) != string(tt.message) {
-				t.Errorf("decompressIfNeeded = %q, want %q", content, tt.message)
+				t.Errorf("readMessage = %q, want %q", content, tt.message)
 			}
 		})
 	}
