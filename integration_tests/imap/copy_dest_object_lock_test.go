@@ -4,6 +4,7 @@ package imap
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -95,12 +96,13 @@ func newCopyObjectLockFixture(t *testing.T) *copyObjectLockFixture {
 	require.NotEmpty(t, fake.Keys(f.destKey), "precondition: the owner's object exists")
 
 	// Control: with nothing in flight, this object is exactly what the cleaner deletes.
-	tx, err := rdb.GetDatabase().GetWritePool().Begin(ctx)
-	require.NoError(t, err)
-	defer tx.Rollback(ctx)
-	orphan, err := rdb.GetDatabase().IsS3ObjectOrphan(ctx, tx, ownerID, hash, copyObjectLockGrace)
-	require.NoError(t, err)
-	require.True(t, orphan, "precondition: the owner's object is an orphan to the cleaner")
+	var confirmed []db.UserScopedObjectForCleanup
+	require.NoError(t, rdb.ExecuteWithLockedS3Orphans(ctx, []db.UserScopedObjectForCleanup{f.candidate}, copyObjectLockGrace, func(_ context.Context, objects []db.UserScopedObjectForCleanup) error {
+		confirmed = objects
+		return nil
+	}))
+	require.Len(t, confirmed, 1, "precondition: the owner's object is an orphan to the cleaner")
+	require.False(t, confirmed[0].KeepObject, "precondition: no other account needs this physical key")
 
 	s3storage, err := storage.New(f.fake.Endpoint(), "test-access-key", "test-secret-key", "test-bucket", false, false, 10*time.Second)
 	require.NoError(t, err)
@@ -116,24 +118,23 @@ func (f *copyObjectLockFixture) reap(t *testing.T, during func()) []db.UserScope
 	t.Helper()
 	rdb := f.server.ResilientDB
 	var confirmed []db.UserScopedObjectForCleanup
-	err := rdb.ExecuteWithLockedS3Orphans(context.Background(), []db.UserScopedObjectForCleanup{f.candidate}, copyObjectLockGrace,
-		func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error {
+	_, err := rdb.ExecuteWithS3BodyCleanup(context.Background(), []db.UserScopedObjectForCleanup{f.candidate}, copyObjectLockGrace,
+		func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error) {
 			confirmed = orphans
 			if during != nil {
 				during()
 			}
 			if len(orphans) == 0 {
-				return nil
+				return db.S3BodyCleanupResult{}, nil
 			}
 			keys := make([]string, len(orphans))
 			for i, o := range orphans {
 				keys[i] = helpers.NewS3Key(o.S3Domain, o.S3Localpart, o.ContentHash)
 			}
 			for key, err := range f.s3.DeleteBulkWithRetry(ctx, keys) {
-				t.Errorf("delete %s: %v", key, err)
+				return db.S3BodyCleanupResult{}, fmt.Errorf("delete %s: %w", key, err)
 			}
-			_, err := rdb.DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx, orphans)
-			return err
+			return db.S3BodyCleanupResult{Gone: orphans}, nil
 		})
 	require.NoError(t, err)
 	return confirmed

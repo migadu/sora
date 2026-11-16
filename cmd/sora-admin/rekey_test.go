@@ -190,7 +190,7 @@ func TestRekeyLegacySHA256Imports(t *testing.T) {
 	assert.Equal(t, legacyOld, f.hashOf(legacyInbox))
 	assert.Equal(t, objectsBefore, f.store.ObjectCount())
 
-	report, err = rekeyAccount(f.ctx, f.rdb, f.store, accountA, rekeyOptions{DeleteOldObjects: true, BatchSize: 2, Jobs: 3})
+	report, err = rekeyAccount(f.ctx, f.rdb, f.store, accountA, rekeyOptions{DeleteOldObjects: true, BodyDeletionProtocol: "global-hash-v1", BatchSize: 2, Jobs: 3})
 	require.NoError(t, err)
 	assert.Equal(t, 5, report.Legacy)
 	assert.Equal(t, 4, report.Rekeyed, "legacy, reused, expunged, shared")
@@ -275,7 +275,7 @@ func TestRekeyLegacySHA256Imports(t *testing.T) {
 
 	// Account B's run moves its row onto the object A's run wrote, and the old object,
 	// referenced by nothing now, goes.
-	report, err = rekeyAccount(f.ctx, f.rdb, f.store, accountB, rekeyOptions{DeleteOldObjects: true, BatchSize: 10, Jobs: 1})
+	report, err = rekeyAccount(f.ctx, f.rdb, f.store, accountB, rekeyOptions{DeleteOldObjects: true, BodyDeletionProtocol: "global-hash-v1", BatchSize: 10, Jobs: 1})
 	require.NoError(t, err)
 	assert.Equal(t, 1, report.Rekeyed)
 	assert.Equal(t, 1, report.Reused)
@@ -379,7 +379,7 @@ func TestRekeyOldObjectWaitsAndRechecks(t *testing.T) {
 	oldKey := helpers.NewS3Key(domain, local, oldHash)
 	f.put(oldKey, body)
 
-	r := &rekeyRun{rdb: f.rdb, store: f.store, accountID: accountID, opts: rekeyOptions{DeleteOldObjects: true, BatchSize: 10, Jobs: 1},
+	r := &rekeyRun{rdb: f.rdb, store: f.store, accountID: accountID, opts: rekeyOptions{DeleteOldObjects: true, BodyDeletionProtocol: "global-hash-v1", BatchSize: 10, Jobs: 1},
 		report: &rekeyReport{}, written: map[db.ContentObject]bool{}}
 	obj := db.ContentObject{S3Domain: domain, S3Localpart: local, ContentHash: oldHash}
 	r.processObject(f.ctx, obj)

@@ -55,29 +55,35 @@ type PurgeWorkerDatabase interface {
 
 // PurgeWorker performs requested account purges on a node with object storage.
 type PurgeWorker struct {
-	rdb      PurgeWorkerDatabase
-	s3       S3BulkDeleter
-	interval time.Duration
-	wake     chan struct{}
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	mu       sync.Mutex
-	running  bool
+	bodyDeletionProtocol string
+	rdb                  PurgeWorkerDatabase
+	s3                   S3BulkDeleter
+	interval             time.Duration
+	wake                 chan struct{}
+	stopCh               chan struct{}
+	wg                   sync.WaitGroup
+	mu                   sync.Mutex
+	running              bool
 }
 
 // NewPurgeWorker creates a purge worker that polls every interval. S3 deletes go through
 // the same resilient wrapper (retries, circuit breaker) the cleaner uses.
-func NewPurgeWorker(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, interval time.Duration) *PurgeWorker {
-	return newPurgeWorker(rdb, resilient.NewResilientS3Storage(s3), interval)
+func NewPurgeWorker(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, interval time.Duration, bodyDeletionProtocol ...string) *PurgeWorker {
+	return newPurgeWorker(rdb, resilient.NewResilientS3Storage(s3), interval, bodyDeletionProtocol...)
 }
 
-func newPurgeWorker(rdb PurgeWorkerDatabase, s3 S3BulkDeleter, interval time.Duration) *PurgeWorker {
+func newPurgeWorker(rdb PurgeWorkerDatabase, s3 S3BulkDeleter, interval time.Duration, bodyDeletionProtocol ...string) *PurgeWorker {
+	protocol := ""
+	if len(bodyDeletionProtocol) > 0 {
+		protocol = bodyDeletionProtocol[0]
+	}
 	return &PurgeWorker{
-		rdb:      rdb,
-		s3:       s3,
-		interval: interval,
-		wake:     make(chan struct{}, 1),
-		stopCh:   make(chan struct{}),
+		bodyDeletionProtocol: protocol,
+		rdb:                  rdb,
+		s3:                   s3,
+		interval:             interval,
+		wake:                 make(chan struct{}, 1),
+		stopCh:               make(chan struct{}),
 	}
 }
 
@@ -164,6 +170,10 @@ func (w *PurgeWorker) run(ctx context.Context) {
 // error is for a cycle that could not run at all (the list failed) or was cancelled.
 func (w *PurgeWorker) RunOnce(ctx context.Context) (int, error) {
 	w.reportPending(ctx)
+	if err := (&config.S3Config{BodyDeletionProtocol: w.bodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+		logger.Info("Purge: queued accounts retained while S3 body deletion is paused", "reason", err)
+		return 0, nil
+	}
 
 	accountIDs, err := w.rdb.ListAccountsForPurgeWithRetry(ctx, purgeWorkerBatch)
 	if err != nil {
@@ -179,7 +189,7 @@ func (w *PurgeWorker) RunOnce(ctx context.Context) (int, error) {
 		var stats PurgeStats
 		claimed, err := w.rdb.ExecuteWithAccountPurgeLock(ctx, accountID, func(ctx context.Context) error {
 			var purgeErr error
-			stats, purgeErr = PurgeAccount(ctx, w.rdb, w.s3, accountID)
+			stats, purgeErr = PurgeAccount(ctx, w.rdb, w.s3, accountID, w.bodyDeletionProtocol)
 			return purgeErr
 		})
 		switch {

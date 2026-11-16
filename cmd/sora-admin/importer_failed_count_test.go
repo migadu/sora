@@ -104,12 +104,10 @@ func TestImportCountsEachMessageOfAFailedBatchOnce(t *testing.T) {
 
 		err := importer.Run()
 		require.ErrorIs(t, err, context.Canceled)
-		assert.Equal(t, int64(3), s3.puts.Load(), "only the first message is uploaded (with its retries)")
-		assert.Equal(t, int64(1), importer.failedMessages,
-			"a message the cancellation left unattempted was counted as failed")
-		if assert.Len(t, recordedFailedPaths(importer), 1) {
-			assert.Equal(t, "1700000001.M1P1.host:2,S", filepath.Base(recordedFailedPaths(importer)[0]))
-		}
+		assert.Equal(t, int64(1), s3.puts.Load(), "cancellation must stop retries after the first upload")
+		assert.Zero(t, importer.failedMessages, "interrupted work remains pending rather than becoming a content failure")
+		assert.Empty(t, recordedFailedPaths(importer))
+		assert.Empty(t, recordedFailedReasons(importer))
 		assert.Zero(t, importer.importedMessages)
 
 		imported, pending := uploadedCounts(t, maildirPath)

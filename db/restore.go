@@ -339,6 +339,13 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		return 0, err
 	}
 
+	// Freeze candidate hashes before reading them. Rekey changes content_hash
+	// under the exclusive account lock; a pre-lock snapshot cannot select one
+	// hash and later admit a different, unlocked hash from the same source row.
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1::int4, hashint8($2::int8))", consts.SoraContentRekeyLockClassID, accountID); err != nil {
+		return 0, fmt.Errorf("failed to hold restore hashes against rekey: %w", err)
+	}
+
 	if err := warnUnroutableCandidates(ctx, tx, accountID, params); err != nil {
 		return 0, err
 	}
@@ -354,7 +361,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	// Collect messages and their target mailboxes
 	type msgToRestore struct {
 		id           int64
-		mailboxName  string  // effective name: live mailbox's current name, else the stored string
+		mailboxName  string // effective name: live mailbox's current name, else the stored string
 		messageID    string
 		deliveryHash *string // set by MTA delivery only; deduplicates headerless redeliveries per mailbox
 		contentHash  string  // for the per-object lock shared with the cleaner
@@ -454,12 +461,12 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		// The row itself may have vanished since the candidate list was built (already
 		// restored by a concurrent run, or purged by the cleaner); that is a skip, not an
 		// error, so a restore is always safe to re-run.
-		// Hold the object's lock while the message comes back to life: the cleaner takes
-		// the same lock (session try-lock) around "confirm orphan → delete object",
-		// so a restore can no longer slip between its check and its delete and leave a
-		// live row whose object is gone.
-		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", GetS3ObjectLockID(accountID, msg.contentHash)); err != nil {
-			return 0, fmt.Errorf("failed to lock object for message %d: %w", msg.id, err)
+		// Restoring claims immutable body bytes, so shared admission excludes
+		// destructive cleanup while overlapping importers and other claimants.
+		// An exclusive lock here would wait on an import's outer shared holder
+		// while that import waits for our target mailbox on another connection.
+		if err := LockS3ObjectsSharedInTx(ctx, tx, accountID, []string{msg.contentHash}); err != nil {
+			return 0, fmt.Errorf("failed to admit object for message %d: %w", msg.id, err)
 		}
 
 		var restorable bool
@@ -541,14 +548,14 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					delivery_hash, mailbox_id, mailbox_path, uid, created_modseq
 				)
 				SELECT
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
 					delivery_hash, $2::bigint, $3::text, $4::bigint, nextval('messages_modseq')
 				FROM source
 				RETURNING id

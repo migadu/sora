@@ -93,7 +93,7 @@ func (t *scriptedBatchTx) QueryRow(ctx context.Context, sql string, args ...any)
 			}}
 		}
 	}
-	return &mockRow{}
+	return t.mockTx.QueryRow(ctx, sql, args...)
 }
 
 type scriptedBatchTxDB struct {

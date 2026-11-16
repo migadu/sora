@@ -148,6 +148,9 @@ func purgeAccount(ctx context.Context, cfg AdminConfig, rdb *resilient.Resilient
 // failure leaves the account out of service with its address, and running the command
 // again resumes it. If s3Storage is nil, it is created from cfg.
 func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient.ResilientDatabase, accountID int64, email string, s3Storage objectStorage) error {
+	if err := cfg.S3.RequireBodyDeletionProtocol(); err != nil {
+		return err
+	}
 	fmt.Printf("Purging all data for account: %s\n", email)
 
 	if s3Storage == nil {
@@ -182,7 +185,7 @@ func purgeAccountWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilien
 	waiting := false
 	for {
 		claimed, err := rdb.ExecuteWithAccountPurgeLock(ctx, accountID, func(ctx context.Context) error {
-			stats, purgeErr = cleaner.PurgeAccount(ctx, rdb, deleter, accountID)
+			stats, purgeErr = cleaner.PurgeAccount(ctx, rdb, deleter, accountID, cfg.S3.BodyDeletionProtocol)
 			return purgeErr
 		})
 		if claimed || err != nil {

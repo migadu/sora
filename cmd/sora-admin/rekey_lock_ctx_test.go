@@ -307,7 +307,7 @@ func TestRekeyDeleteOldObjectHonorsGuardedLockContextAndAccounting(t *testing.T)
 			},
 		}
 
-		r := &rekeyRun{rdb: rdb, store: s3, accountID: 42, report: &rekeyReport{}}
+		r := &rekeyRun{rdb: rdb, store: s3, accountID: 42, opts: rekeyOptions{BodyDeletionProtocol: "global-hash-v1"}, report: &rekeyReport{}}
 		r.deleteOldObject(context.Background(), oldObj)
 
 		assert.False(t, deleteCompletedUnprotected.Load(), "S3 DELETE completed unprotected after lock context was canceled")
@@ -329,7 +329,7 @@ func TestRekeyDeleteOldObjectHonorsGuardedLockContextAndAccounting(t *testing.T)
 			},
 		}
 
-		r := &rekeyRun{rdb: rdb, store: store, accountID: 42, report: &rekeyReport{}}
+		r := &rekeyRun{rdb: rdb, store: store, accountID: 42, opts: rekeyOptions{BodyDeletionProtocol: "global-hash-v1"}, report: &rekeyReport{}}
 		r.deleteOldObject(context.Background(), oldObj)
 
 		assert.Equal(t, 1, r.report.OldDeleted, "the old S3 object was deleted and must be counted in OldDeleted")
@@ -354,7 +354,7 @@ func TestRekeyDeleteOldObjectHonorsGuardedLockContextAndAccounting(t *testing.T)
 			},
 		}
 
-		r := &rekeyRun{rdb: rdb, store: store, accountID: 42, report: &rekeyReport{}}
+		r := &rekeyRun{rdb: rdb, store: store, accountID: 42, opts: rekeyOptions{BodyDeletionProtocol: "global-hash-v1"}, report: &rekeyReport{}}
 		r.deleteOldObject(context.Background(), oldObj)
 
 		assert.Zero(t, store.deleteCalls.Load())
@@ -372,7 +372,7 @@ func TestRekeyDeleteOldObjectHonorsGuardedLockContextAndAccounting(t *testing.T)
 		store.deleteFn = func(ctx context.Context, key string) error {
 			return errors.New("503 SlowDown")
 		}
-		r := &rekeyRun{rdb: &stubRekeyDB{}, store: store, accountID: 42, report: &rekeyReport{}}
+		r := &rekeyRun{rdb: &stubRekeyDB{}, store: store, accountID: 42, opts: rekeyOptions{BodyDeletionProtocol: "global-hash-v1"}, report: &rekeyReport{}}
 		r.deleteOldObject(context.Background(), oldObj)
 		assert.Zero(t, r.report.OldDeleted)
 		assert.Len(t, r.report.OldLeft, 1)
@@ -381,7 +381,7 @@ func TestRekeyDeleteOldObjectHonorsGuardedLockContextAndAccounting(t *testing.T)
 
 		// Second: S3 delete succeeds -> OldDeleted increments, OldLeft empty.
 		store.deleteFn = nil
-		r2 := &rekeyRun{rdb: &stubRekeyDB{}, store: store, accountID: 42, report: &rekeyReport{}}
+		r2 := &rekeyRun{rdb: &stubRekeyDB{}, store: store, accountID: 42, opts: rekeyOptions{BodyDeletionProtocol: "global-hash-v1"}, report: &rekeyReport{}}
 		r2.deleteOldObject(context.Background(), oldObj)
 		assert.Equal(t, 1, r2.report.OldDeleted)
 		assert.Empty(t, r2.report.OldLeft)
@@ -421,4 +421,28 @@ func TestRekeyProcessObjectHonorsCallerContextOnGet(t *testing.T) {
 
 	assert.False(t, getIgnoredCtx.Load(), "processObject download ignored caller context cancellation")
 	assert.Empty(t, r.report.Unreadable, "a canceled run must not classify the interrupted object as unreadable")
+}
+
+func (s *stubRekeyDB) ExecuteWithSharedS3ObjectLocks(ctx context.Context, accountID int64, hashes []string, fn func(context.Context) error) error {
+	if len(hashes) != 1 {
+		return fmt.Errorf("expected one hash")
+	}
+	return s.ExecuteWithS3ObjectLock(ctx, hashes[0], accountID, fn)
+}
+
+func (s *stubRekeyDB) ExecuteWithS3BodyCleanup(ctx context.Context, objects []db.UserScopedObjectForCleanup, _ time.Duration, fn func(context.Context, []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error)) (int64, error) {
+	if len(objects) == 0 {
+		return 0, nil
+	}
+	o := objects[0]
+	err := s.ExecuteWithS3ObjectLock(ctx, o.ContentHash, o.AccountID, func(c context.Context) error {
+		referenced, err := s.IsContentObjectReferencedWithRetry(c, db.ContentObject{S3Domain: o.S3Domain, S3Localpart: o.S3Localpart, ContentHash: o.ContentHash})
+		if err != nil {
+			return err
+		}
+		o.KeepObject = referenced
+		_, err = fn(c, []db.UserScopedObjectForCleanup{o})
+		return err
+	})
+	return 0, err
 }

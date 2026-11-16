@@ -396,3 +396,62 @@ func TestDeleteAllMessagesInQueueDir(t *testing.T) {
 		t.Fatalf("expected only scratch and unpaired .msg to remain after abort, got %d entries", len(entries))
 	}
 }
+
+// The CLI is another process; a worker's live lease must protect both files.
+func TestRelayDeleteAllSkipsLiveProcessing(t *testing.T) {
+	dir := t.TempDir()
+	q, err := relayqueue.NewDiskQueue(dir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Enqueue("from@example.com", "to@example.com", "redirect", []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	msg, _, err := q.AcquireNext()
+	if err != nil || msg == nil {
+		t.Fatalf("claim: %v %v", msg, err)
+	}
+	out := runRelay(t, dir, "", "delete", "--queue", "processing", "--id", "all", "--confirm")
+	if !strings.Contains(out, "Deleted 0 messages") || !strings.Contains(out, "busy") {
+		t.Fatalf("busy deletion result: %s", out)
+	}
+	for _, ext := range []string{".json", ".msg"} {
+		if _, err := os.Stat(filepath.Join(dir, "processing", msg.ID+ext)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.MarkSuccess(msg.ID); err != nil {
+		t.Fatal(err)
+	}
+}
+func TestRelayDeleteRequeuedMessageCannotResurrect(t *testing.T) {
+	dir := t.TempDir()
+	q, err := relayqueue.NewDiskQueue(dir, 1, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Enqueue("from@example.com", "to@example.com", "redirect", []byte("body")); err != nil {
+		t.Fatal(err)
+	}
+	msg, _, err := q.AcquireNext()
+	if err != nil || msg == nil {
+		t.Fatalf("claim: %v %v", msg, err)
+	}
+	if err := q.MarkPermanentFailure(msg.ID, "550 failed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Requeue(msg.ID); err != nil {
+		t.Fatal(err)
+	}
+	out := runRelay(t, dir, "", "delete", "--queue", "pending", "--id", msg.ID, "--confirm")
+	if !strings.Contains(out, "Deleted message "+msg.ID) {
+		t.Fatalf("delete result: %s", out)
+	}
+	if _, err := q.RecoverOrphanedMessages(); err != nil {
+		t.Fatal(err)
+	}
+	pending, processing, failed, err := q.GetStats()
+	if err != nil || pending+processing+failed != 0 {
+		t.Fatalf("discard resurrected: %d/%d/%d %v", pending, processing, failed, err)
+	}
+}

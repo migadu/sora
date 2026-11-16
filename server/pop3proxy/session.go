@@ -807,9 +807,16 @@ func (s *POP3ProxySession) connectToBackend() error {
 	// Send XCLIENT command to backend with forwarding parameters if enabled.
 	// This MUST be done before authenticating.
 	useXCLIENT := s.server.remoteUseXCLIENT
+	skipForwarding := s.server.remoteSkipForwardingWithProxyProtocol
 	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
 	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		useXCLIENT = s.routingInfo.RemoteUseXCLIENT
+		skipForwarding = s.routingInfo.RemoteSkipForwardingWithProxyProtocol
+	}
+	// Explicit opt-in: PROXY does not carry all ID/XCLIENT metadata.
+	// Preserve configured forwarding unless this route accepts that omission.
+	if skipForwarding && useXCLIENT && s.server.connManager.SendsProxyHeader(s.routingInfo, s.serverAddr, clientHost, clientPort, serverHost, serverPort) {
+		useXCLIENT = false
 	}
 	if useXCLIENT {
 		if err := s.sendForwardingParametersToBackend(backendWriter, backendReader); errors.Is(err, errXCLIENTRefused) {
