@@ -78,9 +78,10 @@ An unknown table is listed together with each key in it.
 
 The key keeps its default, so a misspelt key silently does nothing. Read these warnings after every
 change. At startup the file is read before logging is set up, so Sora holds them and writes them to
-the `[logging]` output once it is open, at its level. If startup stops before that, for example on a
-check in [section 4](#4-checks-at-startup) that runs before logging is set up, they are written to
-standard error with the error. On a `SIGHUP` reload they go through the logger.
+the `[logging]` output once it is open, at its level, also when a check in
+[section 4](#4-checks-at-startup) then stops startup. Only a file that cannot be read or parsed stops
+startup before logging is set up; what Sora held is then written to standard error with the error.
+On a `SIGHUP` reload they go through the logger.
 
 ### Duplicate keys
 
@@ -180,9 +181,18 @@ Things to know:
 ## 4. Checks at startup
 
 After parsing, Sora checks the configuration before it opens any listener. Each failed check below
-stops startup with exit status 1. The checks on the file itself run before logging is set up, so
-they write a line of the form `[ERROR] <date> <time> ERROR: invalid configuration - <what>: <reason>`
-to standard error, one for each problem the file has.
+stops startup with exit status 1, after Sora has reported every problem the file has. It sets up
+logging from `[logging]` first, so each problem is an ERROR record of that output (standard error,
+syslog, a log file, ...), in its format and after the warnings held about the file. With the
+console format:
+
+```
+time=2026-01-15T10:00:00.000+01:00 level=ERROR msg="Invalid configuration" field=<what> error=<reason>
+```
+
+The Message column is the `error` value, in some rows after the `field` value (`[s3]: ...`). A file
+that cannot be read or parsed has no `[logging]` to follow: that error goes to standard error
+([OPERATIONS.md](OPERATIONS.md#messages-that-stop-startup)).
 
 | Check | Message |
 |---|---|
