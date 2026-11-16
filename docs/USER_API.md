@@ -145,7 +145,7 @@ Response `200`:
 |---|---|---|
 | 400 | `Invalid request body` | Not JSON. |
 | 400 | `Email and password are required` | A field is missing or empty. |
-| 401 | `Invalid credentials` | Unknown address, deleted account, wrong password, or the client is blocked by the rate limiter. The four look the same on purpose. |
+| 401 | `Invalid credentials` | Unknown address, deleted account, wrong password, or the client is blocked by the rate limiter. The four look the same on purpose, `WWW-Authenticate: Bearer realm="user-api"` included (section 3.2). |
 | 429 | `Too many concurrent authentication attempts. Please try again later.` | Too many logins are waiting out a progressive delay at once. |
 | 503 | `Service unavailable` | Database error, a stored password hash that cannot be verified, or the request was cancelled while it waited out a delay. Not counted as a failed login. |
 | 500 | `Token generation failed` | Signing error. |
@@ -168,6 +168,12 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 | No header | 401 | `{"error":"Authorization header required"}` |
 | Not `Bearer <token>` | 401 | `{"error":"Authorization header must be 'Bearer <token>'"}` |
 | Bad signature, expired, wrong issuer, not HS256 | 401 | `{"error":"Invalid or expired token"}` |
+
+Every `401` of the API carries the challenge `WWW-Authenticate: Bearer realm="user-api"`
+(RFC 9110 section 15.5.2). When the request presented a token and it was refused (the last
+row, or a refused refresh in 3.3), the challenge adds `error="invalid_token"` (RFC 6750
+section 3.1); a request without a token, and a refused login, get it without. Web clients
+on another origin can read the header: it is in `Access-Control-Expose-Headers`.
 
 On these requests the server checks the token only: its HS256 signature with `jwt_secret`, its
 expiry, and its issuer. It does **not** look up the account. A token keeps working until it
@@ -194,7 +200,7 @@ the login response, with the current `account_id`. Otherwise it is
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid request body`, `Token is required` |
-| 401 | `Invalid or expired token` |
+| 401 | `Invalid or expired token`, with `WWW-Authenticate: Bearer realm="user-api", error="invalid_token"` |
 | 503 | `Service unavailable` (database error while checking the account) |
 | 500 | `Token generation failed` |
 
@@ -863,8 +869,8 @@ Each body is `{"error":"message"}` with the message below. Set the proxy's
 | 502 | `Bad gateway` | The backend request failed. |
 | 500 | `Internal server error` | The backend request could not be constructed. |
 
-Backend responses are passed through unchanged. Protected bearer-token errors carry a
-`WWW-Authenticate: Bearer` challenge; public JSON login and refresh errors do not.
+Backend responses are passed through unchanged. Every 401 carries the
+`WWW-Authenticate` challenge a backend sends for the same refusal (section 3.2).
 
 A CORS preflight (`OPTIONS`) needs no token, on any path. It is answered with the backend's
 CORS headers, as when the backend is reached directly, so browser clients on another origin can

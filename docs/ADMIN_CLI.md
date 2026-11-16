@@ -527,6 +527,31 @@ runs, and is rolled back unless every mailbox it repaired comes out right. Run i
 `--apply`: only `MANUAL` and `REPORT` lines are left. The exit status is `1` only when an account
 fails; `MANUAL` and `REPORT` lines do not change it.
 
+### mailbox repair-unseen
+
+Finds mailboxes whose cached unseen count (served by STATUS, LIST and NOTIFY) is higher than
+the number of unseen messages they hold, and with `--apply` recomputes it. Older builds left
+such counts when the failed-upload cleanup, `uploader resolve` or an importer rollback
+hard-deleted an unseen message. A count that has gone negative is repaired by the server
+itself.
+
+```sh
+sora-admin --config config.toml mailbox repair-unseen
+sora-admin --config config.toml mailbox repair-unseen --apply
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--email` | all accounts | Limit to one account. Optional for this subcommand. |
+| `--apply` | `false` | Repair the mailboxes found. Without it, print `WOULD REPAIR` lines and change nothing. |
+| `--batch-size` | `200` | Mailboxes checked per batch. |
+| `--start-after` | `0` | Resume after this mailbox id. |
+
+Mailboxes are checked in id order. After each batch the command prints the id to pass to
+`--start-after` if it is interrupted. Each repair is a short transaction that holds only that
+mailbox's lock, so it can run while the servers are serving mail. It is safe to run again: a
+repaired mailbox is not reported any more.
+
 ---
 
 ## 7. messages
@@ -574,7 +599,8 @@ sora-admin --config config.toml messages restore --email user@example.com --ids 
   they all apply.
 - Without `--confirm`, the command lists up to ten of the matching messages and asks
   `Continue with restoration? (yes/no)`. Only `yes` or `y` continues.
-- A mailbox that no longer exists is created again. Restored messages get new UIDs.
+- A mailbox that no longer exists is created again. Restored messages get new UIDs and new
+  mod-sequences, so IMAP clients are told of them as new messages.
 - With sharing enabled in the config file you pass, a mailbox recreated in the shared namespace
   is a shared mailbox of the account, as `mailbox create` makes one, and so is a parent recreated
   there. Each one starts with owner-only rights: one entry, the owner's primary address with

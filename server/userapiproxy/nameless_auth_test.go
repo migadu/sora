@@ -134,8 +134,11 @@ func TestUserAPIProxy_AuthRequestNamingNobodyIsAnsweredAsTheBackendAnswersIt(t *
 				if got, want := viaProxy.Header().Get("Content-Type"), direct.Header().Get("Content-Type"); got != want {
 					t.Errorf("proxy's Content-Type = %q, want the backend's %q", got, want)
 				}
-				if got := viaProxy.Header().Get("WWW-Authenticate"); got != "" {
-					t.Errorf("JSON authentication endpoint must not advertise a Bearer-header gate: %q", got)
+				if direct.Code == http.StatusUnauthorized && direct.Header().Get("WWW-Authenticate") == "" {
+					t.Errorf("backend's 401 carries no WWW-Authenticate challenge")
+				}
+				if got, want := viaProxy.Header().Values("WWW-Authenticate"), direct.Header().Values("WWW-Authenticate"); !reflect.DeepEqual(got, want) {
+					t.Errorf("proxy's WWW-Authenticate = %q, want the backend's %q", got, want)
 				}
 				var got, want map[string]any
 				if err := json.Unmarshal(direct.Body.Bytes(), &want); err != nil {
@@ -214,8 +217,8 @@ func TestUserAPIProxy_RefreshWithoutAccountIdentityIsRefusedOnWire(t *testing.T)
 				if resp.StatusCode != http.StatusUnauthorized || result["error"] != "Invalid or expired token" {
 					t.Errorf("refused identity: status=%d body=%v", resp.StatusCode, result)
 				}
-				if got := resp.Header.Get("WWW-Authenticate"); got != "" {
-					t.Errorf("JSON refresh got Bearer challenge %q", got)
+				if got, want := resp.Header.Values("WWW-Authenticate"), []string{`Bearer realm="user-api", error="invalid_token"`}; !reflect.DeepEqual(got, want) {
+					t.Errorf("WWW-Authenticate = %q, want %q", got, want)
 				}
 				if got := resp.Header.Get("Access-Control-Allow-Origin"); got != origin {
 					t.Errorf("CORS origin=%q", got)
