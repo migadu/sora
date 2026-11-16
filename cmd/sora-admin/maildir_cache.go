@@ -143,6 +143,33 @@ func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
 		return false, nil
 	}
 	euid := geteuid()
+	parent, owner, mode, err := renamableParent(dir, euid)
+	if err != nil {
+		return false, fmt.Errorf("failed to check where to keep the maildir database: %w", err)
+	}
+	if parent != "" {
+		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory of their own, with hard links at the database's names, in its place after it is checked; use a directory whose parents only root and uid %d can write", dir, euid, parent, owner, mode, euid)
+	}
+	owner, mode, err = directoryOwnerAndMode(dir)
+	if err != nil {
+		return false, fmt.Errorf("failed to check where to keep the maildir database: %w", err)
+	}
+	if owner != euid || mode&0o022 != 0 {
+		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can create files in it (owner uid %d, mode %04o), and SQLite would write through a hard link one of them puts at the database's names; run as the directory's owner, or use a directory only uid %d can write", dir, euid, owner, mode, euid)
+	}
+	return true, nil
+}
+
+// renamableParent returns the first directory above dir, from the filesystem root
+// down, in which a user other than root and euid could rename an entry, and so change
+// what dir names: one that belongs to another user, or that its group or others may
+// write without the sticky bit, which keeps them from renaming an entry they do not
+// own (as on /tmp). It returns that directory's owner and mode with it, or "" when
+// there is none. Checking from the root down, each accepted directory protects the
+// next name from another user's rename, and directoryOwnerAndMode does not follow a
+// link, so a symbolic link put in place of one after dir was resolved is refused,
+// even to a trusted target.
+func renamableParent(dir string, euid int) (parent string, owner int, mode uint32, err error) {
 	var parents []string
 	for parent := filepath.Dir(dir); ; parent = filepath.Dir(parent) {
 		parents = append(parents, parent)
@@ -154,23 +181,15 @@ func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
 	// protects the next name from another user's rename. Lstat below refuses a
 	// symbolic link introduced since dir was resolved, even to a trusted target.
 	for index := len(parents) - 1; index >= 0; index-- {
-		parent := parents[index]
-		owner, mode, err := directoryOwnerAndMode(parent)
+		owner, mode, err := directoryOwnerAndMode(parents[index])
 		if err != nil {
-			return false, err
+			return "", 0, 0, err
 		}
 		if (owner != 0 && owner != euid) || (mode&0o022 != 0 && mode&syscall.S_ISVTX == 0) {
-			return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory of their own, with hard links at the database's names, in its place after it is checked; use a directory whose parents only root and uid %d can write", dir, euid, parent, owner, mode, euid)
+			return parents[index], owner, mode, nil
 		}
 	}
-	owner, mode, err := directoryOwnerAndMode(dir)
-	if err != nil {
-		return false, err
-	}
-	if owner != euid || mode&0o022 != 0 {
-		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can create files in it (owner uid %d, mode %04o), and SQLite would write through a hard link one of them puts at the database's names; run as the directory's owner, or use a directory only uid %d can write", dir, euid, owner, mode, euid)
-	}
-	return true, nil
+	return "", 0, 0, nil
 }
 
 // directoryOwnerAndMode returns the owner of the directory at path and its permission
@@ -179,14 +198,14 @@ func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
 var directoryOwnerAndMode = func(path string) (owner int, mode uint32, err error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to check maildir database directory: %w", err)
+		return 0, 0, fmt.Errorf("failed to check database directory: %w", err)
 	}
 	if !info.IsDir() {
-		return 0, 0, fmt.Errorf("refusing maildir database directory %s: it is not a directory", path)
+		return 0, 0, fmt.Errorf("refusing database directory %s: it is not a directory", path)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, 0, fmt.Errorf("failed to check maildir database directory %s: no owner", path)
+		return 0, 0, fmt.Errorf("failed to check database directory %s: no owner", path)
 	}
 	return int(st.Uid), uint32(st.Mode) & 0o7777, nil
 }
@@ -211,13 +230,13 @@ func resolveMaildirDir(dir string) (string, error) {
 	if !filepath.IsAbs(dir) {
 		wd, err := os.Getwd()
 		if err != nil {
-			return "", fmt.Errorf("failed to resolve maildir database directory: %w", err)
+			return "", fmt.Errorf("failed to resolve database directory: %w", err)
 		}
 		dir = wd + string(filepath.Separator) + dir
 	}
 	dir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve maildir database directory: %w", err)
+		return "", fmt.Errorf("failed to resolve database directory: %w", err)
 	}
 	return dir, nil
 }
