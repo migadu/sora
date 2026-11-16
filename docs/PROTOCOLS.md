@@ -415,6 +415,13 @@ start a cache warm-up that copies the newest INBOX messages from S3 to the local
 - The body is written to the local spool and uploaded to S3 in the background; see
   [STORAGE.md](STORAGE.md).
 
+**COPY and MOVE**
+
+- A `COPY` or `MOVE` that rekeys any selected row to another owner may carry at most
+  1,000 distinct source bodies, including legacy rows already owned by the destination. A larger one is refused with
+  `NO [LIMIT] COPY across accounts is limited to 1000 distinct message bodies`
+  and copies or moves nothing; see [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md#storage-and-statistics).
+
 **Keywords**
 
 - A message may carry at most 50 keywords (custom flags). An APPEND or STORE that would exceed this
@@ -914,9 +921,10 @@ There is no `AUTH`, `DSN` or `BINARYMIME`.
 ### 8.4 Message size
 
 `max_message_size` (default `50mb`) is advertised in `LHLO` and enforced twice. A `MAIL` command
-whose `SIZE=` parameter is above the limit gets `552 5.3.4` at once. A message that turns out
-larger while it is read gets `552 5.3.4 message size exceeds maximum allowed size of <n> bytes`
-after the data. `max_message_size = "0"` means the default 50 MiB, not unlimited. An empty message
+whose `SIZE=` parameter is above the limit gets `552 5.3.4` at once; one whose value is not 1 to
+20 digits (RFC 1870 §3, `size-value ::= 1*20DIGIT`) gets `501 5.5.4`, even when leading zeros
+leave a small number. A message that turns out larger while it is read gets
+`552 5.3.4 message size exceeds maximum allowed size of <n> bytes` after the data. `max_message_size = "0"` means the default 50 MiB, not unlimited. An empty message
 gets `550 5.6.0 empty message rejected: a message must contain at least headers`.
 
 ### 8.5 Delivery
