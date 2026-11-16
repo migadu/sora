@@ -432,7 +432,7 @@ type InsertMessageOptions struct {
 	Size                 int64
 	Subject              string
 	PlaintextBody        string
-	SentDate             time.Time // the Date: header; zero when none parses (see storedSentDate)
+	SentDate             time.Time // the Date: header (helpers.ParseDateHeader), in UTC when its zone is unknown; zero when none parses (see storedSentDate)
 	InReplyTo            []string
 	References           []string
 	BodyStructure        *imap.BodyStructure
@@ -524,8 +524,13 @@ const maxSentUTCOffset = 24 * 60 * 60
 // seconds, of the zone it is expressed in. Ingress passes the parsed Date: header in its own
 // zone, so sent_date plus this offset is the header's wall-clock time, whose day the SENT*
 // keys compare (RFC 9051 §6.4.4: "disregarding time and timezone"). nil (NULL, searched by
-// the UTC day) for an offset beyond maxSentUTCOffset.
+// the UTC day) for an offset beyond maxSentUTCOffset, and for a date whose zone is unknown
+// (helpers.ZoneUnknown, RFC 5322 §3.3 "-0000"): its UTC day is the day it names, and
+// sentDateInHeaderZone gives it back in UTC, so its ENVELOPE date keeps the zone "-0000".
 func sentUTCOffset(sentDate time.Time) *int32 {
+	if helpers.ZoneUnknown(sentDate) {
+		return nil
+	}
 	_, offset := sentDate.Zone()
 	if offset < -maxSentUTCOffset || offset > maxSentUTCOffset {
 		return nil
@@ -538,9 +543,11 @@ func sentUTCOffset(sentDate time.Time) *int32 {
 // the Date: header it was parsed from, given that row's sent_utc_offset. The ENVELOPE date
 // is formatted from it and must name the header's own day, time of day and zone (RFC 9051
 // §7.5.2: the envelope "is computed by the server by parsing the [RFC5322] header into the
-// component parts"). A row without an offset (written before migration 000060, or with a
-// zone beyond maxSentUTCOffset) is given in UTC rather than in the time.Local pgx decodes a
-// timestamptz into, so the ENVELOPE never depends on the server's TZ.
+// component parts"). A row without an offset (a zone that is unknown, one beyond
+// maxSentUTCOffset, or a row written before migration 000060) is given in UTC rather than
+// in the time.Local pgx decodes a timestamptz into, so the ENVELOPE never depends on the
+// server's TZ. go-imap writes a date in UTC with the zone "-0000": the row has no
+// information about the header's zone (RFC 5322 §3.3).
 func sentDateInHeaderZone(sentDate time.Time, offset *int32) time.Time {
 	if offset == nil {
 		return sentDate.UTC()
