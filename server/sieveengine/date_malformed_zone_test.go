@@ -75,6 +75,7 @@ fileinto "${zone} ${time}";
 		{"PDT/UTC", "invalid"},
 		{"+0060", "invalid"},
 		{"+0000 junk", "invalid"},
+		{"-0400 EDT", "invalid"},
 		{"PM -0700", "invalid"},
 	}
 	saved := time.Local
@@ -99,6 +100,44 @@ fileinto "${zone} ${time}";
 			if want := []string{tc.want}; !slices.Equal(result.Mailboxes, want) {
 				t.Errorf("TZ=%s Date: %s: mailboxes = %q, want %q", name, date, result.Mailboxes, want)
 			}
+		}
+	}
+}
+
+// TestDateRFC3339Field: the date test also reads a field holding an RFC 3339
+// date-time, by RFC 3339's grammar (section 5.6: time-numoffset = ("+" / "-")
+// time-hour ":" time-minute, with time-hour 00-23 and time-minute 00-59). So
+// "+01:00" is that field's zone, although after an RFC 5322 date-time it makes
+// the field no date (TestDateMalformedZone). docs/SIEVE.md describes both.
+func TestDateRFC3339Field(t *testing.T) {
+	const script = `require ["date", "fileinto", "variables", "relational", "comparator-i;ascii-numeric"];
+if date :count "eq" :comparator "i;ascii-numeric" "date" "year" "0" { fileinto "invalid"; stop; }
+if date :matches :originalzone "date" "zone" "*" { set "zone" "${1}"; }
+if date :matches :originalzone "date" "time" "*" { set "time" "${1}"; }
+fileinto "${zone} ${time}";
+`
+	executor, err := NewSieveExecutorWithExtensions(script, DefaultSieveExtensions)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	for _, tc := range []struct{ date, want string }{
+		{"2019-01-01T12:00:00+01:00", "+0100 12:00:00"},
+		{"2019-01-01T12:00:00-05:30", "-0530 12:00:00"},
+		{"2019-01-01T12:00:00Z", "+0000 12:00:00"},
+		{"2019-01-01T12:00:00+24:00", "invalid"},
+		{"2019-01-01T12:00:00+01:60", "invalid"},
+	} {
+		result, err := executor.Evaluate(context.Background(), Context{
+			EnvelopeFrom: "sender@example.com",
+			EnvelopeTo:   "user@example.com",
+			Header:       map[string][]string{"Date": {tc.date}, "From": {"sender@example.com"}},
+			Message:      bodyOnly("body"),
+		})
+		if err != nil {
+			t.Fatalf("%q: evaluate: %v", tc.date, err)
+		}
+		if want := []string{tc.want}; !slices.Equal(result.Mailboxes, want) {
+			t.Errorf("Date: %s: mailboxes = %q, want %q", tc.date, result.Mailboxes, want)
 		}
 	}
 }
