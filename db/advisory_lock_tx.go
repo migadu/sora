@@ -49,8 +49,10 @@ var advisoryLockStatementTimeout = 5 * time.Second
 // transaction ends however it ends (COMMIT, ROLLBACK, a killed session, a dropped
 // connection), and nothing can be left behind.
 //
-// The transaction is READ COMMITTED and READ ONLY, so it never gets a transaction id,
-// and every operation on it ends with a bare "SELECT 1", so it holds no snapshot while
+// The public lock-only transaction is READ COMMITTED and READ ONLY, so it never gets
+// a transaction id. Body cleanup privately uses a writable transaction so retirement
+// cannot commit after losing this holder. Lock-only operations end with a bare
+// "SELECT 1", so they hold no snapshot while
 // it idles: that statement drops the unnamed portal an extended-protocol statement
 // leaves behind (whose snapshot would otherwise live until the next Bind) and takes a
 // fresh transaction snapshot, which invalidates the catalog snapshot the function lookup
@@ -66,7 +68,8 @@ var advisoryLockStatementTimeout = 5 * time.Second
 // The locks can still be lost while the guarded work runs — the backend dies, a
 // failover, a proxy retiring the connection, a failed keepalive. Guard hands the work a
 // context that is cancelled the moment that is noticed, and Err reports it afterwards,
-// so an S3 delete stops instead of landing after a fresh upload of the same body.
+// so callers can stop work. Cancellation cannot retract an already accepted remote
+// DELETE; body cleanup persists a separate durable intent before sending it.
 //
 // They also stop meaning anything when Sora stops writing through the server that holds
 // them, even while this transaction lives on and its keepalive succeeds: the runtime
@@ -84,8 +87,7 @@ var advisoryLockStatementTimeout = 5 * time.Second
 // across an S3 round trip; callers bound it with their contexts, and operators size
 // pooler pools for it (see docs/DATABASE.md, "PgBouncer and other connection poolers"). A caller that only
 // needs to order itself after a holder, not exclude others for a while, should not pay
-// it: the uploader takes the lock in a single autocommit statement instead
-// (PassS3WriteGate).
+// it: the uploader uses a short lock/check/lease transaction instead (PassS3WriteGate).
 //
 // pgx connections are not safe for concurrent use, so every statement on the
 // transaction, including the keepalive, is serialized by mu. Any statement error aborts
@@ -218,6 +220,12 @@ func (d *Database) ReinstateWriter() {
 // only acquiring the connection and starting the transaction; the locks themselves live
 // until Release, which the caller must always reach (defer it).
 func (d *Database) BeginAdvisoryLockTx(ctx context.Context) (*AdvisoryLockTx, error) {
+	return d.beginAdvisoryLockTx(ctx, pgx.ReadOnly)
+}
+
+// beginAdvisoryLockTx also serves body retirement: that caller writes only after
+// storage returns, and must commit retirement on the connection holding its locks.
+func (d *Database) beginAdvisoryLockTx(ctx context.Context, access pgx.TxAccessMode) (*AdvisoryLockTx, error) {
 	// Before the connection is taken: a fence that came after this point is seen by
 	// register below, whichever connection the pool hands out.
 	gen, err := d.advisoryLocks.admit()
@@ -228,7 +236,7 @@ func (d *Database) BeginAdvisoryLockTx(ctx context.Context) (*AdvisoryLockTx, er
 	if err != nil {
 		return nil, fmt.Errorf("failed to acquire connection for advisory locks: %w", err)
 	}
-	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: pgx.ReadOnly})
+	tx, err := conn.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted, AccessMode: access})
 	if err != nil {
 		conn.Release()
 		return nil, fmt.Errorf("failed to begin advisory lock transaction: %w", err)
@@ -255,6 +263,15 @@ func (l *AdvisoryLockTx) Lock(ctx context.Context, id int64) error {
 	return l.run(ctx, func(ctx context.Context, tx pgx.Tx) error {
 		_, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock("+strconv.FormatInt(id, 10)+")")
 		return err
+	})
+}
+
+// LockS3ObjectsShared is LockS3ObjectsSharedInTx on the lock transaction, for work that
+// claims the objects across S3 round trips and transactions of its own. Cancel ctx to
+// stop waiting; the transaction is then aborted and must be released.
+func (l *AdvisoryLockTx) LockS3ObjectsShared(ctx context.Context, accountID int64, contentHashes []string) error {
+	return l.run(ctx, func(ctx context.Context, tx pgx.Tx) error {
+		return LockS3ObjectsSharedInTx(ctx, tx, accountID, contentHashes)
 	})
 }
 
@@ -445,8 +462,27 @@ func (l *AdvisoryLockTx) Release() {
 		if err := l.tx.Rollback(ctx); err != nil && !errors.Is(err, pgx.ErrTxClosed) && (l.Err() == nil || errors.Is(l.Err(), ErrAdvisoryLocksFenced)) {
 			logger.Warn("Database: advisory lock transaction could not be rolled back, discarding its connection", "err", err)
 		}
-		l.conn.Release()
 		l.fail(errAdvisoryLockTxReleased)
+		l.conn.Release()
 		l.fence.unregister(l)
 	})
+}
+
+// commit is only used by the writable body-retirement transaction. A lost
+// connection cannot commit its callback's row retirement on another connection.
+func (l *AdvisoryLockTx) commit(ctx context.Context) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := l.Err(); err != nil {
+		return err
+	}
+	if err := l.tx.Commit(ctx); err != nil {
+		l.fail(err)
+		return err
+	}
+	return l.Err()
+}
+
+func (l *AdvisoryLockTx) CheckS3BodyClaims(ctx context.Context, hashes []string) error {
+	return l.run(ctx, func(ctx context.Context, tx pgx.Tx) error { return CheckS3BodyClaims(ctx, tx, hashes) })
 }

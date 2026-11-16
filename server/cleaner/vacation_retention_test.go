@@ -19,7 +19,7 @@ import (
 func TestCleanupWorker_KeepsVacationHistoryForTheLongestDays(t *testing.T) {
 	mockDB := new(mockDatabase)
 	ctx := context.Background()
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 new(mockCache),

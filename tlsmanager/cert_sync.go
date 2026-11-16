@@ -1,9 +1,11 @@
 package tlsmanager
 
 import (
+	"bytes"
 	"context"
 	"crypto/x509"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"time"
 
@@ -100,15 +102,15 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 	}
 
 	// Try to get certificate from local cache
-	localData, err := fallbackCache.fallback.Get(ctx, domain)
+	localData, generation, err := fallbackCache.localSnapshot(ctx, domain)
 	if err != nil {
 		// No local certificate, try to fetch from S3
 		if err == autocert.ErrCacheMiss {
 			logger.Debug("CertSync: No local certificate - checking S3", "domain", domain)
-			s3Data, s3Err := fallbackCache.primary.Get(ctx, domain)
+			s3Data, s3Generation, s3Err := fallbackCache.primarySnapshot(ctx, domain)
 			if s3Err == nil {
 				// Found in S3, store locally
-				if putErr := fallbackCache.fallback.Put(ctx, domain, s3Data); putErr != nil {
+				if putErr := fallbackCache.replaceLocalIfSame(ctx, domain, nil, false, s3Data, s3Generation); putErr != nil {
 					logger.Warn("CertSync: Failed to sync certificate from S3 to local cache", "domain", domain, "error", putErr)
 					return putErr
 				}
@@ -124,15 +126,39 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 	}
 
 	// Try to get certificate from S3
-	s3Data, err := fallbackCache.primary.Get(ctx, domain)
+	s3Data, s3Generation, err := fallbackCache.primarySnapshot(ctx, domain)
 	if err != nil {
 		if err == autocert.ErrCacheMiss {
 			// Only this node has it: it was stored while S3 refused writes.
-			return publishLocalCertificate(ctx, fallbackCache, domain, localData)
+			return publishLocalSnapshot(ctx, fallbackCache, domain, localData, generation)
 		}
 		// S3 error, but local works, so not critical
 		logger.Debug("CertSync: Error reading S3 (local certificate still valid)", "domain", domain, "error", err)
 		return err
+	}
+
+	// A successful shared read establishes the current publication generation.
+	// Date/serial ordering applies only within that generation: same-second
+	// issuance can have identical validity dates on opposite sides of a delete.
+	if s3Generation.Known && generation != s3Generation {
+		if !generation.Known {
+			localFP, _ := certificateFingerprint(localData)
+			remoteFP, _ := certificateFingerprint(s3Data)
+			if s3Generation.Value == "legacy" {
+				chosen := s3Data
+				if olderCertificate(s3Data, localData) {
+					chosen = localData
+				}
+				return fallbackCache.replaceLocalIfSame(ctx, domain, localData, true, chosen, s3Generation, generation)
+			}
+			if localFP != remoteFP {
+				if err := fallbackCache.quarantineLocalIfSame(ctx, domain, localData, generation); err != nil {
+					return err
+				}
+				return fallbackCache.replaceLocalIfSame(ctx, domain, nil, false, s3Data, s3Generation)
+			}
+		}
+		return fallbackCache.replaceLocalIfSame(ctx, domain, localData, true, s3Data, s3Generation, generation)
 	}
 
 	// Parse both certificates for comparison
@@ -140,7 +166,7 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 	if err != nil {
 		logger.Warn("CertSync: Failed to parse local certificate (will update from S3)", "domain", domain, "error", err)
 		// Can't parse local, assume S3 is better
-		if putErr := fallbackCache.fallback.Put(ctx, domain, s3Data); putErr != nil {
+		if putErr := fallbackCache.replaceLocalIfSame(ctx, domain, localData, true, s3Data, s3Generation, generation); putErr != nil {
 			logger.Warn("CertSync: Failed to update local certificate from S3", "domain", domain, "error", putErr)
 			return putErr
 		}
@@ -158,7 +184,8 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 	if localInfo.SerialNumber == s3Info.SerialNumber {
 		// Same certificate, no update needed
 		logger.Debug("CertSync: Certificate up to date", "domain", domain, "serial", localInfo.SerialNumber)
-		return nil
+		// An exact current shared copy establishes provenance for a legacy local file.
+		return fallbackCache.replaceLocalIfSame(ctx, domain, localData, true, s3Data, s3Generation, generation)
 	}
 
 	// Different certificates, check if S3 is newer
@@ -167,7 +194,7 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 			"local_serial", localInfo.SerialNumber, "local_expiry", localInfo.NotAfter.Format(time.RFC3339),
 			"s3_serial", s3Info.SerialNumber, "s3_expiry", s3Info.NotAfter.Format(time.RFC3339))
 
-		if putErr := fallbackCache.fallback.Put(ctx, domain, s3Data); putErr != nil {
+		if putErr := fallbackCache.replaceLocalIfSame(ctx, domain, localData, true, s3Data, s3Generation, generation); putErr != nil {
 			logger.Warn("CertSync: Failed to update local certificate from S3", "domain", domain, "error", putErr)
 			return putErr
 		}
@@ -178,7 +205,7 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 
 	if shouldUpdateCertificate(s3Info, localInfo) {
 		// This node renewed it while S3 refused writes; S3 still holds the old one.
-		return publishLocalCertificate(ctx, fallbackCache, domain, localData)
+		return publishLocalSnapshot(ctx, fallbackCache, domain, localData, generation)
 	}
 
 	logger.Debug("CertSync: Local and S3 certificates differ but neither is newer (keeping both)", "domain", domain)
@@ -189,13 +216,35 @@ func (m *Manager) syncCertificateFromS3(ctx context.Context, domain string) erro
 // S3, where the other nodes read it. FallbackCache.Put keeps a certificate locally when S3
 // refuses the write and retries S3 once; the sync worker retries every interval after
 // that, until the write succeeds.
-func publishLocalCertificate(ctx context.Context, fallbackCache *FallbackCache, domain string, data []byte) error {
-	if err := fallbackCache.primary.Put(ctx, domain, data); err != nil {
-		logger.Warn("CertSync: Certificate held only on this node could not be written to S3 - will retry", "domain", domain, "error", err)
+//
+// Publication carries the local entry's original generation through all CAS
+// retries. Explicit deletion changes that generation; CLEAN leaves a vacancy in
+// the same generation so a valid outage renewal can still publish. Expired or
+// revoked snapshots are removed only while both bytes and generation still match.
+func publishLocalCertificate(ctx context.Context, fc *FallbackCache, name string, data []byte) error {
+	current, g, err := fc.localSnapshot(ctx, name)
+	if err != nil {
 		return err
 	}
-	fallbackCache.markS3Available()
-	logger.Info("CertSync: Wrote certificate held only on this node to S3", "domain", domain)
+	if !bytes.Equal(current, data) {
+		return nil
+	}
+	return publishLocalSnapshot(ctx, fc, name, data, g)
+}
+func publishLocalSnapshot(ctx context.Context, fc *FallbackCache, name string, data []byte, g publicationGeneration) error {
+	if info, err := parseCertificate(data); err == nil && time.Now().After(info.NotAfter) {
+		return fc.removeLocalIfSame(ctx, name, data, g)
+	}
+	if err := fc.primary.Put(generationContext(ctx, g), name, data); err != nil {
+		if errors.Is(err, errUnknownCertificateProvenance) {
+			return fc.quarantineLocalIfSame(ctx, name, data, g)
+		}
+		if errors.Is(err, ErrCertificateRevoked) || errors.Is(err, errExpiredCertificate) {
+			return fc.removeLocalIfSame(ctx, name, data, g)
+		}
+		return err
+	}
+	fc.markS3Available()
 	return nil
 }
 
@@ -206,8 +255,11 @@ func (m *Manager) startCertificateSyncWorker(interval time.Duration) {
 	}
 
 	logger.Info("Starting certificate sync worker", "interval", interval)
-
+	workerCtx, cancelWorker := context.WithCancel(context.Background())
+	m.certSyncCancel = cancelWorker
+	m.certSyncWG.Add(1)
 	go func() {
+		defer m.certSyncWG.Done()
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
@@ -217,7 +269,7 @@ func (m *Manager) startCertificateSyncWorker(interval time.Duration) {
 				logger.Info("Certificate sync worker stopped")
 				return
 			case <-ticker.C:
-				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+				ctx, cancel := context.WithTimeout(workerCtx, 30*time.Second)
 
 				for _, domain := range m.config.LetsEncrypt.Domains {
 					// Sync ECDSA certificate

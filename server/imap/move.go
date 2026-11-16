@@ -206,8 +206,8 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		return s.server.s3.CopyWithRetry(ctx, obj.sourceKey, obj.destKey)
 	}
 
-	ownMessagesDone := s.beginOwnMessages(destMailbox.ID) // a MOVE within the selected mailbox
-	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(ctx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
+	writeCtx, ownMessagesDone := s.beginOwnMessages(ctx, destMailbox.ID)
+	messageUIDMap, err := s.server.rdb.MoveMessagesWithRetry(writeCtx, &sourceUIDs, selectedMailboxID, destMailbox.ID, destMailbox.AccountID, destS3Domain, destS3Localpart, s.server.instanceID, sourceHashes, destHashes, ensureDestObject)
 	if err != nil {
 		ownMessagesDone()
 		var destErr *resilient.DestObjectError
