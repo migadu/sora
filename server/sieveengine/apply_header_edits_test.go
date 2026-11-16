@@ -63,7 +63,14 @@ func TestApplyHeaderEditsFieldOrder(t *testing.T) {
 		},
 		{
 			name:  "deleteheader with a value-pattern",
-			edits: []HeaderEdit{{Action: "delete", FieldName: "X-Foo", Value: "a"}},
+			edits: []HeaderEdit{{Action: "delete", FieldName: "X-Foo", Value: "a", ByValue: true}},
+			want:  received + subject + fooB + to + body,
+		},
+		{
+			// Issue #1623: an empty value selects the empty field only.
+			name:  "deleteheader of an empty field by value",
+			raw:   received + "X-Foo:\r\n" + subject + fooB + to + body,
+			edits: []HeaderEdit{{Action: "delete", FieldName: "X-Foo", Value: "", ByValue: true}},
 			want:  received + subject + fooB + to + body,
 		},
 		{
@@ -88,7 +95,7 @@ func TestApplyHeaderEditsFieldOrder(t *testing.T) {
 			// value it is selected by is the unfolded one the script saw.
 			name:  "deleteheader of a folded field",
 			raw:   received + "X-Foo: a\r\n\tcontinued\r\n" + subject + "X-Foo: a\r\n  continued \r\n" + to + body,
-			edits: []HeaderEdit{{Action: "delete", FieldName: "X-Foo", Value: "a continued"}},
+			edits: []HeaderEdit{{Action: "delete", FieldName: "X-Foo", Value: "a continued", ByValue: true}},
 			want:  received + subject + "X-Foo: a\r\n  continued \r\n" + to + body,
 		},
 		{
