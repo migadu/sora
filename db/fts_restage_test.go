@@ -359,3 +359,138 @@ func TestCrossAccountMoveCopyStageDestinationFTSRow(t *testing.T) {
 		assert.Equal(t, 1, n, "cross-account %s left the message unsearchable by body for its new owner", name)
 	}
 }
+
+// advisoryLocksHeld counts every advisory lock held by tx's backend.
+func advisoryLocksHeld(t *testing.T, ctx context.Context, tx pgx.Tx) int {
+	t.Helper()
+	var n int
+	require.NoError(t, tx.QueryRow(ctx,
+		`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid()`).Scan(&n))
+	return n
+}
+
+// A COPY or MOVE into another account's mailbox may also carry rows that already belong to
+// that account: a message it added to another owner's shared mailbox while
+// messages.account_id was still the adder's. Such a row keeps the FTS row its source row
+// anchors, exactly as in a same-account COPY or MOVE, so only the re-keyed rows may take an
+// FTS lock. Otherwise the lock count is not bounded by the re-keyed bodies the command is
+// limited to, and it holds one lock-table entry per body until commit.
+func TestCrossAccountMoveCopyTakeFTSLocksOnlyForReKeyedBodies(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, _, ownerA, inboxA := setupCleanerTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	emailB := fmt.Sprintf("restage_kept_b_%d@example.com", time.Now().UnixNano())
+	txB, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	_, err = db.CreateAccount(ctx, txB, CreateAccountRequest{Email: emailB, Password: "password123", IsPrimary: true, HashType: "bcrypt"})
+	require.NoError(t, err)
+	require.NoError(t, txB.Commit(ctx))
+	ownerB, err := db.GetAccountIDByAddress(ctx, emailB)
+	require.NoError(t, err)
+	sharedB := createRestageMailbox(t, ctx, db, ownerB, "Shared")
+	t.Cleanup(func() {
+		db.GetWritePool().Exec(context.Background(), `DELETE FROM messages_fts_v2 WHERE account_id = $1`, ownerB)
+		db.GetWritePool().Exec(context.Background(), `DELETE FROM messages WHERE account_id = $1`, ownerB)
+	})
+
+	// UID 9801 is A's own message, re-keyed to B by the command; 9802.. were added by B.
+	base := time.Now().UnixNano()
+	rekeyedHash := fmt.Sprintf("restage_rekeyed_%d", base)
+	insertRestageFixture(t, ctx, db.GetWritePool(), ownerA, inboxA, 9801, rekeyedHash, true)
+	uids := []imap.UID{9801}
+	const kept = 20
+	for i := 0; i < kept; i++ {
+		uid := int64(9802 + i)
+		insertRestageFixture(t, ctx, db.GetWritePool(), ownerB, inboxA, uid, fmt.Sprintf("restage_kept_%d_%d", base, i), true)
+		uids = append(uids, imap.UID(uid))
+	}
+	sourceHashes := map[imap.UID]string{9801: rekeyedHash}
+
+	for _, command := range []string{"COPY", "MOVE"} {
+		t.Run(command, func(t *testing.T) {
+			tx, err := db.GetWritePool().Begin(ctx)
+			require.NoError(t, err)
+			defer tx.Rollback(ctx)
+			set := append([]imap.UID(nil), uids...)
+			var n int
+			if command == "COPY" {
+				copied, _, err := db.CopyMessages(ctx, tx, &set, inboxA, sharedB, ownerB, "example.net", "b", "test-instance", sourceHashes, nil)
+				require.NoError(t, err)
+				n = len(copied)
+			} else {
+				moved, err := db.MoveMessages(ctx, tx, &set, inboxA, sharedB, ownerB, "example.net", "b", "test-instance", sourceHashes, nil)
+				require.NoError(t, err)
+				n = len(moved)
+			}
+			require.Equal(t, len(uids), n)
+			assert.Equal(t, 1, ftsLocksHeld(t, ctx, tx),
+				"%s of 1 re-keyed and %d kept rows took an FTS lock per body, not per re-keyed body", command, kept)
+			var staged int
+			require.NoError(t, tx.QueryRow(ctx,
+				`SELECT count(*) FROM messages_fts_v2 WHERE content_hash = $1 AND account_id = $2`,
+				rekeyedHash, ownerB).Scan(&staged))
+			assert.Equal(t, 1, staged, "%s left the re-keyed message unsearchable by body for its new owner", command)
+		})
+	}
+}
+
+// A cross-account COPY or MOVE at the cap holds two advisory locks per body until commit
+// (the destination object's S3 lock and restageFTS's lock), plus one per source account
+// (lockRekeySources): bounded, whatever the size of the source mailbox.
+func TestCrossAccountMoveCopyAtTheBodyCapHoldTwoLocksPerBody(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, _, ownerA, inboxA := setupCleanerTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	emailB := fmt.Sprintf("restage_cap_b_%d@example.com", time.Now().UnixNano())
+	txB, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	_, err = db.CreateAccount(ctx, txB, CreateAccountRequest{Email: emailB, Password: "password123", IsPrimary: true, HashType: "bcrypt"})
+	require.NoError(t, err)
+	require.NoError(t, txB.Commit(ctx))
+	ownerB, err := db.GetAccountIDByAddress(ctx, emailB)
+	require.NoError(t, err)
+	sharedB := createRestageMailbox(t, ctx, db, ownerB, "Shared")
+
+	const bodies = MaxCrossAccountBodies
+	base := time.Now().UnixNano()
+	uids := make([]imap.UID, 0, bodies)
+	hashes := make([]string, 0, bodies)
+	sourceHashes := make(map[imap.UID]string, bodies)
+	for i := 0; i < bodies; i++ {
+		uid := int64(20001 + i)
+		hash := fmt.Sprintf("restage_cap_%d_%d", base, i)
+		insertRestageFixture(t, ctx, db.GetWritePool(), ownerA, inboxA, uid, hash, false)
+		uids = append(uids, imap.UID(uid))
+		hashes = append(hashes, hash)
+		sourceHashes[imap.UID(uid)] = hash
+	}
+
+	for _, command := range []string{"COPY", "MOVE"} {
+		t.Run(command, func(t *testing.T) {
+			tx, err := db.GetWritePool().Begin(ctx)
+			require.NoError(t, err)
+			defer tx.Rollback(ctx)
+			require.NoError(t, LockS3ObjectsSharedInTx(ctx, tx, ownerB, hashes))
+			set := append([]imap.UID(nil), uids...)
+			if command == "COPY" {
+				_, _, err = db.CopyMessages(ctx, tx, &set, inboxA, sharedB, ownerB, "example.net", "b", "test-instance", sourceHashes, hashes)
+			} else {
+				_, err = db.MoveMessages(ctx, tx, &set, inboxA, sharedB, ownerB, "example.net", "b", "test-instance", sourceHashes, hashes)
+			}
+			require.NoError(t, err)
+			held := advisoryLocksHeld(t, ctx, tx)
+			assert.LessOrEqual(t, held, 2*bodies+1, "%s of %d bodies into another account holds %d advisory locks", command, bodies, held)
+			t.Logf("%s of %d bodies into another account holds %d advisory locks until commit", command, bodies, held)
+		})
+	}
+}

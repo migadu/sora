@@ -974,19 +974,11 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// reported as absent (db.InsertMessageOptions.SentDate).
 	s.DebugLog("message sent date", "sent_date", sentDate)
 
-	var plaintextBody *string
-	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
+	plaintextBody, extractErr := helpers.FTSPlaintextBody(messageContent)
 	if extractErr != nil {
 		// Plaintext extraction had errors but may have succeeded partially.
 		// Log the issues for debugging malformed MIME (invalid Content-Type, truncated parts, etc.)
 		s.DebugLog("plaintext extraction encountered errors", "error", extractErr)
-	}
-	if plaintextBodyResult == nil {
-		// No plaintext or HTML body found in the message; use empty string fallback for FTS.
-		emptyStr := new(string)
-		plaintextBody = emptyStr
-	} else {
-		plaintextBody = plaintextBodyResult
 	}
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
@@ -1302,7 +1294,7 @@ func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveeng
 func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMailbox,
 	fullMessageBytes []byte, contentHash string, deliveryHash string, subject string, messageID string,
 	sentDate time.Time, sentDateUnknownZone bool, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
-	plaintextBody *string, recipients []helpers.Recipient, headerPresence *int16,
+	plaintextBody string, recipients []helpers.Recipient, headerPresence *int16,
 	flags []imap.Flag) error {
 
 	// Create a context for read operations that respects session pinning
@@ -1349,7 +1341,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMa
 			InternalDate:        time.Now(),
 			Size:                size,
 			Subject:             subject,
-			PlaintextBody:       *plaintextBody,
+			PlaintextBody:       plaintextBody,
 			SentDate:            sentDate,
 			SentDateUnknownZone: sentDateUnknownZone,
 			InReplyTo:           inReplyTo,

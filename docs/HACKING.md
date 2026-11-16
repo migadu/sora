@@ -242,8 +242,8 @@ new command, usually starts in the library and reaches Sora through a version bu
 | Library | Module Sora requires | How it is pinned in `go.mod` | Imported as |
 |---|---|---|---|
 | IMAP | `github.com/migadu/go-imap` | `require` at a release tag | `github.com/migadu/go-imap`, `.../imapserver`, `.../imapclient` |
-| POP3 | `github.com/migadu/go-pop3` | `require` at a pseudo-version (one commit) | `github.com/migadu/go-pop3/pop3`, `.../pop3server` |
-| ManageSieve | `github.com/migadu/go-managesieve` | `require` at a pseudo-version | `github.com/migadu/go-managesieve/managesieve`, `.../managesieveserver` |
+| POP3 | `github.com/migadu/go-pop3` | `require` at a release tag | `github.com/migadu/go-pop3/pop3`, `.../pop3server` |
+| ManageSieve | `github.com/migadu/go-managesieve` | `require` at a release tag | `github.com/migadu/go-managesieve/managesieve`, `.../managesieveserver` |
 | Sieve | `github.com/migadu/go-sieve` | `require` at a release tag | `github.com/migadu/go-sieve`, `.../interp` |
 | SMTP and LMTP | `github.com/emersion/go-smtp` | a `replace` directive points it to `github.com/migadu/go-smtp` at a pseudo-version | `github.com/emersion/go-smtp` |
 | MIME | `github.com/emersion/go-message` | a `replace` directive points it to `github.com/migadu/go-message` at a pseudo-version | `github.com/emersion/go-message`, `.../mail`, `.../textproto`, `.../charset` |

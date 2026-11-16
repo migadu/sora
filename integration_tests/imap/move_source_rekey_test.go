@@ -35,9 +35,10 @@ func (f *sourceRekeyFixture) checkOwnerMove(t *testing.T, moveErr error) {
 	assert.Zero(t, f.contributorLiveRows(t), "the MOVE expunged its source")
 }
 
-// TestCrossAccountMoveOfSourceRekeyedBeforeRowLock re-keys the source body after a
+// TestCrossAccountMoveOfSourceRekeyedBeforeRowLock requests a rekey after a
 // cross-account MOVE made it exist under the owner's key for the old hash and before the
-// MOVE locks the source rows (#784). The MOVE must not commit a row under the new hash,
+// MOVE locks the source rows (#784). Current admission holds the rekey off until
+// MOVE ends. The MOVE must not commit a row under a new hash,
 // whose object under the owner's key nothing wrote.
 func TestCrossAccountMoveOfSourceRekeyedBeforeRowLock(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
@@ -51,12 +52,14 @@ func TestCrossAccountMoveOfSourceRekeyedBeforeRowLock(t *testing.T) {
 	barrier.waitBlocked(t)
 	require.NotEmpty(t, f.fake.Keys(f.ownerKey(f.legacy.ContentHash)), "the MOVE copied the body under the owner's key for the old hash")
 
-	f.rekey(t)
+	rekeyDone := f.startBlockedRekey(t)
 	barrier.release(t)
-	f.checkOwnerMove(t, <-moveDone)
+	moveErr := <-moveDone
+	require.NoError(t, <-rekeyDone)
+	f.checkOwnerMove(t, moveErr)
 }
 
-// TestCrossAccountMoveOfSourceRekeyedBeforeObjectCheck re-keys the source body after a
+// TestCrossAccountMoveOfSourceRekeyedBeforeObjectCheck requests a rekey after a
 // cross-account MOVE read it and before the MOVE checks the owner's object, i.e. before
 // the move's transaction first reads the source rows. The MOVE makes the object exist for
 // the hash it read, so it must not commit a row under the new one.
@@ -71,7 +74,9 @@ func TestCrossAccountMoveOfSourceRekeyedBeforeObjectCheck(t *testing.T) {
 	moveDone := startMove(f.cc, f.shared)
 	barrier.waitBlocked(t)
 
-	f.rekey(t)
+	rekeyDone := f.startBlockedRekey(t)
 	barrier.release(t)
-	f.checkOwnerMove(t, <-moveDone)
+	moveErr := <-moveDone
+	require.NoError(t, <-rekeyDone)
+	f.checkOwnerMove(t, moveErr)
 }

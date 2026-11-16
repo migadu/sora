@@ -2319,7 +2319,7 @@ auth_idle_timeout = "2m"        # Idle timeout between commands during authentic
                               # Resets after each command received. Cleared after successful authentication.
                               # Note: absolute_session_timeout (below) separately limits total session duration.
 max_message_size = "50mb"       # Advertised in LHLO as "SIZE <n>"; MAIL ... SIZE= above it gets 552, a SIZE= that is
-                                # not a number 501. SIZE= is passed on to backends that advertise SIZE. "0" also means 50MB.
+                                # not 1 to 20 digits 501. SIZE= is passed on to backends that advertise SIZE. "0" also means 50MB.
 enable_affinity = true        # Enable user-to-backend affinity (requires [cluster.affinity] to be enabled)
 
 # --- TIMEOUT CONFIGURATION ---

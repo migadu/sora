@@ -111,6 +111,16 @@ CREATE DATABASE sora_mail_db OWNER sora ENCODING 'UTF8' TEMPLATE template0;
 - **`idle_in_transaction_session_timeout`**: if you set it, keep it well above one minute. Some
   of Sora's transactions stay open on purpose while they hold a lock across an S3 call, and
   run a statement at least every minute to stay alive (see [section 8](#8-pgbouncer-and-other-connection-poolers)).
+- **`max_locks_per_transaction`**: PostgreSQL has room for `max_locks_per_transaction` ×
+  (`max_connections` + `max_prepared_transactions`) locks for the whole server, advisory locks
+  included; once they are used up, every session fails with `out of shared memory` (SQLSTATE
+  `53200`). A batch of the cleanup cycle holds up to 1,000 advisory locks, and an IMAP `COPY` or
+  `MOVE` with any row handed to another owner is limited to 1,000 distinct source bodies,
+  including selected legacy rows already owned by the destination. Matching global source
+  and destination claims coalesce; body claims plus FTS locks consume at most 2,000 entries
+  for that command. Source-account guards and ordinary SQL locks are additional. Pure
+  same-owner commands retain their existing uncapped body-admission policy. This is not a
+  server-wide capacity guarantee: leave headroom for other lock classes and concurrent work.
 
 ---
 

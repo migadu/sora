@@ -1336,6 +1336,9 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	queryTimeout := s.server.rdb.GetQueryTimeout()
 	dbCtx, dbCancel := context.WithTimeout(s.ctx, queryTimeout)
 	defer dbCancel()
+	// A read replica may retain active account state after revocation and refill
+	// lookupCache past Watcher's invalidation cursor.
+	dbCtx = context.WithValue(dbCtx, consts.UseMasterDBKey, true)
 
 	// Use GetActiveAccountIDByAddressWithRetry which properly handles ErrUserNotFound
 	// as a business logic error (not a circuit breaker failure)
