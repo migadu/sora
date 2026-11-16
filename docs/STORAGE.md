@@ -960,9 +960,9 @@ Required on every storage node.
 | `path` | string | `"/var/cache/sora/cache"` | Cache directory. Created if missing. Put it on the same filesystem as `[uploader] path`. |
 | `capacity` | size | `"1gb"` | Total size the cache is kept within. |
 | `max_object_size` | size | `"5mb"` | Largest body cached, after an upload, an S3 read or a warmup. Also the default of the IMAP server's `preview_s3_max_size`. |
-| `purge_interval` | duration | `"12h"` | How often the cache is trimmed and cleaned. |
+| `purge_interval` | duration | `"12h"` | How often the cache is trimmed and cleaned. Must be positive. |
 | `orphan_cleanup_age` | duration | `"30d"` | Unread time after which a cached body of deleted mail is removed. |
-| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are written to `cache_metrics`. |
+| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are written to `cache_metrics`. Must be positive. |
 | `metrics_retention` | duration | `"30d"` | How long `cache_metrics` rows are kept. |
 | `enable_warmup` | bool | `true` | Preload recent mail at IMAP login. |
 | `warmup_message_count` | int | `50` | Messages per mailbox to preload. |
@@ -971,7 +971,9 @@ Required on every storage node.
 | `warmup_timeout` | duration | `"5m"` | Longest time one warmup may run. |
 | `warmup_interval` | duration | `"24h"` | Shortest interval between two warmups of one account. |
 
-An invalid duration or size in this section is logged as a warning and the default is used.
+An invalid duration or size in this section is logged as a warning and the default is used. A
+`purge_interval` or `metrics_interval` of zero or less is refused at start-up and by
+`sora-admin config validate` when the node has a mail backend (`imap`, `lmtp`, or `pop3`).
 
 ### `[uploader]`
 
