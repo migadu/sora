@@ -48,8 +48,8 @@ func runNotifyDiffSnapshots(
 			}
 			return &notifyDiffTestSession{
 				meteredSession: sess.(*meteredSession),
-				prev:           prev,
-				cur:            cur,
+				prev:           keyedSnapshot(prev),
+				cur:            keyedSnapshot(cur),
 				sharedRoot:     sharedRoot,
 			}, &imapserver.GreetingData{PreAuth: true}, nil
 		},
