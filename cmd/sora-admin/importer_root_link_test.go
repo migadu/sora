@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // The import, often run as root, reads the directory --maildir-path names, and the
@@ -157,6 +159,58 @@ func TestImportSieveScriptRefusesAUsersLinkedDirectoryToAnotherUsers(t *testing.
 				assert.Contains(t, err.Error(), resolvedName(t, link), "the refusal does not name the link")
 			}
 			assert.Empty(t, rdb.stored, "another user's script was stored")
+		})
+	}
+}
+
+// A symbolic link's owner says who made it, not who gave it the name the path
+// reaches: where the system lets a user hard-link a file they do not own (BSD and
+// macOS do, as Linux does with fs.protected_hardlinks = 0), alice can give root's
+// /var/mail/bob -> bob's maildir, or bob's own link to his maildir, the second name
+// ~/Maildir, and a link that is not a regular file has no content check to fall back
+// on. Where hard links are protected, only the link's owner or root can have linked it.
+func TestNewImporterRefusesAHardLinkedSymbolicLinkToAnotherUsersMaildir(t *testing.T) {
+	const name = "1700000001.M1P1.host:2,S"
+	_, bob := rootLinkUIDs()
+
+	for _, tc := range []struct {
+		name      string
+		linkOwner uint32
+		protected bool
+	}{
+		{"root's link", 0, false},             // ln /var/mail/bob ~/Maildir
+		{"the other user's link", bob, false}, // ln /home/bob/Maildir ~/Maildir
+		{"root's link, hard links protected", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			previous := hardLinksProtected
+			t.Cleanup(func() { hardLinksProtected = previous })
+			hardLinksProtected = func() bool { return tc.protected }
+
+			victim := newMaildirWith(t, map[string][]byte{name: cachedSizeMessage("Victim", 100)})
+			ownedByUID(t, bob, victim)
+			spool := filepath.Join(t.TempDir(), "bob")
+			require.NoError(t, os.Symlink(victim, spool))
+			ownedByUID(t, tc.linkOwner, spool)
+			maildirPath := filepath.Join(t.TempDir(), "Maildir")
+			// linkat without AT_SYMLINK_FOLLOW names the link itself, as ln -P does.
+			require.NoError(t, unix.Linkat(unix.AT_FDCWD, spool, unix.AT_FDCWD, maildirPath, 0))
+			info, err := os.Lstat(maildirPath)
+			require.NoError(t, err)
+			require.NotZero(t, info.Mode()&fs.ModeSymlink, "the hard link is not the symbolic link itself")
+
+			importer, err := NewImporter(context.Background(), maildirPath, "alice@example.com", 1, nil, nil, ImporterOptions{TestMode: true})
+			if importer != nil {
+				importer.Close()
+			}
+			if tc.protected {
+				require.NoError(t, err, "only root can have linked root's link where hard links are protected")
+				return
+			}
+			if assert.Error(t, err, "another user's maildir was opened through a hard link alice made") {
+				assert.Contains(t, err.Error(), resolvedName(t, maildirPath), "the refusal does not name the link")
+			}
+			assert.NoFileExists(t, filepath.Join(victim, maildirCacheName), "the cache was created in the directory the link leads to")
 		})
 	}
 }
