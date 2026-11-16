@@ -152,6 +152,11 @@ type verificationResult struct {
 
 func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMissing, fixOrphaned, fixMissing, dryRun bool, batchSize int, deep bool) error {
 	startTime := time.Now()
+	if fixOrphaned && !dryRun {
+		if err := cfg.S3.RequireBodyDeletionProtocol(); err != nil {
+			return err
+		}
+	}
 
 	// Initialize database
 	rdb, err := newAdminDatabase(ctx, &cfg.Database)

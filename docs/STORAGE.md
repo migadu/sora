@@ -1026,3 +1026,28 @@ limit of `0` turns that check off. An overwrite counts only its change in size, 
 frees its slot. The count and size limits refuse only a command that raises the count or the
 size, so an account already past one (the limit was lowered) can still delete, overwrite and
 shrink entries to get back under it.
+
+
+### Forward-only header presence (migration70)
+
+Newly ingested messages record whether the supported searchable fields exist,
+independently of empty values or address parsing. This covers From, To, Cc, Bcc,
+Sender, Reply-To, Subject, Message-ID, In-Reply-To and References. An explicit
+`HEADER <name> ""` uses this presence metadata; address shorthand retains the
+meaning of the currently represented ENVELOPE address lists. The inherited
+empty-group ENVELOPE representation limitation is not changed here. Nonempty
+header terms and unsupported field names retain their existing search behavior.
+
+This change is forward-only. There is no historical or lazy backfill and no S3
+read to repair old metadata. A NULL `messages.header_presence` means unknown,
+and those rows keep their prior search results (including known empty-term
+inaccuracies). COPY, MOVE and restore preserve that unknown state even though
+they create a new row or UID. Mail newly ingested through APPEND, LMTP, HTTP
+or either importer records final headers, after Sieve edits where applicable;
+old writers during a rolling upgrade and severely malformed APPEND headers
+accepted with degraded metadata can still produce unknown rows.
+
+For large databases, follow the concurrent covering-index preparation in
+`db/migrations/000070_messages_header_presence.up.sql` before upgrading. The
+migration refuses an unprepared blocking rebuild. Existing bodies, flags, UIDs,
+MODSEQs, search caches and content hashes are not rewritten.
