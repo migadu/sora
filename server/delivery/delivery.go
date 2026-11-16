@@ -249,7 +249,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date")) // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
+	sentDate, sentDateUnknownZone, _ := helpers.ParseDateHeaderWithZone(mailHeader.Get("Date")) // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -369,6 +369,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			Subject:              subject,
 			PlaintextBody:        *plaintextBody,
 			SentDate:             sentDate,
+			SentDateUnknownZone:  sentDateUnknownZone,
 			InReplyTo:            inReplyTo,
 			References:           references,
 			BodyStructure:        bodyStructure,
@@ -644,7 +645,7 @@ func (d *DeliveryContext) saveMessageToResolvedMailbox(ctx context.Context, reci
 	mailHeader := mail.Header{Header: messageEntity.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date")) // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
+	sentDate, sentDateUnknownZone, _ := helpers.ParseDateHeaderWithZone(mailHeader.Get("Date")) // zero without a Date: header that parses (db.InsertMessageOptions.SentDate)
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -654,25 +655,26 @@ func (d *DeliveryContext) saveMessageToResolvedMailbox(ctx context.Context, reci
 
 	_, _, err = d.RDB.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
-			AccountID:     destAccountID,
-			MailboxID:     mailbox.ID,
-			S3Domain:      destS3Domain,
-			S3Localpart:   destS3Localpart,
-			MailboxName:   mailbox.Name,
-			ContentHash:   contentHash,
-			DeliveryHash:  recipient.DeliveryHash,
-			MessageID:     messageID,
-			InternalDate:  time.Now(),
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: *plaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			References:    references,
-			BodyStructure: bodyStructure,
-			Recipients:    recipients,
-			Flags:         flags,
-			FTSRetention:  d.FTSRetention,
+			AccountID:           destAccountID,
+			MailboxID:           mailbox.ID,
+			S3Domain:            destS3Domain,
+			S3Localpart:         destS3Localpart,
+			MailboxName:         mailbox.Name,
+			ContentHash:         contentHash,
+			DeliveryHash:        recipient.DeliveryHash,
+			MessageID:           messageID,
+			InternalDate:        time.Now(),
+			Size:                size,
+			Subject:             subject,
+			PlaintextBody:       *plaintextBody,
+			SentDate:            sentDate,
+			SentDateUnknownZone: sentDateUnknownZone,
+			InReplyTo:           inReplyTo,
+			References:          references,
+			BodyStructure:       bodyStructure,
+			Recipients:          recipients,
+			Flags:               flags,
+			FTSRetention:        d.FTSRetention,
 		},
 		db.PendingUpload{
 			ContentHash: contentHash,

@@ -272,8 +272,8 @@ func TestParseDateHeaderInvalid(t *testing.T) {
 }
 
 // TestParseDateHeaderUnknownZone: a Date: whose zone is malformed or not defined keeps the
-// date and time of day as written and is read with the zone unknown, as UTC (time.UTC),
-// which go-imap writes as the zone "-0000" in ENVELOPE. RFC 5256 section 2.2: "If the time
+// date and time of day as written and reports the zone as explicitly unknown, with the
+// instant in UTC. go-imap writes that metadata as "-0000" in ENVELOPE. RFC 5256 section 2.2: "If the time
 // zone is invalid, the date and time SHOULD be treated as UTC." RFC 5322 section 4.3: the
 // military zones and "Other multi-character (usually between 3 and 5) alphabetic time
 // zones" whose meaning is not known "SHOULD be considered equivalent to "-0000"", which
@@ -338,22 +338,19 @@ func TestParseDateHeaderUnknownZone(t *testing.T) {
 		require.NoError(t, err)
 		time.Local = loc // no test in this package runs in parallel
 		for _, tc := range cases {
-			got, err := ParseDateHeader(tc.value)
+			got, unknown, err := ParseDateHeaderWithZone(tc.value)
 			if !assert.NoError(t, err, "TZ=%s %q", name, tc.value) {
 				continue
 			}
 			assert.True(t, got.Equal(tc.wall), "TZ=%s %q: %v, want %v", name, tc.value, got, tc.wall)
-			assert.True(t, got.Location() == time.UTC, "TZ=%s %q: %v is not in UTC, the unknown zone", name, tc.value, got)
+			assert.True(t, unknown, "TZ=%s %q: unknown source zone was not reported", name, tc.value)
 		}
 	}
 }
 
-// TestParseDateHeaderKnownZoneNotUTC: a date whose zone is known, "+0000" and the obs-zones
-// "UT" and "GMT" included, is never given in time.UTC, which marks an unknown zone
-// (TestParseDateHeaderUnknownZone). RFC 5322 section 3.3: "The form "+0000" SHOULD be used
-// to indicate a time zone at Universal Time". net/mail gives a zone of offset zero in
-// time.UTC when time.Local is time.UTC.
-func TestParseDateHeaderKnownZoneNotUTC(t *testing.T) {
+// Known zero-offset zones remain explicitly known even when net/mail returns
+// time.UTC. Their metadata must not depend on the application's time.Local.
+func TestParseDateHeaderKnownZoneMetadata(t *testing.T) {
 	const h = 3600
 	cases := []struct {
 		value  string
@@ -374,7 +371,7 @@ func TestParseDateHeaderKnownZoneNotUTC(t *testing.T) {
 	for _, loc := range []*time.Location{time.UTC, time.FixedZone("", 0), time.FixedZone("", -7*h)} {
 		time.Local = loc // no test in this package runs in parallel
 		for _, tc := range cases {
-			got, err := ParseDateHeader(tc.value)
+			got, unknown, err := ParseDateHeaderWithZone(tc.value)
 			if !assert.NoError(t, err, "Local=%v %q", loc, tc.value) {
 				continue
 			}
@@ -382,13 +379,55 @@ func TestParseDateHeaderKnownZoneNotUTC(t *testing.T) {
 			_, offset := got.Zone()
 			assert.True(t, got.Equal(want), "Local=%v %q: %v, want %v", loc, tc.value, got, want)
 			assert.Equal(t, tc.offset, offset, "Local=%v %q: zone offset of %v", loc, tc.value, got)
-			assert.False(t, got.Location() == time.UTC, "Local=%v %q: %v is in UTC, the unknown zone", loc, tc.value, got)
+			assert.False(t, unknown, "Local=%v %q: known source zone was reported unknown", loc, tc.value)
 		}
 	}
 }
 
+func TestParseDateHeaderWithZoneCompatibility(t *testing.T) {
+	for _, tc := range []struct {
+		value   string
+		unknown bool
+		invalid bool
+	}{
+		{value: "Tue, 01 Jan 2019 12:00:00 +0000"},
+		{value: "Tue, 01 Jan 2019 12:00:00 +0000 (unknown -0000 GMT+1)"},
+		{value: "Tue, 01 Jan 2019 12:00:00 GMT (unknown -0000)"},
+		{value: "Tue, 01 Jan 2019 12:00:00 -0000 (known +0000)", unknown: true},
+		{value: "Tue, 01 Jan 2019 12:00:00 GMT+1", unknown: true},
+		{value: "Tue, 01 Jan 2019 12:00:00 UTC", unknown: true},
+		{value: "Tue, 01 Jan 2019 12:00:00 EſT", unknown: true},
+		{value: "Tue, 01 Jan 2019 12:00:00 -0700"},
+		{value: "1 Jan 19 12:00 GMT+1", unknown: true},
+		{value: "Tue (day), 01 Jan 2019 12 (hour):00:60 (time) GMT+1", unknown: true},
+		{value: "", invalid: true},
+		{value: "not a date -0000", invalid: true},
+		{value: "Tue, 32 Jan 2019 12:00:00 GMT+1", invalid: true},
+		{value: "Tue, 01 Jan 2019 12:00:00 PM -0700", invalid: true},
+		{value: "Tue, 01 Jan 2019 12:00:00\n -0000", invalid: true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			date, unknown, err := ParseDateHeaderWithZone(tc.value)
+			legacy, legacyErr := ParseDateHeader(tc.value)
+			if tc.invalid {
+				require.Error(t, err)
+				require.Error(t, legacyErr)
+				assert.False(t, unknown, "a rejected date must not retain unknown-zone metadata")
+				return
+			}
+			require.NoError(t, err)
+			require.NoError(t, legacyErr)
+			assert.Equal(t, tc.unknown, unknown, "source-zone metadata")
+			assert.True(t, date.Equal(legacy), "compatibility wrapper changed the instant: %v versus %v", date, legacy)
+			_, offset := date.Zone()
+			_, legacyOffset := legacy.Zone()
+			assert.Equal(t, legacyOffset, offset, "compatibility wrapper changed the offset")
+		})
+	}
+}
+
 // TestNoIngressPathParsesDateWithNetMail: every path that stores a message parses its Date:
-// header with ParseDateHeader, and builds its body structure with ExtractBodyStructure,
+// header with ParseDateHeaderWithZone, and builds its body structure with ExtractBodyStructure,
 // which reads an attached message's Date: with it too. go-message's mail.Header.Date() is
 // net/mail.ParseDate, which reads an alphabetic zone (PDT, EST, CET, ...) in the host's time
 // zone, so the stored instant and offset would depend on the server's TZ; the go-imap
@@ -419,6 +458,6 @@ func TestNoIngressPathParsesDateWithNetMail(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	assert.Empty(t, offenders, "Date: header parsed with net/mail; use helpers.ParseDateHeader or helpers.ExtractBodyStructure:\n%s",
+	assert.Empty(t, offenders, "Date: header parsed with net/mail; use helpers.ParseDateHeaderWithZone or helpers.ExtractBodyStructure:\n%s",
 		strings.Join(offenders, "\n"))
 }

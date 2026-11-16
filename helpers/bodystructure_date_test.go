@@ -27,16 +27,17 @@ func attachedMessage(date string) string {
 func TestSafeBodyStructureAttachedMessageObsoleteZone(t *testing.T) {
 	const h = 3600
 	cases := []struct {
-		date   string
-		offset int // seconds east of UTC; the wall time is always 1996-07-17 02:23:25
+		date    string
+		offset  int // seconds east of UTC; the wall time is always 1996-07-17 02:23:25
+		unknown bool
 	}{
-		{"Wed, 17 Jul 1996 02:23:25 PDT", -7 * h},
-		{"Wed, 17 Jul 1996 02:23:25 EST", -5 * h},
-		{"Wed, 17 Jul 1996 02:23:25 pdt", -7 * h},
-		{"Wed, 17 Jul 1996 02:23:25\r\n\tPdT", -7 * h},
-		{"Wed, 17 Jul 1996 02:23:25 Z", 0},
-		{"Wed, 17 Jul 1996 02:23:25 CEST", 0},
-		{"Wed, 17 Jul 1996 02:23:25 -0700 (PDT)", -7 * h},
+		{"Wed, 17 Jul 1996 02:23:25 PDT", -7 * h, false},
+		{"Wed, 17 Jul 1996 02:23:25 EST", -5 * h, false},
+		{"Wed, 17 Jul 1996 02:23:25 pdt", -7 * h, false},
+		{"Wed, 17 Jul 1996 02:23:25\r\n\tPdT", -7 * h, false},
+		{"Wed, 17 Jul 1996 02:23:25 Z", 0, true},
+		{"Wed, 17 Jul 1996 02:23:25 CEST", 0, true},
+		{"Wed, 17 Jul 1996 02:23:25 -0700 (PDT)", -7 * h, false},
 	}
 
 	saved := time.Local
@@ -59,25 +60,26 @@ func TestSafeBodyStructureAttachedMessageObsoleteZone(t *testing.T) {
 			_, offset := got.Zone()
 			assert.True(t, want.Equal(got), "TZ=%s %q: attached envelope date %v, want %v", name, tc.date, got, want)
 			assert.Equal(t, tc.offset, offset, "TZ=%s %q: zone offset of %v", name, tc.date, got)
+			assert.Equal(t, tc.unknown, part.MessageRFC822.Envelope.DateUnknownZone, "TZ=%s %q: explicit source zone", name, tc.date)
 		}
 	}
 }
 
 // TestSafeBodyStructureAttachedMessageUnknownZone: the envelope of an attached message
-// whose Date: zone is malformed or not defined keeps the date and time as written, in UTC
-// (time.UTC), the unknown zone that go-imap writes as "-0000" (RFC 5256 section 2.2: "If
+// whose Date: zone is malformed or not defined keeps the date and time as written, in UTC,
+// with explicit unknown-zone metadata that go-imap writes as "-0000" (RFC 5256 section 2.2: "If
 // the time zone is invalid, the date and time SHOULD be treated as UTC"), and keeps that
 // zone through the gob encoding the body structure is stored in. A known zone of offset
 // zero stays "+0000" through it.
 func TestSafeBodyStructureAttachedMessageUnknownZone(t *testing.T) {
-	attachedDate := func(t *testing.T, bs imap.BodyStructure) time.Time {
+	attachedEnvelope := func(t *testing.T, bs imap.BodyStructure) *imap.Envelope {
 		t.Helper()
 		mp, ok := bs.(*imap.BodyStructureMultiPart)
 		require.True(t, ok, "body structure %#v", bs)
 		require.Len(t, mp.Children, 2)
 		part, ok := mp.Children[1].(*imap.BodyStructureSinglePart)
 		require.True(t, ok && part.MessageRFC822 != nil, "part 2 %#v", mp.Children[1])
-		return part.MessageRFC822.Envelope.Date
+		return part.MessageRFC822.Envelope
 	}
 	wall := time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)
 	for _, tc := range []struct {
@@ -101,12 +103,12 @@ func TestSafeBodyStructureAttachedMessageUnknownZone(t *testing.T) {
 		require.NoError(t, err)
 
 		for _, got := range []struct {
-			name string
-			date time.Time
-		}{{"extracted", attachedDate(t, bs)}, {"stored", attachedDate(t, *stored)}} {
-			assert.True(t, got.date.Equal(wall), "%q: %s attached envelope date %v, want %v", tc.date, got.name, got.date, wall)
-			assert.Equal(t, tc.unknown, got.date.Location() == time.UTC,
-				"%q: %s attached envelope date %v: zone unknown (in UTC) = %v, want %v", tc.date, got.name, got.date, got.date.Location() == time.UTC, tc.unknown)
+			name     string
+			envelope *imap.Envelope
+		}{{"extracted", attachedEnvelope(t, bs)}, {"stored", attachedEnvelope(t, *stored)}} {
+			assert.True(t, got.envelope.Date.Equal(wall), "%q: %s attached envelope date %v, want %v", tc.date, got.name, got.envelope.Date, wall)
+			assert.Equal(t, tc.unknown, got.envelope.DateUnknownZone,
+				"%q: %s attached envelope date %v: unknown zone = %v, want %v", tc.date, got.name, got.envelope.Date, got.envelope.DateUnknownZone, tc.unknown)
 		}
 	}
 }

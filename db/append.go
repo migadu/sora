@@ -432,7 +432,8 @@ type InsertMessageOptions struct {
 	Size                 int64
 	Subject              string
 	PlaintextBody        string
-	SentDate             time.Time // the Date: header (helpers.ParseDateHeader), in UTC when its zone is unknown; zero when none parses (see storedSentDate)
+	SentDate             time.Time // The parsed Date: header; zero when none parses (see storedSentDate)
+	SentDateUnknownZone  bool      // The parser explicitly reported no known source zone
 	InReplyTo            []string
 	References           []string
 	BodyStructure        *imap.BodyStructure
@@ -525,10 +526,10 @@ const maxSentUTCOffset = 24 * 60 * 60
 // zone, so sent_date plus this offset is the header's wall-clock time, whose day the SENT*
 // keys compare (RFC 9051 §6.4.4: "disregarding time and timezone"). nil (NULL, searched by
 // the UTC day) for an offset beyond maxSentUTCOffset, and for a date whose zone is unknown
-// (helpers.ZoneUnknown, RFC 5322 §3.3 "-0000"): its UTC day is the day it names, and
+// (unknownZone, RFC 5322 §3.3 "-0000"): its UTC day is the day it names, and
 // sentDateInHeaderZone gives it back in UTC, so its ENVELOPE date keeps the zone "-0000".
-func sentUTCOffset(sentDate time.Time) *int32 {
-	if helpers.ZoneUnknown(sentDate) {
+func sentUTCOffset(sentDate time.Time, unknownZone bool) *int32 {
+	if unknownZone {
 		return nil
 	}
 	_, offset := sentDate.Zone()
@@ -546,8 +547,8 @@ func sentUTCOffset(sentDate time.Time) *int32 {
 // component parts"). A row without an offset (a zone that is unknown, one beyond
 // maxSentUTCOffset, or a row written before migration 000060) is given in UTC rather than
 // in the time.Local pgx decodes a timestamptz into, so the ENVELOPE never depends on the
-// server's TZ. go-imap writes a date in UTC with the zone "-0000": the row has no
-// information about the header's zone (RFC 5322 §3.3).
+// server's TZ. Readers separately record an unknown source zone for a present
+// Date header when offset is NULL; time.Location does not carry that status.
 func sentDateInHeaderZone(sentDate time.Time, offset *int32) time.Time {
 	if offset == nil {
 		return sentDate.UTC()
@@ -828,7 +829,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"size":            options.Size,
 		"subject":         saneSubject,
 		"sent_date":       sentDate,
-		"sent_utc_offset": sentUTCOffset(sentDate),
+		"sent_utc_offset": sentUTCOffset(sentDate, options.SentDateUnknownZone && !options.SentDate.IsZero()),
 		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
@@ -1201,7 +1202,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		"size":            options.Size,
 		"subject":         saneSubject,
 		"sent_date":       sentDate,
-		"sent_utc_offset": sentUTCOffset(sentDate),
+		"sent_utc_offset": sentUTCOffset(sentDate, options.SentDateUnknownZone && !options.SentDate.IsZero()),
 		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
@@ -1597,7 +1598,7 @@ func (d *Database) InsertMessagesBatch(
 			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.SentDate,
 			p.SaneInReplyToStr, p.SaneReferencesStr, p.BodyStructureData, p.RecipientsJSON, uploaded, p.SubjectSort,
 			p.FromNameSort, p.FromEmailSort, p.ToNameSort, p.ToEmailSort, p.CcEmailSort,
-			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.SentDate), p.SentDateUnknown,
+			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.SentDate, p.Opt.SentDateUnknownZone && !p.Opt.SentDate.IsZero()), p.SentDateUnknown,
 		)
 
 		if !uploaded && p.Upload != nil {

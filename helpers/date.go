@@ -11,7 +11,7 @@ import (
 
 // obsZones maps the obsolete alphabetic zones RFC 5322 §4.3 gives a meaning to the
 // numeric zone each one is "semantically equivalent to". ABNF strings are case
-// insensitive (RFC 5234 §2.3), so the keys are upper case and lookups fold case.
+// insensitive (RFC 5234 §2.3), so the keys are upper case and lookups fold ASCII case.
 var obsZones = map[string]string{
 	"UT": "+0000", "GMT": "+0000",
 	"EDT": "-0400", "EST": "-0500",
@@ -29,10 +29,6 @@ var zoneToken = regexp.MustCompile(`^[^:]*\d:\d{2}(?::\d{2})?([ \t]*)([A-Za-z+-]
 // reads, as it does the digits of one with more after them.
 var numericZone = regexp.MustCompile(`^[+-]\d{4}`)
 
-// universalTime is Universal Time, offset zero, as a location of its own: time.UTC marks
-// a zone that is unknown (ZoneUnknown).
-var universalTime = time.FixedZone("UTC", 0)
-
 // obsYear matches a date-time (RFC 5322 §3.3) up to a year of two or three digits
 // (obs-year, §4.3): the digits right before the hour, which the field's first colon
 // follows.
@@ -42,14 +38,22 @@ var obsYear = regexp.MustCompile(`^[^:]*[ \t](\d{2,3})[ \t]+\d{1,2}:`)
 // (the field's first colon is the one after the hour) when they are 60: a leap second.
 var leapSecond = regexp.MustCompile(`^[^:]*\d:\d{2}:(60)(?:\D|$)`)
 
-// ParseDateHeader parses the value of a Date: header field (RFC 5322 §3.3), like
+// ParseDateHeader parses a Date: header without returning its source-zone metadata.
+// Call ParseDateHeaderWithZone when the distinction between a known zero offset and
+// an unknown zone must be preserved.
+func ParseDateHeader(value string) (time.Time, error) {
+	date, _, err := ParseDateHeaderWithZone(value)
+	return date, err
+}
+
+// ParseDateHeaderWithZone parses the value of a Date: header field (RFC 5322 §3.3), like
 // net/mail.ParseDate but reading the zone by RFC 5322 instead of by the host's time zone,
 // a two- or three-digit year by §4.3 too, and comments and white space between the
 // tokens.
 //
-// The date of a zone that is unknown is given in UTC (time.UTC; see ZoneUnknown), every
-// other date in a location of its own offset. The zone is the token after the time of
-// day:
+// The returned boolean reports an unknown source zone independently of the returned
+// time's Location. An unknown-zone date is given in UTC; a known zone keeps its parsed
+// offset. Parse errors return false. The zone is the token after the time of day:
 //
 //   - A sign and four digits is read by net/mail; "-0000" is the unknown zone (§3.3:
 //     "the date-time contains no information about the local time zone").
@@ -65,6 +69,8 @@ var leapSecond = regexp.MustCompile(`^[^:]*\d:\d{2}:(60)(?:\D|$)`)
 //     invalid, the date and time SHOULD be treated as UTC." The date and time of day
 //     are kept as written: net/mail read +01 and CET/CEST in time.Local, and GMT+1 as
 //     the time of day in UTC labelled with +0100, neither reading of GMT+1.
+//     ASCII control bytes in that token invalidate the Date field instead of being
+//     discarded by the unknown-zone replacement.
 //   - Unless a token with a sign follows it after white space or a comment, as in
 //     "02:23:25 PM -0700": the grammar has one zone after the time of day ("time =
 //     time-of-day zone"), and the letters before the offset can change the time itself.
@@ -84,12 +90,13 @@ var leapSecond = regexp.MustCompile(`^[^:]*\d:\d{2}:(60)(?:\D|$)`)
 // A time-of-day whose second is 60, a leap second (§3.3: "the time-of-day MUST be in the
 // range 00:00:00 through 23:59:60"), is read as second 59 of the same minute, as Dovecot
 // reads it: time.Time cannot hold second 60, and net/mail.ParseDate does not parse it.
-func ParseDateHeader(value string) (time.Time, error) {
+func ParseDateHeaderWithZone(value string) (time.Time, bool, error) {
 	// Unfold exactly as net/mail does, without turning an unpaired CR or LF
 	// before the zone into valid white space during the replacement below.
 	unfolded := strings.ReplaceAll(value, "\r\n", "")
 	if strings.ContainsAny(unfolded, "\r\n") {
-		return knownZone(mail.ParseDate(value))
+		date, err := mail.ParseDate(value)
+		return date, false, err
 	}
 	unfolded = normalizeCFWS(unfolded)
 	if m := leapSecond.FindStringSubmatchIndex(unfolded); m != nil {
@@ -110,10 +117,22 @@ func ParseDateHeader(value string) (time.Time, error) {
 		if numericZone.MatchString(token) {
 			unknown = strings.HasPrefix(token, "-0000")
 		} else {
-			if rest := strings.TrimLeft(unfolded[end:], " \t"); rest != "" && (rest[0] == '+' || rest[0] == '-') {
-				return time.Time{}, errors.New("mail: a numeric offset after the Date: zone")
+			ascii := true
+			for i := 0; i < len(token); i++ {
+				if token[i] < 0x20 || token[i] == 0x7f {
+					return time.Time{}, false, errors.New("mail: control character in Date: zone")
+				}
+				if token[i] >= 0x80 {
+					ascii = false
+				}
 			}
-			zone, ok := obsZones[strings.ToUpper(token)]
+			if rest := strings.TrimLeft(unfolded[end:], " \t"); rest != "" && (rest[0] == '+' || rest[0] == '-') {
+				return time.Time{}, false, errors.New("mail: a numeric offset after the Date: zone")
+			}
+			zone, ok := "", false
+			if ascii {
+				zone, ok = obsZones[strings.ToUpper(token)]
+			}
 			if !ok {
 				zone, unknown = "-0000", true
 			}
@@ -122,28 +141,13 @@ func ParseDateHeader(value string) (time.Time, error) {
 		}
 	}
 	t, err := mail.ParseDate(unfolded)
-	if err != nil || !unknown {
-		return knownZone(t, err)
+	if err != nil {
+		return t, false, err
 	}
-	return t.UTC(), nil
-}
-
-// ZoneUnknown reports whether a date ParseDateHeader returned has no known zone, RFC 5322
-// §3.3 "-0000": it is in UTC (time.UTC). go-imap writes an ENVELOPE date in UTC with the
-// zone "-0000", and the binary (gob) encoding of a time.Time keeps time.UTC apart from a
-// zone of offset zero, so a stored body structure keeps it too.
-func ZoneUnknown(t time.Time) bool {
-	return t.Location() == time.UTC
-}
-
-// knownZone returns what net/mail parsed for a known zone, never in time.UTC, which marks
-// an unknown one (ZoneUnknown): net/mail gives offset zero in time.UTC when time.Local is
-// time.UTC, and the names UT and UTC always.
-func knownZone(t time.Time, err error) (time.Time, error) {
-	if err == nil && t.Location() == time.UTC {
-		t = t.In(universalTime)
+	if unknown {
+		t = t.UTC()
 	}
-	return t, err
+	return t, unknown, nil
 }
 
 // normalizeCFWS returns an unfolded date-time with every comment (RFC 5322 §3.2.2) and
