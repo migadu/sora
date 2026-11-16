@@ -70,6 +70,11 @@ type Exporter struct {
 	keywordIndex map[string]map[string]int
 }
 
+// exportRootOpened, when set, runs in NewExporter as soon as the root is open: a test
+// replaces --maildir-path there, as the owner of the directory holding it can at any
+// moment.
+var exportRootOpened func()
+
 // NewExporter creates a new Exporter instance.
 func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ExporterOptions) (*Exporter, error) {
 	// The export runs on exactly this many workers: with none it would write nothing.
@@ -90,6 +95,9 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 			root.Close()
 		}
 	}()
+	if exportRootOpened != nil {
+		exportRootOpened()
+	}
 	maildirPath = effectiveMaildirPath(maildirPath)
 
 	// Use the shared SQLite database in the maildir path
