@@ -53,7 +53,7 @@ func newCapturingPool(t *testing.T, ctx context.Context, src *pgxpool.Pool, trac
 	return pool
 }
 
-// planNode is the subset of an EXPLAIN (ANALYZE, FORMAT JSON) node this test reads.
+// planNode is the subset of an EXPLAIN (ANALYZE, FORMAT JSON) node these tests read.
 type planNode struct {
 	NodeType    string     `json:"Node Type"`
 	ActualRows  float64    `json:"Actual Rows"`
@@ -69,13 +69,20 @@ func (n planNode) walk(visit func(planNode)) {
 }
 
 // explainRowsPerNode runs the statement under EXPLAIN (ANALYZE, FORMAT JSON) and returns
-// the number of rows each plan node actually produced (rows x loops).
+// the number of rows each plan node actually produced (see planRowsPerNode).
 func explainRowsPerNode(t *testing.T, ctx context.Context, pool *pgxpool.Pool, q capturedQuery) map[string]float64 {
 	t.Helper()
 
 	var raw []byte
 	err := pool.QueryRow(ctx, "EXPLAIN (ANALYZE, FORMAT JSON) "+q.SQL, q.Args...).Scan(&raw)
 	require.NoError(t, err, "failed to EXPLAIN the captured statement:\n%s", q.SQL)
+	return planRowsPerNode(t, raw)
+}
+
+// planRowsPerNode returns the number of rows each node of an EXPLAIN (ANALYZE, FORMAT
+// JSON) plan actually produced (rows x loops).
+func planRowsPerNode(t *testing.T, raw []byte) map[string]float64 {
+	t.Helper()
 
 	var explained []struct {
 		Plan planNode `json:"Plan"`
@@ -97,6 +104,45 @@ func explainRowsPerNode(t *testing.T, ctx context.Context, pool *pgxpool.Pool, q
 		i++
 	})
 	return rows
+}
+
+// The rows a statement reads for its mailbox must not include the rows of every other
+// mailbox in the table. A BitmapAnd that ANDs in a partial index without an index
+// condition reads that whole index (here every expunged message of the test database)
+// to narrow a bitmap its sibling already confines to the mailbox; the cost tests that
+// sum these rows then fail once the shared database holds enough expunged messages
+// (#1748). A scan that a heap scan reads from on its own is still the statement's cost.
+func TestPlanRowsLeaveOutWholeIndexScansANDedIntoABitmap(t *testing.T) {
+	sum := func(raw string) float64 {
+		t.Helper()
+		var total float64
+		for _, r := range planRowsPerNode(t, []byte(raw)) {
+			total += r
+		}
+		return total
+	}
+
+	// The held branch of a numbering in a view, as PostgreSQL planned it on a test
+	// database holding 1018 expunged messages.
+	anded := `[{"Plan": {"Node Type": "Limit", "Actual Rows": 1, "Actual Loops": 1, "Plans": [
+		{"Node Type": "Sort", "Actual Rows": 1, "Actual Loops": 1, "Plans": [
+		{"Node Type": "Bitmap Heap Scan", "Actual Rows": 1, "Actual Loops": 1, "Plans": [
+		{"Node Type": "BitmapAnd", "Actual Rows": 0, "Actual Loops": 1, "Plans": [
+			{"Node Type": "Bitmap Index Scan", "Index Name": "idx_messages_mailbox_id_expunged_modseq",
+			 "Index Cond": "((mailbox_id = '7'::bigint) AND (expunged_modseq > '2000'::bigint))",
+			 "Actual Rows": 1, "Actual Loops": 1},
+			{"Node Type": "Bitmap Index Scan", "Index Name": "idx_messages_account_hash_expunged",
+			 "Actual Rows": 1018, "Actual Loops": 1}
+		]}]}]}]}}]`
+	require.Equal(t, float64(4), sum(anded),
+		"the whole-index scan ANDed into the bitmap read other mailboxes' rows, not the statement's")
+
+	alone := `[{"Plan": {"Node Type": "Bitmap Heap Scan", "Actual Rows": 5, "Actual Loops": 1, "Plans": [
+		{"Node Type": "Bitmap Index Scan", "Index Name": "idx_messages_account_hash_expunged",
+		 "Actual Rows": 1018, "Actual Loops": 1}
+	]}}]`
+	require.Equal(t, float64(1023), sum(alone),
+		"a whole-index scan the heap scan reads from on its own is the statement's cost")
 }
 
 // TestPollMailboxUnchangedDoesNotScaleWithMailbox asserts the property that makes idle
