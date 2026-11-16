@@ -1405,14 +1405,31 @@ func (i *Importer) readMaildirFile(path string) ([]byte, error) {
 // a device.
 var errNotRegularFile = errors.New("not a regular file")
 
-// openRegularFile opens name below root for reading if it is a regular file, and
-// fails with errNotRegularFile otherwise. The files the import reads may have been
-// written by their owner, who can make one a FIFO (mkfifo; rsync -a copies them), and
-// opening a FIFO for reading waits until something opens it for writing: the run
-// would never finish, and cancelling it would not end the wait. The file is opened
-// with O_NONBLOCK to avoid that FIFO writer wait, and the open file is checked, so
-// a file replaced since a stat or directory listing cannot get past the check. A regular
-// file is then read in blocking mode, as os.Open reads it.
+// errAnotherUsersFile refuses a file the import would read that whoever named it may
+// not have been able to read (checkNamedByOwner).
+var errAnotherUsersFile = errors.New("may be another user's file")
+
+// fileUID returns the user that owns the file info describes. It is a variable so that
+// a test can make a file appear to belong to another user, which only root can arrange.
+var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t).Uid }
+
+// openRegularFile opens name below root if it is regular and passes the Unix
+// owner-directory check below. It fails with errNotRegularFile or
+// errAnotherUsersFile otherwise. The files the import reads may have been written by their owner, who can
+// make one a FIFO (mkfifo; rsync -a copies them), and opening a FIFO for reading waits
+// until something opens it for writing: the run would never finish, and cancelling it
+// would not end the wait. The file is opened with O_NONBLOCK to avoid that FIFO writer
+// wait, and the open file is checked, so a file replaced since a stat or directory
+// listing cannot get past the check. A regular file is then read in blocking mode, as
+// os.Open reads it.
+//
+// The owner can also make a name a hard link, which root cannot tell from the file's
+// first name, to a file elsewhere on the same file system, one they cannot read where
+// the system lets them link it (BSD and macOS do, as Linux does with
+// fs.protected_hardlinks = 0). The import runs with privileges the owner lacks, so a
+// file others may not read must pass checkNamedByOwner. A
+// link count is no test: Dovecot copies a message between folders as a hard link
+// (maildir_copy_with_hardlinks), and cp -al backups link every file.
 func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -1421,6 +1438,9 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	info, err := file.Stat()
 	if err == nil && !info.Mode().IsRegular() {
 		err = &fs.PathError{Op: "open", Path: name, Err: errNotRegularFile}
+	}
+	if err == nil && info.Mode().Perm()&0o004 == 0 {
+		err = checkNamedByOwner(root, name, info)
 	}
 	if err == nil {
 		var conn syscall.RawConn
@@ -1436,6 +1456,46 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 		return nil, err
 	}
 	return file, nil
+}
+
+// checkNamedByOwner refuses info, the file openRegularFile opened as name below root,
+// with errAnotherUsersFile unless the directory that holds name belongs to the file's
+// owner and its mode bits grant neither group nor other write access. Group members
+// with write access can also add a name, including a hard link. This checks Unix UID
+// and mode bits, not access granted through filesystem ACLs.
+// The root's own owner says nothing: --maildir-path, or the --sieve file's directory,
+// may be a link the user made to a directory of root's that anyone may write into
+// (/tmp), and a maildir extracted as root into a directory root made keeps its owner's
+// files below it. The directory is opened, and name looked up in it, by descriptor,
+// with the file found there required to be the file opened, so a directory renamed or
+// replaced meanwhile cannot vouch for it. A name that is a link vouches only for a file
+// below its own directory, as Pigeonhole's ~/.dovecot.sieve -> sieve/<name>.sieve: the
+// link's owner may not have been able to read one elsewhere in the root.
+func checkNamedByOwner(root *os.Root, name string, info fs.FileInfo) error {
+	dir, err := root.OpenRoot(filepath.Dir(name))
+	if err != nil {
+		return err
+	}
+	defer dir.Close()
+	dirInfo, err := dir.Stat(".")
+	if err != nil {
+		return err
+	}
+	named, err := dir.Stat(filepath.Base(name))
+	var reason string
+	switch {
+	case err != nil:
+		reason = fmt.Sprintf("it is not found below the directory that holds its name (%v)", errors.Unwrap(err))
+	case !os.SameFile(named, info):
+		reason = "it was replaced while it was opened"
+	case dirInfo.Mode().Perm()&0o022 != 0:
+		reason = "group or others may write into the directory that holds it"
+	case fileUID(info) != fileUID(dirInfo):
+		reason = fmt.Sprintf("it belongs to uid %d, the directory that holds it to uid %d", fileUID(info), fileUID(dirInfo))
+	default:
+		return nil
+	}
+	return &fs.PathError{Op: "open", Path: name, Err: fmt.Errorf("%w: %s, and others may not read it", errAnotherUsersFile, reason)}
 }
 
 // readMaildirDir is os.ReadDir through the maildir root (openMaildirFile). Only a
