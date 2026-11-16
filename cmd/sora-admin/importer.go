@@ -190,6 +190,19 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	if jobs < 1 {
 		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
 	}
+	// Every message and metadata file is read through this root. It is opened first,
+	// so a directory that a link on the path may not choose is refused before the
+	// cache is created in it (openImportRoot).
+	root, err := openImportRoot(maildirPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open maildir: %w", err)
+	}
+	var importer *Importer
+	defer func() {
+		if importer == nil {
+			root.Close()
+		}
+	}()
 	maildirPath = effectiveMaildirPath(maildirPath)
 	// Always create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, maildirCacheName)
@@ -316,13 +329,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		batchSize = options.BatchSize
 	}
 
-	root, err := os.OpenRoot(filepath.Clean(maildirPath))
-	if err != nil {
-		sqliteDB.Close()
-		return nil, fmt.Errorf("failed to open maildir: %w", err)
-	}
-
-	importer := &Importer{
+	importer = &Importer{
 		ctx:             ctx,
 		maildirPath:     maildirPath,
 		root:            root,
@@ -629,12 +636,13 @@ func (i *Importer) processSubscriptions() error {
 // ~/.dovecot.sieve -> sieve/<name>.sieve; a link out of it, or an absolute one, does
 // not open. The usual --sieve file of a Dovecot migration is that link, which is the
 // user's, and the import runs with privileges the user lacks: the link must not
-// choose which file those privileges read into the user's account. Only a regular
-// file is read (openRegularFile), at most maxSieveScriptSize+1 bytes to detect an
-// oversized file without reading it whole.
+// choose which file those privileges read into the user's account. Neither may a link
+// on the way to the directory (~/sieve made a link to another user's): the root is
+// opened by openImportRoot. Only a regular file is read (openRegularFile), at most
+// maxSieveScriptSize+1 bytes to detect an oversized file without reading it whole.
 func readSieveFile(path string) ([]byte, error) {
 	path = filepath.Clean(path)
-	root, err := os.OpenRoot(filepath.Dir(path))
+	root, err := openImportRoot(filepath.Dir(path))
 	if err != nil {
 		return nil, err
 	}
@@ -1438,9 +1446,8 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 // mode bits, not access granted through filesystem ACLs.
 //
 // The root's own owner says nothing: --maildir-path, or the --sieve file's directory,
-// may be a link the user made to a directory of root's that anyone may write into
-// (/tmp), and a maildir extracted as root into a directory root made keeps its owner's
-// files below it. Components are walked from root by descriptor (Lstat, Readlink,
+// may be a directory of root's that anyone may write into (/tmp), and a maildir
+// extracted as root into a directory root made keeps its owner's files below it. Components are walked from root by descriptor (Lstat, Readlink,
 // OpenRoot), requiring the final entry to be the file opened so a directory or entry
 // replaced meanwhile cannot vouch for it. Any symbolic link along the path must stay
 // strictly below the directory holding that link (no absolute or .. segments), live in
@@ -1582,6 +1589,155 @@ func checkNamedByOwner(root *os.Root, name string, info fs.FileInfo) error {
 		parts = rest
 	}
 	return refuse("it was replaced while it was opened")
+}
+
+// maxImportRootLinks bounds the symbolic links openImportRoot follows, as
+// filepath.EvalSymlinks does.
+const maxImportRootLinks = 255
+
+// openImportRoot opens the directory at path, --maildir-path or the directory of the
+// --sieve file, as the root the import reads through. The import often runs as root,
+// and a user can make an entry of their home directory (~/Maildir, ~/sieve) a symbolic
+// link to any directory the import can read, such as another user's maildir, which
+// would then be read into the account named by --email. So a link on the way is
+// followed only when it belongs to root or to the owner of the directory it leads to,
+// as a link a user made to a directory of their own does; any other is refused,
+// naming it, so the operator can name the directory itself.
+//
+// path is walked a component at a time by descriptor from the file system root (a
+// relative one from the working directory), as the system resolves it: a ".." after a
+// link goes up from the link's target. The root returned is the directory the walk
+// checked, so an entry replaced meanwhile cannot change what is read through it.
+func openImportRoot(path string) (*os.Root, error) {
+	sep := string(filepath.Separator)
+	given := path
+	if !filepath.IsAbs(path) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		path = wd + sep + path
+	}
+
+	// A step is a name to walk to or, after the target of a link that is not root's,
+	// the check that the directory the target reached belongs to the link's owner.
+	type step struct {
+		name    string
+		link    string
+		linkUID uint32
+	}
+	// cause is the error of a call through a root, to name the file by its path.
+	cause := func(err error) error {
+		if c := errors.Unwrap(err); c != nil {
+			return c
+		}
+		return err
+	}
+	split := func(p string) []step {
+		var steps []step
+		for _, name := range strings.Split(p, sep) {
+			if name != "" && name != "." {
+				steps = append(steps, step{name: name})
+			}
+		}
+		return steps
+	}
+
+	// dirs are the directories walked to, dirs[0] the file system root; resolved
+	// names the last of them, with no link in it.
+	var dirs []*os.Root
+	var resolved string
+	closeDirs := func() {
+		for _, dir := range dirs {
+			dir.Close()
+		}
+		dirs = nil
+	}
+	defer closeDirs()
+	restart := func() error {
+		closeDirs()
+		top, err := os.OpenRoot(sep)
+		if err != nil {
+			return err
+		}
+		dirs, resolved = []*os.Root{top}, sep
+		return nil
+	}
+	if err := restart(); err != nil {
+		return nil, err
+	}
+
+	steps := split(path)
+	links := 0
+	for len(steps) > 0 {
+		st := steps[0]
+		steps = steps[1:]
+		cur := dirs[len(dirs)-1]
+		switch {
+		case st.link != "":
+			info, err := cur.Stat(".")
+			if err != nil {
+				return nil, err
+			}
+			if uid := fileUID(info); uid != st.linkUID {
+				return nil, fmt.Errorf("refusing %s: %s is a symbolic link of uid %d to %s, a directory of uid %d, and a link is followed only if it belongs to root or to the owner of the directory it leads to; name that directory instead", given, st.link, st.linkUID, resolved, uid)
+			}
+			continue
+		case st.name == "..":
+			if len(dirs) > 1 {
+				cur.Close()
+				dirs = dirs[:len(dirs)-1]
+				resolved = filepath.Dir(resolved)
+			}
+			continue
+		}
+
+		name := filepath.Join(resolved, st.name)
+		info, err := cur.Lstat(st.name)
+		if err != nil {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: cause(err)}
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			if links++; links > maxImportRootLinks {
+				return nil, &fs.PathError{Op: "open", Path: given, Err: syscall.ELOOP}
+			}
+			target, err := cur.Readlink(st.name)
+			if err != nil {
+				return nil, &fs.PathError{Op: "readlink", Path: name, Err: cause(err)}
+			}
+			// The owner checked must be that of the link the target was read from.
+			again, err := cur.Lstat(st.name)
+			if err != nil || !os.SameFile(info, again) {
+				return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, name)
+			}
+			next := split(target)
+			if uid := fileUID(again); uid != 0 {
+				next = append(next, step{link: name, linkUID: uid})
+			}
+			steps = append(next, steps...)
+			if filepath.IsAbs(target) {
+				if err := restart(); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if !info.IsDir() {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.ENOTDIR}
+		}
+		dir, err := cur.OpenRoot(st.name)
+		if err != nil {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: cause(err)}
+		}
+		dirs = append(dirs, dir)
+		if dirInfo, err := dir.Stat("."); err != nil || !os.SameFile(info, dirInfo) {
+			return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, name)
+		}
+		resolved = name
+	}
+	root := dirs[len(dirs)-1]
+	dirs = dirs[:len(dirs)-1]
+	return root, nil
 }
 
 // readMaildirDir is os.ReadDir through the maildir root (openMaildirFile). Only a

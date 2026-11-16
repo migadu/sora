@@ -124,8 +124,14 @@ is a message. Files in `new/` usually carry no flags, so they arrive unread.
 
 The maildir may have been written by its owner, while the import runs with more privileges, so
 source messages and Dovecot metadata are read through the opened maildir root. Symbolic links
-below it cannot redirect those reads outside the root. `--maildir-path` itself
-may be a link. Below it, a folder that is a link is not walked and is named in a warning. A message
+below it cannot redirect those reads outside the root. `--maildir-path` itself, or a directory
+on the way to it, may be a symbolic link only when the link belongs to root or to the owner of
+the directory it leads to, as `/var/mail/alice -> /srv/mail/alice` made by root or a user's own
+`~/Maildir -> ~/mail/Maildir` does. A user who can replace `~/Maildir` could otherwise point it at
+another user's maildir and have that read into the account. Any other link makes the import
+refuse to start, naming the link, its owner and the directory it leads to, before the
+`sora-maildir.db` cache is created; name that directory itself to import it. These are Unix UID
+checks. Below the root, a folder that is a link is not walked and is named in a warning. A message
 file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
 file that is a link is read only when the link is relative and its target is below the root. Any
 other link (one pointing outside the root, or any absolute link, even to a file inside the root)
@@ -323,7 +329,10 @@ Very large UIDVALIDITY values in the uidlist are truncated to 32 bits.
 `--sieve PATH` stores the file as a Sieve script of the account before the messages are
 imported. If the file does not exist, it is ignored with a log line.
 
-The file is read through its directory. The usual file from Dovecot, the user's
+The file is read through its directory, opened under the same rule for links on the way to it
+as `--maildir-path` ([section 3](#3-the-maildir-layout-sora-reads)): with `~/sieve` a link the user
+made to another user's directory, the script is not imported and the summary names the link. The
+usual file from Dovecot, the user's
 `~/.dovecot.sieve`, is a symbolic link the user owns, so a link is followed only when it is
 relative and its target is within that directory, as Pigeonhole's own
 `.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
