@@ -560,8 +560,11 @@ its name, so a symbolic or hard link at that name is replaced, and the file it p
 alone. A mailbox directory, `cur/`, `new/` or `tmp/` that is a link is followed only when the link
 is relative and its target is below the target directory; any other link makes the export fail
 before it writes a message, naming the path. An existing `dovecot-keywords` or `dovecot-uidlist`
-that is such a link is not read, and is replaced as if it were not there. The SQLite cache and
-its sidecars still use ordinary paths; their policy is unchanged ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
+that is such a link is not read, and is replaced as if it were not there. Neither is one with more
+than one link: a hard link cannot be told apart from the file it names, while the export and
+Dovecot create these files by renaming a new file over the name, so theirs have one. The SQLite
+cache and its sidecars still use ordinary paths; their policy is unchanged
+([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 
 **Re-runs.** The exporter keeps `sora-maildir.db` in the target directory, with the same schema
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported
