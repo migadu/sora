@@ -81,9 +81,9 @@ func TestMaildirCacheRefusesLinks(t *testing.T) {
 }
 
 // The check before the open leaves a window in which the owner can put a link at the
-// cache's name. Every connection is therefore checked again, before SQLite writes
-// anything (it has read only the header), to have opened the file under its own name
-// and not through a link;
+// cache's name. Every connection is therefore checked again, after SQLite may have
+// read the header but before cache settings are applied, to have opened the file
+// under its own name and not through a link;
 // SQLite opens the cache without creating it, so a link to a missing file creates
 // nothing either.
 func TestMaildirCacheRefusesALinkSwappedInBeforeSQLiteOpensIt(t *testing.T) {
