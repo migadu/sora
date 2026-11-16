@@ -113,13 +113,18 @@ func ValidateScript(content string, configured []string) error {
 	return err
 }
 
-// HeaderEdit represents a header modification from editheader extension
+// HeaderEdit represents a header modification from editheader extension.
+//
+// A delete removes fields named FieldName: with Index above 0 the one Index
+// counts to, from 1 (from the last with Last); else with ByValue the first
+// whose value is Value, which may be empty; else every one of them.
 type HeaderEdit struct {
 	Action    string // "add" or "delete"
 	FieldName string
 	Value     string
 	Last      bool // for addheader: add at end; for deleteheader: count from end
-	Index     int  // for deleteheader: specific index (0 means all)
+	Index     int  // for deleteheader: the field to delete, counted from 1, or 0
+	ByValue   bool // for deleteheader: select the field by Value, even an empty one
 }
 
 type Result struct {
@@ -501,6 +506,7 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 				Value:     edit.Value,
 				Last:      edit.Last,
 				Index:     edit.Index,
+				ByValue:   edit.ByValue,
 			}
 		}
 	}
@@ -816,9 +822,9 @@ func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
 				if n >= 0 && n < len(named) {
 					fields = slices.Delete(fields, named[n], named[n]+1)
 				}
-			case edit.Value != "":
+			case edit.ByValue:
 				// go-sieve records one edit for each field whose value matched
-				// the value-patterns, carrying that value.
+				// the value-patterns, carrying that value, which may be empty.
 				if i := slices.IndexFunc(fields, func(f headerField) bool {
 					return f.key == key && f.value == edit.Value
 				}); i >= 0 {

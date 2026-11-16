@@ -219,6 +219,9 @@ to standard error, one for each problem the file has.
 | `[relay.queue] circuit_breaker_timeout`, `cleanup_interval` or `failed_retention` is not a duration, with `[relay]` configured | `[relay.queue]: invalid <key> "<value>": ...` |
 | An IMAP, POP3 or LMTP server is configured and `[cleanup]` has a negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`, or an `instance_liveness_threshold` of zero or less | `[cleanup]: <key> must not be negative, got "<value>"` or `[cleanup]: instance_liveness_threshold must be positive, got "<value>"` |
 | An IMAP, POP3 or LMTP server is configured and `[uploader]` has a `batch_size`, `concurrency` or `max_attempts` of zero or less, a `cleanup_grace_period` of zero or less or that is not a duration, a `retry_interval` of zero or less, or a `max_staging_size` that is not a size | `[uploader] <key> must be positive, got <n>`, `[uploader] cleanup_grace_period must be positive, got "<value>"`, `[uploader] cleanup_grace_period: <parse error>`, `[uploader] retry_interval must be positive, got "<value>"` or `[uploader] max_staging_size: <parse error>` |
+| An IMAP, POP3 or LMTP server is configured and `[local_cache]` has a `purge_interval` or `metrics_interval` of zero or less | `[local_cache]: <key> must be positive, got "<value>"` |
+| `[auth_cache] enabled = true` and `cleanup_interval` is zero or less | `[auth_cache]: cleanup_interval must be positive, got "<value>"` |
+| `[cluster]` and `[cluster.affinity]` are enabled and `[cluster.affinity] cleanup_interval` is negative | `[cluster.affinity]: cleanup_interval must not be negative, got "<value>"` |
 | `[shared_mailboxes] enabled = true` and `namespace_prefix` is not a mailbox name followed by `/` (for example `""`, `"Shared"` or `"Shared//"`), or is `INBOX/` in any letter case | `[shared_mailboxes]: namespace_prefix "<value>" must be a mailbox name followed by the hierarchy delimiter "/", such as "Shared/"` or `[shared_mailboxes]: namespace_prefix "<value>" conflicts with the reserved personal INBOX` |
 | `[timeout_scheduler] shard_count` is below -1 | `[timeout_scheduler]: shard_count must be >= -1, got <n>` |
 
@@ -526,9 +529,9 @@ See [STORAGE.md](STORAGE.md).
 | `path` | string | `"/var/cache/sora/cache"` | Cache directory. |
 | `capacity` | size | `"1gb"` | Total cache size. |
 | `max_object_size` | size | `"5mb"` | Largest body cached. |
-| `purge_interval` | duration | `"12h"` | How often the cache is trimmed. |
+| `purge_interval` | duration | `"12h"` | How often the cache is trimmed. Must be positive. |
 | `orphan_cleanup_age` | duration | `"30d"` | Age before an orphaned entry is removed. |
-| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are stored in the database. |
+| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are stored in the database. Must be positive. |
 | `metrics_retention` | duration | `"30d"` | How long those stored counts are kept. |
 | `enable_warmup` | bool | `true` | Preload recent messages when a user logs in over IMAP. |
 | `warmup_message_count` | integer | `50` | Messages preloaded per mailbox. |
@@ -706,7 +709,7 @@ See [CLUSTER.md](CLUSTER.md).
 |---|---|---|---|
 | `enabled` | bool | `true` | Share affinities across the cluster. |
 | `ttl` | duration | `"24h"` | How long an affinity lasts. |
-| `cleanup_interval` | duration | `"1h"` | How often expired affinities are removed. |
+| `cleanup_interval` | duration | `"1h"` | How often expired affinities are removed. `0` means `1h`; a negative value stops startup. |
 | `cache_path` | string | none | SQLite file that keeps affinities across restarts. Unset keeps them in memory only. |
 
 `[cluster.rate_limit_sync]`, for the `imap_proxy`, `pop3_proxy` and `managesieve_proxy` listeners with
@@ -729,7 +732,7 @@ A SQLite cache of credentials, used by proxies that check passwords in the datab
 | `path` | string | `"/var/cache/sora/auth_cache.db"` | Database file. Its directory is created. |
 | `max_age` | duration | `"24h"` | Age after which an entry is fetched again. |
 | `purge_unused` | duration | `"168h"` | Entries unused this long are removed. |
-| `cleanup_interval` | duration | `"1h"` | How often old entries are removed. |
+| `cleanup_interval` | duration | `"1h"` | How often old entries are removed. Must be positive. |
 
 If the cache cannot be opened, Sora logs an error and runs without it.
 
