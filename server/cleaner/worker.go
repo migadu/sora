@@ -68,10 +68,10 @@ type DatabaseManager interface {
 	CleanupOldRedirectsWithRetry(ctx context.Context, olderThan time.Duration) (int64, error)
 	CleanupOldHealthStatusesWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUserScopedObjectsForCleanupWithRetry(ctx context.Context, gracePeriod time.Duration, limit int) ([]db.UserScopedObjectForCleanup, error)
-	// ExecuteWithLockedS3Orphans runs fn with the objects that are still orphans while
-	// holding their per-object locks; fn's context is cancelled if the locks are lost.
-	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error
-	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
+	// ExecuteWithS3BodyCleanup runs fn with the objects that are still orphans, or
+	// whose rows alone may go (KeepObject), while holding their per-object locks; fn's
+	// context is cancelled if the locks are lost.
+	ExecuteWithS3BodyCleanup(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(context.Context, []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error)) (int64, error)
 	PruneOldMessageVectorsWithRetry(ctx context.Context, retention time.Duration) (int64, error)
 	GetUnusedFTSKeysWithRetry(ctx context.Context, after db.FTSKey, limit int) ([]db.FTSKey, db.FTSKey, error)
 	DeleteMessagesFTSByKeyBatchWithRetry(ctx context.Context, keys []db.FTSKey) (int64, error)
@@ -281,8 +281,7 @@ func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.Use
 
 // s3ObjectReaper is the database side of reapS3Objects.
 type s3ObjectReaper interface {
-	ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error
-	DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx context.Context, objects []db.UserScopedObjectForCleanup) (int64, error)
+	ExecuteWithS3BodyCleanup(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(context.Context, []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error)) (int64, error)
 }
 
 // S3BulkDeleter deletes objects by key and reports the keys it could not delete.
@@ -291,18 +290,20 @@ type S3BulkDeleter interface {
 }
 
 // reapS3Objects removes the S3 bodies of candidates and then the expunged message rows
-// that referenced them, in batches, holding each body's advisory lock throughout. It
-// returns how many bodies are gone from S3 and how many rows went with them. It is the
-// cleaner's S3 phase, and the account purge's.
+// that referenced them, in batches, holding each body's advisory lock throughout. A body
+// that rows of another account still point at stays, and only the candidate's rows go
+// (db.UserScopedObjectForCleanup.KeepObject). It returns how many bodies are gone from S3
+// and how many rows went. It is the cleaner's S3 phase, and the account purge's.
 //
 // Ordering is deliberate and unchanged: the S3 object goes first and the rows follow.
-// If the process dies in between, the rows are expunged rows nothing can read, the next
-// cycle lists them again and re-issues a delete for an object that is already gone
-// (DeleteObjects treats that as success), and the rows are removed then. The reverse
-// order would strand the body in the bucket with nothing left pointing at it.
+// If the process dies in between, its durable intent keeps the hash quarantined;
+// operator reconciliation must settle the remote outcome before new claims. Later
+// cleanup may retire the remaining expired candidates after reconciliation. Deleting
+// rows before storage would strand the body with no candidate pointing at it.
 func reapS3Objects(ctx context.Context, rdb s3ObjectReaper, s3 S3BulkDeleter, gracePeriod time.Duration, candidates []db.UserScopedObjectForCleanup) (int, int64, error) {
 	deleted := 0
 	var rowsDeleted int64
+	var phaseErr error
 
 	batch := make([]db.UserScopedObjectForCleanup, 0, s3DeleteBatchSize)
 	// flush reports whether the phase can continue; a failure to take the locks (or to
@@ -314,48 +315,71 @@ func reapS3Objects(ctx context.Context, rdb s3ObjectReaper, s3 S3BulkDeleter, gr
 		// The advisory locks are held for the whole callback: the orphan re-check, the
 		// S3 delete and the row delete all see the same "nothing references this body"
 		// verdict, and no upload of the body passes its write gate in between.
-		err := rdb.ExecuteWithLockedS3Orphans(ctx, batch, gracePeriod, func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error {
+		retired, err := rdb.ExecuteWithS3BodyCleanup(ctx, batch, gracePeriod, func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error) {
 			if skipped := len(batch) - len(orphans); skipped > 0 {
 				logger.Info("Cleanup: objects are no longer orphans or are being uploaded, skipping S3 deletion", "count", skipped)
 			}
 			if len(orphans) == 0 {
-				return nil
+				return db.S3BodyCleanupResult{}, nil
 			}
 
-			keys := make([]string, 0, len(orphans))
-			byKey := make(map[string]db.UserScopedObjectForCleanup, len(orphans))
+			// Rows of several accounts can carry one key, so an object can come with
+			// several candidates: it is deleted once, and the rows of each follow once it
+			// is gone. An object that rows of other accounts still point at stays, and only
+			// the candidate's rows go.
+			keyOf := func(o db.UserScopedObjectForCleanup) string {
+				return helpers.NewS3Key(o.S3Domain, o.S3Localpart, o.ContentHash)
+			}
+			var keys []string
+			seen := make(map[string]bool, len(orphans))
+			kept := 0
 			for _, orphan := range orphans {
-				key := helpers.NewS3Key(orphan.S3Domain, orphan.S3Localpart, orphan.ContentHash)
-				keys = append(keys, key)
-				byKey[key] = orphan
+				if orphan.KeepObject {
+					kept++
+				} else if key := keyOf(orphan); !seen[key] {
+					seen[key] = true
+					keys = append(keys, key)
+				}
+			}
+			if kept > 0 {
+				logger.Info("Cleanup: objects are still used by other accounts' rows, deleting only the candidates' rows", "count", kept)
 			}
 
-			failures := s3.DeleteBulkWithRetry(ctx, keys)
-			gone := make([]db.UserScopedObjectForCleanup, 0, len(keys))
+			var failures map[string]error
+			if len(keys) > 0 {
+				failures = s3.DeleteBulkWithRetry(ctx, keys)
+			}
 			for _, key := range keys {
 				if err, failed := failures[key]; failed {
 					logger.Error("Cleanup: Failed to delete S3 object", "key", key, "error", err)
 					continue
 				}
-				gone = append(gone, byKey[key])
+				deleted++
 			}
-			if len(gone) == 0 {
-				return nil
+			gone := make([]db.UserScopedObjectForCleanup, 0, len(orphans))
+			for _, orphan := range orphans {
+				if !orphan.KeepObject {
+					if _, failed := failures[keyOf(orphan)]; failed {
+						continue // the body is still there, and so are the rows
+					}
+				}
+				gone = append(gone, orphan)
 			}
-
-			deletedCount, err := rdb.DeleteExpungedMessagesByS3KeyPartsBatchWithRetry(ctx, gone)
-			if err != nil {
-				// The bodies are gone; their rows are picked up again next cycle.
-				logger.Error("Cleanup: Failed to batch delete DB message rows", "error", err)
-			} else {
-				logger.Info("Cleanup: Successfully cleaned up user-scoped message rows", "count", deletedCount)
-				rowsDeleted += deletedCount
+			result := db.S3BodyCleanupResult{Gone: gone}
+			for _, orphan := range orphans {
+				if orphan.KeepObject {
+					continue
+				}
+				if failure, failed := failures[keyOf(orphan)]; failed && storage.DeleteDefinitelyRefused(failure) {
+					result.Rejected = append(result.Rejected, orphan)
+				}
 			}
-			deleted += len(gone)
-			return nil
+			return result, nil
 		})
+		rowsDeleted += retired
 		batch = batch[:0]
 		if err != nil {
+			phaseErr = err
 			logger.Error("Cleanup: Failed to lock S3 objects for deletion", "error", err)
 			return false
 		}
@@ -379,12 +403,12 @@ func reapS3Objects(ctx context.Context, rdb s3ObjectReaper, s3 S3BulkDeleter, gr
 
 		batch = append(batch, candidate)
 		if len(batch) == s3DeleteBatchSize && !flush() {
-			return deleted, rowsDeleted, nil
+			return deleted, rowsDeleted, phaseErr
 		}
 	}
 
 	flush()
-	return deleted, rowsDeleted, nil
+	return deleted, rowsDeleted, phaseErr
 }
 
 func (w *CleanupWorker) runOnce(ctx context.Context) error {

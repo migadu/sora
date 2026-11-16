@@ -1002,3 +1002,85 @@ resume old deleters alongside new claimers or resume deletion while old work or
 write capabilities can still arrive. This runbook does not establish storage fencing
 across independent PostgreSQL writers after failover; the deployment must retain its
 existing single-writer/fencing guarantees.
+
+### An uncertain body DELETE stays quarantined
+
+The upgraded cleanup path commits a durable deletion intent (migration 72) before
+sending a message-body DELETE. The intent names the content hash, physical keys,
+and an operation UUID. If its PostgreSQL lock holder dies, a storage request times
+out, or the result/retirement commit is uncertain, the intent remains. New upload
+gates, uploaded-state finalization, COPY/MOVE object admission, restore and the
+exclusive object gate refuse that hash. Other deliveries can still stage it for a
+later upload. Neither an old timestamp, an upload lease expiring, nor a restart
+clears this fence. Cleanup retains its candidate rows when retirement cannot commit
+on the connection that held the reference lock.
+
+Inspect these records without changing anything:
+
+```sh
+sora-admin verify body-deletions
+```
+
+An operator must establish that the earlier storage operations cannot still arrive
+before reconciling one record. Stop/drain or revoke the relevant operations and
+capabilities at the provider as required; a canceled HTTP client or a dead database
+session is not that proof. Then use the exact hash and operation UUID from the
+listing, with the deletion protocol enabled:
+
+```sh
+sora-admin verify body-deletions --reconcile --content-hash HASH --operation-id UUID --storage-drained
+```
+
+Under the global hash lock this command checks current references. Bodies needed by
+references outside the original eligible expunge lifecycle must be present and pass
+their content-hash check; restore missing or corrupt bytes from a trusted copy first.
+Orphan-only keys are deleted before the exact intent is cleared. Missing/corrupt
+protected bytes, a changed UUID, a failed storage request, or a failed commit keeps
+the fence. `--storage-drained` is an explicit manual acknowledgment, not automatic
+detection of outstanding provider operations. Do not erase intent rows or downgrade
+migration 72 while they remain; its down migration refuses unresolved records.
+
+A stalled PUT that loses its pending-upload lease cannot finalize a retired row.
+If the provider accepts that PUT after cleanup has finished, it can leave an orphan
+object for later verification; the protocol does not promise to retract remote PUTs
+or external write capabilities. Retain the single-writer database and operational
+drain requirements above. The complete verify/rekey commit-fencing cohort must be
+deployed before enabling destructive cleanup.
+
+
+### Uncertain message-body DELETE requests (migration72)
+
+The body deletion protocol commits a durable per-hash operation UUID, physical
+keys and eligible expunge lifecycles before contacting storage. A lost database
+holder, unknown storage result or uncertain retirement commit leaves this intent
+in place. It never expires with upload leases or elapsed time. All upgraded body
+claimers refuse the quarantined hash until reconciliation; staged uploads remain
+available to retry later. Confirmed retirement removes only the original eligible
+row tuples, preserving rows staged or expunged later within their grace period.
+
+Body cleanup retains its writable lock connection while committing the intent
+on another write-pool connection. A deletion-capable process needs at least two
+available write-pool connections and headroom for other workers. A saturated or
+one-connection pool times out and leaves candidates untouched; this protocol does
+not promise deletion progress at full pool saturation. A local 100-key/2000-row
+SQL probe measured about2x the previous pipeline's time; production costs depend
+on storage latency, pool sizing and workload.
+
+Keep body deletion paused until the complete #607/#774/#787/#838 protocol is
+installed on every server, uploader and admin process sharing the logical write
+database and object store, and every old deleter, writer and outstanding storage
+capability has been drained as described above. Migration72 does not detect that
+drain. Never enable this protocol while an older participant can resume.
+
+List unresolved work with `sora-admin verify body-deletions` (read-only). For one
+intent, first establish that its old DELETE requests and writers cannot resume;
+cancellation or a missing PostgreSQL connection alone does not prove that. Then
+run `sora-admin verify body-deletions --reconcile --content-hash HASH --operation-id UUID --storage-drained`
+with `body_deletion_protocol = "global-hash-v1"`. The explicit acknowledgment is an
+operator assertion, not automatic fleet detection. The command holds the body
+lock, verifies downloaded bytes for references outside the original eligible
+expunge lifecycles, deletes orphan-only keys, and clears only the exact UUID.
+Missing or corrupt protected bytes must be restored from an authoritative copy
+before reconciliation can succeed. Any uncertain new storage request keeps the
+fence. Do not manually delete intent rows or use a TTL to bypass this process.
+Migration72 rollback refuses while any intent remains, preserving recovery state.

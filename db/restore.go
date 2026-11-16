@@ -461,6 +461,9 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", GetS3ObjectLockID(accountID, msg.contentHash)); err != nil {
 			return 0, fmt.Errorf("failed to lock object for message %d: %w", msg.id, err)
 		}
+		if err := CheckS3BodyClaims(ctx, tx, []string{msg.contentHash}); err != nil {
+			return 0, err
+		}
 
 		var restorable bool
 		var alreadyExists bool
