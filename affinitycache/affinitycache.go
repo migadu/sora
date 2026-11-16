@@ -29,6 +29,10 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// errNotAFile refuses an in-memory or temporary database. It is not corruption: deleting
+// the files named after the path and opening it again cannot help.
+var errNotAFile = errors.New("an in-memory or temporary database does not persist")
+
 // AffinityEntry represents a persisted affinity mapping.
 type AffinityEntry struct {
 	Username   string
@@ -45,10 +49,19 @@ type Store struct {
 	mu sync.Mutex
 }
 
-// New creates a new affinity persistence store at dbPath.
-// If the database is corrupted, it is automatically deleted and recreated.
+// New creates a new affinity persistence store at dbPath, a file path or a file: URI
+// (sqlitefile.Parse).
+// If the database is corrupted, it is deleted and recreated only when the URI
+// mode permits creating files (the default or mode=rwc).
 func New(dbPath string) (*Store, error) {
-	sqliteDB, err := openAndValidate(dbPath)
+	file, query, err := sqlitefile.Parse(dbPath)
+	if err == nil && file == "" {
+		err = fmt.Errorf("%q is not a file: %w", dbPath, errNotAFile)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("failed to open affinity cache db: %w", err)
+	}
+	sqliteDB, err := openAndValidate(file, query)
 	if err != nil {
 		if !isCorruptionError(err) {
 			// Not corruption (e.g. permission denied, missing directory,
@@ -57,11 +70,14 @@ func New(dbPath string) (*Store, error) {
 			// real error so the operator can fix the path/permissions.
 			return nil, fmt.Errorf("failed to open affinity cache db: %w", err)
 		}
+		if create, _ := sqlitefile.CanCreate(query); !create {
+			return nil, fmt.Errorf("cannot recreate corrupt affinity cache with a no-create URI mode: %w", err)
+		}
 		logger.Warn("AffinityCache: Database appears corrupted, recreating", "path", dbPath, "error", err)
-		if removeErr := removeDBFiles(dbPath); removeErr != nil {
+		if removeErr := removeDBFiles(file); removeErr != nil {
 			return nil, fmt.Errorf("failed to remove corrupted affinity cache db: %w", removeErr)
 		}
-		sqliteDB, err = openAndValidate(dbPath)
+		sqliteDB, err = openAndValidate(file, query)
 		if err != nil {
 			return nil, fmt.Errorf("failed to recreate affinity cache db: %w", err)
 		}
@@ -77,8 +93,8 @@ func New(dbPath string) (*Store, error) {
 // and read-only errors must be surfaced so an operator can fix them rather than
 // being silently (and futilely) "recreated".
 func isCorruptionError(err error) bool {
-	// Filesystem/access problems are never corruption.
-	if errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist) {
+	// Filesystem/access problems, and a database that is not a file, are never corruption.
+	if errors.Is(err, fs.ErrPermission) || errors.Is(err, fs.ErrNotExist) || errors.Is(err, errNotAFile) {
 		return false
 	}
 	msg := strings.ToLower(err.Error())
@@ -101,34 +117,40 @@ func isCorruptionError(err error) bool {
 // opens; a PRAGMA run with Exec on the pool sets them on one pooled connection only.
 const connParams = "_pragma=busy_timeout(5000)&_pragma=synchronous(NORMAL)"
 
-// openAndValidate opens a SQLite database, sets pragmas, and creates the schema.
-func openAndValidate(dbPath string) (*sql.DB, error) {
-	dsn := dbPath
-	if dbPath != ":memory:" && !strings.HasPrefix(dbPath, "file:") {
-		// Ensure the database file has 0600 permissions.
-		// If the file does not exist, pre-create it with 0600 permissions.
-		f, err := os.OpenFile(dbPath, os.O_CREATE|os.O_RDWR, 0600)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create or set permissions on database file: %w", err)
-		}
-		f.Close()
-		// If the file already exists, enforce 0600 permissions on it.
-		if err := os.Chmod(dbPath, 0600); err != nil {
-			return nil, fmt.Errorf("failed to enforce 0600 permissions on database file: %w", err)
-		}
-		// Open that same file: a plain path would be cut at its first '?'.
-		if dsn, err = sqlitefile.DSN(dbPath, connParams); err != nil {
-			return nil, err
-		}
-	} else if strings.Contains(dsn, "?") {
-		dsn += "&" + connParams
-	} else {
-		dsn += "?" + connParams
+// openAndValidate opens the SQLite database file at path, 0600, with the URI query
+// params (empty for none), sets pragmas, and creates the schema.
+func openAndValidate(path, params string) (*sql.DB, error) {
+	if err := sqlitefile.Prepare(path, params); err != nil {
+		return nil, err
+	}
+	// Open that same file: a plain path would be cut at its first '?'.
+	if params != "" {
+		params += "&"
+	}
+	dsn, err := sqlitefile.DSN(path, params+connParams)
+	if err != nil {
+		return nil, err
 	}
 
 	sqliteDB, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("failed to open: %w", err)
+	}
+
+	// The store must be a database file. An in-memory or temporary database (":memory:",
+	// "file::memory:", mode=memory, vfs=memdb, an empty name), for which SQLite reports
+	// no file name, is private to the connection that opened it, or with a shared cache
+	// lasts only while a connection is open: the pool's other connections would have no
+	// schema and no rows, and none of it survives the restart the store exists for. New
+	// refuses the names known to open one before creating anything; this catches the rest.
+	var file string
+	if err := sqliteDB.QueryRow(`SELECT file FROM pragma_database_list WHERE name = 'main'`).Scan(&file); err != nil {
+		sqliteDB.Close()
+		return nil, fmt.Errorf("failed to read database file name: %w", err)
+	}
+	if file == "" {
+		sqliteDB.Close()
+		return nil, fmt.Errorf("%q is not a file: %w", path, errNotAFile)
 	}
 
 	if _, err := sqliteDB.Exec(`PRAGMA journal_mode = WAL`); err != nil {

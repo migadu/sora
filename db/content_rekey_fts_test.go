@@ -321,3 +321,122 @@ func TestRekeyWaitsForCopiesInFlight(t *testing.T) {
 		})
 	}
 }
+
+// TestRekeyWaitsForCopiesBeforeTheirFTSRow: a COPY or MOVE into another account inserts its
+// rows first and creates the destination's FTS row (restageFTS) only afterwards; a MOVE has
+// also locked its source rows by then. A barrier holds the copy between the two -- the
+// pending upload that restagePendingUploads writes just before restageFTS conflicts with the
+// barrier's uncommitted one -- while the rekey runs. A rekey that does not wait for the copy
+// deletes the old hash's FTS row, the sibling restageFTS then needs (COPY), or deadlocks
+// with the MOVE, which waits for the FTS lock while the rekey waits for its row locks.
+func TestRekeyWaitsForCopiesBeforeTheirFTSRow(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		op   func(f *rekeyFTSFixture, tx pgx.Tx, uids *[]imap.UID, sourceHashes map[imap.UID]string) error
+		inA  bool // whether account A keeps a live row of the body
+	}{
+		{"copy into another account", func(f *rekeyFTSFixture, tx pgx.Tx, uids *[]imap.UID, sourceHashes map[imap.UID]string) error {
+			domain, localpart := f.path(f.b)
+			_, _, err := f.d.CopyMessages(f.ctx, tx, uids, f.inboxA, f.sharedB, f.b, domain, localpart, "test", sourceHashes, nil)
+			return err
+		}, true},
+		{"move into another account", func(f *rekeyFTSFixture, tx pgx.Tx, uids *[]imap.UID, sourceHashes map[imap.UID]string) error {
+			domain, localpart := f.path(f.b)
+			_, err := f.d.MoveMessages(f.ctx, tx, uids, f.inboxA, f.sharedB, f.b, domain, localpart, "test", sourceHashes, nil)
+			return err
+		}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newRekeyFTSFixture(t)
+			oldHash, newHash := f.hash("old"), f.hash("new")
+			t.Cleanup(func() {
+				f.d.GetWritePool().Exec(context.Background(), `DELETE FROM pending_uploads WHERE content_hash = ANY($1)`, f.hashes)
+			})
+			uid := f.importBody(f.a, f.inboxA, oldHash)
+			f.drainFTS()
+			pool := f.d.GetWritePool()
+			ctx, cancel := context.WithTimeout(f.ctx, 30*time.Second)
+			defer cancel()
+
+			// No destination object is passed, so the copied row is not uploaded and the copy
+			// stages an upload of (old hash, B) -- which waits for the barrier's.
+			barrier, err := pool.Begin(ctx)
+			require.NoError(t, err)
+			defer barrier.Rollback(f.ctx)
+			var barrierPID int
+			require.NoError(t, barrier.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&barrierPID))
+			_, err = barrier.Exec(ctx, `INSERT INTO pending_uploads (instance_id, content_hash, size, account_id) VALUES ('barrier', $1, 100, $2)`, oldHash, f.b)
+			require.NoError(t, err)
+
+			copyDone := make(chan error, 1)
+			go func() {
+				tx, err := pool.Begin(ctx)
+				if err != nil {
+					copyDone <- err
+					return
+				}
+				defer tx.Rollback(f.ctx)
+				uids := []imap.UID{uid}
+				if err := tc.op(f, tx, &uids, map[imap.UID]string{uid: oldHash}); err != nil {
+					copyDone <- err
+					return
+				}
+				copyDone <- tx.Commit(ctx)
+			}()
+			require.Eventually(t, func() bool {
+				var blocked bool
+				_ = pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))`, barrierPID).Scan(&blocked)
+				return blocked
+			}, 10*time.Second, 10*time.Millisecond, "the copy never waited for the barrier")
+
+			conn, err := pool.Acquire(ctx)
+			require.NoError(t, err)
+			defer conn.Release()
+			var rekeyPID int
+			require.NoError(t, conn.QueryRow(ctx, "SELECT pg_backend_pid()").Scan(&rekeyPID))
+			rekeyDone := make(chan error, 1)
+			go func() {
+				tx, err := conn.Begin(ctx)
+				if err != nil {
+					rekeyDone <- err
+					return
+				}
+				defer tx.Rollback(f.ctx)
+				domain, localpart := f.path(f.a)
+				if _, err := f.d.RekeyContentHash(ctx, tx, f.a, ContentObject{S3Domain: domain, S3Localpart: localpart, ContentHash: oldHash}, newHash); err != nil {
+					rekeyDone <- err
+					return
+				}
+				rekeyDone <- tx.Commit(ctx)
+			}()
+
+			// Let the copy go once the rekey has finished or waits for a lock.
+			var rekeyErr error
+			rekeyFinished := false
+			require.Eventually(t, func() bool {
+				select {
+				case rekeyErr = <-rekeyDone:
+					rekeyFinished = true
+					return true
+				default:
+				}
+				var waiting bool
+				_ = pool.QueryRow(ctx, `SELECT COALESCE(bool_or(wait_event_type = 'Lock'), false) FROM pg_stat_activity WHERE pid = $1`, rekeyPID).Scan(&waiting)
+				return waiting
+			}, 10*time.Second, 10*time.Millisecond, "the rekey neither finished nor waited for a lock")
+			require.NoError(t, barrier.Rollback(ctx))
+
+			require.NoError(t, <-copyDone, "the copy")
+			if !rekeyFinished {
+				rekeyErr = <-rekeyDone
+			}
+			require.NoError(t, rekeyErr, "the rekey")
+
+			f.drainFTS()
+			f.requireSearchable(f.b, oldHash, newHash)
+			if tc.inA {
+				f.requireSearchable(f.a, oldHash, newHash)
+			}
+		})
+	}
+}

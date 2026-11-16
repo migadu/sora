@@ -456,7 +456,8 @@ func (rd *ResilientDatabase) hardDeleteAccountChunked(ctx context.Context, accou
 		if done {
 			return nil
 		}
-		// A step that is not done always expunged rows, so this loop cannot spin.
+		// A step that is not done always expunged rows, or found live ones that a
+		// concurrent EXPUNGE or MOVE expunged first, so this loop cannot spin.
 	}
 }
 
@@ -766,6 +767,9 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 
 // executeReadWithRetry provides a generic wrapper for executing a read operation with retries and circuit breaker protection.
 func (rd *ResilientDatabase) executeReadWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context) (any, error), nonRetryableErrors ...error) (any, error) {
+	if db.HasReadSnapshot(ctx) {
+		return op(ctx)
+	}
 	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		opCtx, cancel := rd.withTimeout(ctx, opType)

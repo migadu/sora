@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -19,7 +20,7 @@ func TestS3ImporterDatabaseStaysInTempDir(t *testing.T) {
 	require.NoError(t, os.Mkdir(tmpDir, 0700))
 	t.Setenv("TMPDIR", tmpDir)
 
-	importer, err := NewS3Importer(nil, nil, S3ImporterOptions{CleanupDB: true})
+	importer, err := NewS3Importer(context.Background(), nil, nil, S3ImporterOptions{Workers: 1, CleanupDB: true})
 	require.NoError(t, err)
 	assert.FileExists(t, importer.dbPath)
 	assert.Equal(t, tmpDir, filepath.Dir(importer.dbPath))
@@ -39,7 +40,7 @@ func TestS3ImporterRunsDoNotShareDatabase(t *testing.T) {
 	tmpDir := t.TempDir()
 	t.Setenv("TMPDIR", tmpDir)
 
-	first, err := NewS3Importer(nil, nil, S3ImporterOptions{CleanupDB: true})
+	first, err := NewS3Importer(context.Background(), nil, nil, S3ImporterOptions{Workers: 1, CleanupDB: true})
 	require.NoError(t, err)
 	defer first.Close()
 	_, err = first.db.Exec(`INSERT INTO s3_objects (key, size, last_modified, etag, domain, local_part, content_hash)
@@ -47,7 +48,7 @@ func TestS3ImporterRunsDoNotShareDatabase(t *testing.T) {
 		"example.com", "a", "hash")
 	require.NoError(t, err)
 
-	second, err := NewS3Importer(nil, nil, S3ImporterOptions{CleanupDB: true})
+	second, err := NewS3Importer(context.Background(), nil, nil, S3ImporterOptions{Workers: 1, CleanupDB: true})
 	require.NoError(t, err)
 	defer second.Close()
 

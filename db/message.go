@@ -17,31 +17,32 @@ import (
 
 // Message struct to represent an email message
 type Message struct {
-	ID             int64      // ID of the message
-	AccountID      int64      // ID of the user who owns the message
-	UID            imap.UID   // Unique identifier for the message
-	ContentHash    string     // Hash of the message content
-	S3Domain       string     // S3 domain for the message
-	S3Localpart    string     // S3 localpart for the message
-	MailboxID      int64      // ID of the mailbox the message belongs to
-	IsUploaded     bool       // Indicates if the message is uploaded to S3
-	Seq            uint32     // Sequence number of the message in the mailbox
-	BitwiseFlags   int        // Bitwise flags for the message (e.g., \Seen, \Flagged)
-	CustomFlags    []string   // Custom flags for the message
-	FlagsChangedAt *time.Time // Time when the flags were last changed
-	Subject        string     // Subject of the message
-	InternalDate   time.Time  // The internal date the message was received
-	SentDate       time.Time  // The Date: header in its own zone (sentDateInHeaderZone); its INTERNALDATE when NoDateHeader
-	NoDateHeader   bool       // No Date: header that parses (sent_date_unknown): the ENVELOPE date is NIL
-	Size           int        // Size of the message in bytes
-	MessageID      string     // Unique Message-ID from the message headers
-	InReplyTo      string
-	References     string
-	BodyStructure  *imap.BodyStructure
-	CreatedModSeq  int64
-	UpdatedModSeq  *int64
-	RecipientsJSON []byte
-	ExpungedModSeq *int64
+	ID                  int64      // ID of the message
+	AccountID           int64      // ID of the user who owns the message
+	UID                 imap.UID   // Unique identifier for the message
+	ContentHash         string     // Hash of the message content
+	S3Domain            string     // S3 domain for the message
+	S3Localpart         string     // S3 localpart for the message
+	MailboxID           int64      // ID of the mailbox the message belongs to
+	IsUploaded          bool       // Indicates if the message is uploaded to S3
+	Seq                 uint32     // Sequence number of the message in the mailbox
+	BitwiseFlags        int        // Bitwise flags for the message (e.g., \Seen, \Flagged)
+	CustomFlags         []string   // Custom flags for the message
+	FlagsChangedAt      *time.Time // Time when the flags were last changed
+	Subject             string     // Subject of the message
+	InternalDate        time.Time  // The internal date the message was received
+	SentDate            time.Time  // The Date: header in its own zone (sentDateInHeaderZone); its INTERNALDATE when NoDateHeader
+	SentDateUnknownZone bool       // Source zone unavailable (NULL sent_utc_offset), independently of NoDateHeader
+	NoDateHeader        bool       // No Date: header that parses (sent_date_unknown): the ENVELOPE date is NIL
+	Size                int        // Size of the message in bytes
+	MessageID           string     // Unique Message-ID from the message headers
+	InReplyTo           string
+	References          string
+	BodyStructure       *imap.BodyStructure
+	CreatedModSeq       int64
+	UpdatedModSeq       *int64
+	RecipientsJSON      []byte
+	ExpungedModSeq      *int64
 }
 
 // POP3Message is the minimal per-message projection used by the POP3 protocol
@@ -370,8 +371,10 @@ func streamMessagesBySeqSet(ctx context.Context, run MessageStreamDBRunner, mail
 	if len(seqSet) == 0 {
 		return nil
 	}
-	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) {
-		// 1:* names every message: of the mailbox, or in a view (WithSeqView) of the view.
+	// Without a view 1:* names every live message, numbered by counting them. In a view
+	// (WithSeqView) the held messages are counted too and "*" is the view's last
+	// message, so the set goes through uidsBySeqNum. (A session never sends "*".)
+	if len(seqSet) == 1 && seqSet[0].Start == 1 && (seqSet[0].Stop == 0) && seqViewOf(ctx) == 0 {
 		logger.Debug("Database: Streaming SeqSet 1:* fetch", "mailbox_id", mailboxID)
 		return streamAllActiveMessagesRawChunked(ctx, run, mailboxID, cb, includeBodyStructure)
 	}
@@ -415,12 +418,6 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 	if includeBodyStructure {
 		bsCol = "m.body_structure, "
 	}
-	// In a view, a message created since it is not one of its messages.
-	view := seqViewOf(ctx)
-	viewCond := ""
-	if view > 0 {
-		viewCond = "AND m.created_modseq <= $4"
-	}
 
 	query := fmt.Sprintf(`
 		SELECT
@@ -430,18 +427,14 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
-		  AND m.uid > $2 %s
+		  AND m.uid > $2
 		ORDER BY m.uid ASC
 		LIMIT $3
-	`, bsCol, viewCond)
+	`, bsCol)
 
 	return StreamMessageChunksWithRunner(ctx, run, "all_messages", func(stepCtx context.Context, db *Database, afterUID imap.UID, afterSeq uint32) ([]Message, int, error) {
 		chunkSize := db.effectiveFetchChunkSize()
-		args := []any{mailboxID, int64(afterUID), chunkSize}
-		if view > 0 {
-			args = append(args, int64(view))
-		}
-		rows, err := db.GetReadPoolWithContext(stepCtx).Query(stepCtx, query, args...)
+		rows, err := db.GetReadPoolWithContext(stepCtx).Query(stepCtx, query, mailboxID, int64(afterUID), chunkSize)
 		if err != nil {
 			return nil, 0, fmt.Errorf("fetchAllActiveMessagesRaw: failed to query chunk after uid %d: %w", afterUID, err)
 		}
@@ -449,17 +442,6 @@ func streamAllActiveMessagesRawChunked(ctx context.Context, run MessageStreamDBR
 		messages, err := scanMessages(rows, includeBodyStructure)
 		if err != nil {
 			return nil, 0, err
-		}
-
-		// In a view, messages expunged since it still hold sequence numbers between
-		// the live ones read here, so the database numbers the chunk.
-		if view > 0 {
-			if len(messages) > 0 {
-				if err := db.hydrateChunkSequences(stepCtx, mailboxID, messages, uint32(afterUID), afterSeq); err != nil {
-					return nil, 0, err
-				}
-			}
-			return messages, chunkSize, nil
 		}
 
 		// Every active message is read in UID order from the start, so sequence
@@ -501,6 +483,7 @@ func scanMessages(rows pgx.Rows, includeBodyStructure bool) ([]Message, error) {
 			return nil, fmt.Errorf("failed to scan message: %w", err)
 		}
 		msg.SentDate = sentDateInHeaderZone(msg.SentDate, sentUTCOffset)
+		msg.SentDateUnknownZone = sentUTCOffset == nil && !msg.NoDateHeader && !msg.SentDate.IsZero()
 
 		if includeBodyStructure {
 			msg.BodyStructure = deserializeBodyStructure(bodyStructureBytes, msg.Size, msg.AccountID, msg.MailboxID, msg.UID, msg.ContentHash)
@@ -792,7 +775,7 @@ func (db *Database) hydrateChunkSequences(ctx context.Context, mailboxID int64, 
 	}
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
 		SELECT uid, $2::bigint + ROW_NUMBER() OVER(ORDER BY uid)
-		FROM `+seqCountedRows("$1", viewParam, "uid > $3 AND uid <= $4")+` counted
+		FROM `+seqCountedRows("$1", viewParam, "uid > $3 AND uid <= $4", "ASC", "")+` counted
 	`, args...)
 	if err != nil {
 		return fmt.Errorf("failed to query sequence window after uid %d: %w", anchorUID, err)
@@ -846,17 +829,22 @@ func hydrateSequencesCore[T any](
 
 	// Fetch mailbox stats for bidirectional sweep decision.
 	// On deadlock/lock timeout, gracefully fall back to forward sweep.
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT COALESCE(highest_uid, 1)
-		FROM mailboxes
-		WHERE id = $1
-	`, mailboxID).Scan(&uidNext)
+	err := InReadSavepoint(ctx, func(spCtx context.Context) error {
+		return db.readQuerier(spCtx).QueryRow(spCtx, `
+			SELECT COALESCE(highest_uid, 1)
+			FROM mailboxes
+			WHERE id = $1
+		`, mailboxID).Scan(&uidNext)
+	})
 
 	useForwardSweep := true // Default to forward sweep
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			// Mailbox doesn't exist - this is a real error
 			return fmt.Errorf("mailbox %d not found for sequence hydration", mailboxID)
+		}
+		if errors.Is(err, ErrReadSnapshotAborted) {
+			return err
 		}
 		// On deadlock or other transient errors, fall back to forward sweep
 		// This prevents test flakiness during concurrent execution
@@ -888,7 +876,7 @@ func hydrateSequencesCore[T any](
 		query = `
 			WITH all_uids AS (
 				SELECT uid, ROW_NUMBER() OVER(ORDER BY uid) as seqnum
-				FROM ` + seqCountedRows("$1", viewParam, "uid <= $3") + ` counted
+				FROM ` + seqCountedRows("$1", viewParam, "uid <= $3", "ASC", "") + ` counted
 			)
 			SELECT a.uid, a.seqnum
 			FROM all_uids a
@@ -899,11 +887,11 @@ func hydrateSequencesCore[T any](
 		query = `
 			WITH counted_total AS (
 				SELECT COUNT(*)::int as cnt
-				FROM ` + seqCountedRows("$1", viewParam, "") + ` counted
+				FROM ` + seqCountedRows("$1", viewParam, "", "", "") + ` counted
 			),
 			all_uids AS (
 				SELECT uid, (SELECT cnt FROM counted_total) - ROW_NUMBER() OVER(ORDER BY uid DESC) + 1 as seqnum
-				FROM ` + seqCountedRows("$1", viewParam, "uid >= $3") + ` counted
+				FROM ` + seqCountedRows("$1", viewParam, "uid >= $3", "DESC", "") + ` counted
 			)
 			SELECT a.uid, a.seqnum
 			FROM all_uids a
@@ -912,7 +900,7 @@ func hydrateSequencesCore[T any](
 		args[2] = int64(minUID)
 	}
 
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
+	rows, err := db.readQuerier(ctx).Query(ctx, query, args...)
 
 	if err != nil {
 		return fmt.Errorf("failed to query sequence streams: %w", err)

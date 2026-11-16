@@ -132,11 +132,13 @@ func NewAffinityManager(clusterMgr *cluster.Manager, enabled bool, ttl, cleanupI
 // memory only. The manager owns store and closes it in Stop.
 //
 // clusterMgr has already joined the cluster, so gossip arrives from the moment
-// the handler is registered. The store is attached before that, so that every
-// event applied is also written. The handler is registered before the file is
-// read, but waits for that initial snapshot: queued events then pass through
-// the normal timestamp checks against the loaded state, so an older SET cannot
-// replace a newer persisted assignment while the file is being read.
+// the handler is registered, and the cluster drops what arrives before: open
+// store before joining, not in between. The store is attached before the
+// handler is registered, so that every event applied is also written. The
+// handler is registered before the file is read, but waits for that initial
+// snapshot: queued events then pass through the normal timestamp checks
+// against the loaded state, so an older SET cannot replace a newer persisted
+// assignment while the file is being read.
 func NewAffinityManagerWithStore(ctx context.Context, clusterMgr *cluster.Manager, enabled bool, ttl, cleanupInterval time.Duration, store AffinityPersistStore) *AffinityManager {
 	if !enabled || clusterMgr == nil {
 		if store != nil {

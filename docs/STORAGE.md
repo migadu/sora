@@ -247,7 +247,11 @@ directory.
 If the file already exists with the right size (the same body is being delivered again, or
 is still being uploaded), Sora leaves it alone and only updates its modification time. A
 message filed into another account's shared mailbox is staged a second time, under the
-owner's account ID, as a hard link (or a copy, if a link is not possible).
+owner's account ID, as a hard link (or a copy, if a link is not possible). If the
+recipient's file is gone by then (its upload finished in the meantime), the owner's file is
+written from the delivered message instead. The owner's upload reads only the owner's file,
+so a delivery that cannot stage it fails with a temporary error (LMTP `451`, a transient
+Admin API delivery error) and stores nothing in that mailbox.
 
 Keep the staging directory and the cache directory on the same filesystem. After an upload,
 the staged file moves into the cache with a rename. Across filesystems that rename becomes a
@@ -294,13 +298,15 @@ seconds, and at once whenever a message is queued on this node. In each pass it:
 
 ### 6.4 Leases and the write gate
 
-S3 deletes (by the cleanup worker and by account purges) and S3 writes for the same body
-must never overlap. Sora orders them with a per-body PostgreSQL advisory lock and a lease on
-the pending row:
+Within an account, Sora orders S3 deletes (by the cleanup worker and by account purges)
+and writes of a body with a PostgreSQL advisory lock keyed by `(accountID, contentHash)`
+and a lease on the pending row. Another account's reference to the same physical S3 key
+uses a different advisory lock; these locks do not exclude every writer of that key.
+For operations using the same account/hash key:
 
-- Before it writes, an upload briefly takes the body's lock. If a delete, a restore or a
-  cross-account copy of that body is running, the upload is deferred until the row's
-  `retry_interval` passes.
+- Before it writes, an upload briefly takes the body's lock. If a delete, a restore, or a
+  cross-account copy or move of that body is running, the upload is deferred until the
+  row's `retry_interval` passes.
 - Passing the gate leases the pending row to this upload for 2 minutes. The worker renews
   the lease every 30 seconds while the transfer runs. If it cannot renew in time, or the row
   is gone, it stops the transfer.
@@ -356,8 +362,11 @@ Your MTA keeps the message and retries a `452`. LMTP also answers `452 4.3.1` wh
 staging disk is full or read-only, whether or not a limit is set.
 
 The worker keeps the total in memory and corrects it every 5 minutes from this node's rows
-in `pending_uploads`. Set a limit below the free space of the staging disk, so that a long S3
-outage makes the MTA queue mail instead of filling the disk.
+in `pending_uploads`. A body the node staged since it started that has no row (a delivery
+whose transaction has yet to commit, one that failed after writing its file, or a duplicate
+of a body already in S3) stays counted until its row appears or the orphan sweep removes the
+file. Set a limit below the free space of the staging disk, so that a long S3 outage makes
+the MTA queue mail instead of filling the disk.
 
 ### 6.8 The orphan sweep
 
@@ -597,8 +606,9 @@ set, for example to `"365d"`, each cleanup cycle expunges every message whose ro
 than that, in every mailbox of every account.
 
 - The age counts from when Sora created the message row (`messages.created_at`). Delivery,
-  APPEND, import, COPY and MOVE all create a new row, so each of them starts a new clock for
-  that copy. The `Date:` header and the IMAP internal date do not matter.
+  APPEND, import, COPY, MOVE and a restore (`sora-admin messages restore`, the Admin API) all
+  create a new row, so each of them starts a new clock for that copy. The `Date:` header and
+  the IMAP internal date do not matter.
 - The cycle expunges in batches of 1000, pauses 2 seconds between batches, and spends at most
   30 seconds. What does not fit waits for the next cycle.
 - Expunged mail then waits the normal `grace_period` before its body is removed. So mail is
@@ -630,6 +640,9 @@ worker deletes a message that is not uploaded when both of these hold:
 A node that has never written a heartbeat or taken a lease counts as alive, because Sora
 cannot tell whether it is gone. Deleting mail by mistake is permanent; keeping it costs only
 disk.
+
+The worker never waits for a folder that another session is changing at that moment (a
+delivery, a flag change, an expunge). It leaves that folder's messages for a later cycle.
 
 With the defaults this means:
 
@@ -810,7 +823,7 @@ How it works:
    S3 key of the account's expunged messages (with no grace period), deletes the search
    vectors, and finally deletes the addresses and the account row.
 4. **Retries.** If something is still left at the end (an upload of one of its bodies is in
-   flight, a body is locked by a restore or copy, S3 refuses a delete, or a message arrived
+   flight, a body is locked by a restore, copy or move, S3 refuses a delete, or a message arrived
    shortly before the account went out of service), it runs the whole purge again, up to 5
    times in one go, with short pauses. If that is not enough, the attempt fails: the account
    stays out of service, and the next attempt waits 1 minute, doubling per failure up to
@@ -845,7 +858,7 @@ Metrics and log lines:
 | The S3 bucket | **Yes** | Every uploaded body. Use your provider's replication or versioning, or copy the bucket. |
 | `[s3] encryption_key` | **Yes, apart from the bucket** | Without it, an encrypted bucket is unreadable. |
 | The config file and TLS keys | Yes | |
-| `[uploader] path` | Keep it on durable storage instead | It holds the only copy of mail not yet in S3: normally for seconds, during an S3 outage for hours. A periodic backup of it is of little use. Do not put it on `tmpfs` or under a `/tmp` that is cleared at boot (the default is `/tmp/sora/uploads`). |
+| `[uploader] path` | Keep it on durable storage instead | It holds the only copy of mail not yet in S3: normally for seconds, during an S3 outage for hours. A periodic backup of it is of little use. Do not put it on `tmpfs` or under a `/tmp` that is cleared at boot (the default is `/var/spool/sora/uploads`). |
 | `[local_cache] path` | No | Rebuilt from S3. |
 | Auth cache, affinity cache | No | Rebuilt. See [PROXY.md](PROXY.md). |
 | `[relay.queue] path` | See [RELAY.md](RELAY.md) | Outgoing redirects and vacation replies. |
@@ -948,12 +961,12 @@ Required on every storage node.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | `"/tmp/sora/cache"` | Cache directory. Created if missing. Put it on the same filesystem as `[uploader] path`. |
+| `path` | string | `"/var/cache/sora/cache"` | Cache directory. Created if missing. Put it on the same filesystem as `[uploader] path`. |
 | `capacity` | size | `"1gb"` | Total size the cache is kept within. |
 | `max_object_size` | size | `"5mb"` | Largest body cached, after an upload, an S3 read or a warmup. Also the default of the IMAP server's `preview_s3_max_size`. |
-| `purge_interval` | duration | `"12h"` | How often the cache is trimmed and cleaned. |
+| `purge_interval` | duration | `"12h"` | How often the cache is trimmed and cleaned. Must be positive. |
 | `orphan_cleanup_age` | duration | `"30d"` | Unread time after which a cached body of deleted mail is removed. |
-| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are written to `cache_metrics`. |
+| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are written to `cache_metrics`. Must be positive. |
 | `metrics_retention` | duration | `"30d"` | How long `cache_metrics` rows are kept. |
 | `enable_warmup` | bool | `true` | Preload recent mail at IMAP login. |
 | `warmup_message_count` | int | `50` | Messages per mailbox to preload. |
@@ -962,13 +975,15 @@ Required on every storage node.
 | `warmup_timeout` | duration | `"5m"` | Longest time one warmup may run. |
 | `warmup_interval` | duration | `"24h"` | Shortest interval between two warmups of one account. |
 
-An invalid duration or size in this section is logged as a warning and the default is used.
+An invalid duration or size in this section is logged as a warning and the default is used. A
+`purge_interval` or `metrics_interval` of zero or less is refused at start-up and by
+`sora-admin config validate` when the node has a mail backend (`imap`, `lmtp`, or `pop3`).
 
 ### `[uploader]`
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | `"/tmp/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. |
+| `path` | string | `"/var/spool/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. |
 | `instance_id` | string | the hostname | The node's [instance ID](ARCHITECTURE.md#8-node-identity), the owner of its pending uploads. Unique per `sora` process, stable across restarts. |
 | `batch_size` | int | `10` | Pending rows taken per database query. Each body is still its own S3 request. Must be positive. |
 | `concurrency` | int | `20` | Uploads in flight at once. Must be positive. |

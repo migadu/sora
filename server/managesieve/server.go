@@ -380,7 +380,7 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 		OnStartTLS:             serverPkg.BeginStartTLS,
 		OnTLSHandshakeComplete: serverPkg.CompleteStartTLS,
 		Implementation:         "ManageSieve",
-		Greeting:               `"Sora" ManageSieve server ready.`,
+		Greeting:               `"Sora ManageSieve server ready."`, // written verbatim after "OK ": one quoted string (RFC 5804 section 4, response-ok)
 		GreetingStartTLSHint:   true,
 		SieveExtensions:        msieve.GetSieveCapabilities(s.supportedExtensions),
 		MaxScriptSize:          settings.maxScriptSize,
@@ -470,8 +470,14 @@ func (s *ManageSieveServer) buildLibServer() *managesieveserver.Server {
 			}
 			session.mutexHelper = serverPkg.NewMutexTimeoutHelper(&session.mutex, sessionCtx, "managesieve", logFunc)
 
-			// Log connection with session context (protocol, remote, session id)
-			session.DebugLog("new connection")
+			// Log connection with session context (protocol, remote, session id), and the
+			// session a managesieve_proxy's PROXY v2 header names (TLV 0xE1): it leads
+			// from the proxy's session=<id> to this session.
+			if proxyInfo != nil && proxyInfo.ProxySessionID != "" {
+				session.InfoLog("connected", "proxy_session", proxyInfo.ProxySessionID)
+			} else {
+				session.InfoLog("connected")
+			}
 
 			// Track session for graceful shutdown
 			s.addSession(session)
@@ -841,7 +847,8 @@ func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 	return nil
 }
 
-// GetLookupCache returns the lookup cache for testing purposes
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
 func (s *ManageSieveServer) GetLookupCache() *lookupcache.LookupCache {
 	return s.lookupCache
 }
@@ -864,6 +871,8 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 		return 0, "main_db", "transient_error", err
 	}
 
+	cacheGeneration := s.lookupCache.Generation()
+
 	// Check cache first if enabled
 	if s.lookupCache != nil {
 		cachedAccountID, found, cacheErr := s.lookupCache.Authenticate(address, password)
@@ -882,6 +891,8 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 		logger.Debug("Authentication: cache miss, checking database", "address", address)
 	}
 
+	cacheGeneration = s.lookupCache.Generation()
+
 	// Fetch credentials from database (no caching - we handle that here)
 	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, address)
 	if err != nil {
@@ -898,7 +909,7 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 		// Cache negative result if enabled (user not found)
 		if s.lookupCache != nil {
 			// AuthUserNotFound = 1 (from lookupcache package)
-			s.lookupCache.SetFailure(address, 1)
+			s.lookupCache.SetFailureIfGeneration(cacheGeneration, address, 1)
 		}
 		return 0, "main_db", "user_not_found", err
 	}
@@ -918,14 +929,14 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 		// Cache negative result for invalid password if enabled
 		// AuthInvalidPassword = 2 (from lookupcache package)
 		if s.lookupCache != nil {
-			s.lookupCache.SetFailure(address, 2)
+			s.lookupCache.SetFailureIfGeneration(cacheGeneration, address, 2)
 		}
 		return 0, "main_db", "invalid_password", err
 	}
 
 	// Cache successful authentication if enabled
 	if s.lookupCache != nil {
-		s.lookupCache.SetSuccess(address, accountID, hashedPassword, password)
+		s.lookupCache.SetSuccessIfGeneration(cacheGeneration, address, accountID, hashedPassword, password)
 	}
 
 	// Asynchronously rehash if needed
@@ -945,10 +956,10 @@ func (s *ManageSieveServer) Authenticate(ctx context.Context, address, password 
 				newHashedPassword = string(newHash)
 			}
 
-			// Update password in database
-			if err := s.rdb.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
+			// Upgrade only the account/address/hash actually authenticated.
+			if changed, err := s.rdb.RehashCredentialWithRetry(updateCtx, address, accountID, hashedPassword, newHashedPassword); err != nil {
 				logger.Error("Rehash: Failed to update password", "address", address, "error", err)
-			} else {
+			} else if changed {
 				logger.Info("Rehash: Successfully rehashed and updated password", "address", address)
 				// Invalidate cache entry since password hash changed
 				if s.lookupCache != nil {

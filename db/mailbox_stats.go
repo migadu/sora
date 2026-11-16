@@ -91,18 +91,13 @@ func (d *Database) RecomputeMailboxUnseen(ctx context.Context, tx pgx.Tx, mailbo
 	}
 
 	var unseen int64
-	err := tx.QueryRow(ctx, fmt.Sprintf(`
+	err := tx.QueryRow(ctx, `
 		UPDATE mailbox_stats ms
-		SET unseen_count = (
-			SELECT COUNT(*)
-			FROM message_state mst
-			JOIN messages m ON m.id = mst.message_id AND m.mailbox_id = mst.mailbox_id
-			WHERE mst.mailbox_id = $1 AND (mst.flags & %d) = 0 AND m.expunged_at IS NULL
-		),
+		SET unseen_count = `+liveUnseenCount("$1")+`,
 		updated_at = now()
 		WHERE ms.mailbox_id = $1
 		RETURNING unseen_count
-	`, FlagSeen), mailboxID).Scan(&unseen)
+	`, mailboxID).Scan(&unseen)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			// No cache row to repair; effective value is already 0.
@@ -111,6 +106,83 @@ func (d *Database) RecomputeMailboxUnseen(ctx context.Context, tx pgx.Tx, mailbo
 		return 0, fmt.Errorf("failed to recompute unseen_count for mailbox %d: %w", mailboxID, err)
 	}
 	return unseen, nil
+}
+
+// liveUnseenCount is a subquery that counts the live unseen messages of the mailbox
+// whose id is mailboxID, an SQL expression: the value unseen_count caches.
+func liveUnseenCount(mailboxID string) string {
+	return fmt.Sprintf(`(
+		SELECT COUNT(*)
+		FROM message_state mst
+		JOIN messages m ON m.id = mst.message_id AND m.mailbox_id = mst.mailbox_id
+		WHERE mst.mailbox_id = %s AND (mst.flags & %d) = 0 AND m.expunged_at IS NULL
+	)`, mailboxID, FlagSeen)
+}
+
+// MailboxUnseenExcess is a mailbox whose cached unseen_count (Cached) is above the
+// number of live unseen messages it holds (Actual).
+type MailboxUnseenExcess struct {
+	MailboxID int64
+	AccountID int64
+	Name      string
+	Cached    int64
+	Actual    int64
+}
+
+// UnseenExcessBatch is one batch of FindExcessUnseenCounts.
+type UnseenExcessBatch struct {
+	Excess        []MailboxUnseenExcess // the checked mailboxes counted too high
+	Checked       int                   // how many mailboxes the batch checked; 0 at the end
+	LastMailboxID int64                 // the last mailbox checked: where the next batch starts
+}
+
+// FindExcessUnseenCounts checks up to limit mailboxes with a positive cached
+// unseen_count, in id order after afterMailboxID, of the account accountID (of every
+// account when it is 0), and returns those whose cached count is above the live count.
+// Hard deletes of live unseen messages before #1564 left such counts, and the self-heal
+// (ReconcileNegativeMailboxStats, STATUS, LIST) recomputes only a negative one.
+//
+// It only reads, in one statement, so each cached count is compared with the live
+// count of the same snapshot. RecomputeMailboxUnseen repairs a mailbox it returns.
+func (d *Database) FindExcessUnseenCounts(ctx context.Context, accountID, afterMailboxID int64, limit int) (UnseenExcessBatch, error) {
+	args := []any{afterMailboxID, limit}
+	account := ""
+	if accountID != 0 {
+		args = append(args, accountID)
+		account = "AND mb.account_id = $3"
+	}
+	// The live counts are taken in the outer query, so only for the mailboxes of the batch.
+	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT b.mailbox_id, b.account_id, b.name, b.unseen_count, `+liveUnseenCount("b.mailbox_id")+`
+		FROM (
+			SELECT ms.mailbox_id, mb.account_id, mb.name, ms.unseen_count
+			FROM mailbox_stats ms
+			JOIN mailboxes mb ON mb.id = ms.mailbox_id
+			WHERE ms.mailbox_id > $1 AND ms.unseen_count > 0 `+account+`
+			ORDER BY ms.mailbox_id
+			LIMIT $2
+		) b
+		ORDER BY b.mailbox_id
+	`, args...)
+	if err != nil {
+		return UnseenExcessBatch{}, fmt.Errorf("failed to check unseen counts after mailbox %d: %w", afterMailboxID, err)
+	}
+	checked, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (MailboxUnseenExcess, error) {
+		var m MailboxUnseenExcess
+		err := row.Scan(&m.MailboxID, &m.AccountID, &m.Name, &m.Cached, &m.Actual)
+		return m, err
+	})
+	if err != nil {
+		return UnseenExcessBatch{}, fmt.Errorf("failed to check unseen counts after mailbox %d: %w", afterMailboxID, err)
+	}
+	batch := UnseenExcessBatch{Checked: len(checked)}
+	for _, m := range checked {
+		if m.Cached > m.Actual {
+			batch.Excess = append(batch.Excess, m)
+		}
+		batch.LastMailboxID = m.MailboxID
+	}
+	return batch, nil
 }
 
 // ReconcileNegativeMailboxStats finds every mailbox whose cached unseen_count has

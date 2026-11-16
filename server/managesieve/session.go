@@ -27,6 +27,7 @@ const ManageSieveMaxLineLength = 8192 // ManageSieve commands can be longer than
 // logic — authentication (incl. master credentials), script storage in
 // PostgreSQL, go-sieve validation, quotas, rate limiting, and metrics.
 type ManageSieveSession struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	mutex         sync.RWMutex
 	mutexHelper   *server.MutexTimeoutHelper
@@ -88,6 +89,7 @@ func authUnavailable(err error) bool {
 // per-command context: it aborts delay waits and DB calls promptly when the
 // connection or server goes away mid-command.
 func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, authnID, password string) error {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 	start := time.Now()
 	success := false
 	outcome := "failure"
@@ -153,8 +155,14 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 
 		// Suffix matches MasterUsername, authenticate with MasterPassword
 		if len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-			if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
-				return errAuthFailed
+			// Every refusal of the correct master password below costs what a wrong one
+			// costs (refuseLikeWrongPassword), or its response time confirms the guessed
+			// password, here to a peer the gate keeps out. No limiter: the helper records
+			// the failure, once.
+			if !s.AdmitMasterLogin(ctx, settings.masterSASLGate, nil, netConn, proxyInfo, authKey, "master username") {
+				refusalErr, out := s.refuseLikeWrongPassword(ctx, authnParsed, nil, password, netConn, proxyInfo, authKey)
+				outcome = out
+				return refusalErr
 			}
 			// The success is NOT recorded here. A success clears this key's Tier-1 count
 			// and, via clearFailureTracking, the source IP's Tier-2 count and any active
@@ -176,17 +184,17 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			address, err := server.NewAddress(targetUserToImpersonate)
 			if err != nil {
 				// A rejected impersonation target is answered exactly like a bad
-				// credential, and recorded exactly like one under authKey. This site
-				// is reachable ONLY with the correct master password, so a
-				// distinguishable reply — or a failure the master credential is not
-				// charged for, which diverges from a wrong password at the block
-				// threshold — confirms a guessed tenant-wide password without
-				// completing an authentication. The real reason stays in the log.
+				// credential, recorded exactly like one under authKey, and after the
+				// same password-verification work. This site is reachable ONLY with the
+				// correct master password, so a distinguishable reply, a failure the
+				// master credential is not charged for (which diverges from a wrong
+				// password at the block threshold), or a quicker one confirms a guessed
+				// tenant-wide password without completing an authentication. The real
+				// reason stays in the log.
 				s.WarnLog("impersonation target rejected (address not in the correct format)", "target_user", targetUserToImpersonate, "error", err)
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
-				return errAuthFailed
+				refusalErr, out := s.refuseLikeWrongPassword(ctx, authnParsed, nil, password, netConn, proxyInfo, authKey)
+				outcome = out
+				return refusalErr
 			}
 
 			accountID, err = s.server.rdb.GetMasterLoginTargetWithRetry(ctx, address.BaseAddress())
@@ -199,12 +207,12 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 					s.WarnLog("impersonation target lookup unavailable", "target_user", targetUserToImpersonate, "error", err)
 					return errTryLater
 				}
-				// Same reply and same accounting as a bad credential (see above).
+				// Same reply, accounting and password-verification work as a bad
+				// credential (see above).
 				s.WarnLog("impersonation target rejected (account not found)", "target_user", targetUserToImpersonate, "error", err)
-				if s.server.authLimiter != nil {
-					s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-				}
-				return errAuthFailed
+				refusalErr, out := s.refuseLikeWrongPassword(ctx, authnParsed, nil, password, netConn, proxyInfo, authKey)
+				outcome = out
+				return refusalErr
 			}
 
 			// The impersonation is complete, so this attempt really did succeed.
@@ -435,7 +443,7 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 		// username. Not recorded as a failure: the credentials were right.
 		if authzID != "" && authzID != authnID {
 			outcome = ""
-			s.DebugLog("proxy authentication requires master credentials", "authz_id", authzID, "authn_id", authnID)
+			s.InfoLog("authorization failed", "address", address.BaseAddress(), "authzid", authzID, "method", method)
 			return &managesieveserver.Error{Message: msieve.Quote("Proxy authentication requires master credentials")}
 		}
 
@@ -464,7 +472,9 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 // outcome to count. A refusal that skipped the check would be answered one
 // verification sooner and confirm what made it one. Used for a refused master SASL
 // impersonation (#846), which must not answer with the proxy-auth error when
-// authnParsed names an account whose own password is the master SASL password.
+// authnParsed names an account whose own password is the master SASL password, and for
+// every refusal of the correct password in the master username form (gate, target),
+// which must cost what a wrong one costs (#801).
 // The caller logs why the login is refused; only a check that could not be made is
 // logged here, because it changes the reply.
 func (s *ManageSieveSession) refuseLikeWrongPassword(ctx context.Context, authnParsed server.Address, parseErr error, password string, netConn net.Conn, proxyInfo *server.ProxyProtocolInfo, authKey string) (error, string) {
@@ -486,6 +496,7 @@ func (s *ManageSieveSession) refuseLikeWrongPassword(ctx context.Context, authnP
 // accepted. The library has already handled unquoting and the TLS and
 // re-authentication gates. ctx is the library's per-command context.
 func (s *ManageSieveSession) Login(ctx context.Context, username, password string) error {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 	start := time.Now()
 
 	netConn := s.conn
@@ -556,9 +567,13 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 	// credential's key; only a success is the account's.
 	masterForm := len(s.server.masterUsername) > 0 && address.HasSuffix() && checkMasterCredential(address.Suffix(), s.server.masterUsername)
 	if masterForm && len(s.server.masterPassword) > 0 && checkMasterCredential(password, s.server.masterPassword) {
-		if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, s.server.authLimiter, netConn, proxyInfo, authKey, "master username") {
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
-			return errAuthFailed
+		// Every refusal of the correct master password below costs what a wrong one
+		// costs (refuseLikeWrongPassword, see AuthenticatePlain). No limiter: the helper
+		// records the failure, once.
+		if !s.AdmitMasterLogin(ctx, s.server.settings.Load().masterSASLGate, nil, netConn, proxyInfo, authKey, "master username") {
+			refusalErr, out := s.refuseLikeWrongPassword(ctx, address, nil, password, netConn, proxyInfo, authKey)
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, out).Inc()
+			return refusalErr
 		}
 		s.DebugLog("master username authentication successful", "address", address.BaseAddress(), "master_username", address.Suffix())
 		authSuccess = true
@@ -572,12 +587,12 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "unavailable").Inc()
 				return errTryLater
 			}
+			// Same reply, accounting and password-verification work as a bad
+			// credential, see AuthenticatePlain.
 			s.WarnLog("failed to get account id", "address", address.BaseAddress(), "error", err)
-			if s.server.authLimiter != nil {
-				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
-			}
-			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
-			return errAuthFailed
+			refusalErr, out := s.refuseLikeWrongPassword(ctx, address, nil, password, netConn, proxyInfo, authKey)
+			metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, out).Inc()
+			return refusalErr
 		}
 	}
 
@@ -642,7 +657,7 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	// Acquire write lock for updating session authentication state
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
-		s.WarnLog("failed to acquire write lock", "operation", "authenticate")
+		s.WarnLog("failed to acquire write lock", "operation", "authenticate", "address", address.BaseAddress(), "method", method)
 		return errServerBusy
 	}
 	defer release()
@@ -857,7 +872,7 @@ func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 	start := time.Now()
 	ctx, cancel := applyCommandTimeout(ctx, "SETACTIVE", s.server.commandTimeouts)
 	defer cancel()
-	accountID, readCtx, err := s.sessionState(ctx, "SETACTIVE")
+	accountID, _, err := s.sessionState(ctx, "SETACTIVE")
 	if err != nil {
 		return err
 	}
@@ -871,7 +886,9 @@ func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 		return nil
 	}
 
-	script, dbErr := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
+	// Read from the master: a replica may still hold a script deleted since, or
+	// content replaced since, which is not what the activation below activates.
+	script, dbErr := s.server.rdb.GetScriptByNameWithRetry(context.WithValue(ctx, consts.UseMasterDBKey, true), name, accountID)
 	if dbErr != nil {
 		if dbErr == consts.ErrDBNotFound {
 			return errNonExistent
@@ -884,7 +901,12 @@ func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 		return err
 	}
 
+	// Activate the row that was validated, by ID. The script may have been
+	// deleted since the lookup; nothing is changed then.
 	if err := s.server.rdb.SetScriptActiveWithRetry(ctx, script.ID, accountID, true); err != nil {
+		if errors.Is(err, consts.ErrDBNotFound) {
+			return errNonExistent
+		}
 		return errTryLater
 	}
 
@@ -901,31 +923,27 @@ func (s *ManageSieveSession) SetActive(ctx context.Context, name string) error {
 func (s *ManageSieveSession) DeleteScript(ctx context.Context, name string) error {
 	ctx, cancel := applyCommandTimeout(ctx, "DELETESCRIPT", s.server.commandTimeouts)
 	defer cancel()
-	accountID, readCtx, err := s.sessionState(ctx, "DELETESCRIPT")
+	accountID, _, err := s.sessionState(ctx, "DELETESCRIPT")
 	if err != nil {
 		return err
 	}
 
-	script, dbErr := s.server.rdb.GetScriptByNameWithRetry(readCtx, name, accountID)
-	if dbErr != nil {
-		if dbErr == consts.ErrDBNotFound {
-			return errNonExistent
-		}
-		return errTryLater
-	}
-
 	// RFC 5804 §2.10: the active script MUST NOT be deleted; the client must
-	// first deactivate it via SETACTIVE "".
-	if script.Active {
+	// first deactivate it via SETACTIVE "". The script is looked up and checked
+	// in the delete's transaction: a lookup before it (on a lagging replica, or
+	// racing another session's SETACTIVE) can see an inactive script that is
+	// active by the time it is deleted.
+	switch err := s.server.rdb.DeleteInactiveScriptWithRetry(ctx, name, accountID); {
+	case err == nil:
+		s.pinToMasterDB("DELETESCRIPT")
+		return nil
+	case errors.Is(err, consts.ErrDBNotFound):
+		return errNonExistent
+	case errors.Is(err, db.ErrSieveScriptActive):
 		return &managesieveserver.Error{Code: "ACTIVE", Message: "Cannot delete the active script; deactivate it first"}
-	}
-
-	if err := s.server.rdb.DeleteScriptByIDWithRetry(ctx, script.ID, accountID); err != nil {
+	default:
 		return errTryLater
 	}
-
-	s.pinToMasterDB("DELETESCRIPT")
-	return nil
 }
 
 // RenameScript implements managesieveserver.Session. The rename is a single
@@ -1126,7 +1144,7 @@ func (s *ManageSieveSession) startTerminationPoller() {
 	conn := s.conn
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done

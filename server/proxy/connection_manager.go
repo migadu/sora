@@ -99,6 +99,7 @@ func (p *backendPool) stamp(info *UserRoutingInfo) {
 	info.RemoteTLSVerify = p.settings.TLSVerify
 	info.RemoteUseProxyProtocol = p.settings.UseProxyProtocol
 	info.RemoteUseIDCommand = p.settings.UseIDCommand
+	info.RemoteSkipForwardingWithProxyProtocol = p.settings.SkipForwardingWithProxyProtocol
 	info.RemoteUseXCLIENT = p.settings.UseXCLIENT
 	info.RemoteUseUTF8 = p.settings.UseUTF8
 }
@@ -1266,9 +1267,8 @@ func (cm *ConnectionManager) useProxyProtocol(routingInfo *UserRoutingInfo, addr
 
 // SendsProxyHeader reports whether ConnectWithProxy, given these client and server
 // addresses, starts its connection to addr for this route with a PROXY header. The header
-// names the client, and an IMAP or POP3 backend judges ID forwarding and XCLIENT by that
-// client, not by the proxy (server.ForwardingSourceIP), so the IMAP and POP3 proxies send
-// neither on such a connection. The dial decides by this same call.
+// names the client. IMAP/POP3 use this same decision for explicitly configured
+// forwarding suppression; the default preserves configured ID/XCLIENT metadata.
 func (cm *ConnectionManager) SendsProxyHeader(routingInfo *UserRoutingInfo, addr, clientIP string, clientPort int, serverIP string, serverPort int) bool {
 	return cm.useProxyProtocol(routingInfo, addr) && clientIP != "" && clientPort > 0 && serverIP != "" && serverPort > 0
 }

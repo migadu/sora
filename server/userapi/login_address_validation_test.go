@@ -1,7 +1,6 @@
 package userapi
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -13,7 +12,6 @@ import (
 	"golang.org/x/crypto/bcrypt"
 
 	"github.com/migadu/sora/db"
-	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/testutils"
 )
@@ -22,9 +20,9 @@ import (
 // invalid domain or IDN label, internal whitespace, or an @-suffix) names no
 // account. Like an unknown user on a backend or an invalid address on the User
 // API proxy (#850), it must be gated by the rate limiter first, answered 401
-// {"error": "Invalid credentials"} after one dummy password verification, and
-// recorded as a failed login attempt without touching the auth cache or the
-// database.
+// {"error": "Invalid credentials"} with a wrong password's Bearer challenge after one
+// dummy password verification, and recorded as a failed login attempt without touching
+// the database.
 func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testing.T) {
 	origCost := db.BcryptCost
 	db.BcryptCost = bcrypt.MinCost
@@ -109,15 +107,8 @@ func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testin
 			})
 			t.Cleanup(limiter.Stop)
 
-			cache := lookupcache.New("userapi", "test-invalid-addr", 5*time.Minute, time.Minute, 100, 5*time.Minute, 30*time.Second)
-			t.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_ = cache.Stop(ctx)
-			})
-
 			// s.rdb is nil: touching PostgreSQL panics and fails the test.
-			s := &Server{name: "test-invalid-addr", authCache: cache, authLimiter: limiter}
+			s := &Server{name: "test-invalid-addr", authLimiter: limiter}
 			clientAddr := fmt.Sprintf("198.51.100.%d:40000", idx+1)
 
 			postLogin := func(rawBody string) (*httptest.ResponseRecorder, int) {
@@ -144,8 +135,8 @@ func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testin
 				if rec.Code != http.StatusUnauthorized {
 					t.Fatalf("%s: status %d (%q), want 401", step, rec.Code, rec.Body.String())
 				}
-				if got := rec.Header().Values("WWW-Authenticate"); len(got) != 0 {
-					t.Errorf("%s: unexpected WWW-Authenticate header on public JSON login: %q", step, got)
+				if got := rec.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != noTokenChallenge {
+					t.Errorf("%s: WWW-Authenticate = %q, want %q", step, got, noTokenChallenge)
 				}
 				var body map[string]string
 				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["error"] != "Invalid credentials" {
@@ -167,17 +158,14 @@ func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testin
 			rec3, ver3 := postLogin(tc.body1)
 			assertRefused401("attempt 3 (rate-limited)", rec3, ver3, 0)
 
-			hits, misses, size, _ := cache.GetStats()
-			if hits != 0 || misses != 0 || size != 0 {
-				t.Errorf("authCache touched for invalid address: hits=%d misses=%d size=%d, want 0/0/0", hits, misses, size)
-			}
 		})
 	}
 }
 
 // A refresh token whose email claim is blank, malformed, NUL-containing, or
 // carries an @-suffix names no valid credential and must be answered 401
-// {"error": "Invalid or expired token"} before touching the database.
+// {"error": "Invalid or expired token"} with error="invalid_token" in the challenge
+// before touching the database.
 func TestRefreshTokenWithInvalidAddressClaimWithoutDatabase(t *testing.T) {
 	s, err := New(nil, ServerOptions{
 		Name:      "refresh-invalid-addr",
@@ -219,8 +207,8 @@ func TestRefreshTokenWithInvalidAddressClaimWithoutDatabase(t *testing.T) {
 			if rec.Code != http.StatusUnauthorized {
 				t.Fatalf("status %d (%q), want 401", rec.Code, rec.Body.String())
 			}
-			if got := rec.Header().Values("WWW-Authenticate"); len(got) != 0 {
-				t.Errorf("unexpected WWW-Authenticate header on public JSON refresh: %q", got)
+			if got := rec.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != refusedTokenChallenge {
+				t.Errorf("WWW-Authenticate = %q, want %q", got, refusedTokenChallenge)
 			}
 			var resp map[string]string
 			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp["error"] != "Invalid or expired token" {

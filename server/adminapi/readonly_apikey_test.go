@@ -47,7 +47,7 @@ func TestAuthMiddleware_ReadOnlyAPIKey(t *testing.T) {
 		{http.MethodPut, roKey, http.StatusForbidden},
 		{http.MethodDelete, roKey, http.StatusForbidden},
 		{http.MethodPatch, roKey, http.StatusForbidden},
-		{http.MethodGet, "wrong-key", http.StatusForbidden},
+		{http.MethodGet, "wrong-key", http.StatusUnauthorized},
 	}
 	for _, c := range cases {
 		if got := authStatus(s, c.method, c.key); got != c.want {
@@ -100,8 +100,8 @@ func TestReloadConfig_ReadOnlyAPIKey(t *testing.T) {
 	if err := s.ReloadConfig(config.ServerConfig{Name: "ro", APIKey: rwKey, ReadOnlyAPIKey: roKey2}); err != nil {
 		t.Fatal(err)
 	}
-	if got := authStatus(s, http.MethodGet, roKey); got != http.StatusForbidden {
-		t.Errorf("replaced read_only_api_key: status %d, want 403", got)
+	if got := authStatus(s, http.MethodGet, roKey); got != http.StatusUnauthorized {
+		t.Errorf("replaced read_only_api_key: status %d, want 401", got)
 	}
 
 	const weak = "weak-ro-key"
@@ -116,8 +116,8 @@ func TestReloadConfig_ReadOnlyAPIKey(t *testing.T) {
 	if err := s.ReloadConfig(config.ServerConfig{Name: "ro", APIKey: rwKey}); err != nil {
 		t.Fatal(err)
 	}
-	if got := authStatus(s, http.MethodGet, roKey2); got != http.StatusForbidden {
-		t.Errorf("revoked read_only_api_key: status %d, want 403", got)
+	if got := authStatus(s, http.MethodGet, roKey2); got != http.StatusUnauthorized {
+		t.Errorf("revoked read_only_api_key: status %d, want 401", got)
 	}
 }
 
@@ -158,9 +158,9 @@ func TestReloadConfig_RepeatedSIGHUPRejectsAPIKeyReuse(t *testing.T) {
 					{http.MethodPost, rwKey, http.StatusOK},
 					{http.MethodGet, roKey, http.StatusOK},
 					{http.MethodPost, roKey, http.StatusForbidden},
-					{http.MethodGet, nextRW, http.StatusForbidden},
-					{http.MethodPost, nextRW, http.StatusForbidden},
-					{http.MethodGet, roKey2, http.StatusForbidden},
+					{http.MethodGet, nextRW, http.StatusUnauthorized},
+					{http.MethodPost, nextRW, http.StatusUnauthorized},
+					{http.MethodGet, roKey2, http.StatusUnauthorized},
 				} {
 					if got := authStatus(s, check.method, check.key); got != check.want {
 						t.Errorf("reload %d: %s with %q: status %d, want %d", attempt, check.method, check.key, got, check.want)
@@ -193,8 +193,8 @@ func TestReloadConfig_RotatesAPIKeysTogether(t *testing.T) {
 		method, key string
 		want        int
 	}{
-		{http.MethodGet, rwKey, http.StatusForbidden},
-		{http.MethodGet, roKey, http.StatusForbidden},
+		{http.MethodGet, rwKey, http.StatusUnauthorized},
+		{http.MethodGet, roKey, http.StatusUnauthorized},
 		{http.MethodGet, nextRW, http.StatusOK},
 		{http.MethodPost, nextRW, http.StatusOK},
 		{http.MethodGet, roKey2, http.StatusOK},
@@ -208,10 +208,63 @@ func TestReloadConfig_RotatesAPIKeysTogether(t *testing.T) {
 	if err := s.ReloadConfig(cfg); err != nil {
 		t.Fatal(err)
 	}
-	if got := authStatus(s, http.MethodGet, roKey2); got != http.StatusForbidden {
-		t.Errorf("revoked read-only key: status %d, want 403", got)
+	if got := authStatus(s, http.MethodGet, roKey2); got != http.StatusUnauthorized {
+		t.Errorf("revoked read-only key: status %d, want 401", got)
 	}
 	if got := authStatus(s, http.MethodPost, nextRW); got != http.StatusOK {
 		t.Errorf("full-access key after revocation: status %d, want 200", got)
+	}
+}
+
+// A bearer token the Admin API refuses gets the challenge with the reason, and the status
+// the reason calls for. RFC 6750 section 3: "If the protected resource request does not
+// include authentication credentials or does not contain an access token that enables
+// access to the protected resource, the resource server MUST include the HTTP
+// "WWW-Authenticate" response header field". Section 3.1 names the reasons and their
+// statuses: a wrong key is "invalid_token" ("The resource SHOULD respond with the HTTP 401
+// (Unauthorized) status code"), the read-only key on a write "insufficient_scope" ("The
+// resource server SHOULD respond with the HTTP 403 (Forbidden) status code"). The JSON
+// bodies stay as they were.
+func TestAuthMiddleware_RefusedKeyCarriesBearerChallenge(t *testing.T) {
+	s, err := New(&resilient.ResilientDatabase{}, ServerOptions{Name: "ro", APIKey: rwKey, ReadOnlyAPIKey: roKey})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	h := s.authMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	cases := []struct {
+		name, method, key string
+		wantStatus        int
+		wantChallenge     string
+		wantBody          string
+	}{
+		{"wrong key", http.MethodGet, "wrong-key", http.StatusUnauthorized, `Bearer realm="admin-api", error="invalid_token"`, `{"error":"Invalid API key"}`},
+		{"wrong key on a write", http.MethodPost, "wrong-key", http.StatusUnauthorized, `Bearer realm="admin-api", error="invalid_token"`, `{"error":"Invalid API key"}`},
+		{"read-only key on a write", http.MethodPost, roKey, http.StatusForbidden, `Bearer realm="admin-api", error="insufficient_scope"`, `{"error":"API key is read-only"}`},
+		{"read-only key on a read", http.MethodGet, roKey, http.StatusOK, "", ""},
+		{"full key", http.MethodDelete, rwKey, http.StatusOK, "", ""},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			r := httptest.NewRequest(c.method, "/admin/accounts/user@example.com", nil)
+			r.Header.Set("Authorization", "Bearer "+c.key)
+			w := httptest.NewRecorder()
+			h.ServeHTTP(w, r)
+			if w.Code != c.wantStatus {
+				t.Fatalf("status %d, want %d (body %q)", w.Code, c.wantStatus, w.Body.String())
+			}
+			got := w.Header().Values("WWW-Authenticate")
+			if c.wantChallenge == "" {
+				if len(got) != 0 {
+					t.Errorf("accepted key answered with a challenge: %q", got)
+				}
+			} else if len(got) != 1 || got[0] != c.wantChallenge {
+				t.Errorf("WWW-Authenticate = %q, want %q", got, c.wantChallenge)
+			}
+			if body := strings.TrimSpace(w.Body.String()); body != c.wantBody {
+				t.Errorf("body %q, want %q", body, c.wantBody)
+			}
+		})
 	}
 }

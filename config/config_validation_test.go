@@ -280,7 +280,7 @@ func TestWarnUnusedConfigOptions_RemoteStartTLS(t *testing.T) {
 		{
 			name: "user_api_proxy with remote_lookup remote_tls_use_starttls",
 			serverConfig: ServerConfig{Type: "user_api_proxy", Name: "user-api-proxy-test", RemoteTLS: true,
-				RemoteLookup: &RemoteLookupConfig{RemoteTLS: true, RemoteTLSUseStartTLS: true}},
+				RemoteLookup: &RemoteLookupConfig{RemoteTLSUseStartTLS: true}},
 			wantWarning: "'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy",
 		},
 	}
@@ -363,6 +363,20 @@ func TestWarnTLSVerifyWithoutTLS(t *testing.T) {
 				}
 			}
 		})
+	}
+	// The metrics endpoint is plain HTTP with or without tls = true (#1326): one
+	// warning names tls_verify, and it does not send the operator to set tls.
+	for _, withTLS := range []bool{false, true} {
+		cfg := ServerConfig{Type: "metrics", Name: "listener", TLS: withTLS, TLSVerify: true}
+		var named []string
+		cfg.WarnUnusedConfigOptions(func(format string, args ...any) {
+			if w := fmt.Sprintf(format, args...); strings.Contains(w, "'tls_verify'") {
+				named = append(named, w)
+			}
+		})
+		if len(named) != 1 || strings.Contains(named[0], "without 'tls = true'") {
+			t.Fatalf("metrics with tls = %v: want one warning naming tls_verify as not applied, got %v", withTLS, named)
+		}
 	}
 }
 

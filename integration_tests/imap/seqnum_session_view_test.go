@@ -3,10 +3,12 @@
 package imap_test
 
 import (
+	"context"
 	"regexp"
 	"strings"
 	"testing"
 
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/require"
 )
@@ -199,10 +201,12 @@ func TestIMAP_SessionSeqNums_SearchAfterForeignExpunge(t *testing.T) {
 	require.Contains(t, tagged, "OK")
 	require.Equal(t, []string{"* SEARCH 2 3"}, untagged)
 
-	// UID SEARCH may send the EXPUNGE, after its results.
+	// UID SEARCH may send the EXPUNGE, after its results. UID 1 was \Recent in
+	// the viewer, so the corrected RECENT count follows the EXPUNGE (RFC 3501
+	// §7.3.2).
 	untagged, tagged = viewer.cmd("s4", "UID SEARCH 2")
 	require.Contains(t, tagged, "OK")
-	require.Equal(t, []string{"* SEARCH 2", "* 1 EXPUNGE"}, untagged, "the client's message 2 is UID 2")
+	require.Equal(t, []string{"* SEARCH 2", "* 1 EXPUNGE", "* 2 RECENT"}, untagged, "the client's message 2 is UID 2")
 }
 
 // TestIMAP_SessionSeqNums_SortAfterForeignExpunge: SORT results are sequence
@@ -333,4 +337,44 @@ func TestIMAP_Poll_PhantomDoesNotExpungeTheNextMessage(t *testing.T) {
 	untagged, tagged = viewer.cmd("p3", "FETCH 4 (UID)")
 	require.Contains(t, tagged, "OK")
 	require.Equal(t, []string{"4:5"}, seqUIDPairs(untagged))
+}
+
+// TestIMAP_SessionSeqNums_StarStopsAtTheClientsLastMessage: "*" and a range ending at
+// the client's last message name the messages the client knows, however many the
+// database counts by then. A restored message keeps the created_modseq it had before
+// its expunge, so until the next poll it sits below the session's cursor without the
+// client having been told about it; STORE 1:* must not reach it.
+func TestIMAP_SessionSeqNums_StarStopsAtTheClientsLastMessage(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	t.Cleanup(server.Close)
+	ctx := context.Background()
+
+	other := dialRaw(t, server.Address)
+	t.Cleanup(func() { other.conn.Close() })
+	other.login(account)
+	setupInboxWith(t, other, 4)
+	_, tagged := other.cmd("o1", `UID STORE 4 +FLAGS.SILENT (\Deleted)`)
+	require.Contains(t, tagged, "OK")
+	_, tagged = other.cmd("o2", "EXPUNGE")
+	require.Contains(t, tagged, "OK")
+
+	viewer := dialRaw(t, server.Address)
+	t.Cleanup(func() { viewer.conn.Close() })
+	viewer.login(account)
+	untagged, tagged := viewer.cmd("v1", "SELECT INBOX")
+	require.Contains(t, tagged, "OK")
+	require.Contains(t, untagged, "* 3 EXISTS")
+
+	inbox := "INBOX"
+	restored, err := server.ResilientDB.RestoreMessagesWithRetry(ctx, db.RestoreMessagesParams{Email: account.Email, MailboxPath: &inbox})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), restored)
+
+	_, tagged = viewer.cmd("v2", `STORE 1:* +FLAGS.SILENT (\Flagged)`)
+	require.Contains(t, tagged, "OK")
+
+	require.Contains(t, flagsOfUID(t, other, "3"), `\Flagged`)
+	require.NotContains(t, flagsOfUID(t, other, "5"), `\Flagged`,
+		"the restored message (UID 5) is not one of the three the client knew")
 }

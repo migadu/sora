@@ -17,6 +17,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 	"github.com/migadu/sora/consts"
@@ -124,10 +125,11 @@ func (e *DatabaseEndpointConfig) GetMaxConnIdleTime() (time.Duration, error) {
 }
 
 // Validate checks that the endpoint's pool durations, max_conn_lifetime and
-// max_conn_idle_time, parse. A pool is not created without them: a write host is
-// marked failed, so start-up stops with "no healthy database pools available", and a
-// read replica is retried for good. query_timeout is not checked: an unparsable one
-// falls back to the [database] query_timeout with a warning.
+// max_conn_idle_time, parse, and that each host entry resolves to a host and port
+// (HostPort). A pool is not created without them: a write host is marked failed, so
+// start-up stops with "no healthy database pools available", and a read replica is
+// retried for good. query_timeout is not checked: an unparsable one falls back to the
+// [database] query_timeout with a warning.
 func (e *DatabaseEndpointConfig) Validate() error {
 	if _, err := e.GetMaxConnLifetime(); err != nil {
 		return fmt.Errorf("invalid max_conn_lifetime %q: %w", e.MaxConnLifetime, err)
@@ -135,7 +137,55 @@ func (e *DatabaseEndpointConfig) Validate() error {
 	if _, err := e.GetMaxConnIdleTime(); err != nil {
 		return fmt.Errorf("invalid max_conn_idle_time %q: %w", e.MaxConnIdleTime, err)
 	}
+	for _, host := range e.Hosts {
+		if _, err := e.HostPort(host); err != nil {
+			return err
+		}
+	}
 	return nil
+}
+
+// defaultPostgresPort is used for a host entry without a port when the endpoint sets none.
+const defaultPostgresPort = 5432
+
+// HostPort returns the host:port the pool for one host entry of the endpoint connects
+// to. A host entry that carries a port ("db.example.com:5433", "[2001:db8::1]:5433")
+// keeps it; otherwise the endpoint's port applies, 5432 when unset. Either port must be
+// a number in 1-65535. A bare IPv6 address is bracketed.
+func (e *DatabaseEndpointConfig) HostPort(host string) (string, error) {
+	if h, port, err := net.SplitHostPort(host); err == nil {
+		if port != "" {
+			if p, err := strconv.Atoi(port); err != nil || p <= 0 || p > 65535 {
+				return "", fmt.Errorf("invalid port %q in host %q (must be 1-65535)", port, host)
+			}
+			return host, nil
+		}
+		host = h // "db.example.com:" names no port
+	}
+	port := defaultPostgresPort
+	if e.Port != nil {
+		var p int64
+		switch v := e.Port.(type) {
+		case string:
+			var err error
+			if p, err = strconv.ParseInt(v, 10, 32); err != nil {
+				return "", fmt.Errorf("invalid string for port: %q", v)
+			}
+		case int:
+			p = int64(v)
+		case int64:
+			p = v
+		default:
+			return "", fmt.Errorf("invalid type for port: %T", v)
+		}
+		if p <= 0 || p > 65535 {
+			return "", fmt.Errorf("port number %d is out of the valid range (1-65535)", p)
+		}
+		port = int(p)
+	}
+	// A bare IPv6 address may come with or without brackets; JoinHostPort adds them.
+	host = strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")
+	return net.JoinHostPort(host, strconv.Itoa(port)), nil
 }
 
 // GetQueryTimeout parses the query timeout duration for an endpoint.
@@ -334,6 +384,28 @@ func (c *ClusterAffinityConfig) GetCleanupInterval() (time.Duration, error) {
 	return helpers.ParseDuration(c.CleanupInterval)
 }
 
+// Validate refuses a negative cleanup_interval: it is the period of the affinity
+// manager's cleanup ticker, and time.NewTicker panics on it (see positiveInterval).
+// 0 is not refused: NewAffinityManagerWithStore runs the ticker at its 1h default
+// then, as it always has, so a file with 0 keeps starting.
+func (c *ClusterAffinityConfig) Validate() error {
+	if d, err := helpers.ParseDuration(c.CleanupInterval); err == nil && d < 0 {
+		return fmt.Errorf("cleanup_interval must not be negative, got %q", c.CleanupInterval)
+	}
+	return nil
+}
+
+// positiveInterval refuses a ticker period that parses to zero or less. time.NewTicker
+// panics on one, and the tickers these periods drive run in goroutines start-up starts,
+// so the panic stops the server. A value that does not parse takes its default with a
+// warning (Config.Warnings), and "" is the default.
+func positiveInterval(key, value string) error {
+	if d, err := helpers.ParseDuration(value); err == nil && d <= 0 {
+		return fmt.Errorf("%s must be positive, got %q", key, value)
+	}
+	return nil
+}
+
 // ClusterConfig holds cluster coordination configuration using gossip protocol
 type ClusterConfig struct {
 	Enabled           bool                       `toml:"enabled"`                  // Enable cluster mode
@@ -357,13 +429,34 @@ func splitClusterAddr(addr string) (host, port string) {
 	return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), ""
 }
 
+// SplitClusterPeer splits a peers entry the way memberlist's Join reads it: an
+// optional "name/" prefix, a host name or IPv4 or IPv6 address (bare or bracketed),
+// and an optional port that defaults to defaultPort, the gossip bind port. ok is
+// false when the port is not a number from 0 to 65535.
+func SplitClusterPeer(peer string, defaultPort int) (host string, port uint16, ok bool) {
+	if i := strings.Index(peer, "/"); i >= 0 {
+		peer = peer[i+1:]
+	}
+	host, portStr, err := net.SplitHostPort(peer)
+	if err != nil {
+		host, portStr = strings.TrimSuffix(strings.TrimPrefix(peer, "["), "]"), strconv.Itoa(defaultPort)
+	}
+	p, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return "", 0, false
+	}
+	return host, uint16(p), true
+}
+
 // GetBindAddr returns the bind address by parsing the addr field
 func (c *ClusterConfig) GetBindAddr() string {
 	host, _ := splitClusterAddr(c.Addr)
 	return host
 }
 
-// GetBindPort returns the bind port from addr or the port field
+// GetBindPort returns the bind port from addr or the port field. A port key of 0 means
+// unset; any other value is returned as written, so Validate refuses a negative one
+// instead of it binding the default.
 func (c *ClusterConfig) GetBindPort() int {
 	// If addr contains a port, use that
 	if _, p := splitClusterAddr(c.Addr); p != "" {
@@ -373,7 +466,7 @@ func (c *ClusterConfig) GetBindPort() int {
 	}
 
 	// Otherwise use explicit port field
-	if c.Port > 0 {
+	if c.Port != 0 {
 		return c.Port
 	}
 
@@ -392,10 +485,11 @@ func (c *ClusterConfig) GetMaxEventQueueSize() int {
 // Validate checks an enabled [cluster] for the settings gossip cannot run without.
 //
 // addr must be an IP address the other nodes can reach: it is bound and advertised as
-// is, so 0.0.0.0, ::, localhost or a host name cannot be used. secret_key is required
-// and must be the base64 of 32 bytes (AES-256): gossip carries auth-failure state, IP
-// blocks and connection-kick commands, which any host able to reach the gossip port
-// could forge without encryption.
+// is, so 0.0.0.0, ::, localhost or a host name cannot be used. Its port (from addr, or
+// the port key) must be one memberlist can bind; :0 in addr binds a free port, which
+// memberlist advertises. secret_key is required and must be the base64 of 32 bytes (AES-256):
+// gossip carries auth-failure state, IP blocks and connection-kick commands, which any
+// host able to reach the gossip port could forge without encryption.
 func (c *ClusterConfig) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -403,6 +497,16 @@ func (c *ClusterConfig) Validate() error {
 	bindAddr := c.GetBindAddr()
 	if ip := net.ParseIP(bindAddr); ip == nil || ip.IsUnspecified() {
 		return fmt.Errorf("cluster addr '%s' must be a specific IP address reachable from other nodes, such as \"10.10.10.40:7946\" (not 0.0.0.0, ::, localhost or a host name)", bindAddr)
+	}
+	// GetBindPort falls back to the port key or default when Atoi fails. An
+	// explicit port must not silently change because it overflows or is malformed.
+	if _, port := splitClusterAddr(c.Addr); port != "" {
+		if _, err := strconv.Atoi(port); err != nil {
+			return fmt.Errorf("cluster port %q is not a valid port (0 to 65535)", port)
+		}
+	}
+	if port := c.GetBindPort(); port < 0 || port > 65535 {
+		return fmt.Errorf("cluster port %d is not a valid port (0 to 65535)", port)
 	}
 	if c.SecretKey == "" {
 		return errors.New("cluster secret_key is required when cluster mode is enabled (generate one with: openssl rand -base64 32)")
@@ -434,6 +538,43 @@ type TLSLetsEncryptS3Config struct {
 	ServerSideEncryption *string `toml:"server_side_encryption"`
 	// ServerSideEncryptionKMSKeyID is the key id required by "aws:kms".
 	ServerSideEncryptionKMSKeyID string `toml:"server_side_encryption_kms_key_id"`
+}
+
+// The server-side encryption a certificate write can ask of the [tls.letsencrypt.s3]
+// store, besides "" for no encryption header at all.
+const (
+	CertificateSSEAES256 = "AES256"  // the store's own key management, the default
+	CertificateSSEKMS    = "aws:kms" // a KMS key, server_side_encryption_kms_key_id
+)
+
+// CertificateSSE returns the server-side encryption certificate writes ask of the store,
+// and its KMS key id: server_side_encryption, "AES256" when the key is absent.
+func (c TLSLetsEncryptS3Config) CertificateSSE() (algorithm, kmsKeyID string) {
+	algorithm = CertificateSSEAES256
+	if c.ServerSideEncryption != nil {
+		algorithm = *c.ServerSideEncryption
+	}
+	return algorithm, c.ServerSideEncryptionKMSKeyID
+}
+
+// ValidateCertificateSSE refuses server-side encryption settings that would not mean what
+// they say, rather than writing private keys under them: an algorithm other than
+// "AES256", "aws:kms" or "", "aws:kms" without a KMS key id, or a KMS key id with another
+// algorithm. TLSConfig.Validate and the TLS manager's S3 cache both check with it.
+func ValidateCertificateSSE(algorithm, kmsKeyID string) error {
+	switch algorithm {
+	case "", CertificateSSEAES256, CertificateSSEKMS:
+	default:
+		return fmt.Errorf("unsupported server-side encryption %q: use %q, %q or an empty value",
+			algorithm, CertificateSSEAES256, CertificateSSEKMS)
+	}
+	if algorithm == CertificateSSEKMS && kmsKeyID == "" {
+		return fmt.Errorf("server-side encryption %q requires a KMS key id", algorithm)
+	}
+	if algorithm != CertificateSSEKMS && kmsKeyID != "" {
+		return fmt.Errorf("a KMS key id is only used by server-side encryption %q, not %q", CertificateSSEKMS, algorithm)
+	}
+	return nil
 }
 
 // TLSLetsEncryptConfig holds Let's Encrypt automatic certificate management configuration
@@ -552,9 +693,11 @@ type TLSConfig struct {
 // Validate checks, with enabled = true, what the TLS manager needs of [tls] before it
 // opens anything: a known provider, cert_file and key_file for provider = "file", and
 // for provider = "letsencrypt" a [tls.letsencrypt] table with email, domains,
-// storage_provider = "s3" and a renew_before and sync_interval that parse. Whether the
-// certificate files can be read and the certificate store reached is found only by
-// opening them. tlsmanager.New runs it too.
+// storage_provider = "s3", a renew_before and sync_interval that parse, and in
+// [tls.letsencrypt.s3] access_key and secret_key both set or both empty and a
+// server-side encryption the store can be asked for. Whether the certificate files can
+// be read and the certificate store reached is found only by opening them.
+// tlsmanager.New runs it too.
 func (c *TLSConfig) Validate() error {
 	if !c.Enabled {
 		return nil
@@ -596,6 +739,13 @@ func (c *TLSLetsEncryptConfig) validate() error {
 			return fmt.Errorf("invalid sync_interval duration %q: %w", c.SyncInterval, err)
 		}
 	}
+	// The certificate store's client refuses these before it connects.
+	if (c.S3.AccessKey == "") != (c.S3.SecretKey == "") {
+		return fmt.Errorf("letsencrypt.s3: %w", ErrS3KeysNotPaired)
+	}
+	if err := ValidateCertificateSSE(c.S3.CertificateSSE()); err != nil {
+		return fmt.Errorf("letsencrypt.s3: %w", err)
+	}
 	return nil
 }
 
@@ -614,6 +764,13 @@ type CleanupConfig struct {
 	// looks for accounts marked for purging.
 	PurgePollInterval string `toml:"purge_poll_interval"`
 }
+
+// The cleaner raises a shorter wake_interval, and the purge worker a shorter
+// purge_poll_interval, to these.
+const (
+	MinCleanupWakeInterval = time.Minute
+	MinPurgePollInterval   = 5 * time.Second
+)
 
 // GetPurgePollInterval parses the purge worker's poll interval.
 func (c *CleanupConfig) GetPurgePollInterval() (time.Duration, error) {
@@ -761,6 +918,16 @@ func (c *LocalCacheConfig) GetPurgeInterval() (time.Duration, error) {
 		c.PurgeInterval = "12h"
 	}
 	return helpers.ParseDuration(c.PurgeInterval)
+}
+
+// Validate refuses a purge_interval or metrics_interval of zero or less: they are the
+// periods of a mail backend's cache purge loop and cache metrics writer (see
+// positiveInterval).
+func (c *LocalCacheConfig) Validate() error {
+	if err := positiveInterval("purge_interval", c.PurgeInterval); err != nil {
+		return err
+	}
+	return positiveInterval("metrics_interval", c.MetricsInterval)
 }
 
 // GetOrphanCleanupAge parses the orphan cleanup age duration
@@ -1010,6 +1177,11 @@ type LookupCacheConfig struct {
 	MaxSize                    int    `toml:"max_size"`                     // Maximum number of cached entries (default: 50000)
 	CleanupInterval            string `toml:"cleanup_interval"`             // How often to clean expired entries (default: "5m")
 	PositiveRevalidationWindow string `toml:"positive_revalidation_window"` // How long to wait before revalidating positive cache with different password (default: "30s")
+
+	// positiveRevalidationWindowSet records that the table names
+	// positive_revalidation_window, which the defaults otherwise fill in; the LMTP
+	// and User API proxies do not apply it.
+	positiveRevalidationWindowSet bool
 }
 
 // DefaultLookupCacheConfig returns sensible defaults for authentication and routing lookup caching
@@ -1039,6 +1211,11 @@ func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
 		return err
 	}
 	*c = LookupCacheConfig(decoded)
+	for key := range data.(map[string]any) { // decodeTable checked it is a table
+		if strings.EqualFold(key, "positive_revalidation_window") {
+			c.positiveRevalidationWindowSet = true
+		}
+	}
 	return nil
 }
 
@@ -1184,16 +1361,17 @@ type RemoteLookupConfig struct {
 	AuthToken string `toml:"auth_token" secret:"true"` // Bearer token for HTTP authentication (optional)
 
 	// Backend connection settings
-	LookupLocalUsers       bool   `toml:"lookup_local_users"`        // Check local DB when remote returns 404/3xx (for split user scenarios)
-	UserNotFoundResponse   string `toml:"user_not_found_response"`   // LMTP response when user not found: "reject" (550), "tempfail" (450) - default: "reject"
-	RemoteTLS              bool   `toml:"remote_tls"`                // Use TLS for backend connections
-	RemoteTLSUseStartTLS   bool   `toml:"remote_tls_use_starttls"`   // Use STARTTLS for backend connections (requires remote_tls)
-	RemoteTLSVerify        *bool  `toml:"remote_tls_verify"`         // Verify backend TLS certificate
-	RemotePort             any    `toml:"remote_port"`               // Default port for routed backends if not in address
-	RemoteUseProxyProtocol bool   `toml:"remote_use_proxy_protocol"` // Use PROXY protocol for backend connections
-	RemoteUseIDCommand     bool   `toml:"remote_use_id_command"`     // Use IMAP ID command (IMAP only)
-	RemoteUseXCLIENT       bool   `toml:"remote_use_xclient"`        // Use XCLIENT command (POP3/LMTP)
-	RemoteUseUTF8          bool   `toml:"remote_use_utf8"`           // Lookup-routed backends support POP3 UTF8/RFC 6856 (mirror client's pre-auth UTF8 to them). Keep false for Dovecot backends. (POP3 only)
+	LookupLocalUsers                      bool   `toml:"lookup_local_users"`                         // Check local DB when remote returns 404/3xx (for split user scenarios)
+	UserNotFoundResponse                  string `toml:"user_not_found_response"`                    // LMTP response when user not found: "reject" (550), "tempfail" (450) - default: "reject"
+	RemoteTLS                             bool   `toml:"remote_tls"`                                 // Use TLS for backend connections
+	RemoteTLSUseStartTLS                  bool   `toml:"remote_tls_use_starttls"`                    // Use STARTTLS for backend connections (requires remote_tls)
+	RemoteTLSVerify                       *bool  `toml:"remote_tls_verify"`                          // Verify backend TLS certificate
+	RemotePort                            any    `toml:"remote_port"`                                // Default port for routed backends if not in address
+	RemoteUseProxyProtocol                bool   `toml:"remote_use_proxy_protocol"`                  // Use PROXY protocol for backend connections
+	RemoteUseIDCommand                    bool   `toml:"remote_use_id_command"`                      // Use IMAP ID command (IMAP only)
+	RemoteSkipForwardingWithProxyProtocol bool   `toml:"remote_skip_forwarding_with_proxy_protocol"` // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	RemoteUseXCLIENT                      bool   `toml:"remote_use_xclient"`                         // Use XCLIENT command (POP3/LMTP)
+	RemoteUseUTF8                         bool   `toml:"remote_use_utf8"`                            // Lookup-routed backends support POP3 UTF8/RFC 6856 (mirror client's pre-auth UTF8 to them). Keep false for Dovecot backends. (POP3 only)
 
 	// RestrictToPool, when true, refuses a backend address returned by the remote-lookup
 	// API unless it is in the configured pool (remote_addrs); routing then falls back to
@@ -1547,20 +1725,21 @@ type ServerConfig struct {
 	SupportedExtensions []string `toml:"supported_extensions,omitempty"` // managesieve_proxy only: supported names replace the default advertised SIEVE set; if none remain after filtering, the default set is used. A managesieve server uses [sieve] enabled_extensions.
 
 	// Proxy specific
-	RemoteAddrs            []string `toml:"remote_addrs,omitempty"`
-	RemotePort             any      `toml:"remote_port,omitempty"` // Default port for backends if not in address
-	RemoteTLS              bool     `toml:"remote_tls,omitempty"`
-	RemoteTLSUseStartTLS   bool     `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
-	RemoteTLSVerify        bool     `toml:"remote_tls_verify,omitempty"`
-	RemoteTLSCAFile        string   `toml:"remote_tls_ca_file,omitempty"` // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
-	RemoteUseProxyProtocol bool     `toml:"remote_use_proxy_protocol,omitempty"`
-	RemoteUseIDCommand     bool     `toml:"remote_use_id_command,omitempty"`
-	RemoteUseXCLIENT       bool     `toml:"remote_use_xclient,omitempty"`
-	RemoteUseUTF8          bool     `toml:"remote_use_utf8,omitempty"` // POP3 proxy only: advertise UTF8/LANG in pre-auth CAPA and mirror UTF8 to pool backends. Enable ONLY when every backend is sora: classic Outlook sends UTF8 post-auth when advertised, and non-sora backends reject it fatally (0x800CCC90).
-	ConnectTimeout         string   `toml:"connect_timeout,omitempty"`
-	AuthIdleTimeout        string   `toml:"auth_idle_timeout,omitempty"`
-	EnableAffinity         bool     `toml:"enable_affinity,omitempty"`
-	RemoteHealthChecks     *bool    `toml:"remote_health_checks,omitempty"` // Enable backend health checking (default: true)
+	RemoteAddrs                           []string `toml:"remote_addrs,omitempty"`
+	RemotePort                            any      `toml:"remote_port,omitempty"` // Default port for backends if not in address
+	RemoteTLS                             bool     `toml:"remote_tls,omitempty"`
+	RemoteTLSUseStartTLS                  bool     `toml:"remote_tls_use_starttls,omitempty"` // Use STARTTLS for backend connections
+	RemoteTLSVerify                       bool     `toml:"remote_tls_verify,omitempty"`
+	RemoteTLSCAFile                       string   `toml:"remote_tls_ca_file,omitempty"` // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
+	RemoteUseProxyProtocol                bool     `toml:"remote_use_proxy_protocol,omitempty"`
+	RemoteUseIDCommand                    bool     `toml:"remote_use_id_command,omitempty"`
+	RemoteSkipForwardingWithProxyProtocol bool     `toml:"remote_skip_forwarding_with_proxy_protocol"` // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	RemoteUseXCLIENT                      bool     `toml:"remote_use_xclient,omitempty"`
+	RemoteUseUTF8                         bool     `toml:"remote_use_utf8,omitempty"` // POP3 proxy only: advertise UTF8/LANG in pre-auth CAPA and mirror UTF8 to pool backends. Enable ONLY when every backend is sora: classic Outlook sends UTF8 post-auth when advertised, and non-sora backends reject it fatally (0x800CCC90).
+	ConnectTimeout                        string   `toml:"connect_timeout,omitempty"`
+	AuthIdleTimeout                       string   `toml:"auth_idle_timeout,omitempty"`
+	EnableAffinity                        bool     `toml:"enable_affinity,omitempty"`
+	RemoteHealthChecks                    *bool    `toml:"remote_health_checks,omitempty"` // Enable backend health checking (default: true)
 	// RemoteDNSRefresh is how often the proxy re-resolves the hostnames in remote_addrs,
 	// so a backend that changes address (rolling replacement, container reschedule, DNS
 	// failover) is picked up without a restart. Empty = 5m. "0" pins the pool to the
@@ -1618,6 +1797,15 @@ type TimeoutSchedulerConfig struct {
 	ShardCount int `toml:"shard_count"` // Number of timeout scheduler shards (0=runtime.NumCPU(), -1=runtime.NumCPU()/2, >0=specific value)
 }
 
+// Validate checks shard_count as server.InitializeGlobalTimeoutScheduler does: 0 and -1
+// select a count from the CPUs, and nothing below -1 has a meaning.
+func (c TimeoutSchedulerConfig) Validate() error {
+	if c.ShardCount < -1 {
+		return fmt.Errorf("shard_count must be >= -1, got %d", c.ShardCount)
+	}
+	return nil
+}
+
 // ServersConfig holds all server configurations.
 type ServersConfig struct {
 	TrustedNetworks []string `toml:"trusted_networks"` // Global trusted networks for proxy parameter forwarding
@@ -1670,6 +1858,14 @@ func (c SharedMailboxesConfig) InNamespace(name string) bool {
 	return strings.HasPrefix(name, prefix) || name == strings.TrimSuffix(prefix, "/")
 }
 
+// IsNamespaceRoot reports whether name is the shared namespace root ("Shared" for
+// "Shared/"), in any case, while sharing is enabled. The root is a container that holds
+// no messages: IMAP refuses to CREATE or SELECT it and LIST marks it \Noselect, so
+// nothing may store a message in it either. It matches case as InNamespace does.
+func (c SharedMailboxesConfig) IsNamespaceRoot(name string) bool {
+	return c.Enabled && strings.ToLower(name) == strings.TrimSuffix(strings.ToLower(c.NamespacePrefix), "/")
+}
+
 // Validate checks namespace_prefix when sharing is enabled. The personal namespace has
 // the empty prefix, so InNamespace tells shared names apart by the prefix alone, and the
 // prefix must be a mailbox name followed by the hierarchy delimiter: an empty prefix puts
@@ -1701,12 +1897,12 @@ type AdminCLIConfig struct {
 // SieveConfig holds Sieve script engine configuration
 type SieveConfig struct {
 	EnabledExtensions []string `toml:"enabled_extensions"` // List of enabled Sieve extensions (empty = the default set, without editheader)
-	MaxExecutionTime  string   `toml:"max_execution_time"` // Per-script execution budget, also the per-match regex soft-wait cap (e.g. "2s"); default 2s
+	MaxExecutionTime  string   `toml:"max_execution_time"` // Cooperative script budget and large-input regex deadline (e.g. "2s"); default 2s
 }
 
-// GetMaxExecutionTime returns the per-script Sieve execution budget. This bounds total
-// script execution (CPU/resource-exhaustion guard) and is also used as the per-match
-// regex soft-wait cap. Default 2s; an empty or invalid value falls back to the default.
+// GetMaxExecutionTime returns the cooperative Sieve script execution budget and
+// large-input regex deadline. Short matches and compilation still run inline under
+// fixed size limits. Default 2s; an empty or invalid value falls back to the default.
 func (s *SieveConfig) GetMaxExecutionTime() time.Duration {
 	const def = 2 * time.Second
 	if s.MaxExecutionTime == "" {
@@ -1761,6 +1957,12 @@ func (a *AuthCacheConfig) GetCleanupInterval() (time.Duration, error) {
 		return defaultAuthCacheCleanupInterval, nil
 	}
 	return helpers.ParseDuration(a.CleanupInterval)
+}
+
+// Validate refuses a cleanup_interval of zero or less: it is the period of the auth
+// cache's cleanup loop (see positiveInterval).
+func (a *AuthCacheConfig) Validate() error {
+	return positiveInterval("cleanup_interval", a.CleanupInterval)
 }
 
 // GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value cannot be parsed.
@@ -2017,9 +2219,14 @@ func NewDefaultConfig() Config {
 }
 
 // Helper methods for ServerConfig
+
+// defaultAppendLimit is the imap append_limit when the key is absent, does not parse
+// or is not positive (server/imap DefaultAppendLimit).
+const defaultAppendLimit = 25 * 1024 * 1024
+
 func (s *ServerConfig) GetAppendLimit() (int64, error) {
 	if s.AppendLimit == "" {
-		return 25 * 1024 * 1024, nil // 25MB default
+		return defaultAppendLimit, nil
 	}
 	return helpers.ParseSize(s.AppendLimit)
 }
@@ -2067,19 +2274,32 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 // is an error: start-up falls back to the default (GetMaxMessageSizeWithDefault), a
 // reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
+	size, err := s.configuredMaxMessageSize()
+	if err != nil {
+		return 0, err
+	}
+	if size > consts.MaxStoredMessageSize {
+		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize, nil
+	}
+	return size, nil
+}
+
+// defaultMaxMessageSize is max_message_size when omitted, zero or, at start-up, invalid.
+const defaultMaxMessageSize = 50 * 1024 * 1024
+
+// configuredMaxMessageSize is max_message_size as the file sets it, before
+// GetMaxMessageSize caps it, and without its warning.
+func (s *ServerConfig) configuredMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
-		return 50 * 1024 * 1024, nil // 50MB default
+		return defaultMaxMessageSize, nil
 	}
 	size, err := helpers.ParseSize(s.MaxMessageSize)
 	if err != nil {
 		return 0, err
 	}
 	if size == 0 {
-		return 50 * 1024 * 1024, nil
-	}
-	if size > consts.MaxStoredMessageSize {
-		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
-		return consts.MaxStoredMessageSize, nil
+		return defaultMaxMessageSize, nil
 	}
 	return size, nil
 }
@@ -2118,6 +2338,14 @@ func (s *ServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
 
 // defaultTokenDuration is the http_user_api JWT lifetime when token_duration is absent.
 const defaultTokenDuration = 24 * time.Hour
+
+// MaxTokenDuration caps how long a User API JWT may live; the server lowers a longer
+// token_duration to it. JWTs are validated statelessly, so a token cannot be revoked
+// before it expires — a password change or account deletion only stops *renewal* at
+// refresh time. Clamping the duration bounds the window in which a leaked or
+// post-revocation token remains usable. Seven days is generous for an access token
+// while keeping that window finite.
+const MaxTokenDuration = 7 * 24 * time.Hour
 
 // GetTokenDuration parses token_duration (http_user_api). It takes the same
 // syntax as the other duration keys, including days ("7d"); a negative value
@@ -2213,12 +2441,67 @@ func (s *ServerConfig) GetMaxRedirectHops() int {
 	return helpers.DefaultMaxRedirectHops
 }
 
+// defaultSessionMemoryLimit is session_memory_limit when the block leaves it out, and
+// what an imap or pop3 server uses when it does not parse.
+const defaultSessionMemoryLimit = 100 * 1024 * 1024
+
 // GetSessionMemoryLimit parses the session memory limit
 func (s *ServerConfig) GetSessionMemoryLimit() (int64, error) {
 	if s.Limits != nil && s.Limits.SessionMemoryLimit != "" {
 		return helpers.ParseSize(s.Limits.SessionMemoryLimit)
 	}
-	return 100 * 1024 * 1024, nil // Default: 100MB
+	return defaultSessionMemoryLimit, nil
+}
+
+// SessionMemoryShortfall is an imap or pop3 server whose session_memory_limit is below
+// the max_message_size of an lmtp server in the same file.
+type SessionMemoryShortfall struct {
+	Server, Type       string
+	SessionMemoryLimit int64
+	LMTPServer         string
+	MaxMessageSize     int64
+}
+
+// SessionMemoryShortfalls returns the enabled imap and pop3 servers whose
+// session_memory_limit is set (not "0") and below the largest max_message_size of the
+// file's enabled lmtp servers, with that lmtp server. An IMAP FETCH or POP3 RETR holds
+// the whole body in the session's memory budget, so such a server never fetches a
+// message delivered between the two sizes.
+func (c *Config) SessionMemoryShortfalls() []SessionMemoryShortfall {
+	servers := c.GetAllServers()
+	var lmtp string
+	var maxMessageSize int64
+	for i := range servers {
+		if servers[i].Type != "lmtp" {
+			continue
+		}
+		// The lmtp server's limit as GetMaxMessageSizeWithDefault sets it, without logging
+		// again what its start function and Warnings report.
+		size, err := servers[i].configuredMaxMessageSize()
+		if err != nil {
+			size = defaultMaxMessageSize
+		}
+		if size = min(size, consts.MaxStoredMessageSize); size > maxMessageSize {
+			lmtp, maxMessageSize = servers[i].Name, size
+		}
+	}
+	var shortfalls []SessionMemoryShortfall
+	for i := range servers {
+		if servers[i].Type != "imap" && servers[i].Type != "pop3" {
+			continue
+		}
+		limit, err := servers[i].GetSessionMemoryLimit()
+		if err != nil {
+			limit = defaultSessionMemoryLimit
+		}
+		if limit > 0 && limit < maxMessageSize {
+			shortfalls = append(shortfalls, SessionMemoryShortfall{
+				Server: servers[i].Name, Type: servers[i].Type, SessionMemoryLimit: limit,
+				LMTPServer: lmtp, MaxMessageSize: maxMessageSize,
+			})
+		}
+	}
+	return shortfalls
 }
 
 // GetCommandTimeout parses the command timeout duration with protocol-specific defaults
@@ -2240,6 +2523,12 @@ func (s *ServerConfig) GetCommandTimeoutWithDefault() time.Duration {
 	}
 	return timeout
 }
+
+// IMAPLibraryReadDeadline is the read deadline go-imap arms on authenticated
+// connections itself (RFC 3501 §5.4 autologout floor + margin). When it expires the
+// library closes the connection silently: no BYE, no timeout metric. An imap
+// command_timeout at or above it is therefore capped by the library.
+const IMAPLibraryReadDeadline = 35 * time.Minute
 
 // defaultCommandTimeout is the protocol-specific command (idle) timeout.
 func (s *ServerConfig) defaultCommandTimeout() time.Duration {
@@ -2625,7 +2914,7 @@ func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
 	if err != nil {
 		warnf("Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
-		return 25 * 1024 * 1024 // 25MB default
+		return defaultAppendLimit
 	}
 	return limit
 }
@@ -2663,7 +2952,7 @@ func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
 		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
-		return 52428800 // 50MB default
+		return defaultMaxMessageSize
 	}
 	return size
 }
@@ -2859,6 +3148,16 @@ func (s *ServerConfig) Validate() error {
 	if s.MasterSASLUsername != "" && s.MasterSASLPassword == "" {
 		return fmt.Errorf("server %q: master_sasl_username is set but master_sasl_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
 	}
+	// These servers build their master SASL gate from the list with the same parser and
+	// refuse to start on an entry that is not an IP address or CIDR, rather than drop it
+	// and admit master logins from sources the operator meant to exclude. Other types do
+	// not read the key; WarnUnusedConfigOptions says so.
+	switch s.Type {
+	case "imap", "pop3", "managesieve":
+		if _, err := helpers.ParseTrustedNetworks(s.MasterSASLAllowedNetworks); err != nil {
+			return fmt.Errorf("server %q: invalid master_sasl_allowed_networks: %w", s.Name, err)
+		}
+	}
 
 	if s.AuthRateLimit != nil {
 		if err := s.AuthRateLimit.Validate(); err != nil {
@@ -2891,11 +3190,17 @@ func (s *ServerConfig) Validate() error {
 	// lookup client from its enabled remote_lookup. No other server reads either, and a
 	// disabled lookup is never initialized.
 	if strings.HasSuffix(s.Type, "_proxy") {
-		// The proxy adds every entry as a backend, an empty one included, and routes
-		// users to it; ValidatePools refuses an empty [[pool]] backend the same way.
+		// The proxy adds every entry as a backend, as loaded, and routes users to it. The
+		// loader trims each entry's ends; an empty entry, or whitespace left inside one
+		// ("192.0.2.10 :143": no host or IP has any), is a backend that never resolves.
+		// A port alone (":143") is as empty, and worse: a dial to an empty host reaches
+		// this node itself. ValidatePools refuses such a [[pool]] backend the same way.
 		for i, addr := range s.RemoteAddrs {
-			if strings.TrimSpace(addr) == "" {
+			if host, _ := poolBackendHost(addr); host == "" {
 				return fmt.Errorf("server %q: remote_addrs #%d: empty backend address", s.Name, i+1)
+			}
+			if strings.ContainsFunc(addr, unicode.IsSpace) {
+				return fmt.Errorf("server %q: remote_addrs #%d: backend address %q contains whitespace", s.Name, i+1, addr)
 			}
 		}
 		if _, err := s.GetRemotePort(); err != nil {
@@ -2953,7 +3258,13 @@ func (s *ServerConfig) MetricsPath() string {
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
 	for _, k := range serverTypeKeys {
 		if k.set(s) && !slices.Contains(k.appliedBy, s.Type) {
-			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "))
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it%s", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "), serverTypeKeyNotes[k.name])
+		}
+	}
+	// A type that does not read the table at all was told so about the table above.
+	for _, k := range serverTableKeys {
+		if k.set(s) && slices.Contains(k.tableReadBy, s.Type) && !slices.Contains(k.appliedBy, s.Type) {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it%s", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "), serverTypeKeyNotes[k.name])
 		}
 	}
 	// Only these filter clients by address. Every other type, the User API proxy
@@ -2978,8 +3289,9 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		}
 	}
 	// tls_verify asks the TLS handshake for a client certificate; without TLS
-	// there is no handshake to ask in.
-	if s.TLSVerify && !s.TLS {
+	// there is no handshake to ask in. The metrics endpoint has none even with
+	// tls = true; its serverTypeKeys row reports the key.
+	if s.TLSVerify && !s.TLS && slices.Contains(listenerServerTypes, s.Type) {
 		logger("WARNING: Server %s (type: %s) has 'tls_verify' configured without 'tls = true'; it is ignored and no client certificate is required", s.Name, s.Type)
 	}
 	if s.Timeouts != nil && s.Timeouts.SchedulerShardCount != 0 {
@@ -3018,7 +3330,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends: 'remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
 		}
 		if s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSUseStartTLS {
-			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends: 'remote_lookup.remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends and dials a backend a lookup names with the block's own settings: 'remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
 		}
 	} else {
 		// STARTTLS is a way of doing remote_tls: without it the backend leg is plaintext.
@@ -3032,10 +3344,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 
 	switch s.Type {
 	case "lmtp":
-		// Its only timeout setting is timeouts.command_timeout (the idle timeout).
-		s.warnKeysNotApplied(logger, "the LMTP server does not apply it",
-			configKey{"timeouts.absolute_session_timeout", s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != ""},
-			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0})
 		// MTAs deliver many messages at once from few addresses.
 		s.warnKeysNotApplied(logger, "the LMTP server limits only its total connections (max_connections)",
 			configKey{"max_connections_per_ip", s.MaxConnectionsPerIP != 0},
@@ -3043,10 +3351,6 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			configKey{"max_connections_per_user_per_ip", s.MaxConnectionsPerUserPerIP != 0})
 
 	case "lmtp_proxy":
-		// Its timeouts are auth_idle_timeout and timeouts.absolute_session_timeout.
-		s.warnKeysNotApplied(logger, "the LMTP proxy does not apply it",
-			configKey{"timeouts.command_timeout", s.Timeouts != nil && s.Timeouts.CommandTimeout != ""},
-			configKey{"timeouts.min_bytes_per_minute", s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0})
 		// MTAs deliver many messages at once from few addresses, and an LMTP client
 		// does not log in as a user.
 		s.warnKeysNotApplied(logger, "the LMTP proxy limits only its total connections (max_connections)",
@@ -3139,7 +3443,9 @@ var serverTypeKeys = []struct {
 	{"insecure_auth", func(s *ServerConfig) bool { return s.InsecureAuth }, loginServerTypes},
 	// The LMTP backend's only timeout is timeouts.command_timeout.
 	{"auth_idle_timeout", func(s *ServerConfig) bool { return s.AuthIdleTimeout != "" }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
-	{"debug", func(s *ServerConfig) bool { return s.Debug }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	// The POP3 and ManageSieve backends take debug in their options and write
+	// nothing with it.
+	{"debug", func(s *ServerConfig) bool { return s.Debug }, []string{"imap", "lmtp", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
 	// The proxies' backend legs.
 	{"remote_port", func(s *ServerConfig) bool { return s.RemotePort != nil }, proxyServerTypes},
 	{"connect_timeout", func(s *ServerConfig) bool { return s.ConnectTimeout != "" }, proxyServerTypes},
@@ -3147,6 +3453,7 @@ var serverTypeKeys = []struct {
 	{"remote_health_checks", func(s *ServerConfig) bool { return s.RemoteHealthChecks != nil }, proxyServerTypes},
 	{"enable_affinity", func(s *ServerConfig) bool { return s.EnableAffinity }, proxyServerTypes},
 	{"remote_use_id_command", func(s *ServerConfig) bool { return s.RemoteUseIDCommand }, []string{"imap_proxy"}},
+	{"remote_skip_forwarding_with_proxy_protocol", func(s *ServerConfig) bool { return s.RemoteSkipForwardingWithProxyProtocol }, []string{"imap_proxy", "pop3_proxy"}},
 	{"remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteUseXCLIENT }, []string{"pop3_proxy", "lmtp_proxy"}},
 	{"remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteUseUTF8 }, []string{"pop3_proxy"}},
 	// Size limits, and the Sieve extensions the ManageSieve proxy advertises (a
@@ -3155,13 +3462,85 @@ var serverTypeKeys = []struct {
 	{"append_limit", func(s *ServerConfig) bool { return s.AppendLimit != "" }, []string{"imap"}},
 	{"max_script_size", func(s *ServerConfig) bool { return s.MaxScriptSize != "" }, []string{"managesieve"}},
 	{"supported_extensions", func(s *ServerConfig) bool { return len(s.SupportedExtensions) > 0 }, []string{"managesieve_proxy"}},
+	// The nested tables, warned about whole. Only a proxy builds a lookup client; the
+	// LMTP proxy and the Admin API have no login to rate limit, and the LMTP backend,
+	// the Admin API and the metrics listener look up no credentials to cache.
+	{"remote_lookup", func(s *ServerConfig) bool { return s.RemoteLookup != nil }, proxyServerTypes},
+	{"auth_rate_limit", func(s *ServerConfig) bool { return s.AuthRateLimit != nil }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api", "user_api_proxy"}},
+	{"lookup_cache", func(s *ServerConfig) bool { return s.LookupCache != nil }, lookupCacheServerTypes},
+	// Session timeouts. The LMTP backend's command_timeout is its idle timeout, and
+	// the LMTP proxy's timeouts are auth_idle_timeout and absolute_session_timeout.
+	// The HTTP servers time out no sessions, and each per-command table is its own
+	// protocol backend's.
+	{"timeouts.command_timeout", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.CommandTimeout != "" }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+	{"timeouts.absolute_session_timeout", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.AbsoluteSessionTimeout != "" }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+	{"timeouts.min_bytes_per_minute", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.MinBytesPerMinute != 0 }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+	{"timeouts.imap_command_timeouts", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.IMAPCommandTimeouts != nil }, []string{"imap"}},
+	{"timeouts.pop3_command_timeouts", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.POP3CommandTimeouts != nil }, []string{"pop3"}},
+	{"timeouts.managesieve_command_timeouts", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.ManageSieveCommandTimeouts != nil }, []string{"managesieve"}},
+	{"timeouts.lmtp_command_timeouts", func(s *ServerConfig) bool { return s.Timeouts != nil && s.Timeouts.LMTPCommandTimeouts != nil }, []string{"lmtp"}},
+	// The metrics endpoint is always plain HTTP and reads no PROXY header; its tls and
+	// proxy_protocol are warned about below.
+	{"tls_cert_file", func(s *ServerConfig) bool { return s.TLSCertFile != "" }, listenerServerTypes},
+	{"tls_key_file", func(s *ServerConfig) bool { return s.TLSKeyFile != "" }, listenerServerTypes},
+	{"tls_verify", func(s *ServerConfig) bool { return s.TLSVerify }, listenerServerTypes},
+	{"tls_default_domain", func(s *ServerConfig) bool { return s.TLSDefaultDomain != "" }, listenerServerTypes},
+	{"proxy_protocol_timeout", func(s *ServerConfig) bool { return s.ProxyProtocolTimeout != "" }, listenerServerTypes},
 }
 
-// loginServerTypes are the server types with a password login, proxyServerTypes
-// those that dial backends.
+// serverTableKeys is each [server.remote_lookup] and [server.lookup_cache] key that
+// only some of the server types reading its table read, with the types reading the
+// table and those reading the key. WarnUnusedConfigOptions reports one set on a type
+// that reads the table but not the key. A new key of either table that not every
+// reader of the table reads belongs here; remote_lookup.remote_tls_use_starttls has a
+// warning of its own, as the User API proxy has no STARTTLS at all.
+var serverTableKeys = []struct {
+	name        string
+	set         func(*ServerConfig) bool
+	tableReadBy []string
+	appliedBy   []string
+}{
+	// Only the LMTP proxy answers for a recipient the lookup does not know.
+	{"remote_lookup.user_not_found_response", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.UserNotFoundResponse != "" }, proxyServerTypes, []string{"lmtp_proxy"}},
+	// The backend leg to a backend the lookup names, read where the [[server]] key of
+	// the same name is. The User API proxy dials it with the block's own settings.
+	{"remote_lookup.remote_tls", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteTLS }, proxyServerTypes, lineProxyServerTypes},
+	{"remote_lookup.remote_tls_verify", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSVerify != nil }, proxyServerTypes, lineProxyServerTypes},
+	{"remote_lookup.remote_use_proxy_protocol", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseProxyProtocol }, proxyServerTypes, lineProxyServerTypes},
+	{"remote_lookup.remote_use_id_command", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseIDCommand }, proxyServerTypes, []string{"imap_proxy"}},
+	{"remote_lookup.remote_skip_forwarding_with_proxy_protocol", func(s *ServerConfig) bool {
+		return s.RemoteLookup != nil && s.RemoteLookup.RemoteSkipForwardingWithProxyProtocol
+	}, proxyServerTypes, []string{"imap_proxy", "pop3_proxy"}},
+	{"remote_lookup.remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseXCLIENT }, proxyServerTypes, []string{"pop3_proxy", "lmtp_proxy"}},
+	{"remote_lookup.remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseUTF8 }, proxyServerTypes, []string{"pop3_proxy"}},
+	// These route-only proxies check no passwords, so have none to revalidate.
+	{"lookup_cache.positive_revalidation_window", func(s *ServerConfig) bool {
+		return s.LookupCache != nil && s.LookupCache.positiveRevalidationWindowSet
+	}, lookupCacheServerTypes, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+}
+
+// serverTypeKeyNotes ends the warning about a serverTypeKeys or serverTableKeys key
+// with the setting that applies in its place, or why none does.
+var serverTypeKeyNotes = map[string]string{
+	"supported_extensions":                      "; a ManageSieve server advertises the [sieve] enabled_extensions",
+	"remote_lookup.remote_tls":                  "; the User API proxy dials a backend a lookup names with the block's own 'remote_tls'",
+	"remote_lookup.remote_tls_verify":           "; the User API proxy dials a backend a lookup names with the block's own 'remote_tls_verify'",
+	"remote_lookup.remote_use_proxy_protocol":   "; the User API proxy dials a backend a lookup names with the block's own 'remote_use_proxy_protocol'",
+	"lookup_cache.positive_revalidation_window": "; LMTP and User API proxies cache routes without checking passwords",
+}
+
+// loginServerTypes are the IMAP, POP3 and ManageSieve servers and proxies, the line
+// protocols with a password login (the HTTP User API's login reads none of the keys
+// they share); proxyServerTypes dial backends, lineProxyServerTypes over the mail
+// protocols; lookupCacheServerTypes cache credential or route lookups;
+// listenerServerTypes serve TLS and read PROXY headers on the listener (every type but
+// metrics).
 var (
-	loginServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
-	proxyServerTypes = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+	loginServerTypes       = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
+	proxyServerTypes       = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+	lineProxyServerTypes   = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
+	lookupCacheServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+	listenerServerTypes    = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_admin_api", "http_user_api", "user_api_proxy"}
 )
 
 // serverLimitKeys is every [server.limits] key with the server types whose start
@@ -3293,12 +3672,6 @@ func (c *Config) DatabaseUser() *ServerConfig {
 	return nil
 }
 
-// HasDatabaseEndpoint reports whether [database.write] or [database.read] names a host.
-func (c *Config) HasDatabaseEndpoint() bool {
-	return (c.Database.Write != nil && len(c.Database.Write.Hosts) > 0) ||
-		(c.Database.Read != nil && len(c.Database.Read.Hosts) > 0)
-}
-
 // NeedsS3 reports whether the node connects to [s3]. A mail backend stores message bodies
 // there. The User API serves them from there (/user/messages/{id}/body and /raw) on a
 // node without a mail backend too, when [s3] has any connection setting; without one it
@@ -3329,10 +3702,13 @@ type Problem struct {
 // Validate runs the shared configuration checks used by sora before service setup and
 // by `sora-admin config validate`, returning every problem these checks find.
 //
-// What a node does not run is not checked: [uploader] and [cleanup] only with a mail
-// backend, [database] only with a server that queries it, [s3] only on a node that
-// connects to it, [cluster] and [tls] only when enabled. Service setup still checks
-// external connectivity and the node's disk; passing Validate does not check those.
+// What a node does not run is not checked: [uploader], [cleanup] and [local_cache] only
+// with a mail backend, [database] only with a server that queries it, [s3] only on a node
+// that connects to it, [cluster], [tls] and [auth_cache] only when enabled, and
+// [cluster.affinity] only when it and [cluster] are enabled. Validate connects to nothing and
+// does not look at the node's disk. Service setup connects to the database and the
+// certificate store and checks the disk; S3 and a remote lookup are first reached when
+// used, so neither passing Validate nor a clean start shows that they can be reached.
 func (c *Config) Validate() []Problem {
 	var problems []Problem
 	add := func(section string, err error) {
@@ -3363,6 +3739,7 @@ func (c *Config) Validate() []Problem {
 	// One malformed trusted_networks entry would leave LMTP admission with no peers.
 	add("trusted_networks", c.ValidateTrustedNetworks())
 	add("[shared_mailboxes]", c.SharedMailboxes.Validate())
+	add("[timeout_scheduler]", c.TimeoutScheduler.Validate())
 
 	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks
 	// would let any reachable host spoof the client IP via a PROXY header. (security-audit M2)
@@ -3399,18 +3776,33 @@ func (c *Config) Validate() []Problem {
 		add("[uploader]", c.Uploader.Validate())
 		// The cleaner takes [cleanup]; delivery takes its fts_retention too.
 		add("[cleanup]", c.Cleanup.Validate())
+		// The cache purge loop and the cache metrics writer.
+		add("[local_cache]", c.LocalCache.Validate())
+	}
+	// Any node with the auth cache enabled runs its cleanup loop.
+	if c.AuthCache.Enabled {
+		add("[auth_cache]", c.AuthCache.Validate())
 	}
 
 	if user := c.DatabaseUser(); user != nil {
-		if !c.HasDatabaseEndpoint() {
+		// An endpoint without hosts opens no pool.
+		writeHosts := c.Database.Write != nil && len(c.Database.Write.Hosts) > 0
+		readHosts := c.Database.Read != nil && len(c.Database.Read.Hosts) > 0
+		switch {
+		case !writeHosts && !readHosts:
 			add("[database]", fmt.Errorf("server %q (%s) needs the database, but it is not configured in [database.write] or [database.read]", user.Name, user.Type))
+		case !writeHosts:
+			// Start-up opens write pools only from [database.write] and stops without one,
+			// whatever the replicas do: the migrations and every write run there, and
+			// [database.read] only takes reads off it.
+			add("[database.write]", fmt.Errorf("server %q (%s) needs the database, but [database.write] has no hosts; "+
+				"[database.read] alone is not enough: the migrations and every write go to [database.write]", user.Name, user.Type))
 		}
 		add("[database]", c.Database.Validate())
-		// An endpoint without hosts opens no pool.
-		if c.Database.Write != nil && len(c.Database.Write.Hosts) > 0 {
+		if writeHosts {
 			add("[database.write]", c.Database.Write.Validate())
 		}
-		if c.Database.Read != nil && len(c.Database.Read.Hosts) > 0 {
+		if readHosts {
 			add("[database.read]", c.Database.Read.Validate())
 		}
 	}
@@ -3418,6 +3810,10 @@ func (c *Config) Validate() []Problem {
 		add("[s3]", c.S3.Validate())
 	}
 	add("[cluster]", c.Cluster.Validate())
+	// With [cluster.affinity] enabled = false there is no affinity manager.
+	if c.Cluster.Enabled && c.Cluster.Affinity.Enabled {
+		add("[cluster.affinity]", c.Cluster.Affinity.Validate())
+	}
 	add("[tls]", c.TLS.Validate())
 
 	return problems

@@ -36,7 +36,8 @@ func TestIMAP_Store_NormalizedNoopResponse(t *testing.T) {
 			if len(fetches) != 1 {
 				t.Fatalf("%s returned %d FETCH responses, want 1: %v", tc.command, len(fetches), lines)
 			}
-			if !strings.Contains(fetches[0], `FLAGS (\Seen)`) {
+			// \Recent: this session is the first to select INBOX (RFC 3501 §2.3.2).
+			if !strings.Contains(fetches[0], `FLAGS (\Seen \Recent)`) {
 				t.Errorf("response = %s, want the actual normalized flags", fetches[0])
 			}
 		})

@@ -221,6 +221,8 @@ url = %q
 
 // Endpoint APIs authenticate with query parameters of any name, so the masked dump
 // masks every query value, percent-encoded or not, and keeps the parameter names (#596).
+// A component that may be a bare token is masked whole: one without "=", and one whose
+// value is empty or only "=" signs, like a base64 token's padding (#1761).
 func TestConfigDumpMasksURLQueryValues(t *testing.T) {
 	const m = config.SecretMask
 	endpoints := []struct{ key, in, want string }{
@@ -228,8 +230,8 @@ func TestConfigDumpMasksURLQueryValues(t *testing.T) {
 			"https://relay.example.invalid/send?api_key=fixture-query-secret",
 			"https://relay.example.invalid/send?api_key=" + m},
 		{"[spam_training] endpoint",
-			"https://training.example.invalid/train?api%5Fkey=fixture%2Dencoded%2Dsecret&empty=&fixture-bare-token#fragment",
-			"https://training.example.invalid/train?api%5Fkey=" + m + "&empty=&" + m + "#fragment"},
+			"https://training.example.invalid/train?api%5Fkey=fixture%2Dencoded%2Dsecret&empty=&fixture-bare-token&Zml4dHVyZS10b2tlbg==&Zml4dHVyZS10b2tlbjE=#fragment",
+			"https://training.example.invalid/train?api%5Fkey=" + m + "&" + m + "&" + m + "&" + m + "&" + m + "#fragment"},
 		{"[server.remote_lookup] url",
 			"https://lookup-user@lookup.example.invalid/lookup?email=$email&token=fixture-lookup-secret",
 			"https://%2A%2A%2AMASKED%2A%2A%2A@lookup.example.invalid/lookup?email=$email&token=" + m},
@@ -246,7 +248,7 @@ addr = "127.0.0.1:0"
 [server.remote_lookup]
 url = %q
 `, endpoints[0].in, endpoints[1].in, endpoints[2].in))
-	secrets := []string{"fixture-query-secret", "fixture%2Dencoded%2Dsecret", "fixture-encoded-secret", "fixture-bare-token", "fixture-lookup-secret", "lookup-user"}
+	secrets := []string{"fixture-query-secret", "fixture%2Dencoded%2Dsecret", "fixture-encoded-secret", "fixture-bare-token", "Zml4dHVyZS10b2tlbg", "Zml4dHVyZS10b2tlbjE", "fixture-lookup-secret", "lookup-user"}
 	quote := map[string]func(string) string{
 		"toml": strconv.Quote,
 		"json": func(s string) string { b, _ := json.Marshal(s); return string(b) },

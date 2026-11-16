@@ -106,7 +106,11 @@ Rules for `addr`:
   machine.
 - The port can be written in `addr` (`"10.0.0.11:7946"`, or `"[2001:db8::11]:7946"` for IPv6) or in
   `port`. If `addr` has a port, it wins and a warning says `port` is ignored. With neither, the port
-  is `7946`.
+  is `7946`. A port above 65535 or below 0 is refused at startup, and by `sora-admin config
+  validate`, with `cluster port <n> is not a valid port (0 to 65535)`. A nonnumeric or overflowing
+  port in `addr` is refused too. Writing `:0` in `addr` binds a free port, which the node advertises;
+  the other nodes cannot list it in `peers`. The `port = 0` key means unset, so it uses `7946`
+  unless `addr` specifies a port.
 
 ### Ports to open
 
@@ -331,7 +335,7 @@ port 143 and another on port 993. IMAP failures never count on a POP3 proxy.
 | State | What is shared | Key |
 |---|---|---|
 | Tier 2 IP blocks | When an address reaches `max_attempts_per_ip`, its block and the time it ends go to every listener of the protocol. Each refuses logins from the address until that time. | `sync_blocks` |
-| Tier 2 failure counts and progressive delays | Each failure from an address whose count has reached `delay_start_threshold` sends the count and the current wait. A received count only raises the listener's own and never lowers it. Counts below `delay_start_threshold` stay on the listener. | `sync_failure_counts` |
+| Tier 2 failure counts and progressive delays | Each failure from an address whose count has reached `delay_start_threshold` sends the count and the current wait. A received count only raises the listener's own and never lowers it. Counts below `delay_start_threshold` stay on the listener. A successful login from the address clears its count on every listener, except one that blocks the address or has seen a failure from it since the success. | `sync_failure_counts` |
 | Name statistics | Every failure of a name, and the success that clears its failures. | always, while `enabled` |
 | Tier 1 (IP and name) blocks | Not shared: they stay on the listener that set them. | none |
 
@@ -456,8 +460,9 @@ These details matter when you size a busy cluster or read a warning in the log.
   for members that were unreachable at that moment. An overflow is logged at Error level.
 - **Affinity queue.** Up to 5000 outgoing affinity events.
 - **Rate-limit queues.** Each proxy rate limiter queues up to 10000 outgoing IP blocks and 10000
-  other events (failure counts, name failures and successes). An overflow drops messages as in the
-  connection event queue. Nothing repairs a dropped rate-limit event.
+  other events (failure counts and the successes that clear them, name failures and successes). An
+  overflow drops messages as in the connection event queue. Nothing repairs a dropped rate-limit
+  event.
 - **Per-IP queue.** Each per-IP tracker queues up to 10000 outgoing events. The next full-state
   exchange repairs a dropped one.
 - **Receiving.** Each subsystem handles received events on its own worker, with a queue of 256. If
@@ -548,7 +553,7 @@ them.
 |---|---|---|---|
 | `enabled` | bool | `true` | Run the cluster-wide affinity store on this node. The proxies opt in with `enable_affinity`. |
 | `ttl` | duration | `"24h"` | How long an affinity entry lives after it is set. An invalid value logs a warning and uses `24h`. |
-| `cleanup_interval` | duration | `"1h"` | How often expired entries are removed (and the affinity metrics refreshed). An invalid value logs a warning and uses `1h`. |
+| `cleanup_interval` | duration | `"1h"` | How often expired entries are removed (and the affinity metrics refreshed). An invalid value logs a warning and uses `1h`, `0` uses `1h` too, and a negative value stops startup. |
 | `cache_path` | string | `""` | Path of a SQLite file that keeps affinity entries across restarts. Empty keeps them in memory only. The directory must exist and be writable; if the file cannot be opened Sora logs `Failed to initialize affinity cache - continuing without persistence` and runs without it. A corrupt file is deleted and recreated. |
 
 Durations accept Go units (`"30m"`, `"24h"`) and days (`"7d"`); see
@@ -564,7 +569,7 @@ it sends and to what it accepts; set them the same on every node.
 |---|---|---|---|
 | `enabled` | bool | `true` | Share the proxies' rate limiters with the listeners of the same protocol on every node, this one included. The name statistics are always shared while it is on. `false` shares nothing: each listener counts and blocks on its own. |
 | `sync_blocks` | bool | `true` | Send and apply Tier 2 IP blocks. |
-| `sync_failure_counts` | bool | `true` | Send and apply Tier 2 failure counts and progressive delays, from `delay_start_threshold` on. |
+| `sync_failure_counts` | bool | `true` | Send and apply Tier 2 failure counts and progressive delays, from `delay_start_threshold` on, and the successful logins that clear them. |
 
 ### Related `[[server]]` keys
 

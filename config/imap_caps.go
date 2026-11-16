@@ -23,11 +23,81 @@ var IMAPAlwaysAdvertisedCaps = imap.CapSet{
 	imap.CapUTF8Accept:   {},
 }
 
+// IMAPServerCaps returns the capabilities an IMAP server ([[server]] type "imap")
+// starts with, before disabled_caps and client_filters withdraw any: the set
+// disabled_caps and a filter's disable_caps can withdraw from, besides the
+// IMAPAlwaysAdvertisedCaps go-imap adds by itself. PREVIEW (RFC 8970) is opt-in
+// (enable_preview): answering it for mail that is not on this node costs an S3
+// download per message.
+//
+// It holds no AUTH= entry: go-imap advertises AUTH= from the session's
+// AuthenticateMechanisms and never reads it from this set, so one here would let
+// disabled_caps and client_filters report it removed while it stays advertised
+// and usable.
+func IMAPServerCaps(preview bool) imap.CapSet {
+	caps := imap.CapSet{
+		imap.CapIMAP4rev1:                 {},
+		imap.CapIMAP4rev2:                 {},
+		imap.CapLiteralPlus:               {},
+		imap.CapSASLIR:                    {},
+		imap.CapMove:                      {},
+		imap.CapIdle:                      {},
+		imap.CapUIDPlus:                   {},
+		imap.CapESearch:                   {},
+		imap.CapSearchRes:                 {},
+		imap.CapESort:                     {},
+		imap.CapSort:                      {},
+		imap.CapSortDisplay:               {},
+		imap.CapSpecialUse:                {},
+		imap.CapCreateSpecialUse:          {},
+		imap.CapListStatus:                {},
+		imap.CapListExtended:              {}, // listed so a session without IMAP4rev2 keeps it (DisableIMAPCapabilities)
+		imap.CapStatusSize:                {},
+		imap.CapBinary:                    {},
+		imap.CapCondStore:                 {},
+		imap.CapQResync:                   {},
+		imap.CapNotify:                    {},
+		imap.CapChildren:                  {},
+		imap.CapID:                        {},
+		imap.CapNamespace:                 {},
+		imap.CapMetadata:                  {},
+		imap.Cap("THREAD=REFERENCES"):     {},
+		imap.Cap("THREAD=REFS"):           {},
+		imap.Cap("THREAD=ORDEREDSUBJECT"): {},
+		imap.Cap("MULTISEARCH"):           {},
+	}
+	if preview {
+		caps[imap.CapPreview] = struct{}{}
+	}
+	return caps
+}
+
+// IMAPCapNotWithdrawn says why naming a capability in disabled_caps (perClient
+// false) or in a client_filters disable_caps list (perClient true) does not withdraw
+// it from a server whose capabilities are caps (IMAPServerCaps), or returns "" when
+// it does. A filter cannot withdraw IMAP4rev1: go-imap picks the connection's
+// protocol version from the server-wide set. The server logs the reason at start-up,
+// and Config.Warnings reports it.
+func IMAPCapNotWithdrawn(caps imap.CapSet, name string, perClient bool) string {
+	c := IMAPCap(name)
+	if perClient && c == imap.CapIMAP4rev1 {
+		return "go-imap selects connection protocol version from server-global capabilities"
+	}
+	if _, ok := IMAPAlwaysAdvertisedCaps[c]; ok {
+		return "go-imap always advertises it with IMAP4rev1"
+	}
+	if !caps.Has(c) {
+		return "it is not one this server can withdraw"
+	}
+	return ""
+}
+
 // IMAPCap returns the capability a disabled_caps or disable_caps name stands for,
 // spelled as go-imap advertises it and keys its CapSet: capability names are
 // case-insensitive (RFC 9051 section 9, note 1: "Implementations MUST accept these
-// strings in a case-insensitive fashion"), and go-imap spells every capability in
-// upper case but the two base versions.
+// strings in a case-insensitive fashion"), and go-imap spells every capability
+// these settings can withdraw in upper case but the two base versions. (RIGHTS=,
+// whose rights are lower case, is not one of them: go-imap advertises it with ACL.)
 func IMAPCap(name string) imap.Cap {
 	for _, base := range []imap.Cap{imap.CapIMAP4rev1, imap.CapIMAP4rev2} {
 		if strings.EqualFold(name, string(base)) {

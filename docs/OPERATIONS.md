@@ -83,8 +83,10 @@ Sora starts in this order. A failure in any step ends the process with status 1,
 
 1. **Flags.** `-version` prints and exits here.
 2. **Config file.** Sora reads and parses the file. Unknown keys and duplicate keys are warnings, not
-   errors ([CONFIGURATION.md](CONFIGURATION.md)). These warnings go to standard error, because
-   logging is not set up yet.
+   errors ([CONFIGURATION.md](CONFIGURATION.md)). Logging is not set up yet, so Sora holds these
+   warnings and writes them to the `[logging]` output when it opens (step 6, or step 3 when
+   validation stops startup), at its level. If the file cannot be read or parsed, startup stops
+   here and Sora writes them to standard error.
 3. **Validation.** In this order:
    - Unknown names in `[sieve] enabled_extensions` are a warning.
    - Each `[[server]]` block is validated: a `type`, `name` and `addr`, a known `type`, and no
@@ -94,6 +96,15 @@ Sora starts in this order. A failure in any step ends the process with status 1,
    - A listener with `proxy_protocol = true` requires a non-empty `[servers] trusted_networks`.
    - Two `[[server]]` blocks may not share a `name` or an `addr`.
    - At least one `[[server]]` block must exist.
+   - A server that queries the database needs a `[database.write]` host (step 9.2 says which do).
+   - A node that uses S3 needs `[s3] bucket` and `endpoint`, a `timeout` that parses, `access_key`
+     and `secret_key` both set or both empty, and with `encrypt = true` a valid `encryption_key`.
+   - With `[cluster] enabled = true`, `addr` must be a specific IP address with a port memberlist can
+     bind, and `secret_key` the base64 of 32 bytes ([CLUSTER.md](CLUSTER.md)).
+   - The other checks of [CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup), such as
+     `[relay]`, `[relay.queue]`, `[uploader]` and `[cleanup]`. Every problem found is reported
+     before Sora exits. To report them, Sora first opens the `[logging]` output as in step 6, so
+     the problems are logged where every other error goes.
 4. **Database endpoints.** A `[database.write]` or `[database.read]` section that is not in the file
    counts as not configured. This is how a proxy-only node runs without a database.
 5. **Global settings.** `bcrypt_cost` and `[sieve] max_execution_time` are applied.
@@ -109,11 +120,15 @@ Sora starts in this order. A failure in any step ends the process with status 1,
       PostgreSQL. A node with `managesieve`, `http_admin_api` or `http_user_api` needs PostgreSQL,
       and `http_user_api` also uses S3 to serve message bodies. A proxy needs PostgreSQL when it
       checks passwords in the database (no remote lookup, or
-      `[server.remote_lookup] lookup_local_users = true`). A database that is needed but not
-      configured stops startup.
-   3. **S3**, when needed: `[s3] access_key`, `secret_key`, `bucket` and `endpoint` must be set. Sora
-      does not contact S3 here and does not create the bucket. With `[s3] encrypt = true` the
-      encryption key is checked (64 hex characters).
+      `[server.remote_lookup] lookup_local_users = true`). Step 3 has checked that what it needs is
+      configured. A node with an `imap`, `pop3` or `lmtp` server and the default `[uploader] path`
+      then checks that the old default spool, `/tmp/sora/uploads`, holds no staged body
+      in its filesystem namespace. Migrate the host's old spool before first starting the new
+      `PrivateTmp` unit ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)).
+   3. **S3**, when needed: the client is set up with `[s3] endpoint` and `bucket`. Without
+      `access_key` and `secret_key` the AWS default credential chain must supply them. Sora does not
+      contact S3 here and does not create the bucket. With `[s3] encrypt = true` the encryption key
+      is checked (64 hex characters).
    4. **PostgreSQL**, when needed: Sora connects to every write host, applies pending migrations
       through the first one it can reach ([Database migrations](#10-database-migrations)), and
       connects to the read hosts. A failed migration stops startup. Hosts that fail, read or write,
@@ -142,16 +157,18 @@ with status 1. It does not leave the other listeners running.
 
 ### Messages that stop startup
 
-Errors from steps 2 to 9 are written by Sora's error handler. Before step 6 the `[logging]` output
-is not open yet, so they go to standard error, in this form:
+Errors from steps 2 to 9 are written by Sora's error handler. A config file that cannot be read or
+parsed (step 2) has no `[logging]` output to follow, so that error goes to standard error, after
+what Sora logged until then, in this form:
 
 ```
-[ERROR] 2026/01/15 10:00:00 ERROR: invalid configuration - <what>: <why>
-[ERROR] 2026/01/15 10:00:00 FATAL: operation '<what>' failed: <why>
+[ERROR] 2026/01/15 10:00:00 ERROR: configuration file '<path>' not found: <why>
+[ERROR] 2026/01/15 10:00:00 ERROR: failed to parse configuration file '<path>': <why>
 ```
 
-From step 6 on they are ERROR records of the `[logging]` output, in its format, like every other
-error Sora logs. With the console format:
+From step 3 on they are ERROR records of the `[logging]` output, in its format, like every other
+error Sora logs: validation opens that output before it reports what it found. With the console
+format:
 
 ```
 time=2026-01-15T10:00:00.000+01:00 level=ERROR msg="Invalid configuration" field=<what> error=<why>
@@ -165,7 +182,7 @@ show nothing on standard error: look in the log file or in syslog.
 |---|---|---|
 | `configuration file '...' not found` | The file named with `-config` does not exist. | Check the path. |
 | `failed to parse configuration file` | TOML syntax error. The message points at the line. | Fix the syntax. |
-| `invalid configuration - servers: no servers configured` | No `[[server]]` block. | Add one with `type`, `name` and `addr`. |
+| `Invalid configuration` with field `servers` and `no servers configured` | No `[[server]]` block. | Add one with `type`, `name` and `addr`. |
 | `server address is required` (or the name or type) | A `[[server]]` block lacks `addr`, `name` or `type`. | Add the missing key. |
 | `invalid server type` | `type` is misspelled. | Use one of the types in [CONFIGURATION.md](CONFIGURATION.md). |
 | `master_username is set but master_password is empty` | A master user without a password would let anyone in. | Set the password or remove the user. |
@@ -176,6 +193,7 @@ show nothing on standard error: look in the log file or in syslog.
 | `Fatal error` with operation `initialize resilient database` | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
 | `Fatal error` with operation `initialize cache` | `[local_cache] path` cannot be created. | Fix the path or its permissions. |
 | `Fatal error` with operation `create upload worker` | `[uploader] path` cannot be created. | Fix the path or its permissions. |
+| `Invalid configuration` with field `uploader path` and `the previous default [uploader] path, still holds staged bodies` | `[uploader] path` is the default, and the process can see staged bodies in the old `/tmp/sora/uploads` (step 9.2). A private `/tmp` can hide the host's old spool. | Drain or migrate the old spool before changing the unit ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)). |
 | `Fatal error` with operation `initialize TLS manager` | Certificate files unreadable, or a Let's Encrypt setting is missing. | See [TLS.md](TLS.md). |
 | `Fatal error` with operation `server operation` | A listener could not start or failed later, for example `address already in use`. | Free the port, or check privileges for ports below 1024. |
 
@@ -199,7 +217,10 @@ Sora starts despite these, but each one points at something to fix:
 `sora-admin --config PATH config validate` parses the file, prints unknown and duplicate keys,
 validates every `[[server]]` block and runs the other checks `sora` makes on the file before it
 starts anything (see [CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), reporting
-every problem it finds. It connects to nothing and exits with status 0 when the file is valid.
+every problem it finds. It also prints, as `[WARN]` lines, every warning described there that
+follows from the file alone, such as a value that does not parse and is replaced with its default.
+The warnings that depend on the host are logged only at startup. It connects to nothing
+and exits with status 0 when the file is valid, warnings or not.
 `sora-admin --config PATH config dump` prints the parsed config with secrets masked.
 
 ---
@@ -387,10 +408,52 @@ A restart **keeps** everything on disk and in the shared stores:
 - The **local cache**, the **auth cache**, the **affinity cache** file and the Let's Encrypt fallback
   directory.
 
-This only holds if those paths survive a restart. The defaults for the spool, the cache and the auth
-cache are under `/tmp/sora`, which many systems clear at boot. Always set `[uploader] path` (and the
-other paths) to a directory that persists
-([What Sora writes to local disk](#6-what-sora-writes-to-local-disk)).
+This only holds if those paths survive a restart. The defaults put the spool under `/var/spool/sora`
+and the local cache and auth cache under `/var/cache/sora`, so they persist as long as those two
+directories do. Sora creates the paths below them, but an unprivileged user cannot create a
+directory in `/var/spool` or `/var/cache`. `dist/sora.rc` creates both; with `dist/sora.service`,
+systemd creates `/var/cache/sora` and you create `/var/spool/sora` at install
+([Service files](#8-service-files)). Without the service files, create both, writable by the user
+Sora runs as, on a disk that survives reboots, or set the paths elsewhere
+([What Sora writes to local disk](#6-what-sora-writes-to-local-disk)). Never put `[uploader] path`
+on `tmpfs` or under a `/tmp` that is cleared at boot.
+
+Earlier releases defaulted all three paths to `/tmp/sora`. Nothing defaults to it any more. At
+storage startup Sora checks the old spool in its filesystem namespace: a node with an `imap`, `pop3` or `lmtp` server whose
+`[uploader] path` is the default refuses to start while `/tmp/sora/uploads` still holds staged
+bodies, because the new default would never upload them. It logs `Invalid configuration` for the
+field `uploader path`, with an error that begins
+`/tmp/sora/uploads, the previous default [uploader] path, still holds staged bodies` and names one
+of them, and exits with status 1. Either set `[uploader] path = "/tmp/sora/uploads"` until
+`sora-admin uploader status` shows nothing pending and then remove it, or stop Sora and move that
+directory to `/var/spool/sora/uploads`. `sora-admin uploader resolve` refuses to run in the same
+case. At startup only entries of the user Sora runs as, or of root, count: any local user can
+write to `/tmp`, so an entry there that belongs to another user, or that Sora cannot read, is
+logged as a warning (`Uploader: ignoring an entry under the previous default [uploader] path ...`)
+and passed over with everything below it, as is the whole old spool when `/tmp/sora` is a link
+of another user. `resolve`, often run as root, cannot tell which user the server runs as: it
+counts every entry and refuses when it cannot read one. Neither counts a file at
+`/tmp/sora/uploads` itself: bodies were staged in directories below it.
+
+The startup check assumes the service user is unchanged from the version that staged those
+bodies. Changing that user in the same upgrade, or leaving genuine old bodies unreadable, can
+make startup pass over bodies the database still needs. Inspect and drain or migrate those
+bodies before starting on the new path. File ownership does not establish that a spool belongs
+to the connected database; use the matching instance and configuration.
+
+Check the host's old spool before the first start with the new systemd unit. Its
+[`PrivateTmp=true`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#PrivateTmp=)
+gives Sora a different `/tmp`, so the startup check cannot see the host's
+`/tmp/sora/uploads`. Drain that spool using the old service and configuration before replacing
+the unit, or stop the old service and move the preserved host spool to the durable path before
+starting the new one. Merely setting the old path in the new private namespace does not expose
+the host's files. Never configure the upload spool under the unit's private `/tmp`: systemd
+removes that temporary directory when the service stops. If the old service itself stored bodies
+in a private `/tmp`, drain its uploads before stopping it.
+
+An older release that defaults `[uploader] path` to `/tmp/sora/uploads` has no such check and does
+not look in `/var/spool/sora/uploads`: before rolling back to one, set the path explicitly
+([Rolling back](#rolling-back)).
 
 ---
 
@@ -398,9 +461,9 @@ other paths) to a directory that persists
 
 | What | Key | Default | Written when | Contents | Can it be lost? |
 |---|---|---|---|---|---|
-| Upload spool | `[uploader] path` | `/tmp/sora/uploads` | The node has an `imap`, `pop3` or `lmtp` server | One file per message body not yet in S3, at `<path>/<account_id>/<content_hash>`. Written to a `.tmp` name, synced, then renamed. | **No.** Until a body is in S3, this file is its only copy. |
-| Local cache | `[local_cache] path` | `/tmp/sora/cache` | Same | Bodies in `<path>/data/`, 256 SQLite index files `cache_index_00.db` to `cache_index_ff.db` (WAL mode), and one `.sora_warmup_state.<server hash>` per IMAP server (lowercase SHA-256 of its name), written when it stops with cache warmup on (the default). | Yes. Sora fetches bodies from S3 again. |
-| Auth cache | `[auth_cache] path` | `/tmp/sora/auth_cache.db` | `[auth_cache] enabled = true` | SQLite file (mode 0600, WAL) with addresses, account IDs and password hashes. Its parent directory is created. | Yes. It refills from the database. Treat it as secret: it holds password hashes. |
+| Upload spool | `[uploader] path` | `/var/spool/sora/uploads` | The node has an `imap`, `pop3` or `lmtp` server | One file per message body not yet in S3, at `<path>/<account_id>/<content_hash>`. Written to a `.tmp` name, synced, then renamed. | **No.** Until a body is in S3, this file is its only copy. |
+| Local cache | `[local_cache] path` | `/var/cache/sora/cache` | Same | Bodies in `<path>/data/`, 256 SQLite index files `cache_index_00.db` to `cache_index_ff.db` (WAL mode), and one `.sora_warmup_state.<server hash>` per IMAP server (lowercase SHA-256 of its name), written when it stops with cache warmup on (the default). | Yes. Sora fetches bodies from S3 again. |
+| Auth cache | `[auth_cache] path` | `/var/cache/sora/auth_cache.db` | `[auth_cache] enabled = true` | SQLite file (mode 0600, WAL) with addresses, account IDs and password hashes. Its parent directory is created. | Yes. It refills from the database. Treat it as secret: it holds password hashes. |
 | Affinity cache | `[cluster.affinity] cache_path` | none (off) | Cluster and `[cluster.affinity]` enabled, and `cache_path` set | SQLite file (mode 0600, WAL) with user-to-backend affinity. | Yes. Users are routed afresh. |
 | Relay queue | `[relay.queue] path` | `/var/spool/sora/relay` | `[relay] type` is set | `pending/`, `processing/` and `failed/` directories with outgoing Sieve redirects and vacation replies. | Losing `pending/` loses those messages. |
 | Let's Encrypt fallback | `[tls.letsencrypt] fallback_dir` | `/var/lib/sora/certs` | `[tls] provider = "letsencrypt"`, unless `enable_fallback = false` | A local copy of the certificates in S3, including private keys (directory mode 0700). | Yes. It is a mirror of the S3 store. |
@@ -463,8 +526,9 @@ keys. Use it when a log collector parses the lines.
 
 A few things are always written to the process's standard error, whatever `output` says:
 
-- Warnings from reading the config at startup (unknown keys, duplicate keys) and the startup errors
-  that happen before logging is set up ([Startup](#messages-that-stop-startup)).
+- A config file that cannot be read or parsed ([Startup](#messages-that-stop-startup)), with what
+  Sora logged until then. Once the file is parsed, the warnings about it and the problems validation
+  finds go to the `[logging]` output instead.
 - A Go panic and its stack trace.
 
 Under systemd these are in the journal even when Sora logs to a file. Check both when Sora does not
@@ -515,7 +579,7 @@ The unit, abridged:
 Description=Sora Mail Server
 Documentation=https://github.com/migadu/sora
 After=network-online.target postgresql.service
-Wants=network-online.target
+Wants=network-online.target postgresql.service
 
 [Service]
 Type=simple
@@ -531,7 +595,14 @@ RestartSec=5
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
-ReadWritePaths=/var/spool/sora /var/cache/sora /var/lib/sora /var/log/sora
+PrivateTmp=true
+StateDirectory=sora
+StateDirectoryMode=0750
+CacheDirectory=sora
+CacheDirectoryMode=0750
+LogsDirectory=sora
+LogsDirectoryMode=0750
+ReadWritePaths=/var/spool/sora
 LimitNOFILE=65536
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
@@ -553,16 +624,21 @@ What each part means for you:
 - **`Restart=on-failure`, `RestartSec=5`.** A startup failure (status 1) is retried every 5 seconds.
   That suits a database that comes up later. For a config error, it repeats the same error until
   you fix it.
-- **`ProtectSystem=strict`, `ReadWritePaths`.** The whole file system is read-only for Sora except
-  `/var/spool/sora`, `/var/cache/sora`, `/var/lib/sora` and `/var/log/sora`. All four must exist
-  before the unit starts; systemd refuses to start it if one is missing. Every path Sora writes
-  must be under one of them:
-  - set `[uploader] path` to a directory under `/var/spool/sora` (for example
-    `/var/spool/sora/uploads`);
-  - set `[local_cache] path` to a directory under `/var/cache/sora` (for example
-    `/var/cache/sora/cache`), and `[auth_cache] path` too if you use it;
-  - the relay queue default, `/var/spool/sora/relay`, already fits;
-  - with Let's Encrypt, the default `fallback_dir`, `/var/lib/sora/certs`, already fits.
+- **`ProtectSystem=strict`, `ReadWritePaths`, `StateDirectory`, `CacheDirectory`, `LogsDirectory`.**
+  The whole file system is read-only for Sora except `/var/spool/sora`, `/var/lib/sora`,
+  `/var/cache/sora` and `/var/log/sora`. At every start systemd creates the last three if they are
+  missing and sets them to owner `sora` and mode 0750. It does not create `/var/spool/sora`, and
+  refuses to start the unit while it is missing: create it at install with
+  `install -d -o sora -g sora -m 0750 /var/spool/sora`.
+  Every path Sora writes must be under one of the four. The defaults are:
+  - `[uploader] path`, `/var/spool/sora/uploads`, and the relay queue, `/var/spool/sora/relay`;
+  - `[local_cache] path`, `/var/cache/sora/cache`, and `[auth_cache] path`,
+    `/var/cache/sora/auth_cache.db`;
+  - with Let's Encrypt, `fallback_dir`, `/var/lib/sora/certs`.
+
+  A log file set in `[logging] output` must be under `/var/log/sora`.
+- **`PrivateTmp=true`.** Sora gets its own `/tmp`, which systemd deletes whenever the service
+  stops. No path Sora must keep may be under `/tmp`.
 - **`AmbientCapabilities=CAP_NET_BIND_SERVICE`** lets the `sora` user bind ports below 1024 (25, 80,
   110, 143, 993, 995 and so on).
 - **`LimitNOFILE=65536`.** Each client connection uses a file descriptor, and a proxy uses two.
@@ -588,9 +664,12 @@ The rc.d script reads these `rc.conf` variables:
 | `sora_config` | `/usr/local/etc/sora/config.toml` |
 | `sora_logdir` | `/var/log/sora` |
 | `sora_spooldir` | `/var/spool/sora` |
+| `sora_cachedir` | `/var/cache/sora` |
+| `sora_statedir` | `/var/lib/sora` |
 
-Before it starts Sora, it creates `sora_logdir` and `sora_spooldir` (mode 0750, owned by the user).
-It does not create a cache directory. `service sora reload` sends SIGHUP.
+Before it starts Sora, it creates `sora_logdir`, `sora_spooldir`, `sora_cachedir` and
+`sora_statedir` (mode 0750, owned by the user). The default paths are under them.
+`service sora reload` sends SIGHUP.
 
 The script runs Sora under `daemon(8)`, which detaches it and writes the pid file
 `/var/run/sora.pid`. `service sora start` returns once Sora is running, `status` reports its PID,
@@ -746,6 +825,11 @@ property of each release, so the release notes are the place to look.
 - **Restore.** Restore the database backup taken before the upgrade
   ([Backups and restores](#13-backups-and-restores)). Mail delivered since then is lost from the
   database.
+
+On a node whose config does not set `[uploader] path`, check the old binary's default first.
+Releases that default it to `/tmp/sora/uploads` do not look in `/var/spool/sora/uploads`, where the
+newer binary staged the bodies not yet in S3: set `[uploader] path = "/var/spool/sora/uploads"`
+before the old binary starts ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)).
 
 ---
 

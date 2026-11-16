@@ -83,25 +83,31 @@ func TestWarnUnusedConfigOptions_AllowedHostsOnlyOnHTTPServers(t *testing.T) {
 	}
 }
 
-// Keys only some server types read (#908, #1081): listen_backlog by the mail servers
-// and proxies (the HTTP servers listen with the kernel's default backlog), the API
-// keys, the User API's JWT and CORS keys, the metrics listener's path and collection
-// settings, and the protocol, login and backend keys the start functions in
-// cmd/sora/main.go pass to some servers only. Each one set on any other type is
-// reported at startup, naming the key and the server; on a type that reads it,
-// nothing is reported.
+// Keys only some server types read (#908, #1081, #1326): listen_backlog by the mail
+// servers and proxies (the HTTP servers listen with the kernel's default backlog), the
+// API keys, the User API's JWT and CORS keys, the metrics listener's path and
+// collection settings, the protocol, login and backend keys and the nested
+// remote_lookup, auth_rate_limit, lookup_cache and timeouts tables the start functions
+// in cmd/sora/main.go pass to some servers only, and the TLS and PROXY listener keys
+// the metrics listener does not read. Each one set on any other type is reported at
+// startup, naming the key and the server; on a type that reads it, nothing is
+// reported.
 func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 	mailServers := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
 	userAPI := []string{"http_user_api", "user_api_proxy"}
 	metricsOnly := []string{"metrics"}
 	imapOnly := []string{"imap"}
 	imapAndProxy := []string{"imap", "imap_proxy"}
-	// The servers with a password login. The LMTP backend offers no AUTH, so
-	// insecure_auth has nothing to allow there.
+	// The IMAP, POP3 and ManageSieve servers and proxies. The LMTP backend offers no
+	// AUTH, so insecure_auth has nothing to allow there, and the HTTP User API's
+	// login reads none of these keys.
 	loginServers := []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
 	proxies := []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
 	// The LMTP backend's only timeout is timeouts.command_timeout.
 	authIdle := []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
+	allButMetrics := []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_admin_api", "http_user_api", "user_api_proxy"}
+	// The POP3 and ManageSieve backends take debug and write nothing with it.
+	debugReaders := []string{"imap", "lmtp", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
 	no, yes, n := false, true, 50
 	keys := []struct {
 		key    string
@@ -142,7 +148,7 @@ func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 		{"master_sasl_allowed_networks", func(s *ServerConfig) { s.MasterSASLAllowedNetworks = []string{"10.0.0.0/8"} }, []string{"imap", "pop3", "managesieve"}},
 		{"insecure_auth", func(s *ServerConfig) { s.InsecureAuth = true }, loginServers},
 		{"auth_idle_timeout", func(s *ServerConfig) { s.AuthIdleTimeout = "2m" }, authIdle},
-		{"debug", func(s *ServerConfig) { s.Debug = true }, mailServers},
+		{"debug", func(s *ServerConfig) { s.Debug = true }, debugReaders},
 
 		// The proxies' backend legs.
 		{"remote_port", func(s *ServerConfig) { s.RemotePort = int64(143) }, proxies},
@@ -159,6 +165,45 @@ func TestWarnUnusedConfigOptions_KeysOnlySomeServerTypesRead(t *testing.T) {
 		{"append_limit", func(s *ServerConfig) { s.AppendLimit = "10mb" }, imapOnly},
 		{"max_script_size", func(s *ServerConfig) { s.MaxScriptSize = "32kb" }, []string{"managesieve"}},
 		{"supported_extensions", func(s *ServerConfig) { s.SupportedExtensions = []string{"vacation"} }, []string{"managesieve_proxy"}},
+
+		// The nested tables (#1326). A proxy builds a lookup client from its
+		// remote_lookup; the LMTP proxy and the Admin API have no login to rate limit,
+		// and the LMTP backend, the Admin API and the metrics listener look up no
+		// credentials to cache.
+		{"remote_lookup", func(s *ServerConfig) {
+			s.RemoteLookup = &RemoteLookupConfig{Enabled: true, URL: "https://lookup.example.com/$email"}
+		}, proxies},
+		{"auth_rate_limit", func(s *ServerConfig) { s.AuthRateLimit = &AuthRateLimiterConfig{Enabled: true} }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api", "user_api_proxy"}},
+		{"lookup_cache", func(s *ServerConfig) { s.LookupCache = &LookupCacheConfig{Enabled: true} }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}},
+
+		// Session timeouts (#290, #1326): the LMTP backend's command_timeout is its
+		// idle timeout, and the LMTP proxy applies absolute_session_timeout only. The
+		// HTTP servers time out no sessions, and each per-command table belongs to
+		// its own protocol's backend.
+		{"timeouts.command_timeout", func(s *ServerConfig) { s.Timeouts = &ServerTimeoutsConfig{CommandTimeout: "10m"} }, []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+		{"timeouts.absolute_session_timeout", func(s *ServerConfig) { s.Timeouts = &ServerTimeoutsConfig{AbsoluteSessionTimeout: "1h"} }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}},
+		{"timeouts.min_bytes_per_minute", func(s *ServerConfig) { s.Timeouts = &ServerTimeoutsConfig{MinBytesPerMinute: 512} }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+		{"timeouts.imap_command_timeouts", func(s *ServerConfig) {
+			s.Timeouts = &ServerTimeoutsConfig{IMAPCommandTimeouts: &CommandTimeoutsConfig{Search: "5s"}}
+		}, imapOnly},
+		{"timeouts.pop3_command_timeouts", func(s *ServerConfig) {
+			s.Timeouts = &ServerTimeoutsConfig{POP3CommandTimeouts: &POP3CommandTimeoutsConfig{Retr: "1m"}}
+		}, []string{"pop3"}},
+		{"timeouts.managesieve_command_timeouts", func(s *ServerConfig) {
+			s.Timeouts = &ServerTimeoutsConfig{ManageSieveCommandTimeouts: &ManageSieveCommandTimeoutsConfig{PutScript: "20s"}}
+		}, []string{"managesieve"}},
+		{"timeouts.lmtp_command_timeouts", func(s *ServerConfig) {
+			s.Timeouts = &ServerTimeoutsConfig{LMTPCommandTimeouts: &LMTPCommandTimeoutsConfig{Data: "2m"}}
+		}, []string{"lmtp"}},
+
+		// The listener keys of the metrics endpoint, which is always plain HTTP and
+		// reads no PROXY header (#1326). tls_verify is set with tls = true, which the
+		// other types need for it; on metrics the 'tls' warning does not name it.
+		{"tls_cert_file", func(s *ServerConfig) { s.TLSCertFile = "/etc/sora/cert.pem" }, allButMetrics},
+		{"tls_key_file", func(s *ServerConfig) { s.TLSKeyFile = "/etc/sora/key.pem" }, allButMetrics},
+		{"tls_verify", func(s *ServerConfig) { s.TLS, s.TLSVerify = true, true }, allButMetrics},
+		{"tls_default_domain", func(s *ServerConfig) { s.TLSDefaultDomain = "mail.example.com" }, allButMetrics},
+		{"proxy_protocol_timeout", func(s *ServerConfig) { s.ProxyProtocolTimeout = "10s" }, allButMetrics},
 	}
 	for _, k := range keys {
 		for _, serverType := range ServerTypes {

@@ -23,6 +23,7 @@ import (
 )
 
 type IMAPSession struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	*IMAPUser
 	server      *IMAPServer
@@ -75,6 +76,8 @@ type IMAPSession struct {
 	lastSelectedMailboxID int64
 	lastHighestUID        imap.UID
 	recentAboveUID        imap.UID    // Messages above this UID are \Recent in this session (RFC 3501 §2.3.2); set by SELECT
+	numRecent             uint32      // The RECENT count: messages above recentAboveUID in the server view (currentNumMessages); set by SELECT, moved by Poll
+	recentUnsent          atomic.Bool // Poll grew the mailbox or expunged a \Recent message and has not yet written the RECENT count that goes with that EXISTS or EXPUNGE
 	useMasterDB           atomic.Bool // Pin session to master DB after a write to ensure consistency
 	selectedReadOnly      atomic.Bool // True when the selected mailbox is read-only: opened with EXAMINE, or SELECTed without any of the 'iestw' rights
 	selectedExamined      atomic.Bool // True when the selected mailbox was opened with EXAMINE itself (RFC 9051 §6.3.3)
@@ -113,14 +116,10 @@ type IMAPSession struct {
 	// NOTIFY (RFC 5465) watch state. notifyMutex guards the pointer swap:
 	// SetNotify/Close write it on the command goroutine, NotifyPoll reads it
 	// on the pump goroutine (the library stops the pump before SetNotify
-	// runs, so the watch internals are only ever touched by one goroutine).
+	// runs, so the watch internals are only ever touched by one goroutine,
+	// except notifyWatch.own, which notifyMutex guards as well).
 	notifyMutex sync.Mutex
 	notifyWatch *notifyWatch
-
-	// idling is true while the client is in an IDLE command. The NOTIFY pump
-	// reads it to release SELECTED-DELAYED expunges, since IDLE is a delayed-
-	// expunge sync point (RFC 5465 §6.1.2).
-	idling atomic.Bool
 
 	// Memory tracking
 	memTracker *server.SessionMemoryTracker
@@ -580,6 +579,7 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.reportedHighestModSeq.Store(0)
 	s.reportedModSeqGap.Store(false)
 	s.queuedFlagUpdates.Store(false)
+	s.recentUnsent.Store(false)
 	s.currentNumMessages.Store(0)
 	s.firstUnseenSeqNum.Store(0)
 	s.savedSearchUIDs = nil // saved "$" result is scoped to the selected mailbox
@@ -709,7 +709,7 @@ func (s *IMAPSession) startTerminationPoller() {
 	netConn := s.conn.NetConn()
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done

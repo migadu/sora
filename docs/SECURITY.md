@@ -104,8 +104,7 @@ plaintext authentication is allowed without TLS on a publicly reachable address;
 "Publicly reachable" means bound to a public IP, or to a wildcard address (`:143`, `0.0.0.0`, `::`)
 on a host that has a public address. Loopback, private (RFC 1918, ULA), link-local and CGNAT binds
 do not warn. On a listener with `tls = false`, setting `insecure_auth = false` does not change
-anything: configure TLS instead. The POP3 backend also logs
-`POP3: TLS not configured; cleartext authentication auto-enabled. ...` whenever its `tls` is off.
+anything: configure TLS instead.
 
 A backend behind Sora proxies usually runs with `tls = false` on a private address. Keep its ports
 reachable only from the proxies, or turn on TLS on the backend leg ([PROXY.md](PROXY.md#8-the-backend-leg)):
@@ -245,8 +244,14 @@ Where each applies:
 `lmtp_proxy` ignores the per-user limits, with a warning.
 
 Behind Sora proxies that send PROXY headers (`remote_use_proxy_protocol`), a backend's
-`max_connections_per_ip` limits each client a second time, by the address the proxy names. Set it no
-lower than on the proxies, or to `0` to leave the limit to them.
+`max_connections_per_ip` limits each client a second time, by the address the proxy names, and a
+client over it fails its login on the proxy. Set it to `0` to leave the limit to the proxies, or
+above the most connections the proxies let one address open in total. In cluster mode that is the
+proxies' own `max_connections_per_ip`, which `imap_proxy`, `pop3_proxy` and `managesieve_proxy`
+count across all proxy nodes of the protocol. Without `[cluster]` each proxy listener counts only
+its own connections, so it is that limit times the number of proxy listeners. Leave headroom above
+it: the cluster-wide count is eventually consistent, and when a proxy closes a session the backend
+can still count its connection for a moment after the proxy has freed the client's slot.
 
 What a client sees:
 
@@ -431,14 +436,27 @@ When a request does not fit:
 
 | Request | Reply |
 |---|---|
-| IMAP `FETCH` of a body or section | `NO [UNAVAILABLE] Message too large for the session memory limit` |
+| IMAP `FETCH` of a body or section that can never fit the limit | `NO [LIMIT] Message too large for the session memory limit` |
+| IMAP `FETCH` of a body or section that fits the limit, but not what the session holds now | `NO [UNAVAILABLE] Session memory limit reached, please try again later` |
 | IMAP `APPEND` | `NO [UNAVAILABLE] Session memory limit reached, please try again later` |
 | IMAP `SEARCH` | an internal error reply |
-| POP3 `RETR`, `TOP` | `-ERR [SYS/TEMP] Message too large to retrieve in this session` |
+| POP3 `RETR`, `TOP` of a body that can never fit the limit | `-ERR [SYS/PERM] Message too large for the session memory limit` |
+| POP3 `RETR`, `TOP` of a body that fits the limit, but not what the session holds now | `-ERR [SYS/TEMP] Session memory limit reached, please try again later` |
 | POP3 opening a mailbox whose message list is too large | `-ERR [SYS/TEMP] Mailbox too large to open in this session` |
 
+An IMAP `FETCH` can never fit when the body is larger than the limit, or when a section such as
+`BODY[TEXT]` does not fit beside the body it is copied from. A POP3 body can never fit when it does
+not fit beside the session's message list. No retry helps then, so the permanent codes (RFC 5530
+`LIMIT`, RFC 3206 `SYS/PERM`) tell clients not to retry; the temporary ones (`UNAVAILABLE`,
+`SYS/TEMP`) are for a session that holds other data at the moment. A message the limit refuses is
+not marked `\Seen`.
+
 Each case is counted in `sora_session_memory_limit_exceeded_total{protocol, server_name, hostname}`.
-Raise the limit if legitimate users hit it with large messages.
+Raise the limit if legitimate users hit it with large messages. Keep it above the `max_message_size`
+of the `lmtp` servers: start-up and a reload warn about an `imap` or `pop3` server whose limit is
+below the largest one in the same file, since mail between the two sizes is delivered but never
+fetched. Messages imported with `sora-admin` are bounded by `[admin_cli] import_message_limit`
+instead.
 
 ---
 
@@ -498,7 +516,7 @@ one.**
 | Key | Meaning |
 |---|---|
 | `allowed_hosts` | IPs or CIDRs allowed to scrape. Matched against the TCP peer; `X-Forwarded-For` is ignored. Others get HTTP 403 `forbidden`. |
-| `api_key` | Requires `Authorization: Bearer <key>`, compared in constant time. A missing token gets 401 with `WWW-Authenticate: Bearer realm="metrics"`; a wrong one gets 403. |
+| `api_key` | Requires `Authorization: Bearer <key>`, compared in constant time. A missing token gets 401 with `WWW-Authenticate: Bearer realm="metrics"`; a wrong one gets 401 with `WWW-Authenticate: Bearer realm="metrics", error="invalid_token"`. |
 
 With both set, a request must pass both. The endpoint is always plain HTTP: `tls` on a metrics block
 is ignored with a warning, so put a TLS proxy in front if a token crosses an untrusted network.

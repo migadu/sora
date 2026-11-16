@@ -243,7 +243,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 	// Header conditions
 	for _, header := range criteria.Header {
 		lowerValue := strings.ToLower(header.Value)
-		lowerKey := strings.ToLower(header.Key)
+		// A field name is printable US-ASCII (RFC 5322 §2.2): fold its ASCII
+		// letters only. strings.ToLower maps U+0130 to "i" and U+212A to "k",
+		// turning a name no message can have into Message-ID or In-Reply-To.
+		lowerKey := lowerASCII(header.Key)
 		switch lowerKey {
 		case "subject":
 			param := nextParam()
@@ -1209,7 +1212,7 @@ func (db *Database) uidsBySeqNumAndLiveLast(ctx context.Context, mailboxID int64
 		SELECT ranked.seqnum, ranked.uid
 		FROM (
 			SELECT uid, ROW_NUMBER() OVER (ORDER BY uid) AS seqnum
-			FROM ` + seqCountedRows("$1", viewParam, "") + ` counted
+			FROM ` + seqCountedRows("$1", viewParam, "", "ASC", "$2") + ` counted
 			ORDER BY uid
 			LIMIT $2
 		) ranked

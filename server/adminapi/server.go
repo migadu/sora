@@ -674,14 +674,14 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		authHeader := r.Header.Get("Authorization")
 		if authHeader == "" {
-			server.SetBearerChallenge(w.Header(), bearerRealm, false)
+			server.SetBearerChallenge(w.Header(), bearerRealm, "")
 			s.writeError(w, http.StatusUnauthorized, "Authorization header required")
 			return
 		}
 
 		parts := strings.SplitN(authHeader, " ", 2)
 		if len(parts) != 2 || strings.ToLower(parts[0]) != "bearer" {
-			server.SetBearerChallenge(w.Header(), bearerRealm, false)
+			server.SetBearerChallenge(w.Header(), bearerRealm, "")
 			s.writeError(w, http.StatusUnauthorized, "Authorization header must be 'Bearer <token>'")
 			return
 		}
@@ -692,13 +692,21 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// A refused key carries the challenge with the reason: RFC 6750 section 3
+		// requires the header for a request that "does not contain an access token that
+		// enables access to the protected resource", and section 3.1 names the reasons
+		// and their statuses. A key that is neither key is "invalid_token": "The
+		// resource SHOULD respond with the HTTP 401 (Unauthorized) status code."
 		if settings.readOnlyAPIKey == "" || subtle.ConstantTimeCompare(token, []byte(settings.readOnlyAPIKey)) != 1 {
-			s.writeError(w, http.StatusForbidden, "Invalid API key")
+			server.SetBearerChallenge(w.Header(), bearerRealm, server.BearerInvalidToken)
+			s.writeError(w, http.StatusUnauthorized, "Invalid API key")
 			return
 		}
 		// The read-only key: every GET route only reads, and every write is a
-		// POST, PUT or DELETE.
+		// POST, PUT or DELETE. A write with it is "insufficient_scope": "The resource
+		// server SHOULD respond with the HTTP 403 (Forbidden) status code".
 		if r.Method != http.MethodGet {
+			server.SetBearerChallenge(w.Header(), bearerRealm, server.BearerInsufficientScope)
 			s.writeError(w, http.StatusForbidden, "API key is read-only")
 			return
 		}
@@ -2257,7 +2265,10 @@ func (s *Server) handleRestoreMessages(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Restore messages. Chunked: a failure part-way leaves already-restored chunks
-	// committed; the caller can simply repeat the request to restore the remainder.
+	// committed; the caller can simply repeat the request to restore the remainder. With
+	// the shared mailbox config in the context, a deleted mailbox in the shared namespace
+	// comes back as a shared mailbox of the account.
+	ctx = context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: s.sharedMailboxes})
 	count, err := s.rdb.RestoreMessagesWithRetry(ctx, params)
 	if err != nil {
 		if errors.Is(err, db.ErrAccountNotFound) {

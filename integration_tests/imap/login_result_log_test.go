@@ -15,12 +15,15 @@ import (
 // once, by the session, so the line can be tied to the client and to the session's
 // other lines (protocol, remote, session, and on success user/account_id), and its
 // cached/method say how the password was checked. The second login with the same
-// password is answered by the lookup cache, the wrong passwords by the database.
+// password is answered by the lookup cache, the wrong passwords by the database. The
+// last login has the right password but asks to act as another user: it is refused
+// for authorization (AUTHORIZATIONFAILED), and that is its result.
 func TestIMAPLoginResultLoggedOnceThroughSession(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	rdb := common.SetupTestDatabase(t)
 	account := common.CreateTestAccount(t, rdb)
+	other := common.CreateTestAccount(t, rdb)
 	address := startIMAPWithMasterSASL(t, rdb, server.AuthRateLimiterConfig{}, "", "")
 	logs := common.CaptureLogs(t)
 
@@ -34,6 +37,9 @@ func TestIMAPLoginResultLoggedOnceThroughSession(t *testing.T) {
 			t.Fatalf("%s with a wrong password: %q, want NO [AUTHENTICATIONFAILED]", cmd.name, reply)
 		}
 	}
+	if reply := imapAuthPlain(t, address, other.Email, account.Email, account.Password); !strings.HasPrefix(reply, "A001 NO [AUTHORIZATIONFAILED]") {
+		t.Fatalf("AUTHENTICATE PLAIN acting as another user: %q, want A001 NO [AUTHORIZATIONFAILED]", reply)
+	}
 
 	success := []string{"protocol=IMAP-", "user=" + account.Email, `msg="authentication successful"`}
 	failed := []string{"protocol=IMAP-", "address=" + account.Email, `msg="authentication failed"`, "reason=invalid_password", "cached=false", "method=main_db"}
@@ -42,5 +48,6 @@ func TestIMAPLoginResultLoggedOnceThroughSession(t *testing.T) {
 		slices.Concat(success, []string{"cached=true", "method=cache"}),
 		failed,
 		failed,
+		[]string{"protocol=IMAP-", "address=" + account.Email, `msg="authorization failed"`, "authzid=" + other.Email, "method=main_db"},
 	)
 }

@@ -322,7 +322,7 @@ func TestRestoreAfterPurgeKeepsMessageState(t *testing.T) {
 		err := db.GetReadPool().QueryRow(ctx, `
 			SELECT ms.mailbox_id, m.mailbox_id, ms.flags, ms.custom_flags::text
 			FROM messages m JOIN message_state ms ON ms.message_id = m.id
-			WHERE m.id = $1 AND m.expunged_at IS NULL`, id).Scan(&s.mailboxID, &s.msgMailbox, &s.flags, &s.customFlags)
+			WHERE m.id = $1 AND m.expunged_at IS NULL`, restoredCopyID(t, db, id)).Scan(&s.mailboxID, &s.msgMailbox, &s.flags, &s.customFlags)
 		require.NoError(t, err, "restored message %d must be live and have a message_state row", id)
 		return s
 	}

@@ -77,9 +77,12 @@ func (v seqView) encode(seq uint32) uint32 {
 
 // decode returns the server-view sequence set naming the messages the client's set
 // names. A client number past its last message names nothing, as does one whose
-// message has been expunged although the client has not been told yet. In the result
-// 0 ("*") stands for the last message of the server view, which the database reads as
-// the last message of the view (db.WithSeqView), not of the mailbox.
+// message has been expunged although the client has not been told yet. The result
+// holds no "*": its ranges end at the last message the client knows, wherever the
+// database's view ends. The two can differ (a message delivered or restored since the
+// poll is live but not yet reported, mailbox_stats.message_count can trail the live
+// count), and a message the client was not told about must not be stored to, copied or
+// moved by sequence number.
 func (v seqView) decode(set imap.SeqSet) imap.SeqSet {
 	clientCount := v.clientCount()
 	out := imap.SeqSet{}
@@ -116,9 +119,6 @@ func (v seqView) decode(set imap.SeqSet) imap.SeqSet {
 			if lo > hi {
 				continue // every one of them has been expunged
 			}
-		}
-		if hi == v.serverCount {
-			hi = 0
 		}
 		out = append(out, imap.SeqRange{Start: lo, Stop: hi})
 	}

@@ -86,13 +86,14 @@ var (
 // member once it has picked one. A named pool carries its own (config.PoolConfig); the
 // unnamed pool a flat remote_addrs list becomes uses the proxy server's.
 type BackendSettings struct {
-	TLS              bool
-	TLSUseStartTLS   bool // Dial plaintext; the proxy upgrades with its protocol's STARTTLS (BackendStartTLSConfig)
-	TLSVerify        bool
-	UseProxyProtocol bool
-	UseIDCommand     bool // IMAP only
-	UseXCLIENT       bool // POP3/LMTP only
-	UseUTF8          bool // POP3 only
+	TLS                             bool
+	TLSUseStartTLS                  bool // Dial plaintext; the proxy upgrades with its protocol's STARTTLS (BackendStartTLSConfig)
+	TLSVerify                       bool
+	UseProxyProtocol                bool
+	UseIDCommand                    bool // IMAP only
+	SkipForwardingWithProxyProtocol bool // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	UseXCLIENT                      bool // POP3/LMTP only
+	UseUTF8                         bool // POP3 only
 	// TLSCAFile is a PEM file of CA certificates the pool's backends are verified against
 	// (private-CA or self-signed backends); "" = the system roots. Loaded once, when the
 	// manager is built.
@@ -188,14 +189,15 @@ func PoolSpecsFromConfig(pools []config.PoolConfig) []PoolSpec {
 			Backends: append([]string(nil), p.Backends...),
 			Default:  p.Default,
 			Settings: BackendSettings{
-				TLS:              p.RemoteTLS,
-				TLSUseStartTLS:   p.RemoteTLSUseStartTLS,
-				TLSVerify:        p.GetRemoteTLSVerify(),
-				UseProxyProtocol: p.RemoteUseProxyProtocol,
-				UseIDCommand:     p.RemoteUseIDCommand,
-				UseXCLIENT:       p.RemoteUseXCLIENT,
-				UseUTF8:          p.RemoteUseUTF8,
-				TLSCAFile:        p.RemoteTLSCAFile,
+				TLS:                             p.RemoteTLS,
+				TLSUseStartTLS:                  p.RemoteTLSUseStartTLS,
+				TLSVerify:                       p.GetRemoteTLSVerify(),
+				UseProxyProtocol:                p.RemoteUseProxyProtocol,
+				UseIDCommand:                    p.RemoteUseIDCommand,
+				SkipForwardingWithProxyProtocol: p.RemoteSkipForwardingWithProxyProtocol,
+				UseXCLIENT:                      p.RemoteUseXCLIENT,
+				UseUTF8:                         p.RemoteUseUTF8,
+				TLSCAFile:                       p.RemoteTLSCAFile,
 			},
 		})
 	}
@@ -213,23 +215,39 @@ type UserRoutingLookup interface {
 
 // UserRoutingInfo contains backend routing information for a user
 type UserRoutingInfo struct {
-	backendRoute           *BackendRoute // per-request explicit-pin ownership; never persisted in the lookup cache
-	ServerAddress          string        // Backend server to connect to (empty in auth-only mode or when routed by pool)
-	PoolName               string        // Named pool to pick a backend from (set by the lookup answer, or by routing once resolved)
-	AccountID              int64         // Account ID for tracking/metrics
-	IsRemoteLookupAccount  bool          // Whether this came from remotelookup
-	AuthOnlyMode           bool          // Remote API authenticated but didn't specify backend (use local selection)
-	ActualEmail            string        // Actual email address for backend impersonation
-	FromCache              bool          // Whether this result came from remotelookup cache
-	RemoteTLS              bool          // Use TLS for backend connection
-	RemoteTLSUseStartTLS   bool          // Use STARTTLS after the greeting instead of implicit TLS
-	RemoteTLSVerify        bool          // Verify backend TLS certificate
-	RemoteUseProxyProtocol bool          // Use PROXY protocol for backend connection
-	RemoteUseIDCommand     bool          // Use IMAP ID command (IMAP only)
-	RemoteUseXCLIENT       bool          // Use XCLIENT command (POP3/LMTP)
-	RemoteUseUTF8          bool          // Backend supports POP3 UTF8 (RFC 6856); mirror a client's pre-auth UTF8 to it (POP3 only)
-	ClientConn             net.Conn      // Client connection (for extracting JA4 fingerprint)
-	ProxySessionID         string        // Proxy session ID for end-to-end tracing
+	backendRoute                          *BackendRoute // per-request explicit-pin ownership; never persisted in the lookup cache
+	ServerAddress                         string        // Backend server to connect to (empty in auth-only mode or when routed by pool)
+	PoolName                              string        // Named pool to pick a backend from (set by the lookup answer, or by routing once resolved)
+	AccountID                             int64         // Account ID for tracking/metrics
+	IsRemoteLookupAccount                 bool          // Whether this came from remotelookup
+	AuthOnlyMode                          bool          // Remote API authenticated but didn't specify backend (use local selection)
+	ActualEmail                           string        // Actual email address for backend impersonation
+	FromCache                             bool          // Whether this result came from remotelookup cache
+	RemoteTLS                             bool          // Use TLS for backend connection
+	RemoteTLSUseStartTLS                  bool          // Use STARTTLS after the greeting instead of implicit TLS
+	RemoteTLSVerify                       bool          // Verify backend TLS certificate
+	RemoteUseProxyProtocol                bool          // Use PROXY protocol for backend connection
+	RemoteUseIDCommand                    bool          // Use IMAP ID command (IMAP only)
+	RemoteSkipForwardingWithProxyProtocol bool          // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	RemoteUseXCLIENT                      bool          // Use XCLIENT command (POP3/LMTP)
+	RemoteUseUTF8                         bool          // Backend supports POP3 UTF8 (RFC 6856); mirror a client's pre-auth UTF8 to it (POP3 only)
+	ClientConn                            net.Conn      // Client connection (for extracting JA4 fingerprint)
+	ProxySessionID                        string        // Proxy session ID for end-to-end tracing
+}
+
+// ForDial returns the routing info a proxy session dials its backend with: a copy of r (an
+// empty one when r is nil) carrying the client's connection, whose JA4 fingerprint the
+// PROXY v2 header forwards (TLV 0xE0), and the proxy's session ID, which it forwards for
+// the backend to log as proxy_session (TLV 0xE1). r is not modified, so a session without
+// routing info keeps meaning "no route looked up yet".
+func (r *UserRoutingInfo) ForDial(clientConn net.Conn, sessionID string) *UserRoutingInfo {
+	var info UserRoutingInfo
+	if r != nil {
+		info = *r
+	}
+	info.ClientConn = clientConn
+	info.ProxySessionID = sessionID
+	return &info
 }
 
 // LookupRouted reports whether addr is the backend the remote lookup named, the only one

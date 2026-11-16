@@ -151,10 +151,13 @@ At startup `sora` looks at the server types in the config and decides what it ne
 | A proxy that checks passwords in the database (no remote lookup, or `[server.remote_lookup]` with `lookup_local_users = true`) | Connects (required) | No |
 | Only proxies that use remote lookup, or `metrics` | Not needed | No |
 
-If a server type needs PostgreSQL and the config has no `[database.write]` section, `sora`
-stops with `[database]: server "<name>" (<type>) needs the database, but it is not configured in
-[database.write] or [database.read]`. On a node that needs S3, `[s3] endpoint` and `bucket` must
-be set, or `sora` stops with `[s3]: endpoint is required ...` or `[s3]: bucket is required ...`;
+If a server type needs PostgreSQL and the config has no database endpoint, `sora` stops with
+`[database]: server "<name>" (<type>) needs the database, but it is not configured in
+[database.write] or [database.read]`. With `[database.read]` hosts but no `[database.write]` hosts
+it stops with `[database.write]: server "<name>" (<type>) needs the database, but [database.write]
+has no hosts; ...`: the migrations and every write go to `[database.write]`. On a node that needs
+S3, `[s3] endpoint` and `bucket` must be set, or `sora` stops with `[s3]: endpoint is required ...`
+or `[s3]: bucket is required ...`;
 without `access_key` and `secret_key` the AWS default credential chain must supply them.
 `sora-admin config validate` refuses such a file too.
 
@@ -246,8 +249,8 @@ safely.
 | Sieve scripts, vacation reply records | PostgreSQL | |
 | The upload queue and node heartbeats | PostgreSQL (`pending_uploads`, `instance_heartbeats`) | |
 | Message bodies | S3 bucket | Keyed `<domain>/<localpart>/<content hash>`. See [STORAGE.md](STORAGE.md#2-s3-keys). |
-| Bodies not yet uploaded | Local disk of the node that accepted them, `[uploader] path` (default `/tmp/sora/uploads`) | The only copy until the upload finishes. |
-| Cached bodies | Local disk, `[local_cache] path` (default `/tmp/sora/cache`) | Disposable. |
+| Bodies not yet uploaded | Local disk of the node that accepted them, `[uploader] path` (default `/var/spool/sora/uploads`) | The only copy until the upload finishes. |
+| Cached bodies | Local disk, `[local_cache] path` (default `/var/cache/sora/cache`) | Disposable. |
 | Outgoing relay messages | Local disk, `[relay.queue] path` (default `/var/spool/sora/relay`) | See [RELAY.md](RELAY.md). |
 | Auth cache, affinity cache | Local SQLite files on proxy nodes | Disposable. See [PROXY.md](PROXY.md). |
 | Let's Encrypt certificates | The S3 bucket in `[tls.letsencrypt.s3]`, mirrored to a local fallback directory | See [TLS.md](TLS.md). |
@@ -255,9 +258,11 @@ safely.
 | Per-user and per-IP connection counts on IMAP, POP3 and ManageSieve proxies, affinity | Memory, shared between nodes by gossip | Lost on restart. See [CLUSTER.md](CLUSTER.md). |
 | Client sessions | Memory of the node that holds the connection | |
 
-The default paths under `/tmp` are fine for a laptop and wrong for production: the staging
-directory holds the only copy of mail that has not reached S3 yet, and many systems clear
-`/tmp` at boot. Set `[uploader] path` to a persistent directory. See
+The staging directory holds the only copy of mail that has not reached S3 yet, so it must
+survive a restart and a reboot. The defaults, under `/var/spool/sora` and `/var/cache/sora`, do
+as long as those two directories exist and the user Sora runs as can write to them
+([OPERATIONS.md](OPERATIONS.md#5-what-a-restart-loses-and-keeps)). Never move `[uploader] path`
+to `tmpfs` or to a `/tmp` that is cleared at boot. See
 [STORAGE.md](STORAGE.md#14-what-to-back-up).
 
 ---

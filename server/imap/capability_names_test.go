@@ -43,7 +43,8 @@ func TestDisabledCaps_NamesAreCaseInsensitive(t *testing.T) {
 // withdraw does nothing. disabled_caps logged it at DEBUG and disable_caps not at
 // all, so at the default level a typo, or a capability go-imap adds by itself
 // such as ACL, went unnoticed (#1114). PREVIEW counts as withdrawable when it is
-// enabled, and a lowercase name is not a typo.
+// enabled, and a lowercase name is not a typo. Every client_filters WARN names
+// the entry, including the ones for IMAP4rev1 and the always advertised names.
 func TestDisabledCaps_UnknownNameWarns(t *testing.T) {
 	logs := &syncLogBuffer{}
 	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
@@ -54,7 +55,7 @@ func TestDisabledCaps_UnknownNameWarns(t *testing.T) {
 		Preview:      PreviewOptions{Enabled: true},
 		CapabilityFilters: []config.ClientCapabilityFilter{{
 			ClientName:  "^ExampleMail$",
-			DisableCaps: []string{"CONDSTOR", "ACL", "preview"},
+			DisableCaps: []string{"CONDSTOR", "ACL", "preview", "imap4rev1", "sasl-ir"},
 		}},
 	})
 
@@ -70,7 +71,7 @@ func TestDisabledCaps_UnknownNameWarns(t *testing.T) {
 	if line := warned("IDEL"); line == "" {
 		t.Errorf("disabled_caps = [IDEL]: no WARN; WARN output:\n%s", out)
 	}
-	for _, capability := range []string{"CONDSTOR", "ACL"} {
+	for _, capability := range []string{"CONDSTOR", "ACL", "imap4rev1", "sasl-ir"} {
 		line := warned(capability)
 		if line == "" {
 			t.Errorf("client_filters disable_caps = [%s]: no WARN; WARN output:\n%s", capability, out)
@@ -84,5 +85,54 @@ func TestDisabledCaps_UnknownNameWarns(t *testing.T) {
 		if line := warned(capability); line != "" {
 			t.Errorf("%s is a capability the server can withdraw, but: %s", capability, line)
 		}
+	}
+}
+
+// AUTH=PLAIN was in the configured set, so disabled_caps and client_filters
+// deleted it from that set and the startup log said it was disabled. But go-imap
+// builds the AUTH= list from the session's AuthenticateMechanisms, never from the
+// set, so clients still saw AUTH=PLAIN and could AUTHENTICATE PLAIN (#1323). It is
+// one of the names the server cannot withdraw (it follows tls, tls_use_starttls
+// and insecure_auth), so naming it must WARN like STARTTLS and ACL do, and no
+// INFO line may claim it was disabled.
+func TestDisabledCaps_AuthPlainCannotBeWithdrawn(t *testing.T) {
+	logs := &syncLogBuffer{}
+	prev := logger.Swap(slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelInfo})))
+	defer logger.Swap(prev)
+
+	c := dialWireCapServerNotAuthenticated(t, IMAPServerOptions{
+		DisabledCaps: []string{"AUTH=PLAIN"},
+		CapabilityFilters: []config.ClientCapabilityFilter{{
+			ClientName:  "^ExampleMail$",
+			DisableCaps: []string{"auth=plain"},
+		}},
+	})
+	c.mustOK(`ID ("name" "ExampleMail")`)
+	if caps := parseWireCaps(t, c.mustOK("CAPABILITY")); !slices.Contains(caps, "AUTH=PLAIN") {
+		t.Fatalf("CAPABILITY before login lost AUTH=PLAIN: %v", caps)
+	}
+
+	out := logs.String()
+	lines := strings.Split(out, "\n")
+	for _, line := range lines {
+		if strings.Contains(line, "level=INFO") && strings.Contains(strings.ToUpper(line), "AUTH=PLAIN") {
+			t.Errorf("INFO line claims AUTH=PLAIN was disabled: %s", line)
+		}
+	}
+	warned := func(capability string) string {
+		for _, line := range lines {
+			if strings.Contains(line, "level=WARN") && strings.Contains(line, `capability="`+capability+`"`) {
+				return line
+			}
+		}
+		return ""
+	}
+	if warned("AUTH=PLAIN") == "" {
+		t.Errorf("disabled_caps = [AUTH=PLAIN]: no WARN; output:\n%s", out)
+	}
+	if line := warned("auth=plain"); line == "" {
+		t.Errorf("client_filters disable_caps = [auth=plain]: no WARN; output:\n%s", out)
+	} else if !strings.Contains(line, "entry=1") {
+		t.Errorf("client_filters disable_caps = [auth=plain]: WARN does not name the entry: %s", line)
 	}
 }
