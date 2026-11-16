@@ -96,6 +96,7 @@ type CacheManager interface {
 }
 
 type CleanupWorker struct {
+	bodyDeletionProtocol  string
 	rdb                   DatabaseManager
 	s3                    S3Manager
 	cache                 CacheManager
@@ -117,7 +118,11 @@ type CleanupWorker struct {
 
 // New creates a new CleanupWorker. redirectRateWindow is the longest redirect rate
 // window of this node's servers (config.LongestRedirectRateWindow).
-func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow time.Duration, uploadMaxAttempts int, instanceLiveness time.Duration, errCh chan<- error) *CleanupWorker {
+func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.Cache, interval, gracePeriod, maxAgeRestriction, ftsRetention, healthStatusRetention, redirectRateWindow time.Duration, uploadMaxAttempts int, instanceLiveness time.Duration, errCh chan<- error, bodyDeletionProtocol ...string) *CleanupWorker {
+	protocol := ""
+	if len(bodyDeletionProtocol) > 0 {
+		protocol = bodyDeletionProtocol[0]
+	}
 	// Wrap S3 storage with resilient patterns including circuit breakers
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 
@@ -133,6 +138,7 @@ func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.C
 	ftsSweepStart := db.FTSKey{ContentHash: fmt.Sprintf("%016x", rand.Uint64())}
 
 	return &CleanupWorker{
+		bodyDeletionProtocol:  protocol,
 		rdb:                   rdb,         // *resilient.ResilientDatabase implements DatabaseManager
 		s3:                    resilientS3, // *resilient.ResilientS3Storage implements S3Manager
 		cache:                 cache,       // *cache.Cache implements CacheManager
@@ -266,6 +272,9 @@ func (w *CleanupWorker) reportStrandedInstances(ctx context.Context) {
 // deleteS3Objects removes the S3 bodies of candidates and then the message rows that
 // referenced them, in batches. It returns how many bodies are gone from S3.
 func (w *CleanupWorker) deleteS3Objects(ctx context.Context, candidates []db.UserScopedObjectForCleanup) (int, error) {
+	if err := (&config.S3Config{BodyDeletionProtocol: w.bodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+		return 0, err
+	}
 	deleted, _, err := reapS3Objects(ctx, w.rdb, w.s3, w.gracePeriod, candidates)
 	return deleted, err
 }
@@ -426,47 +435,52 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 		}
 	}
 
-	// --- Phase 0a: Cleanup of failed uploads ---
-	// This removes message metadata for messages that were never successfully uploaded to S3.
-	// SAFETY: Only run when S3 is healthy. If S3 is down, messages can't be uploaded,
-	// and deleting their metadata would cause permanent message loss.
-	if !w.s3.IsHealthy() {
-		logger.Warn("Cleanup: Skipping failed upload cleanup - S3 is unhealthy (circuit breaker open). Messages preserved for retry when S3 recovers.")
+	if err := (&config.S3Config{BodyDeletionProtocol: w.bodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+		logger.Info("Cleanup: failed-upload and account/mailbox retirement deferred during the body-lock cutover", "reason", err)
 	} else {
-		// Report before reaping: an instance that stopped retrying is invisible to the
-		// failed-upload alerting (which only counts attempts >= max_attempts), yet it
-		// is exactly the case where mail is about to be dropped.
-		w.reportStrandedInstances(ctx)
+		// --- Phase 0a: Cleanup of failed uploads ---
+		// This removes message metadata for messages that were never successfully uploaded to S3.
+		// SAFETY: Only run when S3 is healthy. If S3 is down, messages can't be uploaded,
+		// and deleting their metadata would cause permanent message loss.
+		if !w.s3.IsHealthy() {
+			logger.Warn("Cleanup: Skipping failed upload cleanup - S3 is unhealthy (circuit breaker open). Messages preserved for retry when S3 recovers.")
+		} else {
+			// Report before reaping: an instance that stopped retrying is invisible to the
+			// failed-upload alerting (which only counts attempts >= max_attempts), yet it
+			// is exactly the case where mail is about to be dropped.
+			w.reportStrandedInstances(ctx)
 
-		failedUploadsCount, err = w.rdb.CleanupFailedUploadsWithRetry(ctx, w.gracePeriod, w.uploadMaxAttempts, w.instanceLiveness)
+			failedUploadsCount, err = w.rdb.CleanupFailedUploadsWithRetry(ctx, w.gracePeriod, w.uploadMaxAttempts, w.instanceLiveness)
+			if err != nil {
+				// Log the error but continue, as other cleanup tasks can still proceed.
+				logger.Error("Cleanup: Failed to clean up failed uploads", "error", err)
+			} else if failedUploadsCount > 0 {
+				logger.Info("Cleanup: Cleaned up failed upload messages", "count", failedUploadsCount)
+			}
+		} // end S3 healthy check
+
+		// --- Phase 0: Process soft-deleted accounts ---
+		// This prepares accounts for deletion by expunging their messages and removing
+		// associated data, making them ready for the subsequent cleanup phases.
+		deletedAccountCount, err = w.rdb.CleanupSoftDeletedAccountsWithRetry(ctx, w.gracePeriod)
 		if err != nil {
-			// Log the error but continue, as other cleanup tasks can still proceed.
-			logger.Error("Cleanup: Failed to clean up failed uploads", "error", err)
-		} else if failedUploadsCount > 0 {
-			logger.Info("Cleanup: Cleaned up failed upload messages", "count", failedUploadsCount)
+			logger.Error("Cleanup: Failed to process soft-deleted accounts", "error", err)
+		} else if deletedAccountCount > 0 {
+			logger.Info("Cleanup: Processed soft-deleted accounts", "count", deletedAccountCount)
 		}
-	} // end S3 healthy check
 
-	// --- Phase 0: Process soft-deleted accounts ---
-	// This prepares accounts for deletion by expunging their messages and removing
-	// associated data, making them ready for the subsequent cleanup phases.
-	deletedAccountCount, err = w.rdb.CleanupSoftDeletedAccountsWithRetry(ctx, w.gracePeriod)
-	if err != nil {
-		logger.Error("Cleanup: Failed to process soft-deleted accounts", "error", err)
-	} else if deletedAccountCount > 0 {
-		logger.Info("Cleanup: Processed soft-deleted accounts", "count", deletedAccountCount)
-	}
+		// --- Two-phase mailbox deletion: purge soft-deleted mailboxes ---
+		// IMAP DELETE only stamps mailboxes.deleted_at (O(1)) and returns; the heavy
+		// per-message expunge + row removal happens here, off the client command path.
+		// No grace period: unlike accounts there is no IMAP "undelete", and quota/restore
+		// availability should track the deletion as closely as the cleanup cadence allows,
+		// so tombstones are purged on the next tick.
+		if purgedMailboxCount, err := w.rdb.PurgeSoftDeletedMailboxesWithRetry(ctx, 0); err != nil {
+			logger.Error("Cleanup: Failed to purge soft-deleted mailboxes", "error", err)
+		} else if purgedMailboxCount > 0 {
+			logger.Info("Cleanup: Purged soft-deleted mailboxes", "count", purgedMailboxCount)
+		}
 
-	// --- Two-phase mailbox deletion: purge soft-deleted mailboxes ---
-	// IMAP DELETE only stamps mailboxes.deleted_at (O(1)) and returns; the heavy
-	// per-message expunge + row removal happens here, off the client command path.
-	// No grace period: unlike accounts there is no IMAP "undelete", and quota/restore
-	// availability should track the deletion as closely as the cleanup cadence allows,
-	// so tombstones are purged on the next tick.
-	if purgedMailboxCount, err := w.rdb.PurgeSoftDeletedMailboxesWithRetry(ctx, 0); err != nil {
-		logger.Error("Cleanup: Failed to purge soft-deleted mailboxes", "error", err)
-	} else if purgedMailboxCount > 0 {
-		logger.Info("Cleanup: Purged soft-deleted mailboxes", "count", purgedMailboxCount)
 	}
 
 	// Clean up old vacation responses. A row is what stops a second reply to its sender
@@ -519,32 +533,37 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// never drain, no matter how often the worker wakes up. The loop also stops as soon
 	// as a round makes no progress, so candidates whose S3 delete keeps failing are
 	// left to the next cycle instead of being re-fetched forever.
-	s3Budget := time.Now().Add(s3CleanupBudget)
-	for {
-		candidates, err := w.rdb.GetUserScopedObjectsForCleanupWithRetry(ctx, w.gracePeriod, db.BATCH_PURGE_SIZE)
-		if err != nil {
-			logger.Error("Cleanup: Failed to list user-scoped objects for cleanup", "error", err)
-			return fmt.Errorf("failed to list user-scoped objects for cleanup: %w", err)
-		}
-
-		if len(candidates) == 0 {
-			if s3DeletedCount == 0 {
-				logger.Info("Cleanup: no user-scoped objects to clean up")
+	if err := (&config.S3Config{BodyDeletionProtocol: w.bodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+		logger.Info("Cleanup: message bodies and their candidate rows retained while S3 deletion is paused", "reason", err)
+	} else {
+		s3Budget := time.Now().Add(s3CleanupBudget)
+		for {
+			candidates, err := w.rdb.GetUserScopedObjectsForCleanupWithRetry(ctx, w.gracePeriod, db.BATCH_PURGE_SIZE)
+			if err != nil {
+				logger.Error("Cleanup: Failed to list user-scoped objects for cleanup", "error", err)
+				return fmt.Errorf("failed to list user-scoped objects for cleanup: %w", err)
 			}
-			break
+
+			if len(candidates) == 0 {
+				if s3DeletedCount == 0 {
+					logger.Info("Cleanup: no user-scoped objects to clean up")
+				}
+				break
+			}
+
+			logger.Info("Cleanup: Found user-scoped object groups for S3 cleanup", "count", len(candidates))
+
+			deleted, err := w.deleteS3Objects(ctx, candidates)
+			s3DeletedCount += deleted
+			if err != nil {
+				return err
+			}
+
+			if deleted == 0 || len(candidates) < db.BATCH_PURGE_SIZE || time.Now().After(s3Budget) {
+				break
+			}
 		}
 
-		logger.Info("Cleanup: Found user-scoped object groups for S3 cleanup", "count", len(candidates))
-
-		deleted, err := w.deleteS3Objects(ctx, candidates)
-		s3DeletedCount += deleted
-		if err != nil {
-			return err
-		}
-
-		if deleted == 0 || len(candidates) < db.BATCH_PURGE_SIZE || time.Now().After(s3Budget) {
-			break
-		}
 	}
 
 	// --- Phase 2a: FTS Vector & Queue Pruning ---
