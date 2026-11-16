@@ -164,7 +164,7 @@ func (s *Session) handleConnection() {
 		}
 
 		// Read command from client
-		line, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth line to prevent memory exhaustion
+		line, err := s.readPreAuthLine() // bound pre-auth line to prevent memory exhaustion
 		if err != nil {
 			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 				s.DebugLog("client timed out waiting for command")
@@ -282,7 +282,7 @@ func (s *Session) handleConnection() {
 					username = string(literalBuf)
 
 					// Read the rest of the line (should be password or another literal)
-					line, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth line to prevent memory exhaustion
+					line, err := s.readPreAuthLine() // bound pre-auth line to prevent memory exhaustion
 					if err != nil {
 						if err != io.EOF {
 							s.DebugLog("error reading password after username literal", "error", err)
@@ -535,7 +535,7 @@ func (s *Session) handleConnection() {
 				s.sendResponse("+ ")
 
 				// Read SASL response from client
-				saslLine, err := server.ReadBoundedLine(s.clientReader, 65536) // bound pre-auth SASL response
+				saslLine, err := s.readPreAuthLine() // bound pre-auth SASL response
 				if err != nil {
 					if err != io.EOF {
 						s.DebugLog("error reading SASL response", "error", err)
@@ -703,12 +703,24 @@ func (s *Session) handleConnection() {
 	s.startProxy()
 }
 
+// readPreAuthLine requires a complete physical line before pre-authentication
+// consumes it. ReadBoundedLine also returns partial EOF data without an error;
+// that must not authenticate a prefix or finish a literal command. Keep the
+// existing line bound and bare-LF tolerance local to this proxy unchanged.
+func (s *Session) readPreAuthLine() (string, error) {
+	line, err := server.ReadBoundedLine(s.clientReader, 65536)
+	if err == nil && !strings.HasSuffix(line, "\n") {
+		return "", io.ErrUnexpectedEOF
+	}
+	return line, err
+}
+
 // finishLoginLiteral consumes the final CRLF after a password literal.
 // Anything before the line ending (including whitespace or an extra CR) is
 // invalid; any trailing literals still belong to LOGIN and must be drained
 // before the command can be rejected.
 func (s *Session) finishLoginLiteral() (extra bool, err error) {
-	rest, err := server.ReadBoundedLine(s.clientReader, 65536)
+	rest, err := s.readPreAuthLine()
 	if err != nil {
 		return false, err
 	}
@@ -787,7 +799,7 @@ func (s *Session) skipLiterals(line string, sync bool) error {
 		if _, err := s.clientReader.Discard(size); err != nil {
 			return err
 		}
-		next, err := server.ReadBoundedLine(s.clientReader, 65536)
+		next, err := s.readPreAuthLine()
 		if err != nil {
 			return err
 		}

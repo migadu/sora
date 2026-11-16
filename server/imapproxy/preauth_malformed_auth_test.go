@@ -656,3 +656,48 @@ func startCachedAuthFramingTestSession(t *testing.T) (net.Conn, *bufio.Reader, *
 	}
 	return client, reader, &backendConns
 }
+
+// EOF before LF cannot complete an authentication line, even after valid literal
+// octets. A half-close preserves the response direction for this real TCP probe.
+func TestPreAuthIncompleteAuthenticationLinesNeverAuthenticate(t *testing.T) {
+	for _, tc := range []struct {
+		name, input string
+		challenge   bool
+	}{
+		{"initial login", "a1 LOGIN user@example.com secret\r", false},
+		{"after username literal", "a1 LOGIN {16+}\r\nuser@example.com secret\r", false},
+		{"after password literal", "a1 LOGIN user@example.com {6+}\r\nsecret\r", false},
+		{"authenticate response", "a1 AUTHENTICATE PLAIN AGZvbwBiYXI=\r", false},
+		{"authenticate continuation", "AGZvbwBiYXI=\r", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c, r, backend := startCachedAuthFramingTestSession(t)
+			if tc.challenge {
+				if _, err := io.WriteString(c, "a1 AUTHENTICATE PLAIN\r\n"); err != nil {
+					t.Fatal(err)
+				}
+				if reply, err := r.ReadString('\n'); err != nil || reply != "+ \r\n" {
+					t.Fatalf("continuation: %q, %v", reply, err)
+				}
+			}
+			_, err := io.WriteString(c, tc.input)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tcp, ok := c.(*net.TCPConn)
+			if !ok {
+				t.Fatal("expected real TCP")
+			}
+			if err := tcp.CloseWrite(); err != nil {
+				t.Fatal(err)
+			}
+			line, err := r.ReadString('\n')
+			if strings.Contains(line, " OK ") || backend.Load() != 0 {
+				t.Fatalf("incomplete command authenticated: reply=%q err=%v backend=%d", line, err, backend.Load())
+			}
+			if err == nil && !strings.Contains(line, " BAD ") {
+				t.Fatalf("unexpected reply=%q", line)
+			}
+		})
+	}
+}
