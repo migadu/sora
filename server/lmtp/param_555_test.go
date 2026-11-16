@@ -10,7 +10,9 @@ import (
 // section 4.1.1.11: "If the server SMTP does not recognize or cannot implement one or
 // more of the parameters associated with a particular MAIL FROM or RCPT TO command, it
 // will return code 555." Section 4.3.2 lists neither 500 nor 504 among the error replies
-// to MAIL and RCPT. The refusals come before the database, so no account is needed.
+// to MAIL and RCPT. An unrecognized RCPT parameter is not go-smtp's to refuse: the
+// backend enables RCPT extensions for XRCPTFORWARD, and the session refuses the others.
+// The refusals come before the database, so no account is needed.
 func TestUnsupportedMailRcptParametersGet555(t *testing.T) {
 	_, addr := startWireBackend(t, "param-555", LMTPServerOptions{})
 	c := dialWire(t, addr)
@@ -34,6 +36,8 @@ func TestUnsupportedMailRcptParametersGet555(t *testing.T) {
 		t.Fatalf("MAIL: %q", resp)
 	}
 	for _, param := range []string{
+		"FOO=1",                      // not recognized
+		"X-UNKNOWN",                  // not recognized, no value
 		"NOTIFY=NEVER",               // DSN (RFC 3461), not enabled
 		"ORCPT=rfc822;b@example.org", // DSN (RFC 3461), not enabled
 		"RRVS=2014-04-03T23:01:00Z",  // RFC 7293, not enabled
