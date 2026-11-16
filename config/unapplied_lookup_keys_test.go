@@ -20,7 +20,7 @@ var lookupTableKeysReadBy = func() map[string]map[string]struct {
 } {
 	lineProxies := []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
 	proxies := append(slices.Clone(lineProxies), "user_api_proxy")
-	cacheReaders := []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_user_api", "user_api_proxy"}
+	cacheReaders := []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
 	type key = struct {
 		line  string
 		types []string

@@ -3510,7 +3510,7 @@ var serverTableKeys = []struct {
 	// These route-only proxies check no passwords, so have none to revalidate.
 	{"lookup_cache.positive_revalidation_window", func(s *ServerConfig) bool {
 		return s.LookupCache != nil && s.LookupCache.positiveRevalidationWindowSet
-	}, lookupCacheServerTypes, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api"}},
+	}, lookupCacheServerTypes, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
 }
 
 // serverTypeKeyNotes ends the warning about a serverTypeKeys or serverTableKeys key
@@ -3533,7 +3533,7 @@ var (
 	loginServerTypes       = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
 	proxyServerTypes       = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
 	lineProxyServerTypes   = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
-	lookupCacheServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_user_api", "user_api_proxy"}
+	lookupCacheServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
 	listenerServerTypes    = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_admin_api", "http_user_api", "user_api_proxy"}
 )
 

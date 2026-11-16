@@ -741,7 +741,7 @@ A SQLite cache of credentials, used by proxies that check passwords in the datab
 |---|---|---|---|
 | `enabled` | bool | `false` | |
 | `path` | string | `"/var/cache/sora/auth_cache.db"` | Database file. Its directory is created. |
-| `max_age` | duration | `"24h"` | Age after which an entry is fetched again. |
+| `max_age` | duration | `"24h"` | Age after which an entry is fetched again; capped at the seven-day credential-feed retention. |
 | `purge_unused` | duration | `"168h"` | Entries unused this long are removed. |
 | `cleanup_interval` | duration | `"1h"` | How often old entries are removed. Must be positive. |
 
@@ -980,9 +980,10 @@ An in-memory cache of login results. See [AUTHENTICATION.md](AUTHENTICATION.md) 
 [PROXY.md](PROXY.md).
 
 By default the cache is on for `imap`, `pop3`, `managesieve` and the line proxies, and off for
-`http_user_api` and `user_api_proxy`. A table you write changes only the keys it names; the others,
-`enabled` included, keep their defaults. The `lmtp`, `metrics` and `http_admin_api` servers keep no
-lookup cache; on them the table is ignored, with a startup warning.
+`user_api_proxy`. A table you write changes only the keys it names; the others, `enabled` included,
+keep their defaults. The `http_user_api` backend always reads its credential hash and token epoch
+from the primary. It keeps no login cache, like the `lmtp`, `metrics` and `http_admin_api` servers;
+on these types the table is ignored, with a startup warning.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|

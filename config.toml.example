@@ -569,7 +569,7 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 [auth_cache]
 enabled = true                     # Enable persistent auth cache (default: false)
 path = "/var/cache/sora/auth_cache.db" # SQLite database path (default: "/var/cache/sora/auth_cache.db"). Fast storage (SSD) recommended.
-max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h)
+max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h; capped at 168h credential-feed retention)
 cleanup_interval = "1h"            # How often to purge expired/unused entries (default: 1 hour; must be positive)
 purge_unused = "168h"              # Purge entries unused for this duration (default: 7 days)
 
@@ -1379,11 +1379,12 @@ auth_rate_limit.max_username_entries = 50000      # Max username tracking entrie
 # Cache authentication results to reduce database queries and improve performance.
 # ENABLED BY DEFAULT with sensible settings. Only configure to override defaults or disable;
 # keys left out of the table keep their defaults (a table without "enabled" leaves it on).
-# Exception: http_user_api and user_api_proxy cache only when the table is present.
+# Exception: user_api_proxy caches routes only when the table is present.
+# http_user_api ignores this table: each login reads its hash and token epoch from the primary.
 # [server.lookup_cache]
 # enabled = true                          # Enable authentication and routing lookup caching for this server (default: true)
 # positive_ttl = "5m"                     # How long to cache successful authentications (default: 5m)
-#                                         # Longer TTL = better performance, but password changes take time to propagate
+#                                         # Database-backed changes invalidate through the primary feed; external lookup changes follow its own cache policy
 # negative_ttl = "1m"                     # How long to cache failed auth attempts (default: 1m)
 #                                         # Helps mitigate brute force attacks by preventing repeated database queries
 #                                         # Note: Brute force protection itself is handled by protocol-level rate limiting

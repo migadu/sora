@@ -1113,6 +1113,8 @@ func hasASCIIControl(s string) bool {
 
 // handleRecipient looks up the recipient, determines routing, and sets session state.
 func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
+	cacheGeneration := s.server.lookupCache.Generation()
+
 	address, err := server.NewAddress(to)
 	if err != nil {
 		s.InfoLog("rejecting recipient - invalid address format",
@@ -1256,7 +1258,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 				Result:      lookupcache.AuthSuccess,
 			}
 			proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
-			s.server.lookupCache.Set(s.server.name, originalAddress, entry)
+			s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, originalAddress, entry)
 
 			// Single consolidated log for lookup success
 			duration := time.Since(lookupStart)
@@ -1303,7 +1305,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 				// Cache negative result to protect remotelookup. FromRemoteLookup lets a
 				// cache hit give the reply given here (userNotFoundError).
-				s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
+				s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, originalAddress, &lookupcache.CacheEntry{
 					Result:           lookupcache.AuthUserNotFound,
 					IsNegative:       true,
 					FromRemoteLookup: true,
@@ -1357,7 +1359,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			// Cache negative result (user not found)
 			// We reached here so user is not in remotelookup (if enabled) AND not in DB.
-			s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
+			s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, originalAddress, &lookupcache.CacheEntry{
 				Result:     lookupcache.AuthUserNotFound,
 				IsNegative: true,
 			})
@@ -1390,7 +1392,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	}
 
 	// Cache positive result (routing info from DB)
-	s.server.lookupCache.Set(s.server.name, originalAddress, &lookupcache.CacheEntry{
+	s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, originalAddress, &lookupcache.CacheEntry{
 		AccountID:        s.accountID,
 		RemoteUseXCLIENT: s.server.remoteUseXCLIENT,
 		Result:           lookupcache.AuthSuccess,

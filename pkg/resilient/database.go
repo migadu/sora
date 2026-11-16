@@ -195,6 +195,8 @@ type ResilientDatabase struct {
 // authCacheInterface defines the interface for the persistent auth cache.
 // This avoids a direct import cycle with the authcache package.
 type authCacheInterface interface {
+	Generation() uint64
+	PutIfGeneration(ctx context.Context, address string, accountID int64, hashedPassword string, generation uint64) error
 	Get(ctx context.Context, address string) (accountID int64, hashedPassword string, err error)
 	Put(ctx context.Context, address string, accountID int64, hashedPassword string) error
 	Invalidate(ctx context.Context, address string) error
