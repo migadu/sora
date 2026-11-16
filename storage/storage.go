@@ -538,7 +538,7 @@ func (s *S3Storage) DeleteBulkContext(ctx context.Context, keys []string) map[st
 			key := aws.ToString(deleteError.Key)
 			code := aws.ToString(deleteError.Code)
 			message := aws.ToString(deleteError.Message)
-			errors[key] = fmt.Errorf("S3 delete error: %s - %s", code, message)
+			errors[key] = &DeleteObjectError{Code: code, Message: message}
 			logger.Warn("STORAGE: Failed to delete object in bulk operation", "key", key, "code", code, "message", message)
 		}
 	}

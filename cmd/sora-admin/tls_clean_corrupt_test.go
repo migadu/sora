@@ -82,7 +82,7 @@ func TestTLSCleanPreservesUnparseableLocalCacheCopy(t *testing.T) {
 				t.Errorf("local cache file contents changed: got %q, want %q", gotLocal, tc.localData)
 			}
 
-			if got := stub.keys(); len(got) != 0 {
+			if got := stub.activeKeys(); len(got) != 0 {
 				t.Errorf("S3 objects after clean = %v, want none (expired S3 objects should still be cleaned)", got)
 			}
 			if got, want := localNames(t, cacheDir), []string{"mail.example.com"}; !slices.Equal(got, want) {
@@ -159,7 +159,7 @@ func TestTLSCleanFailsOnCorruptS3Certificate(t *testing.T) {
 			if err := cleanTLSCertificates(context.Background(), cfg, cacheDir, false, true); err == nil {
 				t.Error("cleanTLSCertificates returned nil despite corrupt S3 certificate object")
 			}
-			if got := stub.keys(); !slices.Equal(got, corruptS3Keys) {
+			if got := stub.activeKeys(); !slices.Equal(got, corruptS3Keys) {
 				t.Errorf("S3 objects after clean = %v, want only corrupt object %v", got, corruptS3Keys)
 			}
 			if got, want := localNames(t, cacheDir), []string{"mail.example.com"}; !slices.Equal(got, want) {
@@ -188,7 +188,7 @@ func TestTLSCleanSkipsAutocertAccountKeys(t *testing.T) {
 	if err := cleanTLSCertificates(context.Background(), cfg, cacheDir, false, true); err != nil {
 		t.Fatalf("cleanTLSCertificates failed when ACME account keys were present: %v", err)
 	}
-	if got := stub.keys(); !slices.Equal(got, accountKeys) {
+	if got := stub.activeKeys(); !slices.Equal(got, accountKeys) {
 		t.Errorf("S3 objects after clean = %v, want ACME account keys %v", got, accountKeys)
 	}
 	if got := localNames(t, cacheDir); len(got) != 0 {
@@ -223,7 +223,7 @@ func TestTLSCleanContinuesWhenLocalCacheReadFails(t *testing.T) {
 			t.Fatal("cleanTLSCertificates succeeded although reading a local cache entry failed")
 		}
 
-		if got := stub.keys(); len(got) != 0 {
+		if got := stub.activeKeys(); len(got) != 0 {
 			t.Errorf("S3 objects after clean = %v, want none (early abort left expired S3 certs uncleaned)", got)
 		}
 		if got, want := localNames(t, cacheDir), []string{"a.example.com"}; !slices.Equal(got, want) {
@@ -254,7 +254,7 @@ func TestTLSCleanContinuesWhenLocalCacheReadFails(t *testing.T) {
 			t.Fatal("cleanTLSCertificates succeeded although reading a local cache file failed")
 		}
 
-		if got := stub.keys(); len(got) != 0 {
+		if got := stub.activeKeys(); len(got) != 0 {
 			t.Errorf("S3 objects after clean = %v, want none (early abort left expired S3 certs uncleaned)", got)
 		}
 		if got, want := localNames(t, cacheDir), []string{"a.example.com"}; !slices.Equal(got, want) {

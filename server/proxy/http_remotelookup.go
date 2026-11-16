@@ -46,21 +46,22 @@ const (
 // HTTPRemoteLookupClient performs user routing lookups via HTTP GET requests
 // NOTE: This client does NOT cache results - caching is handled at the ConnectionManager level
 type HTTPRemoteLookupClient struct {
-	baseURL                string
-	timeout                time.Duration
-	authToken              string // Bearer token for HTTP authentication
-	client                 *http.Client
-	breaker                *circuitbreaker.CircuitBreaker
-	remotePort             int // Port for a server address without one (0 = leave it port-less)
-	remoteTLS              bool
-	remoteTLSUseStartTLS   bool
-	remoteTLSVerify        bool
-	remoteUseProxyProtocol bool
-	remoteUseIDCommand     bool
-	remoteUseXCLIENT       bool
-	remoteUseUTF8          bool          // Lookup-routed backends support POP3 UTF8 (RFC 6856)
-	dialTimeout            time.Duration // Stored for timeout calculation
-	tlsHandshakeTimeout    time.Duration // Stored for timeout calculation
+	baseURL                               string
+	timeout                               time.Duration
+	authToken                             string // Bearer token for HTTP authentication
+	client                                *http.Client
+	breaker                               *circuitbreaker.CircuitBreaker
+	remotePort                            int // Port for a server address without one (0 = leave it port-less)
+	remoteTLS                             bool
+	remoteTLSUseStartTLS                  bool
+	remoteTLSVerify                       bool
+	remoteUseProxyProtocol                bool
+	remoteUseIDCommand                    bool
+	remoteSkipForwardingWithProxyProtocol bool
+	remoteUseXCLIENT                      bool
+	remoteUseUTF8                         bool          // Lookup-routed backends support POP3 UTF8 (RFC 6856)
+	dialTimeout                           time.Duration // Stored for timeout calculation
+	tlsHandshakeTimeout                   time.Duration // Stored for timeout calculation
 }
 
 // HTTPRemoteLookupResponse represents the JSON response from the HTTP remotelookup endpoint
@@ -501,19 +502,20 @@ func (c *HTTPRemoteLookupClient) LookupUserRouteWithClientIP(ctx context.Context
 	// else: Auth-only mode - ServerAddress will be empty, backend selected locally
 
 	info := &UserRoutingInfo{
-		ServerAddress:          normalizedServer,
-		PoolName:               lookupResp.Pool,
-		AccountID:              lookupResp.AccountID,
-		IsRemoteLookupAccount:  true,
-		AuthOnlyMode:           lookupResp.AuthOnlyMode,
-		ActualEmail:            actualEmail,
-		RemoteTLS:              c.remoteTLS,
-		RemoteTLSUseStartTLS:   c.remoteTLSUseStartTLS,
-		RemoteTLSVerify:        c.remoteTLSVerify,
-		RemoteUseProxyProtocol: c.remoteUseProxyProtocol,
-		RemoteUseIDCommand:     c.remoteUseIDCommand,
-		RemoteUseXCLIENT:       c.remoteUseXCLIENT,
-		RemoteUseUTF8:          c.remoteUseUTF8,
+		ServerAddress:                         normalizedServer,
+		PoolName:                              lookupResp.Pool,
+		AccountID:                             lookupResp.AccountID,
+		IsRemoteLookupAccount:                 true,
+		AuthOnlyMode:                          lookupResp.AuthOnlyMode,
+		ActualEmail:                           actualEmail,
+		RemoteTLS:                             c.remoteTLS,
+		RemoteTLSUseStartTLS:                  c.remoteTLSUseStartTLS,
+		RemoteTLSVerify:                       c.remoteTLSVerify,
+		RemoteUseProxyProtocol:                c.remoteUseProxyProtocol,
+		RemoteUseIDCommand:                    c.remoteUseIDCommand,
+		RemoteSkipForwardingWithProxyProtocol: c.remoteSkipForwardingWithProxyProtocol,
+		RemoteUseXCLIENT:                      c.remoteUseXCLIENT,
+		RemoteUseUTF8:                         c.remoteUseUTF8,
 	}
 
 	// Log success (no caching - handled at ConnectionManager level)
