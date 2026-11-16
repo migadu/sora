@@ -380,6 +380,10 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 	if err := lockMailboxStats(ctx, tx, mailboxID); err != nil {
 		return nil, err
 	}
+	window := modSeqWindowFor(ctx, mailboxID)
+	if err := window.begin(ctx, tx); err != nil {
+		return nil, err
+	}
 
 	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
 	if err != nil || len(messageIDs) == 0 {
@@ -449,6 +453,10 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 				PrevModSeq: prevModSeqs[id],
 			})
 		}
+	}
+
+	if err := window.end(ctx, tx); err != nil {
+		return nil, err
 	}
 
 	return results, nil

@@ -1369,7 +1369,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	return db.renameMailbox(ctx, tx, mailboxID, AccountID, newName, newParentID, nil)
 }
 
-func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64, changes *[]MailboxNameMutation) error {
+func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64, capture *mailboxRenameCapture) error {
 	// The same names createMailbox refuses: control characters, empty levels and
 	// "." / ".." levels (maildir-export path traversal).
 	if !helpers.MailboxNameValid(newName) {
@@ -1605,7 +1605,7 @@ func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	}
 
 	var beforeNames map[int64]MailboxNameMutation
-	if changes != nil {
+	if capture != nil {
 		beforeNames = make(map[int64]MailboxNameMutation)
 		rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE account_id=$1 AND deleted_at IS NULL AND (id=$2 OR path LIKE $3 || '%')`, ownerAccountID, mailboxID, oldPath)
 		if err != nil {
@@ -1715,29 +1715,59 @@ func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		return fmt.Errorf("failed to move subscriptions during rename of mailbox %d: %w", mailboxID, err)
 	}
 
-	if changes != nil {
+	if capture != nil {
 		ids := make([]int64, 0, len(beforeNames))
 		for id := range beforeNames {
 			ids = append(ids, id)
 		}
-		rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE id=ANY($1) AND deleted_at IS NULL ORDER BY id`, ids)
-		if err != nil {
-			return fmt.Errorf("read transaction's renamed mailbox names: %w", err)
-		}
-		for rows.Next() {
-			var id int64
-			var name, key string
-			if err := rows.Scan(&id, &name, &key); err != nil {
-				rows.Close()
+		if capture.viewer != 0 && capture.viewer != ownerAccountID {
+			rows, err := tx.Query(ctx, `
+				SELECT m.id, m.name, LOWER(m.name),
+				       EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id = $2 AND LOWER(s.mailbox_name) = LOWER(m.name))
+				FROM mailboxes m
+				WHERE m.id = ANY($1) AND m.deleted_at IS NULL
+				ORDER BY m.id
+			`, ids, capture.viewer)
+			if err != nil {
+				return fmt.Errorf("read transaction's renamed mailbox names: %w", err)
+			}
+			for rows.Next() {
+				var id int64
+				var name, key string
+				var subscribed bool
+				if err := rows.Scan(&id, &name, &key, &subscribed); err != nil {
+					rows.Close()
+					return err
+				}
+				n := beforeNames[id]
+				n.AfterName, n.AfterKey = name, key
+				n.SubscribedSet, n.AfterSubscribed = true, subscribed
+				capture.changes = append(capture.changes, n)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
 				return err
 			}
-			n := beforeNames[id]
-			n.AfterName, n.AfterKey = name, key
-			*changes = append(*changes, n)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
-			return err
+		} else {
+			rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE id=ANY($1) AND deleted_at IS NULL ORDER BY id`, ids)
+			if err != nil {
+				return fmt.Errorf("read transaction's renamed mailbox names: %w", err)
+			}
+			for rows.Next() {
+				var id int64
+				var name, key string
+				if err := rows.Scan(&id, &name, &key); err != nil {
+					rows.Close()
+					return err
+				}
+				n := beforeNames[id]
+				n.AfterName, n.AfterKey = name, key
+				capture.changes = append(capture.changes, n)
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return err
+			}
 		}
 	}
 

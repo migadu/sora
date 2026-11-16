@@ -68,18 +68,29 @@ func lockNotifyMailboxForMutation(ctx context.Context, tx pgx.Tx, actorID int64,
 
 // MailboxNameMutation describes only this transaction's name change, never a
 // complete later snapshot entry (which could contain someone else's flags).
+// When the caller is not the mailbox owner, db.RenameMailbox does not rewrite
+// the caller's name-based subscriptions, so SubscribedSet is true and
+// AfterSubscribed records whether the caller already held a subscription on
+// AfterName inside the rename transaction.
 type MailboxNameMutation struct {
 	ID                    int64
 	BeforeName, BeforeKey string
 	AfterName, AfterKey   string
+	SubscribedSet         bool
+	AfterSubscribed       bool
 }
 
-func (d *Database) RenameMailboxReturningNames(ctx context.Context, tx pgx.Tx, mailboxID, ownerID int64, name string, parentID *int64) ([]MailboxNameMutation, error) {
-	var names []MailboxNameMutation
-	if err := d.renameMailbox(ctx, tx, mailboxID, ownerID, name, parentID, &names); err != nil {
+type mailboxRenameCapture struct {
+	viewer  int64
+	changes []MailboxNameMutation
+}
+
+func (d *Database) RenameMailboxReturningNames(ctx context.Context, tx pgx.Tx, mailboxID, ownerID, viewerID int64, name string, parentID *int64) ([]MailboxNameMutation, error) {
+	capture := mailboxRenameCapture{viewer: viewerID}
+	if err := d.renameMailbox(ctx, tx, mailboxID, ownerID, name, parentID, &capture); err != nil {
 		return nil, err
 	}
-	return names, nil
+	return capture.changes, nil
 }
 
 // SubscriptionMutation is emitted only when this write changed the name-based

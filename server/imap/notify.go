@@ -215,7 +215,32 @@ func (s *IMAPSession) beginOwnMessages(ctx context.Context, mailboxID int64) (co
 	if !watch.wantsNonSelectedMessageEvents() {
 		return ctx, func(...imap.UID) {}
 	}
+	writeCtx, done := s.trackOwnStatusWindow(ctx, watch, mailboxID)
+	return writeCtx, func(created ...imap.UID) {
+		done(len(created) > 0)
+	}
+}
 
+// beginOwnStatus announces an own write to mailboxID that changes message state
+// without adding messages to the selected mailbox (e.g. soft-expunging INBOX
+// during RENAME INBOX when INBOX is not selected).
+func (s *IMAPSession) beginOwnStatus(ctx context.Context, mailboxID int64) (context.Context, func(committed bool)) {
+	s.notifyMutex.Lock()
+	watch := s.notifyWatch
+	s.notifyMutex.Unlock()
+	if watch == nil {
+		return ctx, func(bool) {}
+	}
+	if selectedID, ok := s.currentSelectedMailboxID(); ok && selectedID == mailboxID {
+		return ctx, func(bool) {}
+	}
+	if !watch.wantsNonSelectedMessageEvents() {
+		return ctx, func(bool) {}
+	}
+	return s.trackOwnStatusWindow(ctx, watch, mailboxID)
+}
+
+func (s *IMAPSession) trackOwnStatusWindow(ctx context.Context, watch *notifyWatch, mailboxID int64) (context.Context, func(committed bool)) {
 	window := &db.ModSeqWindow{MailboxID: mailboxID}
 	s.notifyMutex.Lock()
 	own := &watch.ownStatus
@@ -226,14 +251,14 @@ func (s *IMAPSession) beginOwnMessages(ctx context.Context, mailboxID int64) (co
 	own.seq++
 	seq := own.seq
 	s.notifyMutex.Unlock()
-	return db.WithModSeqWindow(ctx, window), func(created ...imap.UID) {
+	return db.WithModSeqWindow(ctx, window), func(committed bool) {
 		s.notifyMutex.Lock()
 		defer s.notifyMutex.Unlock()
 		own.writes[mailboxID]--
 		if own.writes[mailboxID] == 0 {
 			delete(own.writes, mailboxID)
 		}
-		if len(created) > 0 && window.Measured {
+		if committed && window.Measured {
 			own.record(window, seq)
 		}
 	}
@@ -446,8 +471,14 @@ func (watch *notifyWatch) ownRenamed(names []db.MailboxNameMutation) {
 			continue
 		}
 		e.name, e.key = n.AfterName, n.AfterKey
-		// Do not copy later subscription state: a foreign SUBSCRIBE can have
-		// committed before this rename, or after it, without changing the ID.
+		// For an owner rename, RenameSubscriptions moved the owner's
+		// subscriptions with the mailbox, so keep e.subscribed to leave any
+		// unnotified foreign SUBSCRIBE/UNSUBSCRIBE visible. For a non-owner
+		// rename, the caller's subscriptions stay on BeforeName and
+		// AfterSubscribed carries the caller's subscription on AfterName.
+		if n.SubscribedSet {
+			e.subscribed = n.AfterSubscribed
+		}
 		watch.snapshot[n.ID] = e
 	}
 }

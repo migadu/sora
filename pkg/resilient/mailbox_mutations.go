@@ -24,9 +24,9 @@ func (rd *ResilientDatabase) CreateMailboxReturningStateWithRetry(ctx context.Co
 	return r.(*db.CreatedMailbox), nil
 }
 
-func (rd *ResilientDatabase) RenameMailboxReturningNamesWithRetry(ctx context.Context, id, ownerID int64, name string, parentID *int64) ([]db.MailboxNameMutation, error) {
+func (rd *ResilientDatabase) RenameMailboxReturningNamesWithRetry(ctx context.Context, id, ownerID, viewerID int64, name string, parentID *int64) ([]db.MailboxNameMutation, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).RenameMailboxReturningNames(ctx, tx, id, ownerID, name, parentID)
+		return rd.getOperationalDatabaseForOperation(ctx, true).RenameMailboxReturningNames(ctx, tx, id, ownerID, viewerID, name, parentID)
 	}
 	r, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op, consts.ErrMailboxAlreadyExists, consts.ErrMailboxInvalidName)
 	if err != nil {

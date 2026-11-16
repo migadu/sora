@@ -101,6 +101,13 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	if err := lockMailboxStatsPair(ctx, tx, srcMailboxID, destMailboxID); err != nil {
 		return nil, fmt.Errorf("failed to lock mailbox stats for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
 	}
+	var srcWindow *ModSeqWindow
+	if srcMailboxID != destMailboxID {
+		srcWindow = modSeqWindowFor(ctx, srcMailboxID)
+	}
+	if err := srcWindow.begin(ctx, tx); err != nil {
+		return nil, err
+	}
 	window := modSeqWindowFor(ctx, destMailboxID)
 	if err := window.begin(ctx, tx); err != nil {
 		return nil, err
@@ -353,6 +360,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 	}
 
+	if err := srcWindow.end(ctx, tx); err != nil {
+		return nil, err
+	}
 	if err := window.end(ctx, tx); err != nil {
 		return nil, err
 	}
