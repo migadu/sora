@@ -180,7 +180,7 @@ func (s *Session) handleConnection() {
 			return
 		}
 
-		line = strings.TrimRight(line, "\r\n")
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 
 		// Use the shared command parser. IMAP commands have tags.
 		tag, command, args, err := server.ParseLine(line, true)
@@ -288,7 +288,7 @@ func (s *Session) handleConnection() {
 						}
 						return
 					}
-					rest := strings.TrimRight(line, "\r\n")
+					rest := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 					line = strings.TrimSpace(rest)
 
 					if line == "" {
@@ -661,7 +661,7 @@ func (s *Session) finishLoginLiteral() (extra bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	rest = strings.TrimRight(rest, "\r\n")
+	rest = strings.TrimSuffix(strings.TrimSuffix(rest, "\n"), "\r")
 	if strings.TrimSpace(rest) == "" {
 		return false, nil
 	}
@@ -740,7 +740,7 @@ func (s *Session) skipLiterals(line string, sync bool) error {
 		if err != nil {
 			return err
 		}
-		line = strings.TrimRight(next, "\r\n")
+		line = strings.TrimSuffix(strings.TrimSuffix(next, "\n"), "\r")
 	}
 }
 
