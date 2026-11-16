@@ -45,8 +45,10 @@ func metricsAccessGuard(allowedHosts []string, apiKey string, next http.Handler)
 		}
 
 		if apiKey != "" {
-			// Both refusals carry the challenge (RFC 9110 section 15.5.2 on the 401,
-			// RFC 6750 section 3 on both); a wrong token says why (section 3.1).
+			// Both refusals are 401 with the challenge (RFC 9110 section 15.5.2); a
+			// wrong token says why, "invalid_token", for which RFC 6750 section 3.1
+			// says "The resource SHOULD respond with the HTTP 401 (Unauthorized)
+			// status code."
 			token, ok := bearerToken(r.Header.Get("Authorization"))
 			if !ok {
 				server.SetBearerChallenge(w.Header(), metricsRealm, "")
@@ -55,7 +57,7 @@ func metricsAccessGuard(allowedHosts []string, apiKey string, next http.Handler)
 			}
 			if subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
 				server.SetBearerChallenge(w.Header(), metricsRealm, server.BearerInvalidToken)
-				http.Error(w, "forbidden", http.StatusForbidden)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
 		}
