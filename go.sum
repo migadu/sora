@@ -199,6 +199,8 @@ github.com/migadu/go-imap v1.2.8-0.20261116075906-e9dbeb686f0c h1:b5eRO2b8q8ZO8f
 github.com/migadu/go-imap v1.2.8-0.20261116075906-e9dbeb686f0c/go.mod h1:fvRvl7ajggZYKHgHokVT0O5uQsAj7ZVAhK6PoQYgga0=
 github.com/migadu/go-imap v1.2.8-0.20261116085438-72ec7b4a8cd7 h1:kWGMEMyTfn1xAryB7qGymqnHZBRDLPXUY0DBhuXn+IE=
 github.com/migadu/go-imap v1.2.8-0.20261116085438-72ec7b4a8cd7/go.mod h1:fvRvl7ajggZYKHgHokVT0O5uQsAj7ZVAhK6PoQYgga0=
+github.com/migadu/go-imap v1.2.8-0.20261116094423-565563e6d8cb h1:vsi/r5M/7w1m5mFqmvlwhypwWUJ6g2UwmVkLk3tilg0=
+github.com/migadu/go-imap v1.2.8-0.20261116094423-565563e6d8cb/go.mod h1:fvRvl7ajggZYKHgHokVT0O5uQsAj7ZVAhK6PoQYgga0=
 github.com/migadu/go-managesieve v0.1.4 h1:Gd+Q8kjlAElaHJamHwLFNcHlsNaHBtsv6D1fNjIwgL0=
 github.com/migadu/go-managesieve v0.1.4/go.mod h1:E38XgVuCDYRSNz/9ku4Sc7CvVDmJ8FLqGc1udcxP9SE=
 github.com/migadu/go-managesieve v0.1.5-0.20261115212706-bc72beba53a0 h1:gsZFJBu6zGyf+674504orFDjQTC83bLSFJnCq1qBcT8=
