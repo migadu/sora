@@ -272,16 +272,18 @@ func (d *DatabaseConfig) GetFetchChunkSize() int {
 
 // S3Config holds S3 configuration.
 type S3Config struct {
-	Endpoint      string `toml:"endpoint"`
-	DisableTLS    bool   `toml:"disable_tls"`
-	Region        string `toml:"region"`                   // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
-	AccessKey     string `toml:"access_key" secret:"true"` // Without both keys the AWS default credential chain is used
-	SecretKey     string `toml:"secret_key" secret:"true"`
-	Bucket        string `toml:"bucket"`
-	Debug         bool   `toml:"debug"`   // Enable detailed S3 request/response tracing
-	Timeout       string `toml:"timeout"` // Timeout for individual S3 operations (default: 30s)
-	Encrypt       bool   `toml:"encrypt"`
-	EncryptionKey string `toml:"encryption_key" secret:"true"`
+	// BodyDeletionProtocol enables destructive message-body work only after the documented fleet drain.
+	BodyDeletionProtocol string `toml:"body_deletion_protocol"`
+	Endpoint             string `toml:"endpoint"`
+	DisableTLS           bool   `toml:"disable_tls"`
+	Region               string `toml:"region"`                   // Signing region (default: AWS_REGION or the shared AWS config, else "us-east-1")
+	AccessKey            string `toml:"access_key" secret:"true"` // Without both keys the AWS default credential chain is used
+	SecretKey            string `toml:"secret_key" secret:"true"`
+	Bucket               string `toml:"bucket"`
+	Debug                bool   `toml:"debug"`   // Enable detailed S3 request/response tracing
+	Timeout              string `toml:"timeout"` // Timeout for individual S3 operations (default: 30s)
+	Encrypt              bool   `toml:"encrypt"`
+	EncryptionKey        string `toml:"encryption_key" secret:"true"`
 }
 
 // GetDebug returns the debug flag
@@ -303,6 +305,9 @@ func (s *S3Config) GetTimeout() (time.Duration, error) {
 // Without access_key and secret_key the AWS default credential chain supplies them, which
 // only connecting can check.
 func (s *S3Config) Validate() error {
+	if err := s.ValidateBodyDeletionProtocol(); err != nil {
+		return err
+	}
 	if s.Bucket == "" {
 		return errors.New("bucket is required for mail services (IMAP, LMTP, POP3) and for the User API to serve message bodies")
 	}
