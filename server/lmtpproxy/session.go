@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/tls"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"net"
@@ -283,7 +284,7 @@ func (s *Session) handleConnection() {
 			// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
 			// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
 			// NOTIFY=SUCCESS). DSN parameters sent anyway get 555, as on the backend
-			// (mailParameterReply, unsupportedRcptParameter).
+			// (mailParameterReply, rcptParameterReply).
 			lhlo.WriteString("250 SMTPUTF8\r\n")
 			if _, err := s.writeClientReply(lhlo.String(), false); err != nil {
 				return
@@ -374,11 +375,12 @@ func (s *Session) handleConnection() {
 				s.sendResponse("503 5.5.1 Error: need MAIL command")
 				continue
 			}
-			// A parameter the proxy does not take gets 555, as on the backend, before the
-			// recipient is routed. The transaction stays open for the next recipient.
-			if param := unsupportedRcptParameter(params); param != "" {
-				s.InfoLog("RCPT refused for a parameter", "to", to, "parameter", param)
-				s.sendResponse("555 5.5.4 RCPT TO parameter not recognized or not implemented")
+			// A parameter the proxy does not take gets 555 (or 501 for a malformed or
+			// repeated XRCPTFORWARD), as on the backend, before the recipient is routed.
+			// The transaction stays open for the next recipient.
+			if param, reply := rcptParameterReply(params); reply != "" {
+				s.InfoLog("RCPT refused for a parameter", "to", to, "parameter", param, "response", reply)
+				s.sendResponse(reply)
 				continue
 			}
 			if !server.IsASCII(to) {
@@ -923,15 +925,13 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 	if !ok || address == "" {
 		return "", nil, false
 	}
-	for _, rawArg := range rest {
-		if strings.HasPrefix(rawArg, `"`) {
+	for _, param := range rest {
+		if strings.HasPrefix(param, `"`) {
 			continue
 		}
-		for _, param := range strings.Fields(rawArg) {
-			key, val, hasEq := strings.Cut(param, "=")
-			if hasEq && val != "" && server.EqualFoldASCII(key, "XRCPTFORWARD") {
-				keptParams = append(keptParams, param)
-			}
+		key, val, hasEq := strings.Cut(param, "=")
+		if hasEq && server.EqualFoldASCII(key, "XRCPTFORWARD") && validXRCPTFORWARD(val) {
+			keptParams = append(keptParams, param)
 		}
 	}
 	return address, keptParams, true
@@ -950,15 +950,16 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 // particular MAIL FROM or RCPT TO command, it will return code 555."
 func mailParameterReply(params []string) (param, reply string) {
 	const unsupported = "555 5.5.4 MAIL FROM parameter not recognized or not implemented"
-	body := false
+	body, smtputf8 := false, false
 	for _, p := range params {
 		keyword, value, hasValue := strings.Cut(p, "=")
 		switch server.ToUpperASCII(keyword) {
 		case "SIZE":
 		case "SMTPUTF8":
-			if hasValue {
+			if hasValue || smtputf8 {
 				return p, "501 5.5.4 Syntax error in SMTPUTF8 parameter"
 			}
+			smtputf8 = true
 		case "BODY":
 			switch server.ToUpperASCII(value) {
 			case "7BIT", "8BITMIME":
@@ -978,19 +979,49 @@ func mailParameterReply(params []string) (param, reply string) {
 	return "", ""
 }
 
-// unsupportedRcptParameter returns the first RCPT parameter the proxy does not take, ""
-// if there is none. XRCPTFORWARD is the only one: it is forwarded, and it is the only
-// one the backend takes. The DSN parameters NOTIFY and ORCPT (RFC 3461) are refused like
-// any other, as DSN is not advertised: "The client MUST NOT transmit parameters other
-// than those associated with a service extension offered by the server in its EHLO
-// response" (RFC 5321 section 4.1.1.3).
-func unsupportedRcptParameter(params []string) string {
+// rcptParameterReply returns the first RCPT parameter the proxy refuses and the reply
+// refusing the command ("" for none). XRCPTFORWARD is the only RCPT parameter the proxy
+// takes and forwards: a missing, malformed or repeated XRCPTFORWARD value gets 501 5.5.4
+// (matching go-smtp's validateXRCPTFORWARD rules so the backend never answers 501 after
+// routing and evicts lookupCache). The DSN parameters NOTIFY and ORCPT (RFC 3461) and
+// every other unrecognized parameter get 555 5.5.4 (RFC 5321 sections 4.1.1.3 and
+// 4.1.1.11).
+func rcptParameterReply(params []string) (param, reply string) {
+	xrcptforward := false
 	for _, p := range params {
-		if keyword, _, _ := strings.Cut(p, "="); server.ToUpperASCII(keyword) != "XRCPTFORWARD" {
-			return p
+		keyword, value, hasValue := strings.Cut(p, "=")
+		if !server.EqualFoldASCII(keyword, "XRCPTFORWARD") {
+			return p, "555 5.5.4 RCPT TO parameter not recognized or not implemented"
+		}
+		if !hasValue || xrcptforward || !validXRCPTFORWARD(value) {
+			return p, "501 5.5.4 Syntax error in XRCPTFORWARD parameter"
+		}
+		xrcptforward = true
+	}
+	return "", ""
+}
+
+// validXRCPTFORWARD matches go-smtp's Conn.validateXRCPTFORWARD: a non-empty standard
+// base64 string decoding to at most 900 bytes of tab-separated non-empty-key key=value
+// pairs (empty tab-delimited segments are permitted).
+func validXRCPTFORWARD(value string) bool {
+	if value == "" || strings.ContainsAny(value, "\r\n") {
+		return false
+	}
+	decoded, err := base64.StdEncoding.DecodeString(value)
+	if err != nil || len(decoded) > 900 {
+		return false
+	}
+	for _, pair := range strings.Split(string(decoded), "\t") {
+		if pair == "" {
+			continue
+		}
+		key, _, ok := strings.Cut(pair, "=")
+		if !ok || key == "" {
+			return false
 		}
 	}
-	return ""
+	return true
 }
 
 // extractAddress extracts email address from MAIL FROM or RCPT TO parameter.
@@ -1016,7 +1047,7 @@ func extractAddressString(param string) (address string, ok bool) {
 	}
 	param = server.UnquoteString(param)
 
-	if len(param) < 2 {
+	if len(param) < 2 || hasASCIIControl(param) {
 		return "", false
 	}
 
@@ -1034,13 +1065,26 @@ func extractAddressString(param string) (address string, ok bool) {
 		return "", false
 	}
 
-	// Some clients might not use angle brackets (non-standard but handle it)
-	// In this case, stop at the first space (which would separate address from parameters)
-	if idx := strings.Index(param, " "); idx > 0 {
+	// Some clients might not use angle brackets (non-standard but handle it).
+	// Stop at the first space only for unquoted arguments; inside quotes a space
+	// is part of the quoted token and must not strip trailing parameters.
+	if idx := strings.IndexByte(param, ' '); idx >= 0 {
+		if quoted || idx == 0 {
+			return "", false
+		}
 		return param[:idx], true
 	}
 
 	return param, true
+}
+
+func hasASCIIControl(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] == 0x7f {
+			return true
+		}
+	}
+	return false
 }
 
 // handleRecipient looks up the recipient, determines routing, and sets session state.
@@ -2004,11 +2048,30 @@ func findParameter(args []string, prefix string) (value string, params []string,
 		if len(args) < 2 {
 			return "", nil, false // Found prefix but no value.
 		}
-		return args[1], args[2:], true
+		return args[1], splitESMTPParameters(args[2:]), true
 	case strings.HasPrefix(first, prefix):
-		return args[0][len(prefix):], args[1:], true
+		return args[0][len(prefix):], splitESMTPParameters(args[1:]), true
 	}
 	return "", nil, false
+}
+
+// splitESMTPParameters splits unquoted parameter tokens on whitespace as go-smtp's
+// parseArgs (strings.Fields) does — server.ParseLine splits atoms only on ' ', not '\t'
+// — while keeping quoted tokens intact so a quoted string is never read as an ESMTP
+// parameter keyword.
+func splitESMTPParameters(raw []string) []string {
+	if len(raw) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(raw))
+	for _, tok := range raw {
+		if strings.HasPrefix(tok, `"`) {
+			out = append(out, tok)
+			continue
+		}
+		out = append(out, strings.Fields(tok)...)
+	}
+	return out
 }
 
 // hasSMTPUTF8Param reports whether the MAIL FROM arguments carry the SMTPUTF8 parameter
@@ -2027,12 +2090,9 @@ func hasSMTPUTF8Param(args []string) bool {
 // ("" for none) and the reply refusing the command ("" for none): 501 for a value that
 // is not "size-value ::= 1*20DIGIT" (section 3 (4)) and for a second SIZE ("Only one
 // SIZE parameter may be specified in a single MAIL command", section 6), 552 for a size
-// above the limit (section 6.1 (2)). Without a limit no SIZE is advertised, and the
-// parameter is ignored.
+// above the limit (section 6.1 (2)). Without a limit (limit <= 0) no SIZE is advertised
+// and no declared size is refused as too large, though syntax and uniqueness still apply.
 func mailSizeParameter(args []string, limit int64) (size, reply string) {
-	if limit <= 0 {
-		return "", ""
-	}
 	for _, arg := range args {
 		key, value, _ := strings.Cut(arg, "=")
 		if !server.EqualFoldASCII(key, "SIZE") {
@@ -2046,9 +2106,11 @@ func mailSizeParameter(args []string, limit int64) (size, reply string) {
 	if size == "" {
 		return "", ""
 	}
-	// Twenty digits can exceed an int64: the only error left is the range.
-	if n, err := strconv.ParseInt(size, 10, 64); err != nil || n > limit {
-		return "", "552 5.3.4 Message size exceeds fixed maximum message size"
+	if limit > 0 {
+		// Twenty digits can exceed an int64: the only error left is the range.
+		if n, err := strconv.ParseInt(size, 10, 64); err != nil || n > limit {
+			return "", "552 5.3.4 Message size exceeds fixed maximum message size"
+		}
 	}
 	return size, ""
 }
