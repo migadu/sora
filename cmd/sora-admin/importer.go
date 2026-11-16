@@ -1555,10 +1555,10 @@ func (i *Importer) scanMaildir() error {
 		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/ or new/)", cleanPath)
 	}
 
-	// filepath.Walk lstats its root and never follows a symbolic link, so a path that
-	// is a link to a maildir (accepted above: isMaildirFolder stats through it) was
-	// walked as a file and the run imported nothing. The walk starts at the directory
-	// the path names and reports every path below the path given, which mailbox names,
+	// The walk lstats its root and never follows a symbolic link, so a path that is a
+	// link to a maildir (accepted above: isMaildirFolder stats through it) was walked
+	// as a file and the run imported nothing. The walk starts at the directory the
+	// path names and reports every path below the path given, which mailbox names,
 	// keywords and uidlists are resolved against.
 	walkRoot, err := filepath.EvalSymlinks(cleanPath)
 	if err != nil {
@@ -1567,7 +1567,7 @@ func (i *Importer) scanMaildir() error {
 
 	// --- Parallel Processing Setup ---
 	var wg sync.WaitGroup
-	// This channel will be used by the producer (filepath.Walk) to send files to consumers (workers).
+	// This channel will be used by the producer (the walk) to send files to consumers (workers).
 	filesToProcess := make(chan fileToProcess, i.jobs*10) // Buffered channel
 
 	var refusedMu sync.Mutex
@@ -1635,7 +1635,13 @@ func (i *Importer) scanMaildir() error {
 	if i.options.PathsFile != "" {
 		walkErr = i.processPathsFile(cleanPath, filesToProcess)
 	} else {
-		walkErr = filepath.Walk(walkRoot, func(walked string, info os.FileInfo, err error) error {
+		// filepath.WalkDir lists a directory through an O_DIRECTORY open (os.ReadDir),
+		// which fails on anything else before opening it. filepath.Walk opened a folder
+		// it had lstatted with a blocking open, and the maildir's owner can swap the
+		// folder for a FIFO in between with one rename: the open waited for a writer
+		// and the scan never returned. A folder swapped away is a scan error, as any
+		// folder that cannot be listed is.
+		walkErr = filepath.WalkDir(walkRoot, func(walked string, entry fs.DirEntry, err error) error {
 			select {
 			case <-i.ctx.Done():
 				return i.ctx.Err() // Stop walking if context is cancelled.
@@ -1659,12 +1665,12 @@ func (i *Importer) scanMaildir() error {
 			// not folders: they are read through the maildir root (openMaildirFile),
 			// which follows a link only within the maildir. A cur/ or new/ it does not
 			// read is named below, and a message file it does not read is refused by path.
-			if info.Mode()&os.ModeSymlink != 0 {
+			if entry.Type()&os.ModeSymlink != 0 {
 				parent := filepath.Dir(walked)
 				// The root itself may be named cur, new or tmp; only a message
 				// directory below it makes this entry a message rather than a folder.
 				inMessageDir := parent != walkRoot && isMaildirMessageDir(filepath.Base(parent))
-				if !isMaildirMessageDir(info.Name()) && !inMessageDir {
+				if !isMaildirMessageDir(entry.Name()) && !inMessageDir {
 					if target, statErr := os.Stat(walked); statErr != nil {
 						logger.Warn("Skipping maildir entry: it is a symbolic link whose target cannot be read", "path", path, "error", statErr)
 					} else if target.IsDir() {
@@ -1675,7 +1681,7 @@ func (i *Importer) scanMaildir() error {
 			}
 
 			// We are looking for directories that are maildir folders.
-			if !info.IsDir() {
+			if !entry.IsDir() {
 				return nil
 			}
 

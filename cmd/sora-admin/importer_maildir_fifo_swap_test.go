@@ -17,9 +17,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The scan's walk lstats an entry of the maildir and then opens it to list it. The
-// maildir's owner can swap a folder and a FIFO with one rename (swapPaths) in between,
-// and an open that meets the FIFO waits for a writer: the scan never returned (#1608).
+// The scan's walk finds that an entry of the maildir is a folder and then opens it to
+// list it. The maildir's owner can swap a folder and a FIFO with one rename (swapPaths)
+// in between, and an open that meets the FIFO waits for a writer: the scan never
+// returned (#1608).
 func TestScanMaildirDoesNotWaitOnAFolderSwappedForAFIFO(t *testing.T) {
 	const name = "1700000001.M1P1.host:2,S"
 	maildirPath := newMaildirWith(t, map[string][]byte{name: cachedSizeMessage("One", 100)})
