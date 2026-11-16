@@ -31,8 +31,8 @@ type DBMailbox struct {
 
 	// NameKey is LOWER(name) as the database computes it: the mailbox's identity
 	// (unique per owner, migration 000041). lower() depends on the collation, and
-	// no Go case mapping matches it, so names are compared by this key. Set by
-	// GetMailboxes.
+	// no Go case mapping matches it, so names are compared by this key
+	// (MailboxNameKeys gives a client's names theirs). Set by GetMailboxes.
 	NameKey string
 }
 
@@ -157,6 +157,41 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 	}
 
 	return mailboxes, nil
+}
+
+// MailboxNameKeys returns, in order, the key of each of names: LOWER(name) as the
+// database computes it, the key a name resolves to a mailbox by (DBMailbox.NameKey).
+// lower() depends on the collation and no Go case mapping matches it, so a name a
+// client gives is compared with mailboxes by this key. A name PostgreSQL cannot hold
+// (helpers.MailboxNameStorable) names no mailbox and gets the empty key, which no
+// mailbox has.
+func (db *Database) MailboxNameKeys(ctx context.Context, names []string) ([]string, error) {
+	keys := make([]string, len(names))
+	storable := make([]string, 0, len(names))
+	for _, name := range names {
+		if helpers.MailboxNameStorable(name) {
+			storable = append(storable, name)
+		}
+	}
+	if len(storable) == 0 {
+		return keys, nil
+	}
+
+	var lowered []string
+	if err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT ARRAY(SELECT LOWER(n) FROM unnest($1::text[]) WITH ORDINALITY AS t(n, i) ORDER BY i)
+	`, storable).Scan(&lowered); err != nil {
+		return nil, fmt.Errorf("failed to compute mailbox name keys: %w", err)
+	}
+	if len(lowered) != len(storable) {
+		return nil, fmt.Errorf("computed %d mailbox name keys for %d names", len(lowered), len(storable))
+	}
+	for i, name := range names {
+		if helpers.MailboxNameStorable(name) {
+			keys[i], lowered = lowered[0], lowered[1:]
+		}
+	}
+	return keys, nil
 }
 
 // GetMailboxesCount returns the number of mailboxes for an account
@@ -1265,16 +1300,30 @@ func (db *Database) RenameCrossesSharedBoundary(ctx context.Context, shared conf
 	if !shared.Enabled || mbox.Path == "" {
 		return false, nil
 	}
-	// Each new name as RenameMailbox gives it: the new name in place of the old one.
+	// Each new name as RenameMailbox gives it: the new name in place of the old one's
+	// levels.
+	delimiter := string(consts.MailboxDelimiter)
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
-		SELECT $3 || SUBSTRING(name FROM LENGTH($4) + 1), COALESCE(is_shared, FALSE)
+		SELECT array_to_string(ARRAY[$3::text] || (string_to_array(name, $5))[$4::int + 1:], $5),
+			COALESCE(is_shared, FALSE)
 		FROM mailboxes
 		WHERE account_id = $1 AND path LIKE $2 || '%' AND deleted_at IS NULL
-	`, mbox.AccountID, mbox.Path, newName, mbox.Name)
+	`, mbox.AccountID, mbox.Path, newName, mailboxNameLevels(mbox.Name, delimiter), delimiter)
 	if err != nil {
 		return false, err
 	}
 	return crossSharedBoundary(rows, &shared)
+}
+
+// mailboxNameLevels is the number of levels of the mailbox name, which a rename
+// replaces with the new name at the front of each descendant's name and
+// subscription. A descendant keeps its levels after that many, not its characters
+// after as many as the old name has: it is linked below its ancestor by LOWER(name),
+// and lower() can change a name's length (under ICU lower('İ') is "i̇", so a child
+// "i̇q/c" sits below "İq", issue #1650). lower() never writes or removes the ASCII
+// delimiter, so both spellings have the same number of levels.
+func mailboxNameLevels(name, delimiter string) int {
+	return strings.Count(name, delimiter) + 1
 }
 
 // isInboxMailboxName reports whether stored, a mailbox name resolved from the database,
@@ -1469,12 +1518,11 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Construct the new path
 	newPath := helpers.GetMailboxPath(newParentPath, mailboxID)
 
+	delimiter := string(consts.MailboxDelimiter)
+	oldLevels := mailboxNameLevels(oldName, delimiter)
+
 	// Before updating, check if any child would conflict with existing mailboxes
 	if hasChildren {
-		delimiter := string(consts.MailboxDelimiter)
-		oldPrefix := oldName + delimiter
-		newPrefix := newName + delimiter
-
 		// Check if any child's new name would conflict with an existing mailbox
 		var conflictCount int
 		err = tx.QueryRow(ctx, `
@@ -1488,9 +1536,9 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 				  AND child.path LIKE $2 || '%'
 				  AND child.path != $2
 				  AND child.deleted_at IS NULL
-				  AND existing.name = $3 || SUBSTRING(child.name FROM LENGTH($4) + 1)
+				  AND existing.name = array_to_string(ARRAY[$3::text] || (string_to_array(child.name, $5))[$4::int + 1:], $5)
 			  )
-		`, ownerAccountID, oldPath, newPrefix, oldPrefix).Scan(&conflictCount)
+		`, ownerAccountID, oldPath, newName, oldLevels, delimiter).Scan(&conflictCount)
 		if err != nil {
 			logger.Error("Database: failed to check for conflicting child names", "mailbox_id", mailboxID, "err", err)
 			return fmt.Errorf("%w: %w", consts.ErrInternalError, err)
@@ -1513,17 +1561,13 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 
 	// Now, update all children of the renamed mailbox if it has any.
 	if hasChildren {
-		delimiter := string(consts.MailboxDelimiter)
-		oldPrefix := oldName + delimiter
-		newPrefix := newName + delimiter
-
 		// The path of children only changes if the mailbox is moved to a new parent. For a simple
-		// rename, only the 'name' of the children needs to be updated. We use concatenation with
-		// SUBSTRING to only replace the prefix, which is safer than a global REPLACE.
+		// rename, only the 'name' of the children needs to be updated: the new name in place of
+		// the old one's levels (see mailboxNameLevels), which is safer than a global REPLACE.
 		const childUpdate = `
 			UPDATE mailboxes
 			SET
-				name = $1 || SUBSTRING(name FROM LENGTH($2) + 1),
+				name = array_to_string(ARRAY[$1::text] || (string_to_array(name, $6))[$2::int + 1:], $6),
 				path = CASE
 					WHEN $3 != $4 THEN $3 || SUBSTRING(path FROM LENGTH($4) + 1)
 					ELSE path
@@ -1532,7 +1576,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			WHERE
 				account_id = $5 AND
 				path LIKE $4 || '%' AND path != $4`
-		args := []any{newPrefix, oldPrefix, newPath, oldPath, ownerAccountID}
+		args := []any{newName, oldLevels, newPath, oldPath, ownerAccountID, delimiter}
 
 		if sharedCfg == nil {
 			_, err = tx.Exec(ctx, childUpdate, args...)
