@@ -124,9 +124,28 @@ is a message. Files in `new/` usually carry no flags, so they arrive unread.
 
 The maildir may have been written by its owner, while the import runs with more privileges, so
 source messages and Dovecot metadata are read through the opened maildir root. Symbolic links
-below it cannot redirect those reads outside the root. `--maildir-path` itself
-may be a link. Below it, a folder that is a link is not walked and is named in a warning. A message
-file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
+below it cannot redirect those reads outside the root. `--maildir-path` itself, or a directory
+on the way to it, may be a symbolic link only when the link belongs to root, to the user running
+`sora-admin`, or to the owner of the directory it leads to, as
+`/var/mail/alice -> /srv/mail/alice` made by root, `/srv/import/alice -> /var/vmail/alice` made by
+an operator who is not root, or a user's own `~/Maildir -> ~/mail/Maildir` does. A link of root or
+of the user running `sora-admin` leads only where that user could name directly. A user who can
+replace `~/Maildir` could otherwise point it at another user's maildir and have that read into the
+account. Any other link makes the import refuse to start, naming the link, its owner and the
+directory it leads to, before the `sora-maildir.db` cache is created; name that directory itself
+to import it. A link's owner says who made it, not who gave it its name, so where users may
+hard-link a file they do not own (macOS and the BSDs, and Linux with `fs.protected_hardlinks = 0`)
+a link with more than one name is refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise
+pass as root's link. The import sees only the names a link has when it runs: on such a system, a
+hard link a user made earlier to root's link (or to a link of the user running `sora-admin`, or to
+another user's link to their own maildir) has one name again once that original name is removed
+(root deletes `/var/mail/bob`, or bob replaces his link), and it is then followed as the link of
+its owner. Where users may make such links, name the maildir's own directory, with no link on the
+way, as `--maildir-path` (or `--sieve`). These are
+Unix UID checks. Checking them needs no more permission than opening the path does: the
+directories above the maildir need only be searchable (`x`), not readable, by the user running
+the import. Below the root, a folder that is a link is not walked and is named in a warning.
+A message file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
 file that is a link is read only when the link is relative and its target is below the root. Any
 other link (one pointing outside the root, or any absolute link, even to a file inside the root)
 is not read: such a message file is reported as failed by its path, and such a `cur/` or `new/` is
@@ -323,7 +342,10 @@ Very large UIDVALIDITY values in the uidlist are truncated to 32 bits.
 `--sieve PATH` stores the file as a Sieve script of the account before the messages are
 imported. If the file does not exist, it is ignored with a log line.
 
-The file is read through its directory. The usual file from Dovecot, the user's
+The file is read through its directory, opened under the same rule for links on the way to it
+as `--maildir-path` ([section 3](#3-the-maildir-layout-sora-reads)): with `~/sieve` a link the user
+made to another user's directory, the script is not imported and the summary names the link. The
+usual file from Dovecot, the user's
 `~/.dovecot.sieve`, is a symbolic link the user owns, so a link is followed only when it is
 relative and its target is within that directory, as Pigeonhole's own
 `.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
@@ -365,6 +387,15 @@ them is a symbolic link, even to a file inside the maildir, or another kind of f
 refuses to start and names it. The cache is opened without following a link, so a link put in its
 place while the run starts is refused as well. The export applies the same rule to the
 `sora-maildir.db` in its target directory.
+
+Once the import has checked the directory `--maildir-path` leads to (section 3), it does not look
+the path up again: the cache is checked and created, and the folders are listed, through the
+directory it opened, so the maildir's owner cannot make them land in another directory by renaming
+`~/Maildir` and putting a link in its place during the run. On Linux SQLite opens the cache, and its
+`-wal` and `-shm`, as `/proc/self/fd/N/sora-maildir.db`, through that directory's descriptor, which
+needs `/proc`. Elsewhere it opens them by the directory's name, which the rule below lets only root
+and the user running `sora-admin` change, and only while that name still leads to the directory
+that was checked.
 
 SQLite also writes through a hard link at those names, and a hard link cannot be refused
 without a race in a directory another user can write: SQLite opens the `-wal` and `-shm` files by
@@ -606,14 +637,19 @@ sora-admin --config config.toml export maildir --email user@example.com \
 | `--jobs` | `4` | Messages exported in parallel within a mailbox. |
 | `--delay` | `0` | Pause after each exported message (Go duration). |
 
-**Dry-run cache snapshot.** A missing target or cache stays missing. When a cache
-exists, preview copies its database and WAL into an owner-only temporary directory,
-reads that private copy, and removes it on close. The source database, WAL and SHM
-are never opened by SQLite or changed; source SHM is not copied. Committed rows left
-in WAL after a crash are included. The preview runs a separate helper process that
-holds a nonblocking exclusive POSIX lock while copying, so an active SQLite user
-causes a clear refusal. Stop users of that cache and retry; do not remove its WAL.
-A rollback journal is also refused: recover and close it normally before preview.
+**Dry-run cache snapshot.** A missing target or cache stays missing. The dry run
+reaches the target as the export does ("Links in the target" below): a link the export
+refuses makes the dry run refuse to start too, naming the link, before any cache is
+looked for, and a target the export would create is missing, with every message new.
+When a cache exists, preview copies its database and WAL into an owner-only temporary
+directory, reads that private copy, and removes it on close. The copy is made through
+the directory the dry run checked, not by the target's name again. The source
+database, WAL and SHM are never opened by SQLite or changed; source SHM is not copied.
+Committed rows left in WAL after a crash are included. The preview runs a separate
+helper process that holds a nonblocking exclusive POSIX lock while copying, so an
+active SQLite user causes a clear refusal. Stop users of that cache and retry; do not
+remove its WAL. A rollback journal is also refused: recover and close it normally
+before preview.
 
 This snapshot is supported on local POSIX-locking Linux filesystems
 (ext2/3/4, XFS, Btrfs, tmpfs or overlayfs) and macOS APFS/HFS/UFS/tmpfs. Other
@@ -670,7 +706,21 @@ uidlist in the target is merged: its entries for files still present are kept.
 
 **Links in the target.** The target may be a maildir its owner could write to, while the export
 runs with more privileges, so message and Dovecot contents and Maildir child directories below
-it are accessed through the opened target directory. `--maildir-path` itself may be a link.
+it are accessed through the opened target directory. `--maildir-path` itself, or a directory on
+the way to it, may be a symbolic link under the import's rule
+([section 3](#3-the-maildir-layout-sora-reads)): only when the link belongs to root, to the user
+running `sora-admin`, or to the owner of the directory it leads to. A user who can replace
+`~/Maildir`, or a directory above it, could
+otherwise point it at another user's maildir or home and have the account's mail, Dovecot files
+and `sora-maildir.db` written there. Any other link makes the export refuse to start, naming the
+link, before anything is created. The directories missing on the way are created only once every
+link on the way is checked, and never through a link to a directory that does not exist. As for
+the import, the directories above the target need only be searchable, and those a directory is
+created in writable, by the user running the export. Once checked, the target is reached through
+the directory the check opened: every directory and every file below it, the cache included, is
+created through that directory. Only SQLite opens the cache's files by a name again, as section 8
+describes: on Linux through that directory's descriptor, elsewhere by the target's name, which
+must still lead to the checked directory.
 Each exported content file (a message,
 `dovecot-keywords`, `subscriptions`, `dovecot-uidlist`) is written as a new file and renamed over
 its name, so a symbolic or hard link at that name is replaced, and the file it points to is left
@@ -683,8 +733,8 @@ Dovecot create these files by renaming a new file over the name, so theirs have 
 is there but not read is logged as a warning: the folder's keyword numbering, or the UIDs of the
 files an earlier run wrote, are then not kept. A copy of the target made with `cp -al`, or a tool
 that replaces identical files with hard links, gives these files a second link. The SQLite
-cache and its sidecars still use ordinary paths; their policy is unchanged
-([section 8](#8-the-sqlite-cache-sora-maildirdb)).
+cache and its sidecars are not replaced this way: one that is a symbolic link, or anything else
+but a regular file, makes the export refuse to start ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 
 **Re-runs.** The exporter keeps `sora-maildir.db` in the target directory, with the same schema
 as the importer's ([section 8](#8-the-sqlite-cache-sora-maildirdb)), and records each exported

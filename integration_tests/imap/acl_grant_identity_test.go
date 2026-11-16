@@ -63,7 +63,7 @@ func (g *aclPermissionGate) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, data
 
 func (g *aclPermissionGate) resume() { g.resumeOnce.Do(func() { close(g.release) }) }
 
-func startACLPermissionGateServer(t *testing.T, source *resilient.ResilientDatabase, gate *aclPermissionGate) string {
+func startACLPermissionGateServer(t *testing.T, source *resilient.ResilientDatabase, gate pgx.QueryTracer) string {
 	t.Helper()
 	ctx := context.Background()
 	connCfg := source.GetDatabase().GetWritePool().Config().ConnConfig
