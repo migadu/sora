@@ -908,8 +908,9 @@ There is no `AUTH`, `DSN` or `BINARYMIME`.
   §4.1.1.11), the DSN parameters `NOTIFY`, `ORCPT`, `RET` and `ENVID` among them, and `AUTH`, as
   `LHLO` does not announce `AUTH`. `XRCPTFORWARD` is the only `RCPT` parameter taken. A malformed
   parameter gets `501 5.5.4`: `SMTPUTF8` with a value (RFC 6531 §3.4), or any parameter written
-  with `=` and no value (RFC 5321 §4.1.2). When more than one parameter is refused, the first in
-  the order sent decides the reply, so `SIZE=abc FOO=1` gets `501` and `FOO=1 SIZE=abc` gets `555`.
+  with `=` and no value (RFC 5321 §4.1.2), which is refused before any other is looked at.
+  Otherwise, when more than one parameter is refused, the first in the order sent decides the
+  reply, so `SIZE=abc FOO=1` gets `501` and `FOO=1 SIZE=abc` gets `555`.
 - `VRFY` answers `252 2.5.0 Cannot VRFY user, but will accept message`.
 
 ### 8.4 Message size

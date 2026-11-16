@@ -35,12 +35,15 @@ func TestFirstRefusedParameterDecidesReply(t *testing.T) {
 		{"RET=HDRS SMTPUTF8=YES", "555 5.5.4 "},
 		{"BODY=9BIT RET=HDRS", "501 5.5.4 "},
 		{"RET=HDRS BODY=9BIT", "555 5.5.4 "},
+		// "=" with no value is refused before any parameter is looked at.
+		{"FOO=1 SIZE=", "501 5.5.4 "},
 	}
 	rcptCases := []struct{ params, want string }{
 		{"XRCPTFORWARD=!!! NOTIFY=NEVER", "501 5.5.4 "},
 		{"NOTIFY=NEVER XRCPTFORWARD=!!!", "555 5.5.4 "},
 		{"XRCPTFORWARD=!!! FOO=1", "501 5.5.4 "},
 		{"FOO=1 XRCPTFORWARD=!!!", "555 5.5.4 "},
+		{"NOTIFY=NEVER FOO=", "501 5.5.4 "},
 	}
 
 	check := func(t *testing.T, send func(string) string) {
