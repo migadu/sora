@@ -24,6 +24,7 @@ func CacheRoute(entry *lookupcache.CacheEntry, info *UserRoutingInfo) {
 	entry.RemoteTLSVerify = info.RemoteTLSVerify
 	entry.RemoteUseProxyProtocol = info.RemoteUseProxyProtocol
 	entry.RemoteUseIDCommand = info.RemoteUseIDCommand
+	entry.RemoteSkipForwardingWithProxyProtocol = info.RemoteSkipForwardingWithProxyProtocol
 	entry.RemoteUseXCLIENT = info.RemoteUseXCLIENT
 	entry.RemoteUseUTF8 = info.RemoteUseUTF8
 	entry.FromRemoteLookup = info.IsRemoteLookupAccount
@@ -34,18 +35,19 @@ func CacheRoute(entry *lookupcache.CacheEntry, info *UserRoutingInfo) {
 // as the lookup client reports it; a pin keeps its enforcement (IsRemoteLookupAccount).
 func RouteFromCache(entry *lookupcache.CacheEntry) *UserRoutingInfo {
 	return &UserRoutingInfo{
-		AccountID:              entry.AccountID,
-		ServerAddress:          entry.ServerAddress,
-		PoolName:               entry.PoolName,
-		IsRemoteLookupAccount:  entry.FromRemoteLookup,
-		AuthOnlyMode:           entry.FromRemoteLookup && entry.ServerAddress == "",
-		RemoteTLS:              entry.RemoteTLS,
-		RemoteTLSUseStartTLS:   entry.RemoteTLSUseStartTLS,
-		RemoteTLSVerify:        entry.RemoteTLSVerify,
-		RemoteUseProxyProtocol: entry.RemoteUseProxyProtocol,
-		RemoteUseIDCommand:     entry.RemoteUseIDCommand,
-		RemoteUseXCLIENT:       entry.RemoteUseXCLIENT,
-		RemoteUseUTF8:          entry.RemoteUseUTF8,
+		AccountID:                             entry.AccountID,
+		ServerAddress:                         entry.ServerAddress,
+		PoolName:                              entry.PoolName,
+		IsRemoteLookupAccount:                 entry.FromRemoteLookup,
+		AuthOnlyMode:                          entry.FromRemoteLookup && entry.ServerAddress == "",
+		RemoteTLS:                             entry.RemoteTLS,
+		RemoteTLSUseStartTLS:                  entry.RemoteTLSUseStartTLS,
+		RemoteTLSVerify:                       entry.RemoteTLSVerify,
+		RemoteUseProxyProtocol:                entry.RemoteUseProxyProtocol,
+		RemoteUseIDCommand:                    entry.RemoteUseIDCommand,
+		RemoteSkipForwardingWithProxyProtocol: entry.RemoteSkipForwardingWithProxyProtocol,
+		RemoteUseXCLIENT:                      entry.RemoteUseXCLIENT,
+		RemoteUseUTF8:                         entry.RemoteUseUTF8,
 	}
 }
 

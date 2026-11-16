@@ -84,7 +84,7 @@ func (f *fakePurgeWorkerDB) GetAccountDeletionStateWithRetry(_ context.Context, 
 func TestPurgeWorker_RunOnce_PurgesEachDueAccountItCanClaim(t *testing.T) {
 	rdb := newFakePurgeWorkerDB(1, 2, 3)
 	rdb.held[2] = true
-	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute)
+	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute, "global-hash-v1")
 
 	purged, err := w.RunOnce(context.Background())
 	require.NoError(t, err)
@@ -97,7 +97,7 @@ func TestPurgeWorker_RunOnce_PurgesEachDueAccountItCanClaim(t *testing.T) {
 func TestPurgeWorker_RunOnce_FailureIsBackedOffAndDoesNotStopTheCycle(t *testing.T) {
 	rdb := newFakePurgeWorkerDB(1, 2)
 	rdb.failing[1] = errors.New("S3 refused")
-	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute)
+	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute, "global-hash-v1")
 
 	purged, err := w.RunOnce(context.Background())
 	require.NoError(t, err)
@@ -109,7 +109,7 @@ func TestPurgeWorker_RunOnce_FailureIsBackedOffAndDoesNotStopTheCycle(t *testing
 func TestPurgeWorker_RunOnce_RestoredAccountIsNeitherPurgedNorBackedOff(t *testing.T) {
 	rdb := newFakePurgeWorkerDB(1)
 	rdb.restored[1] = true
-	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute)
+	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute, "global-hash-v1")
 
 	purged, err := w.RunOnce(context.Background())
 	require.NoError(t, err)
@@ -122,7 +122,7 @@ func TestPurgeWorker_RunOnce_CancelledContextStopsWithoutBackoff(t *testing.T) {
 	rdb := newFakePurgeWorkerDB(1, 2)
 	ctx, cancel := context.WithCancel(context.Background())
 	rdb.failing[1] = context.Canceled
-	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute)
+	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute, "global-hash-v1")
 	cancel()
 
 	purged, err := w.RunOnce(ctx)
@@ -132,7 +132,7 @@ func TestPurgeWorker_RunOnce_CancelledContextStopsWithoutBackoff(t *testing.T) {
 }
 
 func TestPurgeWorker_WakeIsNonBlockingAndCoalesces(t *testing.T) {
-	w := newPurgeWorker(newFakePurgeWorkerDB(), okBulkDeleter{}, time.Minute)
+	w := newPurgeWorker(newFakePurgeWorkerDB(), okBulkDeleter{}, time.Minute, "global-hash-v1")
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 100; i++ {
@@ -155,7 +155,7 @@ var _ = db.AccountPurgeLockID // the claim's lock id lives in db; see ExecuteWit
 func TestPurgeWorker_RunOnce_LockErrorIsNotTheAccountsFailure(t *testing.T) {
 	rdb := newFakePurgeWorkerDB(1, 2)
 	rdb.lockErr[1] = errors.New("pool timeout")
-	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute)
+	w := newPurgeWorker(rdb, okBulkDeleter{}, time.Minute, "global-hash-v1")
 
 	purged, err := w.RunOnce(context.Background())
 	require.NoError(t, err)

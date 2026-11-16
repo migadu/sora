@@ -149,6 +149,9 @@ func (db *Database) ResetUploadAttempts(ctx context.Context, tx pgx.Tx, contentH
 // The pending row is locked before dropFinishedPendingUpload decides; see there.
 // CompleteLeasedS3Upload locks it by ending its lease.
 func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, writtenKeys []string) error {
+	if err := LockS3ObjectsSharedInTx(ctx, tx, accountID, []string{contentHash}); err != nil {
+		return err
+	}
 	if err := markS3Uploaded(ctx, tx, contentHash, accountID, writtenKeys); err != nil {
 		return err
 	}
@@ -183,6 +186,9 @@ var ErrUploadLeaseLost = fmt.Errorf("upload lease lost: %w", consts.ErrDBNotFoun
 // statement ends the lease: the row is deleted below once nothing is left to write, and
 // otherwise stays, unleased, for the next lease to write what is left.
 func (db *Database) CompleteLeasedS3Upload(ctx context.Context, tx pgx.Tx, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
+	if err := LockS3ObjectsSharedInTx(ctx, tx, accountID, []string{contentHash}); err != nil {
+		return err
+	}
 	if err := markS3Uploaded(ctx, tx, contentHash, accountID, writtenKeys); err != nil {
 		return err
 	}
@@ -302,33 +308,48 @@ const (
 // live is answered S3WriteBusy. Renewal, release and the finalize act only for the owner,
 // so the one that lost cannot finalize, and drop the row, under the one still writing.
 //
-// One autocommit statement: the transaction-scoped try-lock is released when the
-// statement's implicit transaction ends, so the gate costs one round trip and pins
-// nothing behind any pooler. It never waits.
+// A short READ COMMITTED transaction takes a try-lock, then checks deletion
+// intents and grants the lease from a fresh snapshot. It never waits for a body lock
+// and ends before storage I/O, retaining no connection across the transfer.
 func (db *Database) PassS3WriteGate(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (S3WriteGate, error) {
-	var open, leased, exists bool
-	err := db.GetWritePool().QueryRow(ctx, `
-		WITH gate AS MATERIALIZED (
-			SELECT pg_try_advisory_xact_lock($1) AS open
-		), lease AS (
-			UPDATE pending_uploads SET lease_until = now() + $3::interval, lease_owner = $4
-			WHERE id = $2 AND (SELECT open FROM gate)
-			  AND (lease_until IS NULL OR lease_until < now())
-			RETURNING id
-		)
-		SELECT (SELECT open FROM gate), EXISTS (SELECT 1 FROM lease),
-		       EXISTS (SELECT 1 FROM pending_uploads WHERE id = $2)
-	`, GetS3ObjectLockID(accountID, contentHash), pendingID, ttl, owner).Scan(&open, &leased, &exists)
+	// The intent read must take a fresh snapshot AFTER the global try-lock. A
+	// single-statement CTE could resume with a snapshot from before intent commit.
+	tx, err := db.GetWritePool().BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
 	if err != nil {
-		return S3WriteBusy, fmt.Errorf("failed to pass the write gate for hash %s of account %d: %w", contentHash, accountID, err)
+		return S3WriteBusy, err
+	}
+	defer func() {
+		rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancelRollback()
+		_ = tx.Rollback(rollbackCtx)
+	}()
+	var open bool
+	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock($1)", GetS3ObjectLockID(accountID, contentHash)).Scan(&open); err != nil {
+		return S3WriteBusy, err
+	}
+	if !open {
+		return S3WriteBusy, nil
+	}
+	var permitted, leased, exists bool
+	if err := tx.QueryRow(ctx, `
+        WITH allowed AS MATERIALIZED(SELECT NOT EXISTS(SELECT 1 FROM s3_body_delete_intents WHERE content_hash=$4) AS open), lease AS (
+          UPDATE pending_uploads SET lease_until=now()+$2::interval,lease_owner=$3
+          WHERE id=$1 AND (SELECT open FROM allowed) AND (lease_until IS NULL OR lease_until<now()) RETURNING id
+        )
+        SELECT (SELECT open FROM allowed),EXISTS(SELECT 1 FROM lease),EXISTS(SELECT 1 FROM pending_uploads WHERE id=$1)
+    `, pendingID, ttl, owner, contentHash).Scan(&permitted, &leased, &exists); err != nil {
+		return S3WriteBusy, fmt.Errorf("failed to pass write gate for %s of account %d: %w", contentHash, accountID, err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return S3WriteBusy, err
 	}
 	switch {
-	case !open:
+	case !permitted:
 		return S3WriteBusy, nil
 	case leased:
 		return S3WriteOpen, nil
 	case exists:
-		return S3WriteBusy, nil // another upload holds a live lease on the row
+		return S3WriteBusy, nil
 	}
 	return S3WriteAbandoned, nil
 }

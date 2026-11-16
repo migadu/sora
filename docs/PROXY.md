@@ -676,15 +676,28 @@ For each protocol, the backend server block must accept what the proxy sends:
 `XCLIENT` client addresses, and refuses to start with `proxy_protocol = true`. List only the proxy
 addresses: every host in the list may claim any client address. See [SECURITY.md](SECURITY.md).
 
-You need only one way to pass the client address. PROXY protocol works for all protocols and keeps
-the backend from seeing the proxy's address at all. `ID` and `XCLIENT` work without changing the
-backend's listener. On IMAP and POP3, a backend that receives a PROXY header judges `ID` and
-`XCLIENT` by the client the header names, not by the proxy, so next to a header it ignores the `ID`
-forwarding fields and refuses the POP3 `XCLIENT` (unless that client is itself in
-`trusted_networks`); the login continues. The header already carries the client's address and
-port, its JA4 fingerprint and the proxy session ID (8.4). LMTP `XCLIENT` is judged by the proxy
-and still carries the client's `HELO` next to a PROXY header
+PROXY protocol conveys the client endpoint before the application greeting. ID and XCLIENT
+can also carry forwarding context that the header does not represent. A backend's trust policy
+determines which fields it accepts alongside PROXY: Sora IMAP checks the effective client
+address for ID forwarding, while Sora POP3 accepts XCLIENT from a trusted transport peer and
+keeps TTL and extra variables even when it retains the PROXY client address. Other backends
+may differ. Configure the appropriate trusted proxy networks and check the backend's policy
+before suppressing either command. LMTP XCLIENT retains its HELO forwarding alongside PROXY
 ([SECURITY.md](SECURITY.md#31-trusted_networks)).
+
+### Explicit suppression alongside PROXY
+
+Configured IMAP ID and POP3 XCLIENT forwarding is preserved by default, including
+when the backend leg sends a PROXY header. To omit those commands on such a leg,
+set `remote_skip_forwarding_with_proxy_protocol = true` on the server, named pool,
+or remote-lookup backend settings. Pool/lookup settings apply to the route they own.
+The setting applies only to IMAP and POP3; LMTP keeps its XCLIENT/HELO forwarding.
+
+PROXY carries endpoint identity and some trace fields, but does not replace all
+ID/XCLIENT TTL, proxy-server, user and source variables or original connected-endpoint
+context. Enable suppression only when the backend does not need those fields. A
+connection that cannot send a PROXY header still sends its configured forwarding
+command. Changing backend-leg settings needs a restart, like other forwarding settings.
 
 ### 8.2 Which settings apply
 
