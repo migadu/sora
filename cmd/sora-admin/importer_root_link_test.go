@@ -17,7 +17,8 @@ import (
 // place, the user can make ~/Maildir (or ~/sieve) a symbolic link to any directory the
 // import can read, such as another user's maildir, which would then be read into the
 // account named by --email. A link on the way to the root is followed only when root
-// made it or it belongs to the owner of the directory it leads to (#1729).
+// or the user running the import made it, or it belongs to the owner of the directory
+// it leads to (#1729).
 
 // rootLinkUIDs are two users other than the one running the test, and other than root.
 func rootLinkUIDs() (alice, bob uint32) {

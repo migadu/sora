@@ -125,20 +125,23 @@ is a message. Files in `new/` usually carry no flags, so they arrive unread.
 The maildir may have been written by its owner, while the import runs with more privileges, so
 source messages and Dovecot metadata are read through the opened maildir root. Symbolic links
 below it cannot redirect those reads outside the root. `--maildir-path` itself, or a directory
-on the way to it, may be a symbolic link only when the link belongs to root or to the owner of
-the directory it leads to, as `/var/mail/alice -> /srv/mail/alice` made by root or a user's own
-`~/Maildir -> ~/mail/Maildir` does. A user who can replace `~/Maildir` could otherwise point it at
-another user's maildir and have that read into the account. Any other link makes the import
-refuse to start, naming the link, its owner and the directory it leads to, before the
-`sora-maildir.db` cache is created; name that directory itself to import it. A link's owner says
-who made it, not who gave it its name, so where users may hard-link a file they do not own (macOS
-and the BSDs, and Linux with `fs.protected_hardlinks = 0`) a link with more than one name is
-refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise pass as root's link. The import
-sees only the names a link has when it runs: on such a system, a hard link a user made earlier
-to root's link (or to another user's link to their own maildir) has one name again once that
-original name is removed (root deletes `/var/mail/bob`, or bob replaces his link), and it is then
-followed as the link of its owner. Where users may make such links, name the maildir's own
-directory, with no link on the way, as `--maildir-path` (or `--sieve`). These are
+on the way to it, may be a symbolic link only when the link belongs to root, to the user running
+`sora-admin`, or to the owner of the directory it leads to, as
+`/var/mail/alice -> /srv/mail/alice` made by root, `/srv/import/alice -> /var/vmail/alice` made by
+an operator who is not root, or a user's own `~/Maildir -> ~/mail/Maildir` does. A link of root or
+of the user running `sora-admin` leads only where that user could name directly. A user who can
+replace `~/Maildir` could otherwise point it at another user's maildir and have that read into the
+account. Any other link makes the import refuse to start, naming the link, its owner and the
+directory it leads to, before the `sora-maildir.db` cache is created; name that directory itself
+to import it. A link's owner says who made it, not who gave it its name, so where users may
+hard-link a file they do not own (macOS and the BSDs, and Linux with `fs.protected_hardlinks = 0`)
+a link with more than one name is refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise
+pass as root's link. The import sees only the names a link has when it runs: on such a system, a
+hard link a user made earlier to root's link (or to a link of the user running `sora-admin`, or to
+another user's link to their own maildir) has one name again once that original name is removed
+(root deletes `/var/mail/bob`, or bob replaces his link), and it is then followed as the link of
+its owner. Where users may make such links, name the maildir's own directory, with no link on the
+way, as `--maildir-path` (or `--sieve`). These are
 Unix UID checks. Checking them needs no more permission than opening the path does: the
 directories above the maildir need only be searchable (`x`), not readable, by the user running
 the import. Below the root, a folder that is a link is not walked and is named in a warning.
