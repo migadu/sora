@@ -649,9 +649,9 @@ sora-admin --config config.toml messages repair-references --apply
   is safe to run again: a filled row is not counted again. A message restored later with
   `messages restore` gets the value its expunged row had, so run the command again after
   restoring old mail.
-- The run reads every row of the `messages` table once and does one index lookup for each row
-  without References. The dry run reads exactly what `--apply` reads, so the time it takes is
-  a measurement of the read part of `--apply`.
+- The query scans message IDs in batches and looks for a same-hash donor for each candidate.
+  Its plan and cost depend on the table statistics and batch arguments. The dry run uses the
+  same read queries as `--apply`, so its elapsed time measures the read part on that database.
 
 ---
 
