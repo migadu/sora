@@ -130,9 +130,12 @@ the directory it leads to, as `/var/mail/alice -> /srv/mail/alice` made by root 
 `~/Maildir -> ~/mail/Maildir` does. A user who can replace `~/Maildir` could otherwise point it at
 another user's maildir and have that read into the account. Any other link makes the import
 refuse to start, naming the link, its owner and the directory it leads to, before the
-`sora-maildir.db` cache is created; name that directory itself to import it. These are Unix UID
-checks. Below the root, a folder that is a link is not walked and is named in a warning. A message
-file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
+`sora-maildir.db` cache is created; name that directory itself to import it. A link's owner says
+who made it, not who gave it its name, so where users may hard-link a file they do not own (macOS
+and the BSDs, and Linux with `fs.protected_hardlinks = 0`) a link with more than one name is
+refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise pass as root's link. These are
+Unix UID checks. Below the root, a folder that is a link is not walked and is named in a warning.
+A message file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
 file that is a link is read only when the link is relative and its target is below the root. Any
 other link (one pointing outside the root, or any absolute link, even to a file inside the root)
 is not read: such a message file is reported as failed by its path, and such a `cur/` or `new/` is

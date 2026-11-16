@@ -1447,8 +1447,9 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 //
 // The root's own owner says nothing: --maildir-path, or the --sieve file's directory,
 // may be a directory of root's that anyone may write into (/tmp), and a maildir
-// extracted as root into a directory root made keeps its owner's files below it. Components are walked from root by descriptor (Lstat, Readlink,
-// OpenRoot), requiring the final entry to be the file opened so a directory or entry
+// extracted as root into a directory root made keeps its owner's files below it.
+// Components are walked from root by descriptor (Lstat, Readlink, OpenRoot),
+// requiring the final entry to be the file opened so a directory or entry
 // replaced meanwhile cannot vouch for it. Any symbolic link along the path must stay
 // strictly below the directory holding that link (no absolute or .. segments), live in
 // a directory without group or other write access, and belong (together with its
@@ -1602,7 +1603,9 @@ const maxImportRootLinks = 255
 // would then be read into the account named by --email. So a link on the way is
 // followed only when it belongs to root or to the owner of the directory it leads to,
 // as a link a user made to a directory of their own does; any other is refused,
-// naming it, so the operator can name the directory itself.
+// naming it, so the operator can name the directory itself. The owner of a link says
+// who made it, not who gave it its name: where users may hard-link a file they do not
+// own, a link with more than one name is refused too.
 //
 // path is walked a component at a time by descriptor from the file system root (a
 // relative one from the working directory), as the system resolves it: a ".." after a
@@ -1709,6 +1712,12 @@ func openImportRoot(path string) (*os.Root, error) {
 			again, err := cur.Lstat(st.name)
 			if err != nil || !os.SameFile(info, again) {
 				return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, name)
+			}
+			// The owner says who made the link, not who gave it this name: where users
+			// may hard-link a file they do not own (hardLinksProtected), alice can name
+			// root's /var/mail/bob, or bob's own link to his maildir, ~/Maildir.
+			if sys, ok := again.Sys().(*syscall.Stat_t); ok && sys.Nlink > 1 && !hardLinksProtected() {
+				return nil, fmt.Errorf("refusing %s: %s is a symbolic link with %d names, and on this system any user may have given it this one with a hard link; name the directory it leads to instead", given, name, sys.Nlink)
 			}
 			next := split(target)
 			if uid := fileUID(again); uid != 0 {
