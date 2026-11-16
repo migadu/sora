@@ -70,6 +70,24 @@ func TestExportKeywordsReadIsBounded(t *testing.T) {
 	assert.Contains(t, logs.String(), keywordsPath, "the oversized dovecot-keywords was replaced without a warning naming it")
 }
 
+// A mailbox without keywords needs no dovecot-keywords, but one left in the export's
+// destination that cannot be read is replaced all the same, as the warning naming it
+// says: the export must not leave it for Dovecot or a re-import to read (#1672).
+func TestExportReplacesUnreadableKeywordsOfMailboxWithoutKeywords(t *testing.T) {
+	exporter, dest := newLinkTestExporter(t, nil, ExporterOptions{Dovecot: true})
+	keywordsPath := filepath.Join(dest, "dovecot-keywords")
+	newSparseFile(t, keywordsPath, metadataFileSize)
+	logs := captureLogs(t, slog.LevelWarn)
+
+	require.NoError(t, exporter.prepareKeywords("INBOX", []db.Message{{UID: 1}}))
+
+	assertRegularFile(t, keywordsPath)
+	info, err := os.Stat(keywordsPath)
+	require.NoError(t, err)
+	assert.Zero(t, info.Size(), "the dovecot-keywords that cannot be read was left in place")
+	assert.Contains(t, logs.String(), keywordsPath, "the dovecot-keywords was replaced without a warning naming it")
+}
+
 // The import reads the root and every folder's dovecot-keywords, which the maildir's
 // owner wrote: the read must stop far short of a huge file, which is named and
 // ignored, and the import goes on without its keywords (#1672).

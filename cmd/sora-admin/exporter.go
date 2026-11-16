@@ -1168,6 +1168,7 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 
 	index := make(map[string]int)
 	used := make(map[int]bool)
+	unreadable := false
 	open := func(name string) (*os.File, error) { return openExportEntry(exporter.root, name, false) }
 	if existing, err := parseKeywordsFile(keywordsName, open); err == nil {
 		for idx, kw := range existing {
@@ -1175,6 +1176,7 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 			used[idx] = true
 		}
 	} else if !errors.Is(err, os.ErrNotExist) {
+		unreadable = true
 		logger.Warn("Replacing a dovecot-keywords file that cannot be read",
 			"path", filepath.Join(exporter.maildirPath, keywordsName), "error", err)
 	}
@@ -1205,7 +1207,9 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 	exporter.keywordIndex[mailboxName] = index
 	exporter.mu.Unlock()
 
-	if len(index) == 0 {
+	// A mailbox without keywords needs no file, but one that cannot be read is
+	// replaced all the same (with an empty one), as the warning says.
+	if len(index) == 0 && !unreadable {
 		return nil
 	}
 	if err := exporter.root.MkdirAll(dir, 0755); err != nil {
