@@ -611,10 +611,13 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 	// This single query uses a Common Table Expression (CTE) to perform the deletions
 	// in one atomic operation, which is more efficient than separate queries.
 	// 1. The `deleted_messages` CTE deletes the reapable messages, now expunged, and
-	//    returns their keys.
+	//    returns their ids and keys.
 	// 2. The `deleted_pending` CTE then uses these keys to remove the corresponding
-	//    entries from `pending_uploads`, but only the same still-dead row version the
-	//    statement saw. A concurrent delivery or copy can re-arm a row while DELETE
+	//    entries from `pending_uploads` once no other unuploaded message row in that
+	//    account still references the body (for example a copy in a busy mailbox that
+	//    lockIdleLiveMessageMailboxes skipped, or a copy still within the grace period),
+	//    and only the same still-dead row version the statement saw. A concurrent
+	//    delivery or copy can re-arm a row while DELETE
 	//    waits for its lock. READ COMMITTED rechecks the new target version, but its
 	//    heartbeat subquery keeps the old statement snapshot, so liveness alone is
 	//    insufficient. Compare ctid with a separate snapshot lookup by primary key:
@@ -636,13 +639,20 @@ func (d *Database) CleanupFailedUploads(ctx context.Context, tx pgx.Tx, gracePer
 			DELETE FROM messages m
 			WHERE ` + reapable + `
 			  AND ` + notLiveInMailbox + `
-			RETURNING m.content_hash, m.account_id
+			RETURNING m.id, m.content_hash, m.account_id
 		),
 		deleted_pending AS (
 			DELETE FROM pending_uploads pu
 			WHERE (pu.content_hash, pu.account_id) IN (SELECT content_hash, account_id FROM deleted_messages)
 			  AND pu.ctid = (SELECT snapshot_pu.ctid FROM pending_uploads snapshot_pu WHERE snapshot_pu.id = pu.id)
 			  AND ` + livePendingUpload + ` IS NOT TRUE
+			  AND NOT EXISTS (
+				SELECT 1 FROM messages m
+				WHERE m.content_hash = pu.content_hash
+				  AND m.account_id = pu.account_id
+				  AND m.uploaded = FALSE
+				  AND NOT EXISTS (SELECT 1 FROM deleted_messages dm WHERE dm.id = m.id)
+			  )
 		),
 		deleted_instances AS (
 			DELETE FROM instance_heartbeats ih
