@@ -1051,3 +1051,19 @@ For large databases, follow the concurrent covering-index preparation in
 `db/migrations/000070_messages_header_presence.up.sql` before upgrading. The
 migration refuses an unprepared blocking rebuild. Existing bodies, flags, UIDs,
 MODSEQs, search caches and content hashes are not rewritten.
+
+### Initial flag-state versions (migration71)
+
+A new UID and a later flag change can arrive between the same two polls. The
+nullable `message_state.initial_modseq` records the flag version installed by
+that row's INSERT; a trigger keeps it unchanged on UPDATE. Poll suppresses the
+initial flags of a newly announced message, while a later STORE still produces
+FlagChange or keeps the reported CONDSTORE watermark below a filtered change.
+This also covers an own APPEND whose MessageNew FETCH is suppressed.
+
+Existing state rows remain NULL and follow the conservative flag-update path.
+There is no backfill or body read. All writers get this metadata from the INSERT
+trigger, including older servers during a rolling upgrade. COPY, MOVE and restore
+install a fresh state row and initial version; they do not reuse the source's
+version. Rolling migration71 back removes this knowledge; applying it again
+leaves those existing rows unknown rather than inferring their original flags.
