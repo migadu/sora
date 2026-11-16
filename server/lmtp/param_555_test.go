@@ -3,6 +3,8 @@ package lmtp
 import (
 	"strings"
 	"testing"
+
+	"github.com/emersion/go-smtp"
 )
 
 // A MAIL or RCPT parameter the backend does not recognize, or whose extension it has
@@ -44,6 +46,25 @@ func TestUnsupportedMailRcptParametersGet555(t *testing.T) {
 	} {
 		if resp := c.cmd("RCPT TO:<b@example.org> " + param); !strings.HasPrefix(resp[0], "555 5.5.4 ") {
 			t.Errorf("RCPT TO with %s: %q, want 555 5.5.4", param, resp)
+		}
+	}
+}
+
+// unsupportedRcptParameter names a parameter the session must refuse: anything go-smtp
+// passed on in Extensions other than XRCPTFORWARD.
+func TestUnsupportedRcptParameter(t *testing.T) {
+	for _, tc := range []struct {
+		opts *smtp.RcptOptions
+		want string
+	}{
+		{nil, ""},
+		{&smtp.RcptOptions{}, ""},
+		{&smtp.RcptOptions{Extensions: map[string]string{"XRCPTFORWARD": "eD15"}}, ""},
+		{&smtp.RcptOptions{Extensions: map[string]string{"FOO": "1"}}, "FOO"},
+		{&smtp.RcptOptions{Extensions: map[string]string{"XRCPTFORWARD": "eD15", "X-UNKNOWN": ""}}, "X-UNKNOWN"},
+	} {
+		if got := unsupportedRcptParameter(tc.opts); got != tc.want {
+			t.Errorf("unsupportedRcptParameter(%+v) = %q, want %q", tc.opts, got, tc.want)
 		}
 	}
 }
