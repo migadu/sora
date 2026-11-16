@@ -1026,3 +1026,44 @@ limit of `0` turns that check off. An overwrite counts only its change in size, 
 frees its slot. The count and size limits refuse only a command that raises the count or the
 size, so an account already past one (the limit was lowered) can still delete, overwrite and
 shrink entries to get back under it.
+
+
+### Forward-only header presence (migration70)
+
+Newly ingested messages record whether the supported searchable fields exist,
+independently of empty values or address parsing. This covers From, To, Cc, Bcc,
+Sender, Reply-To, Subject, Message-ID, In-Reply-To and References. An explicit
+`HEADER <name> ""` uses this presence metadata; address shorthand retains the
+meaning of the currently represented ENVELOPE address lists. The inherited
+empty-group ENVELOPE representation limitation is not changed here. Nonempty
+header terms and unsupported field names retain their existing search behavior.
+
+This change is forward-only. There is no historical or lazy backfill and no S3
+read to repair old metadata. A NULL `messages.header_presence` means unknown,
+and those rows keep their prior search results (including known empty-term
+inaccuracies). COPY, MOVE and restore preserve that unknown state even though
+they create a new row or UID. Mail newly ingested through APPEND, LMTP, HTTP
+or either importer records final headers, after Sieve edits where applicable;
+old writers during a rolling upgrade and severely malformed APPEND headers
+accepted with degraded metadata can still produce unknown rows.
+
+For large databases, follow the concurrent covering-index preparation in
+`db/migrations/000070_messages_header_presence.up.sql` before upgrading. The
+migration refuses an unprepared blocking rebuild. Existing bodies, flags, UIDs,
+MODSEQs, search caches and content hashes are not rewritten.
+
+### Initial flag-state versions (migration71)
+
+A new UID and a later flag change can arrive between the same two polls. The
+nullable `message_state.initial_modseq` records the flag version installed by
+that row's INSERT; a trigger keeps it unchanged on UPDATE. Poll suppresses the
+initial flags of a newly announced message, while a later STORE still produces
+FlagChange or keeps the reported CONDSTORE watermark below a filtered change.
+This also covers an own APPEND whose MessageNew FETCH is suppressed.
+
+Existing state rows remain NULL and follow the conservative flag-update path.
+There is no backfill or body read. All writers get this metadata from the INSERT
+trigger, including older servers during a rolling upgrade. COPY, MOVE and restore
+install a fresh state row and initial version; they do not reuse the source's
+version. Rolling migration71 back removes this knowledge; applying it again
+leaves those existing rows unknown rather than inferring their original flags.
