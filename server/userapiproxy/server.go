@@ -605,7 +605,7 @@ func (s *Server) setupHandler() http.Handler {
 			}
 			if errors.Is(err, errRefreshTokenRefused) {
 				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
-				s.writeError(w, r, "Invalid or expired token", http.StatusUnauthorized)
+				s.writeUnauthorized(w, r, err)
 				return
 			}
 			if errors.Is(err, errLoginRefused) {
@@ -640,11 +640,13 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, msg string, 
 }
 
 // writeLoginRefused answers a login the proxy refuses itself (errLoginRefused) as a
-// backend answers a wrong password (userapi handleLogin): 401 {"error": "Invalid
-// credentials"} with the backend's headers. Unlike writeError it sets no
-// X-Content-Type-Options, which the backend's answer lacks: a header only the proxy sets
-// would show that no backend was asked, and so what the lookup said of the address.
+// backend answers a wrong password (userapi writeLoginRefused): 401 {"error": "Invalid
+// credentials"} with the backend's headers, its Bearer challenge without an error code
+// included. Unlike writeError it sets no X-Content-Type-Options, which the backend's
+// answer lacks: a header only the proxy sets, or one only the backend sets, would show
+// that no backend was asked, and so what the lookup said of the address.
 func (s *Server) writeLoginRefused(w http.ResponseWriter, r *http.Request) {
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, "")
 	s.writeUserAPIError(w, r, "Invalid credentials", http.StatusUnauthorized)
 }
 
@@ -1272,11 +1274,12 @@ var (
 	errNotBearerAuth = errors.New("authorization header must be 'Bearer <token>'")
 )
 
-// writeUnauthorized answers r, whose token extractAndValidateToken refused with err, as
-// the User API answers the same refusal (userapi jwtAuthMiddleware), so a token the proxy
-// refuses is answered as a backend answers it: the same message and the same Bearer
-// challenge, which RFC 9110 section 15.5.2 requires on every 401. A request without a
-// bearer token gets the challenge without an error code, a refused token
+// writeUnauthorized answers r, whose token extractAndValidateToken refused with err (or
+// whose refresh token peekAuthIdentity refused, errRefreshTokenRefused), as the User API
+// answers the same refusal (userapi jwtAuthMiddleware, handleRefreshToken), so a token
+// the proxy refuses is answered as a backend answers it: the same message and the same
+// Bearer challenge, which RFC 9110 section 15.5.2 requires on every 401. A request
+// without a bearer token gets the challenge without an error code, a refused token
 // error="invalid_token" (RFC 6750 section 3.1).
 func (s *Server) writeUnauthorized(w http.ResponseWriter, r *http.Request, err error) {
 	msg, errorCode := "Invalid or expired token", server.BearerInvalidToken

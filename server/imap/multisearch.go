@@ -3,6 +3,7 @@ package imap
 import (
 	"context"
 	"errors"
+	"slices"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -194,6 +195,11 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 // verbs (selected/inboxes/personal/subscribed/subtree/subtree-one) require lookup
 // visibility. Explicit names additionally allow read-only ACL visibility (r without
 // l); inaccessible names are ignored (RFC 7377 §2.2). Read checks follow per result.
+//
+// Names are matched as the database matches them, by LOWER(name) under its
+// collation, which no Go case mapping matches (under ICU "İNBOX" is not the
+// INBOX): the mailboxes carry it as NameKey, and the names the source gives, and
+// INBOX, are resolved to theirs in one query. The selected mailbox is taken by ID.
 func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.SearchSource, allMailboxes []*db.DBMailbox) ([]*db.DBMailbox, error) {
 	accountID := s.IMAPUser.AccountID()
 	delim := string(consts.MailboxDelimiter)
@@ -208,9 +214,30 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 	}
 	release()
 
-	byLower := make(map[string]*db.DBMailbox, len(allMailboxes))
+	var names []string
+	if source.Inboxes {
+		names = append(names, consts.MailboxInbox)
+	}
+	names = append(names, source.Subtree...)
+	names = append(names, source.SubtreeOne...)
+	names = append(names, source.Mailboxes...)
+	var keys []string
+	if len(names) > 0 {
+		var err error
+		if keys, err = s.server.rdb.MailboxNameKeysWithRetry(ctx, names); err != nil {
+			return nil, s.internalError("failed to resolve search mailbox names: %v", err)
+		}
+	}
+	// nextKeys returns the keys of the next n names, in the order they were added.
+	nextKeys := func(n int) []string {
+		k := keys[:n]
+		keys = keys[n:]
+		return k
+	}
+
+	byKey := make(map[string]*db.DBMailbox, len(allMailboxes))
 	for _, m := range allMailboxes {
-		byLower[strings.ToLower(m.Name)] = m
+		byKey[m.NameKey] = m
 	}
 
 	var out []*db.DBMailbox
@@ -227,14 +254,14 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 	}
 
 	if source.Selected && selected != nil {
-		if m, ok := byLower[strings.ToLower(selected.Name)]; ok {
-			add(m)
-		} else {
-			add(selected)
+		m := selected
+		if i := slices.IndexFunc(allMailboxes, func(live *db.DBMailbox) bool { return live.ID == selected.ID }); i >= 0 {
+			m = allMailboxes[i]
 		}
+		add(m)
 	}
 	if source.Inboxes {
-		add(byLower["inbox"])
+		add(byKey[nextKeys(1)[0]])
 	}
 	if source.Personal {
 		// The user's own namespace: owned mailboxes only (exclude shared, whose
@@ -253,35 +280,40 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 			}
 		}
 	}
-	for _, root := range source.Subtree {
-		lroot := strings.ToLower(root)
-		prefix := lroot + delim
+	// A descendant's key starts with its ancestor's: lower() leaves the hierarchy
+	// delimiter alone, as the database relies on when it matches descendants by
+	// LOWER(name) LIKE LOWER(prefix) || '%'.
+	for _, root := range nextKeys(len(source.Subtree)) {
+		if root == "" {
+			continue // names no mailbox
+		}
+		prefix := root + delim
 		for _, m := range allMailboxes {
-			lname := strings.ToLower(m.Name)
-			if lname == lroot || strings.HasPrefix(lname, prefix) {
+			if m.NameKey == root || strings.HasPrefix(m.NameKey, prefix) {
 				add(m)
 			}
 		}
 	}
-	for _, root := range source.SubtreeOne {
-		lroot := strings.ToLower(root)
-		prefix := lroot + delim
+	for _, root := range nextKeys(len(source.SubtreeOne)) {
+		if root == "" {
+			continue // names no mailbox
+		}
+		prefix := root + delim
 		for _, m := range allMailboxes {
-			lname := strings.ToLower(m.Name)
-			if lname == lroot {
+			if m.NameKey == root {
 				add(m)
 				continue
 			}
-			if rest, ok := strings.CutPrefix(lname, prefix); ok && !strings.Contains(rest, delim) {
+			if rest, ok := strings.CutPrefix(m.NameKey, prefix); ok && !strings.Contains(rest, delim) {
 				add(m)
 			}
 		}
 	}
-	for _, name := range source.Mailboxes {
-		m, ok := byLower[strings.ToLower(name)]
+	for i, key := range nextKeys(len(source.Mailboxes)) {
+		m, ok := byKey[key]
 		if !ok {
 			var err error
-			m, err = s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, accountID, name, db.ACLRightRead)
+			m, err = s.server.rdb.GetMailboxByNameForRightWithRetry(ctx, accountID, source.Mailboxes[i], db.ACLRightRead)
 			if errors.Is(err, consts.ErrMailboxNotFound) {
 				continue
 			}

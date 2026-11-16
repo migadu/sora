@@ -43,12 +43,7 @@ func TestUserAPIProxy_LoginTheLookupRefusesLooksLikeAWrongPassword(t *testing.T)
 
 	const login = `{"email":"nobody@example.com","password":"wrong-password"}`
 	refresh := `{"token":"` + corsTestToken(t, time.Hour) + `"}`
-
-	// What a backend's wrong-password answer carries (userapi corsMiddleware, then
-	// writeError through writeJSON), with the same allowed_origins as the proxy's.
-	wantHeader := http.Header{}
-	server.SetCORSHeaders(wantHeader, corsTestOrigin, []string{corsTestOrigin})
-	wantHeader.Set("Content-Type", "application/json")
+	wantHeader := wrongPasswordHeader()
 
 	for _, c := range []struct {
 		name          string
@@ -97,6 +92,18 @@ func TestUserAPIProxy_LoginTheLookupRefusesLooksLikeAWrongPassword(t *testing.T)
 			}
 		})
 	}
+}
+
+// wrongPasswordHeader is the header of a backend's answer to a login with a wrong
+// password from corsTestOrigin, with the proxy's allowed_origins (userapi corsMiddleware,
+// then the login's 401 with the Bearer challenge a request without a token gets, RFC 9110
+// section 15.5.2): the header the proxy's own refusal of a login must carry too.
+func wrongPasswordHeader() http.Header {
+	h := http.Header{}
+	server.SetCORSHeaders(h, corsTestOrigin, []string{corsTestOrigin})
+	h.Set("Content-Type", "application/json")
+	h.Set("WWW-Authenticate", `Bearer realm="user-api"`)
+	return h
 }
 
 // A login whose body a backend refuses before it looks anyone up (no password, an empty
@@ -161,7 +168,8 @@ func TestUserAPIProxy_LoginRefusedFromItsBodyIsNotLookedUp(t *testing.T) {
 // 401 after a dummy verification, and a 503 sends the client into retries instead of
 // telling the user the address or password is wrong. It reaches no backend: a
 // credential stored under an address the proxy cannot parse would be looked up in
-// whichever pool answered.
+// whichever pool answered. The proxy's answer is the backend's for the same login, its
+// Bearer challenge included (#790).
 func TestUserAPIProxy_LoginWithAnInvalidAddressLooksLikeAWrongPassword(t *testing.T) {
 	origCost := db.BcryptCost
 	db.BcryptCost = bcrypt.MinCost
@@ -173,7 +181,7 @@ func TestUserAPIProxy_LoginWithAnInvalidAddressLooksLikeAWrongPassword(t *testin
 		w.WriteHeader(http.StatusNotFound)
 	}))
 	t.Cleanup(lookup.Close)
-	_, addr, hits := countingBackend(t)
+	reference, addr, hits := countingBackend(t)
 
 	for _, isDefault := range []bool{false, true} {
 		s, err := New(t.Context(), &resilient.ResilientDatabase{}, ServerOptions{
@@ -197,18 +205,29 @@ func TestUserAPIProxy_LoginWithAnInvalidAddressLooksLikeAWrongPassword(t *testin
 		handler := s.setupHandler()
 
 		for _, email := range []string{"john", "john@", "@example.com"} {
-			r := httptest.NewRequest(http.MethodPost, "/user/auth/login", strings.NewReader(`{"email":"`+email+`","password":"wrong-password"}`))
-			r.Header.Set("Content-Type", "application/json")
-			w := httptest.NewRecorder()
+			send := func(h http.Handler) *httptest.ResponseRecorder {
+				r := httptest.NewRequest(http.MethodPost, "/user/auth/login", strings.NewReader(`{"email":"`+email+`","password":"wrong-password"}`))
+				r.Header.Set("Content-Type", "application/json")
+				w := httptest.NewRecorder()
+				h.ServeHTTP(w, r)
+				return w
+			}
+			direct := send(reference)
 			before := testutils.PasswordVerifications()
-			handler.ServeHTTP(w, r)
+			w := send(handler)
 			verifications := testutils.PasswordVerifications() - before
 
-			if w.Code != http.StatusUnauthorized {
-				t.Fatalf("default=%v, email %q: status %d (%q), want 401", isDefault, email, w.Code, w.Body.String())
+			if w.Code != http.StatusUnauthorized || direct.Code != http.StatusUnauthorized {
+				t.Fatalf("default=%v, email %q: status %d (%q), backend %d; want 401 from both", isDefault, email, w.Code, w.Body.String(), direct.Code)
 			}
 			if msg := errorBody(t, w); msg != "Invalid credentials" {
 				t.Errorf("default=%v, email %q: error %q, want \"Invalid credentials\"", isDefault, email, msg)
+			}
+			if direct.Header().Get("WWW-Authenticate") == "" {
+				t.Errorf("default=%v, email %q: backend's 401 carries no WWW-Authenticate challenge", isDefault, email)
+			}
+			if got, want := w.Header().Values("WWW-Authenticate"), direct.Header().Values("WWW-Authenticate"); !reflect.DeepEqual(got, want) {
+				t.Errorf("default=%v, email %q: proxy's WWW-Authenticate = %q, want the backend's %q", isDefault, email, got, want)
 			}
 			if verifications != 1 {
 				t.Errorf("default=%v, email %q: %d password verifications, want 1", isDefault, email, verifications)

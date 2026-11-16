@@ -722,7 +722,8 @@ be positive.
 
 Each message goes back to the mailbox it was expunged from. A mailbox that has since been
 deleted is created again, with its parents. Restored messages get new UIDs, in their original
-arrival order per mailbox. Messages already restored or already purged are skipped.
+arrival order per mailbox, and new mod-sequences, so IMAP clients are told of them as new messages
+(the mailbox's HIGHESTMODSEQ rises). Messages already restored or already purged are skipped.
 
 With `[shared_mailboxes]` enabled, a mailbox recreated in the shared namespace is a shared
 mailbox of the account, and so is a parent recreated there. Each one starts with owner-only

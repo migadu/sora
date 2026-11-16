@@ -501,6 +501,19 @@ func (rd *ResilientDatabase) ReconcileNegativeMailboxStatsWithRetry(ctx context.
 	return rd.getOperationalDatabaseForOperation(ctx, true).ReconcileNegativeMailboxStats(ctx)
 }
 
+// FindExcessUnseenCountsWithRetry checks one batch of mailboxes for a cached unseen_count
+// above the live count (see db.FindExcessUnseenCounts).
+func (rd *ResilientDatabase) FindExcessUnseenCountsWithRetry(ctx context.Context, accountID, afterMailboxID int64, limit int) (db.UnseenExcessBatch, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).FindExcessUnseenCounts(ctx, accountID, afterMailboxID, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return db.UnseenExcessBatch{}, err
+	}
+	return result.(db.UnseenExcessBatch), nil
+}
+
 func (rd *ResilientDatabase) GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetPrimaryEmailForAccount(ctx, accountID)
@@ -731,6 +744,20 @@ func (rd *ResilientDatabase) GetSubscribedMailboxNamesByKeyWithRetry(ctx context
 	}
 	names, _ := result.(map[string]string)
 	return names, nil
+}
+
+// MailboxNameKeysWithRetry returns, in order, the key of each of names: LOWER(name)
+// as the database computes it (db.MailboxNameKeys).
+func (rd *ResilientDatabase) MailboxNameKeysWithRetry(ctx context.Context, names []string) ([]string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).MailboxNameKeys(ctx, names)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	keys, _ := result.([]string)
+	return keys, nil
 }
 
 // HasMailboxWithSpecialUseWithRetry reports whether the account already has a live

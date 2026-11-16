@@ -157,15 +157,6 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		}
 	}
 
-	// Extract plaintext body for FTS. A message with no text/plain or text/html part
-	// (attachment only) yields no text and no error; it is delivered with an empty
-	// body, as LMTP and APPEND do.
-	plaintextBody, err := helpers.ExtractPlaintextBody(messageEntity)
-	if err != nil || plaintextBody == nil {
-		emptyBody := ""
-		plaintextBody = &emptyBody
-	}
-
 	// Safety guard: Reject if this node's staging limit is exceeded. Checked before Sieve runs,
 	// so a rejected delivery cannot have redirected or auto-replied first.
 	if d.Uploader.IsStagingLimitExceeded(int64(len(messageBytes))) {
@@ -243,6 +234,15 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	if err := CheckStorableSize(len(messageBytes)); err != nil {
 		result.ErrorMessage = err.Error()
 		return result, err
+	}
+
+	// Extract plaintext body for FTS. A message with no text/plain or text/html part
+	// (attachment only) yields no text and no error; it is delivered with an empty
+	// body, as LMTP and APPEND do.
+	plaintextBody, err := helpers.ExtractPlaintextBody(messageEntity)
+	if err != nil || plaintextBody == nil {
+		emptyBody := ""
+		plaintextBody = &emptyBody
 	}
 
 	// Parse message metadata
