@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,6 +171,53 @@ func TestS3ImporterRefusesATempDirOthersCanReplaceItsDirectoryIn(t *testing.T) {
 			assert.ErrorContains(t, err, "refusing to keep the S3 import's work database in "+filepath.Join(realTmpDir, "sora-s3-import-"))
 			assert.ErrorContains(t, err, "TMPDIR")
 			assert.Empty(t, dirNames(t, tmpDir), "the refused run left its directory in TMPDIR")
+		})
+	}
+}
+
+// The run's directory is made by its name in TMPDIR, and --cleanup-db removes it with
+// everything in it. A user who may rename entries of TMPDIR (one without the sticky
+// bit) can move it aside the moment it appears and put a symbolic link to another
+// directory at its name. The run must not take that directory for its own: --cleanup-db
+// would remove it, with everything in it, often as root, and where hard links are not
+// protected the refusal of such a TMPDIR would check the parents of that directory
+// instead of TMPDIR. Where they are protected nothing is checked, and the database is
+// then created through the link, but only the link is removed.
+func TestS3ImporterCleanupRemovesOnlyItsOwnDirectory(t *testing.T) {
+	for _, protected := range []bool{true, false} {
+		t.Run(fmt.Sprintf("protected hard links %t", protected), func(t *testing.T) {
+			realProtection, realMkdirTemp := hardLinksProtected, mkdirTemp
+			t.Cleanup(func() { hardLinksProtected, mkdirTemp = realProtection, realMkdirTemp })
+			hardLinksProtected = func() bool { return protected }
+			tmpDir := t.TempDir()
+			require.NoError(t, os.Chmod(tmpDir, 0777))
+			t.Setenv("TMPDIR", tmpDir)
+			realTmpDir, err := filepath.EvalSymlinks(tmpDir)
+			require.NoError(t, err)
+			precious := t.TempDir()
+			require.NoError(t, os.WriteFile(filepath.Join(precious, "keep"), []byte("not the import's\n"), 0600))
+			mkdirTemp = func(dir, pattern string) (string, error) {
+				name, err := realMkdirTemp(dir, pattern)
+				if err == nil {
+					require.NoError(t, os.Rename(name, name+".moved"))
+					require.NoError(t, os.Symlink(precious, name))
+				}
+				return name, err
+			}
+
+			si, err := NewS3Importer(context.Background(), nil, nil, S3ImporterOptions{Workers: 1, CleanupDB: true})
+			if err == nil {
+				require.NoError(t, si.Close())
+			}
+
+			assert.FileExists(t, filepath.Join(precious, "keep"), "--cleanup-db removed the directory the link at the run's directory named")
+			if protected {
+				require.NoError(t, err)
+				return
+			}
+			assert.ErrorContains(t, err, "refusing to keep the S3 import's work database in ")
+			assert.ErrorContains(t, err, "can rename entries of "+realTmpDir+" above it")
+			assert.Equal(t, []string{"keep"}, dirNames(t, precious), "the refused run wrote in the directory the link named")
 		})
 	}
 }

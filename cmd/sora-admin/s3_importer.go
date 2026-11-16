@@ -109,6 +109,10 @@ const s3ImportDBParams = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 // makes for the run.
 const s3ImportDBName = "sora-s3-import.db"
 
+// mkdirTemp is os.MkdirTemp, replaceable in tests to model another user who renames
+// entries of the temporary directory the moment the run's directory appears in it.
+var mkdirTemp = os.MkdirTemp
+
 // createS3ImportDir creates a directory for a run's work database in the temporary
 // directory, which only its owner may read, write or create a name in, and returns
 // its name with every link resolved. SQLite opens the database's -wal and -shm files
@@ -126,7 +130,7 @@ const s3ImportDBName = "sora-s3-import.db"
 // others may write in it only with the sticky bit set (renamableParent), as for the
 // maildir cache (#1669). /tmp and the per-user temporary directory of macOS pass.
 func createS3ImportDir() (dir string, err error) {
-	created, err := os.MkdirTemp("", "sora-s3-import-*")
+	created, err := mkdirTemp("", "sora-s3-import-*")
 	if err != nil {
 		return "", fmt.Errorf("failed to create temporary database directory: %w", err)
 	}
