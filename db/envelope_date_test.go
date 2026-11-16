@@ -34,6 +34,25 @@ func TestBuildEnvelopeDateIsNotInternalDate(t *testing.T) {
 	assert.True(t, env.Date.Equal(header), "envelope date %v, want the Date: header %v", env.Date, header)
 }
 
+// TestSentUTCOffsetUnknownZone: a sent date in UTC, ParseDateHeader's date of a zone that
+// is unknown (helpers.ZoneUnknown, RFC 5322 section 3.3 "-0000"), is stored without an
+// offset and read back in UTC, so its ENVELOPE date is written "-0000". It is searched by
+// its UTC day, the day it names. A zone of offset zero ("+0000") keeps its offset.
+func TestSentUTCOffsetUnknownZone(t *testing.T) {
+	unknown := time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)
+	assert.Nil(t, sentUTCOffset(unknown), "an unknown zone has no offset")
+	// pgx decodes sent_date in time.Local.
+	got := sentDateInHeaderZone(unknown.Local(), sentUTCOffset(unknown))
+	assert.True(t, got.Equal(unknown) && got.Location() == time.UTC, "read back as %v, want %v in UTC", got, unknown)
+
+	universal := time.Date(2019, 1, 1, 12, 0, 0, 0, time.FixedZone("", 0))
+	if offset := sentUTCOffset(universal); assert.NotNil(t, offset, "+0000") {
+		assert.Equal(t, int32(0), *offset)
+	}
+	got = sentDateInHeaderZone(universal.Local(), sentUTCOffset(universal))
+	assert.True(t, got.Equal(universal) && got.Location() != time.UTC, "read back as %v, want %v not in UTC", got, universal)
+}
+
 // TestAbsentDateHeaderReportedAsNIL stores messages with and without a Date: header
 // through every insert path and checks what each reader makes of the date: the stored
 // sent_date (SORT, SENT* search), the IMAP ENVELOPE, THREAD's input and the User API.
@@ -160,7 +179,8 @@ func TestAbsentDateHeaderReportedAsNIL(t *testing.T) {
 // a Message for it. RFC 9051 section 7.5.2: the envelope "is computed by the server by
 // parsing the [RFC5322] header into the component parts"; sent_date keeps only the instant
 // and sent_utc_offset (migration 000060) the header's zone. A row without an offset
-// (written before that migration) is given in UTC, never in the server's zone.
+// (written before that migration) is given in UTC, never in the server's zone, as is a
+// date whose zone is unknown (helpers.ZoneUnknown): go-imap writes both "-0000".
 func TestEnvelopeDateKeepsHeaderZone(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -188,7 +208,7 @@ func TestEnvelopeDateKeepsHeaderZone(t *testing.T) {
 		defer tx.Rollback(ctx)
 		var bs imap.BodyStructure = &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 64}
 		_, offset := sent.Zone()
-		hash := fmt.Sprintf("envzone_%s_%d_%d", path, offset, ts)
+		hash := fmt.Sprintf("envzone_%s_%d_%t_%d", path, offset, sent.Location() == time.UTC, ts)
 		opts := &InsertMessageOptions{
 			AccountID:     accountID,
 			MailboxID:     mailboxID,
@@ -224,20 +244,32 @@ func TestEnvelopeDateKeepsHeaderZone(t *testing.T) {
 		return uid
 	}
 
-	// want maps each UID to its envelope date member.
+	// want maps each UID to its envelope date member, and inUTC the UIDs whose date
+	// must be given in UTC, the zone go-imap writes "-0000".
 	want := map[int64]string{}
+	inUTC := map[int64]bool{}
 	for _, path := range []string{"live", "importer", "batch"} {
 		for _, zone := range zones {
 			sent := instant.In(zone)
 			want[insert(path, sent)] = sent.Format(layout)
 		}
+		// A Date: whose zone is unknown: ParseDateHeader gives it in UTC.
+		uid := insert(path, instant.UTC())
+		want[uid], inUTC[uid] = instant.Format(layout), true
 	}
 	// A row written before migration 000060 has no offset: it is given in UTC.
 	legacy := insert("live", instant.In(time.FixedZone("", 2*3600)))
 	_, err := db.GetWritePool().Exec(ctx,
 		`UPDATE messages SET sent_utc_offset = NULL WHERE mailbox_id = $1 AND uid = $2`, mailboxID, legacy)
 	require.NoError(t, err)
-	want[legacy] = instant.Format(layout)
+	want[legacy], inUTC[legacy] = instant.Format(layout), true
+
+	for uid := range inUTC {
+		var offset *int32
+		require.NoError(t, db.GetReadPool().QueryRow(ctx,
+			`SELECT sent_utc_offset FROM messages WHERE mailbox_id = $1 AND uid = $2`, mailboxID, uid).Scan(&offset))
+		assert.Nil(t, offset, "uid %d: a date in UTC is stored without an offset", uid)
+	}
 
 	check := func(reader string, msgs []Message) {
 		t.Helper()
@@ -247,10 +279,8 @@ func TestEnvelopeDateKeepsHeaderZone(t *testing.T) {
 			require.NoError(t, err)
 			uid := int64(msgs[i].UID)
 			assert.Equal(t, want[uid], env.Date.Format(layout), "%s uid %d: envelope date", reader, uid)
-			if uid == legacy {
-				assert.True(t, env.Date.Location() == time.UTC,
-					"%s uid %d: a row without an offset must be given in UTC, not in time.Local", reader, uid)
-			}
+			assert.Equal(t, inUTC[uid], env.Date.Location() == time.UTC,
+				"%s uid %d: envelope date %v in UTC (zone -0000)", reader, uid, env.Date)
 		}
 	}
 
@@ -276,5 +306,7 @@ func TestEnvelopeDateKeepsHeaderZone(t *testing.T) {
 		env, err := db.GetMessageEnvelope(ctx, imap.UID(uid), mailboxID)
 		require.NoError(t, err)
 		assert.Equal(t, date, env.Date.Format(layout), "GetMessageEnvelope uid %d: envelope date", uid)
+		assert.Equal(t, inUTC[uid], env.Date.Location() == time.UTC,
+			"GetMessageEnvelope uid %d: envelope date %v in UTC (zone -0000)", uid, env.Date)
 	}
 }

@@ -2,7 +2,6 @@ package helpers
 
 import (
 	"io/fs"
-	"net/mail"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -236,27 +235,25 @@ func TestParseDateHeaderLeapSecond(t *testing.T) {
 func TestParseDateHeaderInvalid(t *testing.T) {
 	for _, value := range []string{
 		"", "PDT", "Wed, 17 Jul 1996 PDT", "not a date 12:00 PDT",
-		// Replacing only the alphabetic prefix would let net/mail discard the
-		// rest after the numeric replacement, turning these errors into dates.
-		"Wed, 17 Jul 1996 02:23:25 PDT+0400",
-		"Wed, 17 Jul 1996 02:23:25 PDT0",
-		"Wed, 17 Jul 1996 02:23:25 PDT-0700",
 		"Wed, 17 Jul 1996 02:23:25\r PDT",
 		"Wed, 17 Jul 1996 02:23:25\n PDT",
-		"Wed, 17 Jul 1996 02:23:25 GMT+0200",
-		"Wed, 17 Jul 1996 02:23:25 UTC-0500",
 		// Nor are letters a zone when a numeric offset follows them after white space
 		// or a comment: the RFC 5322 section 3.3 grammar has one zone after the time of
-		// day ("time = time-of-day zone"), and the offset after the letters would be
-		// discarded.
+		// day ("time = time-of-day zone"), the letters can change the time itself (PM),
+		// and the offset after the letters would be discarded. The same holds for any
+		// zone that is not one of RFC 5322 (TestParseDateHeaderUnknownZone).
 		"Wed, 17 Jul 1996 02:23:25 PM -0700",
 		"Wed, 17 Jul 1996 02:23:25 PDT +0500",
 		"Wed, 17 Jul 1996 02:23:25 PDT\r\n +0500",
 		"Wed, 17 Jul 1996 02:23:25 Z\t-0700",
 		"Wed, 17 Jul 1996 02:23:25 PDT (c) +0500",
+		"Wed, 17 Jul 1996 02:23:25 GMT+1 -0700",
+		"Wed, 17 Jul 1996 02:23:25 CET/CEST +0100",
+		"Wed, 17 Jul 1996 02:23:25 PDT+0400 (c) -0700",
+		"Wed, 17 Jul 1996 02:23:25 +01 +0100",
 		// year = 4*DIGIT / obs-year, and obs-year is 2*DIGIT (RFC 5322 sections 3.3, 4.3).
 		"Mon, 17 Jul 5 02:23:25 +0000",
-		"Mon, 17 Jul 50 02:23:25 PDT+0400",
+		"Mon, 17 Jul 5 02:23:25 GMT+1",
 		// NUL is not comment text (ctext or obs-ctext), so removing a
 		// malformed comment must not turn a previously invalid value into a date.
 		"Wed, 17 Jul 1996 02:23:25 (bad\x00) -0700",
@@ -274,65 +271,119 @@ func TestParseDateHeaderInvalid(t *testing.T) {
 	}
 }
 
-// TestParseDateHeaderGMTHourOffset: GMT with a signed hour ("GMT+1", "GMT-05") is no zone of
-// RFC 5322 (section 3.3: zone = (FWS ( "+" / "-" ) 4DIGIT) / obs-zone, and the obs-zone
-// names of section 4.3 are alphabetic), and it has no single meaning: read as an offset,
-// GMT+1 is +0100, read as a POSIX TZ, it is UTC-1. net/mail.ParseDate accepts it, but
-// time.Parse takes the time of day as UTC and only labels it with the offset, so
-// "12:00:00 GMT+1" came out as 13:00:00 +0100 and "12:00:00 GMT-5" as 07:00:00 -0500, a
-// time of day neither reading gives. It is not parsed, like GMT+0200: the sent date is
-// unknown, and SORT and THREAD use the INTERNALDATE (db.storedSentDate). RFC 5256
-// section 2.2 would keep the written time instead: "If the time zone is invalid, the
-// date and time SHOULD be treated as UTC". A zero hour means Universal Time either way
-// and keeps net/mail's reading.
-func TestParseDateHeaderGMTHourOffset(t *testing.T) {
-	for _, value := range []string{
-		"Tue, 01 Jan 2019 12:00:00 GMT+1",
-		"Tue, 01 Jan 2019 12:00:00 GMT+01",
-		"Tue, 01 Jan 2019 12:00:00 GMT-5",
-		"Tue, 01 Jan 2019 12:00:00 GMT+23",
-		// net/mail reads the digits after GMT as hours, whatever their number.
-		"Tue, 01 Jan 2019 12:00:00 GMT+0001",
-		// A comment after the zone is read as white space.
-		"Tue, 01 Jan 2019 12:00:00 GMT+10 (CET)",
-		"Tue, 01 Jan 19 12:00 GMT-1",
-	} {
-		got, err := ParseDateHeader(value)
-		assert.Error(t, err, "%q: parsed as %v", value, got)
+// TestParseDateHeaderUnknownZone: a Date: whose zone is malformed or not defined keeps the
+// date and time of day as written and is read with the zone unknown, as UTC (time.UTC),
+// which go-imap writes as the zone "-0000" in ENVELOPE. RFC 5256 section 2.2: "If the time
+// zone is invalid, the date and time SHOULD be treated as UTC." RFC 5322 section 4.3: the
+// military zones and "Other multi-character (usually between 3 and 5) alphabetic time
+// zones" whose meaning is not known "SHOULD be considered equivalent to "-0000"", which
+// section 3.3 says "also indicates Universal Time" for a date-time that "contains no
+// information about the local time zone". The zone of RFC 5322 is zone = (FWS ( "+" / "-" )
+// 4DIGIT) / obs-zone (section 3.3); none of these is one.
+//
+// Before, GMT with a signed hour (GMT+1, GMT-5) and an alphabetic run with more after it
+// (GMT+0200, UTC-0500, PDT+0400, PDT0) were not parsed, so the sent date was unknown, and
+// net/mail read a sign with two or three digits (+01, -03) and a name it cut after its T
+// (CET/CEST, PDT/UTC) in the server's time zone: +01 was 12:00 UTC on a server in UTC and
+// 11:00 UTC on one in Africa/Casablanca, whose tzdata abbreviation is "+01".
+func TestParseDateHeaderUnknownZone(t *testing.T) {
+	cases := []struct {
+		value string
+		wall  time.Time // the date and time as written
+	}{
+		// GMT or UTC with a signed hour: +0100 as an offset, UTC-1 as a POSIX TZ.
+		{"Tue, 01 Jan 2019 12:00:00 GMT+1", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jan 2019 12:00:00 GMT+01", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jan 2019 12:00:00 GMT-5", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jan 2019 12:00:00 GMT+23", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jan 2019 12:00:00 GMT+0001", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jan 2019 12:00:00 GMT+10 (CET)", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jan 19 12:00 GMT-1", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jan 2019 12:00:00 GMT+0200", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jan 2019 12:00:00 GMT+0", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jan 2019 12:00:00 GMT-0000", time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 GMT+0000", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 UTC-0500", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		// An obs-zone with more after it.
+		{"Wed, 17 Jul 1996 02:23:25 PDT+0400", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 PDT-0700", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 PDT0", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 PDT/UTC", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		{"Mon, 17 Jul 50 02:23:25 PDT+0400", time.Date(1950, 7, 17, 2, 23, 25, 0, time.UTC)},
+		// A name cut short, or run into another.
+		{"Wed, 17 Jan 1996 02:23:25 CET/CEST", time.Date(1996, 1, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 CES", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		// A sign without four digits.
+		{"Tue, 01 Jul 2019 12:00:00 +01", time.Date(2019, 7, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jul 2019 12:00:00 -03", time.Date(2019, 7, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jul 2019 12:00:00 +04 (Gulf)", time.Date(2019, 7, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jul 2019 12:00:00 +001", time.Date(2019, 7, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jul 2019 12:00:00 +1", time.Date(2019, 7, 1, 12, 0, 0, 0, time.UTC)},
+		{"Tue, 01 Jul 2019 12:00:00 +01:00", time.Date(2019, 7, 1, 12, 0, 0, 0, time.UTC)},
+		// Military and unknown alphabetic zones (RFC 5322 section 4.3).
+		{"Wed, 17 Jul 1996 02:23:25 Z", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 a", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jan 1996 02:23:25 CET", time.Date(1996, 1, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 MSK", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 UTC", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		// "-0000" itself (RFC 5322 section 3.3).
+		{"Wed, 17 Jul 1996 02:23:25 -0000", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
+		{"Wed, 17 Jul 1996 02:23:25 -0000 (unknown)", time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)},
 	}
 
-	wall := time.Date(2019, 1, 1, 12, 0, 0, 0, time.UTC)
-	for _, value := range []string{
-		"Tue, 01 Jan 2019 12:00:00 GMT+0",
-		"Tue, 01 Jan 2019 12:00:00 GMT-0",
-		"Tue, 01 Jan 2019 12:00:00 GMT+00",
-		"Tue, 01 Jan 2019 12:00:00 GMT-0000",
-	} {
-		got, err := ParseDateHeader(value)
-		if !assert.NoError(t, err, "%q", value) {
-			continue
+	saved := time.Local
+	t.Cleanup(func() { time.Local = saved })
+	for _, name := range []string{"UTC", "Africa/Casablanca", "America/Sao_Paulo", "Asia/Dubai", "Europe/Berlin", "America/Los_Angeles"} {
+		loc, err := time.LoadLocation(name)
+		require.NoError(t, err)
+		time.Local = loc // no test in this package runs in parallel
+		for _, tc := range cases {
+			got, err := ParseDateHeader(tc.value)
+			if !assert.NoError(t, err, "TZ=%s %q", name, tc.value) {
+				continue
+			}
+			assert.True(t, got.Equal(tc.wall), "TZ=%s %q: %v, want %v", name, tc.value, got, tc.wall)
+			assert.True(t, got.Location() == time.UTC, "TZ=%s %q: %v is not in UTC, the unknown zone", name, tc.value, got)
 		}
-		_, offset := got.Zone()
-		assert.True(t, got.Equal(wall), "%q: %v, want %v", value, got, wall)
-		assert.Equal(t, 0, offset, "%q: zone offset of %v", value, got)
 	}
 }
 
-// An alphabetic prefix that is not a whole obs-zone must retain net/mail's
-// behavior, including its accepted GMT extension and permissive suffix handling.
-func TestParseDateHeaderPreservesParserExtensions(t *testing.T) {
-	for _, value := range []string{
-		"Wed, 17 Jul 1996 02:23:25 GMT+0000",
-		"Wed, 17 Jul 1996 02:23:25 PDT/UTC",
-	} {
-		want, err := mail.ParseDate(value)
-		require.NoError(t, err)
-		got, err := ParseDateHeader(value)
-		require.NoError(t, err)
-		assert.True(t, got.Equal(want))
-		_, wantOffset := want.Zone()
-		_, gotOffset := got.Zone()
-		assert.Equal(t, wantOffset, gotOffset)
+// TestParseDateHeaderKnownZoneNotUTC: a date whose zone is known, "+0000" and the obs-zones
+// "UT" and "GMT" included, is never given in time.UTC, which marks an unknown zone
+// (TestParseDateHeaderUnknownZone). RFC 5322 section 3.3: "The form "+0000" SHOULD be used
+// to indicate a time zone at Universal Time". net/mail gives a zone of offset zero in
+// time.UTC when time.Local is time.UTC.
+func TestParseDateHeaderKnownZoneNotUTC(t *testing.T) {
+	const h = 3600
+	cases := []struct {
+		value  string
+		offset int // seconds east of UTC; the wall time is always 1996-07-17 02:23:25
+	}{
+		{"Wed, 17 Jul 1996 02:23:25 +0000", 0},
+		{"Wed, 17 Jul 1996 02:23:25 +0000 (UTC)", 0},
+		{"Wed, 17 Jul 1996 02:23:25 UT", 0},
+		{"Wed, 17 Jul 1996 02:23:25 GMT", 0},
+		{"Wed, 17 Jul 1996 02:23:25 gmt", 0},
+		{"Wed, 17 Jul 1996 02:23:25 -0700", -7 * h},
+		{"Wed, 17 Jul 1996 02:23:25 PDT", -7 * h},
+		{"Wed, 17 Jul 1996 02:23:25 +0530", 5*h + 30*60},
+	}
+
+	saved := time.Local
+	t.Cleanup(func() { time.Local = saved })
+	for _, loc := range []*time.Location{time.UTC, time.FixedZone("", 0), time.FixedZone("", -7*h)} {
+		time.Local = loc // no test in this package runs in parallel
+		for _, tc := range cases {
+			got, err := ParseDateHeader(tc.value)
+			if !assert.NoError(t, err, "Local=%v %q", loc, tc.value) {
+				continue
+			}
+			want := time.Date(1996, 7, 17, 2, 23, 25, 0, time.FixedZone("", tc.offset))
+			_, offset := got.Zone()
+			assert.True(t, got.Equal(want), "Local=%v %q: %v, want %v", loc, tc.value, got, want)
+			assert.Equal(t, tc.offset, offset, "Local=%v %q: zone offset of %v", loc, tc.value, got)
+			assert.False(t, got.Location() == time.UTC, "Local=%v %q: %v is in UTC, the unknown zone", loc, tc.value, got)
+		}
 	}
 }
 

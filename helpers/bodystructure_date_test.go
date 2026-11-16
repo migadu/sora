@@ -62,3 +62,51 @@ func TestSafeBodyStructureAttachedMessageObsoleteZone(t *testing.T) {
 		}
 	}
 }
+
+// TestSafeBodyStructureAttachedMessageUnknownZone: the envelope of an attached message
+// whose Date: zone is malformed or not defined keeps the date and time as written, in UTC
+// (time.UTC), the unknown zone that go-imap writes as "-0000" (RFC 5256 section 2.2: "If
+// the time zone is invalid, the date and time SHOULD be treated as UTC"), and keeps that
+// zone through the gob encoding the body structure is stored in. A known zone of offset
+// zero stays "+0000" through it.
+func TestSafeBodyStructureAttachedMessageUnknownZone(t *testing.T) {
+	attachedDate := func(t *testing.T, bs imap.BodyStructure) time.Time {
+		t.Helper()
+		mp, ok := bs.(*imap.BodyStructureMultiPart)
+		require.True(t, ok, "body structure %#v", bs)
+		require.Len(t, mp.Children, 2)
+		part, ok := mp.Children[1].(*imap.BodyStructureSinglePart)
+		require.True(t, ok && part.MessageRFC822 != nil, "part 2 %#v", mp.Children[1])
+		return part.MessageRFC822.Envelope.Date
+	}
+	wall := time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)
+	for _, tc := range []struct {
+		date    string
+		unknown bool
+	}{
+		{"Wed, 17 Jul 1996 02:23:25 GMT+1", true},
+		{"Wed, 17 Jul 1996 02:23:25 PDT+0400", true},
+		{"Wed, 17 Jul 1996 02:23:25 +01", true},
+		{"Wed, 17 Jul 1996 02:23:25 CET/CEST", true},
+		{"Wed, 17 Jul 1996 02:23:25 Z", true},
+		{"Wed, 17 Jul 1996 02:23:25 -0000", true},
+		{"Wed, 17 Jul 1996 02:23:25 +0000", false},
+		{"Wed, 17 Jul 1996 02:23:25 GMT", false},
+	} {
+		bs, err := SafeBodyStructure([]byte(attachedMessage(tc.date)))
+		require.NoError(t, err)
+		data, err := SerializeBodyStructureGob(&bs)
+		require.NoError(t, err)
+		stored, err := DeserializeBodyStructureGob(data)
+		require.NoError(t, err)
+
+		for _, got := range []struct {
+			name string
+			date time.Time
+		}{{"extracted", attachedDate(t, bs)}, {"stored", attachedDate(t, *stored)}} {
+			assert.True(t, got.date.Equal(wall), "%q: %s attached envelope date %v, want %v", tc.date, got.name, got.date, wall)
+			assert.Equal(t, tc.unknown, got.date.Location() == time.UTC,
+				"%q: %s attached envelope date %v: zone unknown (in UTC) = %v, want %v", tc.date, got.name, got.date, got.date.Location() == time.UTC, tc.unknown)
+		}
+	}
+}
