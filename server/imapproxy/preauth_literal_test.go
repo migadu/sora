@@ -104,51 +104,157 @@ func TestPreAuthSyncLiteralOfRejectedCommandGetsNoContinuation(t *testing.T) {
 }
 
 // TestPreAuthOversizedNonSyncLiteralEndsSession verifies that a
-// non-synchronizing literal over the pre-auth bound ends the session with BYE
-// [TOOBIG] instead of being read as commands. The proxy advertises LITERAL-:
-// such a literal must not exceed 4096 octets, and a server that receives a
-// larger one either reads it and rejects the command or sends BYE and closes
-// the connection (RFC 7888 §4, §5: a BYE "SHOULD include the TOOBIG response
+// non-synchronizing literal over 4096 octets ends the session with BYE
+// [TOOBIG] instead of being read. The proxy advertises LITERAL- and IMAP4rev2
+// before authentication: under both such a literal must not exceed 4096
+// octets (RFC 7888 §5, RFC 9051 §4.3), and a server that receives a larger one
+// either reads it and rejects the command or sends BYE and closes the
+// connection (RFC 7888 §4, §5: a BYE "SHOULD include the TOOBIG response
 // code"). Before authentication the proxy does not read it.
 func TestPreAuthOversizedNonSyncLiteralEndsSession(t *testing.T) {
-	// 1000 command lines, 9000 octets: what a proxy that does not read the
-	// literal goes on to execute.
-	payload := strings.Repeat("x2 NOOP\r\n", 1000)
-	lit := fmt.Sprintf("{%d+}", len(payload))
+	tests := []struct {
+		name         string
+		insecureAuth bool
+		first        string // first line of the command, before the literal
+	}{
+		{name: "unknown command", first: "a1 FOO "},
+		{name: "LOGIN refused without TLS", first: "a1 LOGIN "},
+		{name: "LOGIN user name", insecureAuth: true, first: "a1 LOGIN "},
+		{name: "LOGIN password", insecureAuth: true, first: "a1 LOGIN user "},
+		{name: "LOGIN password after a user name literal", insecureAuth: true, first: "a1 LOGIN {4+}\r\nuser "},
+		{name: "ID", first: `a1 ID ("name" `},
+	}
+
+	// 4097: one octet over the LITERAL- bound. 9000: over the most the proxy
+	// reads of any literal before authentication.
+	for _, size := range []int{4097, 9000} {
+		// Command lines: what a proxy that does not read the literal goes on
+		// to execute.
+		payload := literalOctets(size)
+		for _, tc := range tests {
+			t.Run(fmt.Sprintf("%s/%d", tc.name, size), func(t *testing.T) {
+				client, reader := startPreAuthLiteralSession(t, tc.insecureAuth)
+				first := fmt.Sprintf("%s{%d+}", tc.first, size)
+				// The proxy closes the connection without reading all of it.
+				go func() { _, _ = io.WriteString(client, first+"\r\n"+payload+"\r\na3 NOOP\r\n") }()
+
+				got := readReplies(t, reader, "a3 ")
+				want := []string{"* BYE [TOOBIG] Non-synchronizing literal too big"}
+				if strings.Join(got, "\n") != strings.Join(want, "\n") {
+					t.Errorf("%q: got %q, want %q and the connection closed", first, got, want)
+				}
+			})
+		}
+	}
+}
+
+// TestPreAuthNonSyncLiteralUpToLiteralMinusBoundIsRead verifies that a
+// non-synchronizing literal of exactly 4096 octets, the LITERAL- bound (RFC
+// 7888 §5), is read as part of its command, and that a synchronizing literal
+// over that bound is still invited and read: the 4096-octet limit applies to
+// non-synchronizing literals only.
+func TestPreAuthNonSyncLiteralUpToLiteralMinusBoundIsRead(t *testing.T) {
+	payload := literalOctets(4096)
+	tests := []struct {
+		name  string
+		first string
+		want  []string
+	}{
+		{name: "unknown command", first: "a1 FOO {4096+}",
+			want: []string{"a1 BAD Unknown command"}},
+		{name: "ID", first: `a1 ID ("name" {4096+}`,
+			want: []string{"* ID (", "a1 OK ID completed"}},
+		{name: "LOGIN password", first: "a1 LOGIN user {4096+}",
+			want: []string{"a1 NO "}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			client, reader := startPreAuthFramingTCPSession(t)
+			input := tc.first + "\r\n" + payload + "\r\na3 NOOP\r\n"
+			go func() { _, _ = io.WriteString(client, input) }()
+			want := append(append([]string{}, tc.want...), "a3 OK NOOP completed")
+			assertReplies(t, tc.first, readReplies(t, reader, "a3 "), want)
+		})
+	}
+
+	t.Run("synchronizing literal over the bound", func(t *testing.T) {
+		sync := literalOctets(5000)
+		client, reader := startPreAuthFramingTCPSession(t)
+		if _, err := io.WriteString(client, `a1 ID ("name" {5000}`+"\r\n"); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if line := readLine(t, reader); !strings.HasPrefix(line, "+") {
+			t.Fatalf("got %q, want a continuation request", line)
+		}
+		if _, err := io.WriteString(client, sync+")\r\na3 NOOP\r\n"); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		assertReplies(t, "ID {5000}", readReplies(t, reader, "a3 "),
+			[]string{"* ID (", "a1 OK ID completed", "a3 OK NOOP completed"})
+	})
+}
+
+// TestPreAuthBraceBeforeWhiteSpaceIsNotALiteral verifies that "{N+}" or "{N}"
+// followed by white space announces no literal. A literal is "{" number64
+// ["+"] "}" CRLF (RFC 9051 §9), and the server looks for the non-synchronizing
+// form "immediately preceding the CRLF" (RFC 7888 §3). Such a line is the
+// whole command, so the next line is the next command. LOGIN, whose argument
+// is then neither a literal nor an atom ("{" is an atom-special), gets BAD and
+// no continuation request.
+func TestPreAuthBraceBeforeWhiteSpaceIsNotALiteral(t *testing.T) {
+	lit := fmt.Sprintf("{%d+}", len(literalPayload))
+	syncLit := fmt.Sprintf("{%d}", len(literalPayload))
+	loginBAD := []string{"a1 BAD Invalid LOGIN arguments"}
 	tests := []struct {
 		name         string
 		insecureAuth bool
 		first        string
+		want         []string
 	}{
-		{name: "unknown command", first: "a1 FOO " + lit},
-		{name: "LOGIN refused without TLS", first: "a1 LOGIN " + lit},
-		{name: "LOGIN user name", insecureAuth: true, first: "a1 LOGIN " + lit},
-		{name: "LOGIN password", insecureAuth: true, first: "a1 LOGIN user " + lit},
-		{name: "LOGIN password and white space", insecureAuth: true, first: "a1 LOGIN user " + lit + " "},
-		{name: "LOGIN password after a user name literal", insecureAuth: true, first: "a1 LOGIN {4+}\r\nuser " + lit},
-		{name: "ID", first: `a1 ID ("name" ` + lit},
+		{name: "unknown command", first: "a1 FOO " + lit + " ",
+			want: []string{"a1 BAD Unknown command"}},
+		{name: "unknown command and a tab", first: "a1 FOO " + lit + "\t",
+			want: []string{"a1 BAD Unknown command"}},
+		{name: "unknown command and an extra CR", first: "a1 FOO " + lit + "\r",
+			want: []string{"a1 BAD Unknown command"}},
+		{name: "extra CR after a chained literal", first: "a1 FOO {1+}\r\nz " + lit + "\r",
+			want: []string{"a1 BAD Unknown command"}},
+		{name: "ID", first: `a1 ID ("name" ` + lit + " ",
+			want: []string{"* ID (", "a1 OK ID completed"}},
+		{name: "ID synchronizing", first: `a1 ID ("name" ` + syncLit + " ",
+			want: []string{"* ID (", "a1 OK ID completed"}},
+		{name: "LOGIN refused without TLS", first: "a1 LOGIN user " + lit + " ",
+			want: []string{"a1 NO [PRIVACYREQUIRED] Authentication requires TLS connection"}},
+		{name: "LOGIN user name", insecureAuth: true, first: "a1 LOGIN " + lit + " ", want: loginBAD},
+		{name: "LOGIN user name synchronizing", insecureAuth: true, first: "a1 LOGIN " + syncLit + " ", want: loginBAD},
+		{name: "LOGIN password", insecureAuth: true, first: "a1 LOGIN user " + lit + " ", want: loginBAD},
+		{name: "LOGIN password and an extra CR", insecureAuth: true, first: "a1 LOGIN user " + lit + "\r", want: loginBAD},
+		{name: "LOGIN password synchronizing", insecureAuth: true, first: "a1 LOGIN user " + syncLit + " ", want: loginBAD},
+		{name: "LOGIN password after a user name literal", insecureAuth: true,
+			first: "a1 LOGIN {4+}\r\nuser " + lit + " ", want: loginBAD},
+		{name: "extra CR after a user name literal", insecureAuth: true,
+			first: "a1 LOGIN {4+}\r\nuser " + lit + "\r", want: loginBAD},
+		{name: "extra CR after a final password literal", insecureAuth: true,
+			first: "a1 LOGIN user {4+}\r\npass extra " + lit + "\r", want: loginBAD},
+		{name: "LOGIN synchronizing password after a user name literal", insecureAuth: true,
+			first: "a1 LOGIN {4+}\r\nuser " + syncLit + " ", want: loginBAD},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			client, reader := startPreAuthLiteralSession(t, tc.insecureAuth)
-			// The proxy closes the connection without reading all of it.
-			go func() { _, _ = io.WriteString(client, tc.first+"\r\n"+payload+"\r\na3 NOOP\r\n") }()
-
-			var got []string
-			for len(got) < 5 {
-				line, err := reader.ReadString('\n')
-				if err != nil {
-					break
-				}
-				got = append(got, strings.TrimRight(line, "\r\n"))
-			}
-			want := []string{"* BYE [TOOBIG] Non-synchronizing literal too big"}
-			if strings.Join(got, "\n") != strings.Join(want, "\n") {
-				t.Errorf("%q: got %q, want %q and the connection closed", tc.first, got, want)
-			}
+			input := tc.first + "\r\n" + literalPayload + "\r\na3 NOOP\r\n"
+			go func() { _, _ = io.WriteString(client, input) }()
+			want := append(append([]string{}, tc.want...), "x2 BAD Unknown command", "a3 OK NOOP completed")
+			assertReplies(t, input, readReplies(t, reader, "a3 "), want)
 		})
 	}
+}
+
+// literalOctets returns n octets of literal data made of command lines, so a
+// proxy that reads them back as commands answers them.
+func literalOctets(n int) string {
+	return strings.Repeat("x2 NOOP\r\n", n/9) + strings.Repeat("x", n%9)
 }
 
 // readReplies reads response lines until the first one starting with last.
