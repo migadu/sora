@@ -230,6 +230,13 @@ including headers other systems rely on. Even when it is on, `deleteheader` cann
 
 ### Behaviour of particular extensions in Sora
 
+- **`date`:** a field whose zone is not an RFC 5322 zone (`GMT+1`, `UTC-0500`, `+01`, `+01:00`,
+  `CET/CEST`, minutes above 59 as in `+0060`, or anything other than a comment after the zone)
+  holds no date: every `date` test on it is false and `:count` is 0 (RFC 5260 section 4). An
+  alphabetic zone whose meaning is not known (`CET`, `XYZ`, a one-letter military zone) is read as
+  `-0000`, the time of day as written at offset zero (RFC 5322 section 4.3); `:originalzone` then
+  gives the zone as `+0000`. The sent date Sora stores for IMAP `SORT` and `THREAD` is read
+  separately and takes an invalid zone as UTC (RFC 5256 section 2.2).
 - **`mailbox`:** `fileinto :create` creates a missing folder ([section 5](#5-what-each-action-does)).
   The `mailboxexists` test is true only when every named folder exists and the user may deliver
   into it: an own folder, or a shared folder on which the user holds the right to add messages.

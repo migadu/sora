@@ -8,27 +8,34 @@ import (
 	_ "time/tzdata" // the zones the test runs in, on hosts without zoneinfo
 )
 
-// TestDateMalformedZone is issue #1514: the date test (RFC 5260 §4) read a
-// Date: zone of GMT and a signed hour with the time of day shifted by that
-// hour (12:00:00 GMT+1 as 13:00:00 +0100), read +01 and CET/CEST by the
-// server's zone, and did not read GMT+0200, UTC-0500 or PDT+0400 at all.
+// TestDateMalformedZone covers issues #1514 and #1778: how the date test
+// (RFC 5260 §4) reads the zone of a Date: field, in whatever zone the server
+// runs.
 //
-// RFC 5322 §3.3 has zone = (FWS ( "+" / "-" ) 4DIGIT) / obs-zone, §4.3 has a
-// zone "whose meaning is not known" be "considered equivalent to "-0000"", and
-// RFC 5256 §2.2 says "If the time zone is invalid, the date and time SHOULD be
-// treated as UTC." So each is the time of day as written at offset zero, which
-// RFC 5260 §4.2 writes as zone "+0000" ("An offset of 0 (Zulu) always has a
-// positive sign") and with iso8601 "Z" ("a time zone offset of zero MUST be
-// represented by "Z""). Letters before a numeric offset are still not a date.
+// RFC 5322 §3.3 has zone = (FWS ( "+" / "-" ) 4DIGIT) / obs-zone, and "the
+// last two digits of the zone MUST be within the range 00 through 59". A value
+// whose zone is not that (GMT+1, UTC-0500, +01, +01:00, CET/CEST, +0060) is not
+// a date-time, and RFC 5260 §4 says "The date test returns false
+// unconditionally if the specified header field does not exist, the field
+// exists but does not contain a syntactically valid date-time specification",
+// so every date test is false and :count is 0. RFC 5256 §2.2's "If the time
+// zone is invalid, the date and time SHOULD be treated as UTC" is for the sent
+// date of IMAP SORT, not for Sieve.
+//
+// An alphabetic zone whose meaning is not known (CET, XYZ, a military letter)
+// is a zone: RFC 5322 §4.3 has it "considered equivalent to "-0000"", so it is
+// the time of day as written at offset zero, which RFC 5260 §4.2 writes as
+// "+0000" ("An offset of 0 (Zulu) always has a positive sign").
 func TestDateMalformedZone(t *testing.T) {
-	const script = `require ["date", "fileinto"];
-if allof (date :originalzone "date" "hour" "12",
-          date :originalzone "date" "zone" "+0000",
-          date :originalzone "date" "iso8601" "2019-01-01T12:00:00Z",
-          date :originalzone "date" "std11" "Tue, 01 Jan 2019 12:00:00 +0000",
-          date :zone "+0100" "date" "time" "13:00:00") { fileinto "written"; }
-elsif date :originalzone "date" "hour" "13" { fileinto "hour13"; }
-else { fileinto "nomatch"; }
+	const script = `require ["date", "fileinto", "variables", "relational", "comparator-i;ascii-numeric"];
+if date :count "eq" :comparator "i;ascii-numeric" "date" "year" "0" {
+  if date :matches "date" "year" "*" { fileinto "counted 0 but matched"; }
+  else { fileinto "invalid"; }
+  stop;
+}
+if date :matches :originalzone "date" "zone" "*" { set "zone" "${1}"; }
+if date :matches :zone "+0100" "date" "time" "*" { set "time" "${1}"; }
+fileinto "${zone} ${time}";
 `
 	// What ManageSieve PUTSCRIPT checks, with the default [sieve] enabled_extensions.
 	if err := ValidateScript(script, nil); err != nil {
@@ -39,22 +46,36 @@ else { fileinto "nomatch"; }
 		t.Fatalf("compile: %v", err)
 	}
 
+	// The original zone, and the time of day at +0100, of 12:00:00 in each zone.
 	cases := []struct {
-		date string
-		want []string
+		zone string
+		want string
 	}{
-		{"Tue, 01 Jan 2019 12:00:00 +0000", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 -0000", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 GMT+1", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 GMT-5", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 GMT+0200", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 UTC-0500", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 PDT+0400", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 +01", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 CET/CEST", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 PDT/UTC", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 XYZ", []string{"written"}},
-		{"Tue, 01 Jan 2019 12:00:00 PM -0700", []string{"nomatch"}},
+		// Valid zones.
+		{"+0000", "+0000 13:00:00"},
+		{"-0000", "+0000 13:00:00"},
+		{"+0100", "+0100 12:00:00"},
+		{"-0530", "-0530 18:30:00"},
+		{"GMT", "+0000 13:00:00"},
+		{"PDT", "-0700 20:00:00"},
+		{"+0000 (UTC)", "+0000 13:00:00"},
+		// Alphabetic zones whose meaning is not known: -0000.
+		{"XYZ", "+0000 13:00:00"},
+		{"CET", "+0000 13:00:00"},
+		{"A", "+0000 13:00:00"},
+		// Zones that are not RFC 5322 zones: not a date.
+		{"GMT+1", "invalid"},
+		{"GMT-5", "invalid"},
+		{"GMT+0200", "invalid"},
+		{"UTC-0500", "invalid"},
+		{"PDT+0400", "invalid"},
+		{"+01", "invalid"},
+		{"+01:00", "invalid"},
+		{"CET/CEST", "invalid"},
+		{"PDT/UTC", "invalid"},
+		{"+0060", "invalid"},
+		{"+0000 junk", "invalid"},
+		{"PM -0700", "invalid"},
 	}
 	saved := time.Local
 	t.Cleanup(func() { time.Local = saved })
@@ -65,17 +86,18 @@ else { fileinto "nomatch"; }
 		}
 		time.Local = loc // no test in this package runs in parallel
 		for _, tc := range cases {
+			date := "Tue, 01 Jan 2019 12:00:00 " + tc.zone
 			result, err := executor.Evaluate(context.Background(), Context{
 				EnvelopeFrom: "sender@example.com",
 				EnvelopeTo:   "user@example.com",
-				Header:       map[string][]string{"Date": {tc.date}, "From": {"sender@example.com"}},
+				Header:       map[string][]string{"Date": {date}, "From": {"sender@example.com"}},
 				Message:      bodyOnly("body"),
 			})
 			if err != nil {
-				t.Fatalf("TZ=%s %q: evaluate: %v", name, tc.date, err)
+				t.Fatalf("TZ=%s %q: evaluate: %v", name, date, err)
 			}
-			if !slices.Equal(result.Mailboxes, tc.want) {
-				t.Errorf("TZ=%s Date: %s: mailboxes = %q, want %q", name, tc.date, result.Mailboxes, tc.want)
+			if want := []string{tc.want}; !slices.Equal(result.Mailboxes, want) {
+				t.Errorf("TZ=%s Date: %s: mailboxes = %q, want %q", name, date, result.Mailboxes, want)
 			}
 		}
 	}
