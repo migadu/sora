@@ -57,6 +57,13 @@ var hardLinksProtected = func() bool {
 // links only in the name of the database (and then names the file by the link's
 // target); it opens the database and its -wal, -shm and -journal files with
 // O_NOFOLLOW. dir itself is trusted, as for the rest of the import.
+//
+// A hard link at one of the four names is a regular file, and SQLite writes through
+// it: the WAL index into -shm on every run, WAL frames into -wal, the cache into
+// sora-maildir.db (#1669). No check of the files can be race-free here, since SQLite
+// opens -wal and -shm by name after any check, so maildirCacheLinkRule allows the
+// cache only in a directory where no other user can put such a link to a file they
+// could not write themselves.
 func openMaildirCache(dir string) (*sql.DB, error) {
 	// SQLite names the database by its absolute path with every link resolved, and
 	// the files beside it are checked in that resolved directory.
@@ -64,9 +71,15 @@ func openMaildirCache(dir string) (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	refuseHardLinks, err := maildirCacheLinkRule(dir)
+	if err != nil {
+		return nil, err
+	}
 	for _, name := range []string{maildirCacheName, maildirCacheName + "-wal", maildirCacheName + "-shm", maildirCacheName + "-journal"} {
-		if info, err := os.Lstat(filepath.Join(dir, name)); err == nil && !info.Mode().IsRegular() {
-			return nil, notRegularMaildirCache(filepath.Join(dir, name), info)
+		if info, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+			if err := checkMaildirCacheFile(filepath.Join(dir, name), info, refuseHardLinks); err != nil {
+				return nil, err
+			}
 		}
 	}
 	path := filepath.Join(dir, maildirCacheName)
@@ -80,11 +93,51 @@ func openMaildirCache(dir string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open maildir database: %w", err)
 	}
-	if !info.Mode().IsRegular() {
-		return nil, notRegularMaildirCache(path, info)
+	if err := checkMaildirCacheFile(path, info, refuseHardLinks); err != nil {
+		return nil, err
 	}
 
 	return openMaildirCacheFile(path)
+}
+
+// maildirCacheLinkRule decides where the cache may be kept against hard links. On a
+// system that lets a user hard-link only a file they own or may read and write, such
+// a link can only make the run write a file whoever put it there could write
+// themselves, and any directory will do. Elsewhere dir must belong to the user this
+// process runs as, with no group or other write permission (access control lists are
+// not read): then nobody else can put a link in it while the run starts, and one that
+// is already there (left from before the directory was that user's alone, or linked
+// to a backup) is refused, as refuseHardLinks says. A directory other users can write
+// is refused.
+func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
+	if hardLinksProtected() {
+		return false, nil
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return false, fmt.Errorf("failed to check maildir database directory: %w", err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false, fmt.Errorf("failed to check maildir database directory %s: no owner", dir)
+	}
+	if euid := geteuid(); int(st.Uid) != euid || info.Mode().Perm()&0o022 != 0 {
+		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can create files in it (owner uid %d, mode %04o), and SQLite would write through a hard link one of them puts at the database's names; run as the directory's owner, or use a directory only uid %d can write", dir, euid, st.Uid, info.Mode().Perm(), euid)
+	}
+	return true, nil
+}
+
+// checkMaildirCacheFile refuses the maildir cache, or one of the files SQLite keeps
+// beside it, at path when info shows it is not a regular file or, with
+// refuseHardLinks, when the file has another name too.
+func checkMaildirCacheFile(path string, info fs.FileInfo, refuseHardLinks bool) error {
+	if !info.Mode().IsRegular() {
+		return notRegularMaildirCache(path, info)
+	}
+	if st, ok := info.Sys().(*syscall.Stat_t); ok && refuseHardLinks && st.Nlink > 1 {
+		return fmt.Errorf("refusing maildir database file %s: it is a hard link, one of %d names of its file", path, st.Nlink)
+	}
+	return nil
 }
 
 // resolveMaildirDir returns the absolute path of dir with every symbolic link

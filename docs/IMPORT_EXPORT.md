@@ -64,7 +64,8 @@ running Sora server, and they can run while servers are running.
   keys from an address, such as `verify hash`, then need that same address.
 - **Run it where the maildir is.** The importer reads the files directly and writes its cache,
   `sora-maildir.db`, **into the maildir directory**. The user running `sora-admin` needs write
-  access to that directory, even for a dry run.
+  access to that directory, even for a dry run. Except on Linux with `fs.protected_hardlinks = 1`,
+  no other user may be able to write in it ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 - **Check the size limit.** Messages larger than `[admin_cli] import_message_limit` are not
   imported and count as failed. Unset, the limit is the `append_limit` of the first IMAP
   `[[server]]` block in the file (default 25 MB), or 50 MB without one. See
@@ -326,6 +327,19 @@ them is a symbolic link, even to a file inside the maildir, or another kind of f
 refuses to start and names it. The cache is opened without following a link, so a link put in its
 place while the run starts is refused as well. The export applies the same rule to the
 `sora-maildir.db` in its target directory.
+
+SQLite also writes through a hard link at those names, and a hard link cannot be refused
+without a race in a directory another user can write: SQLite opens the `-wal` and `-shm` files by
+name after any check. On Linux with `fs.protected_hardlinks = 1`, the default of most
+distributions, a user can hard-link only a file they own or may read and write, so such a link
+gains them nothing, and the cache is kept in the maildir whoever can write in it. Elsewhere
+(macOS, FreeBSD by default, Linux with `fs.protected_hardlinks = 0`) the directory that holds the
+cache must belong to the user running `sora-admin`, and its group and others must not be able to
+write in it; otherwise the import or export refuses to start and names the directory. Run
+`sora-admin` as the maildir's owner, or import a copy that belongs to the user running it. In such
+a directory a `sora-maildir.db`, `-wal`, `-shm` or `-journal` that is a hard link (its file has
+another name too, for example in a backup made with `cp -al`) is refused as well; replace it with
+a copy, or remove it.
 
 Table `messages`:
 
