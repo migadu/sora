@@ -21,8 +21,9 @@ const maildirCacheName = "sora-maildir.db"
 
 // maildirCacheSettings are the connection settings of sora-maildir.db, for import and
 // export alike: WAL lets readers and the writer work concurrently, and a locked
-// database is waited for up to 5 seconds.
-const maildirCacheSettings = `PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA synchronous = NORMAL`
+// database is waited for up to 5 seconds. The busy timeout comes first: the switch to
+// WAL needs the database lock, which another process may hold.
+const maildirCacheSettings = `PRAGMA busy_timeout = 5000; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL`
 
 // openMaildirCache opens sora-maildir.db in dir (the maildir of an import, the
 // destination of an export), creating it if it is missing. dir is the operator's
