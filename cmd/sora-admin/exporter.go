@@ -1090,12 +1090,27 @@ func replaceFile(root *os.Root, tmpDir, name string, content []byte) error {
 // owner could write to (replaceFile), so whatever it reads back there (a file an
 // earlier run left, or a directory it created) may have been replaced by anything, a
 // FIFO included, and opening a FIFO for reading blocks until something opens it for
-// writing: the export would never finish. O_NONBLOCK prevents opening a FIFO from
-// waiting for a writer and does not change regular file or directory reads. The
-// file opened is refused unless it is of the kind asked for. The
-// check is on the open file, so nothing can take its place afterwards. The root
-// follows no link out of the export directory.
+// writing: the export would never finish.
+//
+// With dir, O_DIRECTORY makes the kernel reject anything that is not a directory with
+// ENOTDIR before opening it, so neither a FIFO nor a device node is opened, and real
+// directories open in normal blocking mode. Without dir, O_NONBLOCK prevents opening a
+// FIFO from waiting for a writer; the open descriptor is checked with Stat so nothing
+// can take its place afterwards, and O_NONBLOCK is cleared before returning so the
+// regular file is read in blocking mode (as os.Open reads it). The root follows no link
+// out of the export directory.
 func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
+	if dir {
+		f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+		if err != nil {
+			if errors.Is(err, syscall.ENOTDIR) {
+				return nil, fmt.Errorf("refusing %s in the export directory: it is not a directory: %w", name, err)
+			}
+			return nil, err
+		}
+		return f, nil
+	}
+
 	f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
@@ -1105,13 +1120,20 @@ func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
 		f.Close()
 		return nil, err
 	}
-	kind, ok := "a regular file", info.Mode().IsRegular()
-	if dir {
-		kind, ok = "a directory", info.IsDir()
-	}
-	if !ok {
+	if !info.Mode().IsRegular() {
 		f.Close()
-		return nil, fmt.Errorf("refusing %s in the export directory: it is not %s", name, kind)
+		return nil, fmt.Errorf("refusing %s in the export directory: it is not a regular file", name)
+	}
+	conn, err := f.SyscallConn()
+	if err == nil {
+		var setErr error
+		if err = conn.Control(func(fd uintptr) { setErr = syscall.SetNonblock(int(fd), false) }); err == nil {
+			err = setErr
+		}
+	}
+	if err != nil {
+		f.Close()
+		return nil, err
 	}
 	return f, nil
 }

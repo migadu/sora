@@ -22,9 +22,9 @@ import (
 // invalid domain or IDN label, internal whitespace, or an @-suffix) names no
 // account. Like an unknown user on a backend or an invalid address on the User
 // API proxy (#850), it must be gated by the rate limiter first, answered 401
-// {"error": "Invalid credentials"} after one dummy password verification, and
-// recorded as a failed login attempt without touching the auth cache or the
-// database.
+// {"error": "Invalid credentials"} with a wrong password's Bearer challenge after one
+// dummy password verification, and recorded as a failed login attempt without touching
+// the auth cache or the database.
 func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testing.T) {
 	origCost := db.BcryptCost
 	db.BcryptCost = bcrypt.MinCost
@@ -144,8 +144,8 @@ func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testin
 				if rec.Code != http.StatusUnauthorized {
 					t.Fatalf("%s: status %d (%q), want 401", step, rec.Code, rec.Body.String())
 				}
-				if got := rec.Header().Values("WWW-Authenticate"); len(got) != 0 {
-					t.Errorf("%s: unexpected WWW-Authenticate header on public JSON login: %q", step, got)
+				if got := rec.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != noTokenChallenge {
+					t.Errorf("%s: WWW-Authenticate = %q, want %q", step, got, noTokenChallenge)
 				}
 				var body map[string]string
 				if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body["error"] != "Invalid credentials" {
@@ -177,7 +177,8 @@ func TestLoginWithInvalidAddressLooksLikeAWrongPasswordWithoutDatabase(t *testin
 
 // A refresh token whose email claim is blank, malformed, NUL-containing, or
 // carries an @-suffix names no valid credential and must be answered 401
-// {"error": "Invalid or expired token"} before touching the database.
+// {"error": "Invalid or expired token"} with error="invalid_token" in the challenge
+// before touching the database.
 func TestRefreshTokenWithInvalidAddressClaimWithoutDatabase(t *testing.T) {
 	s, err := New(nil, ServerOptions{
 		Name:      "refresh-invalid-addr",
@@ -219,8 +220,8 @@ func TestRefreshTokenWithInvalidAddressClaimWithoutDatabase(t *testing.T) {
 			if rec.Code != http.StatusUnauthorized {
 				t.Fatalf("status %d (%q), want 401", rec.Code, rec.Body.String())
 			}
-			if got := rec.Header().Values("WWW-Authenticate"); len(got) != 0 {
-				t.Errorf("unexpected WWW-Authenticate header on public JSON refresh: %q", got)
+			if got := rec.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != refusedTokenChallenge {
+				t.Errorf("WWW-Authenticate = %q, want %q", got, refusedTokenChallenge)
 			}
 			var resp map[string]string
 			if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil || resp["error"] != "Invalid or expired token" {
