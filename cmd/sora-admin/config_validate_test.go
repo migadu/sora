@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -599,7 +600,7 @@ func TestConfigValidateReportsFileOnlyStartupWarnings(t *testing.T) {
 	const (
 		imap        = "[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n\n"
 		imapProxy   = "[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\nremote_addrs = [\"192.0.2.10:143\"]\n"
-		cluster     = "[cluster]\nenabled = true\naddr = \"192.0.2.1:7946\"\nnode_id = \"node-1\"\nsecret_key = \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\"\n\n"
+		cluster     = "[cluster]\nenabled = true\naddr = \"192.0.2.1:7946\"\nnode_id = \"node-1\"\npeers = [\"192.0.2.2:7946\"]\nsecret_key = \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\"\n\n"
 		dbOnly      = "[database.write]\nhosts = [\"db.example.com\"]\n\n"
 		adminAPI    = "[[server]]\ntype = \"http_admin_api\"\nname = \"admin-api\"\naddr = \"127.0.0.1:8080\"\napi_key = \"key\"\n\n"
 		userAPI     = "[[server]]\ntype = \"http_user_api\"\nname = \"user-api\"\naddr = \"127.0.0.1:8081\"\njwt_secret = \"secret\"\n\n"
@@ -902,4 +903,179 @@ func configValidateOutput(t *testing.T, content string) string {
 		t.Fatalf("config validate did not report the file valid:\n%s", out)
 	}
 	return string(out)
+}
+
+// TestConfigValidateReportsServerStartupWarnings (#1605): `sora-admin config validate`
+// also prints the warnings the servers, the cluster, the TLS manager and the cleaner log
+// at start-up about the file alone: master SASL without master_sasl_allowed_networks, an
+// IMAP append_limit above the largest message Sora stores or above session_memory_limit,
+// an IMAP command_timeout at or above the protocol library's 35m read deadline, IMAP
+// capabilities disabled_caps or client_filters cannot withdraw, a User API token_duration
+// above its maximum, Admin and User API allowed_hosts entries that match no client,
+// tls_cert_file and tls_key_file beside an enabled [tls], a Let's Encrypt certificate
+// cache without its local fallback, the [cluster] addr, port and peers, and [cleanup]
+// intervals below their minimum. It used to print none of them. Each file still passes,
+// and a file start-up does not warn about gets no warning here.
+func TestConfigValidateReportsServerStartupWarnings(t *testing.T) {
+	const (
+		imap        = "[[server]]\ntype = \"imap\"\nname = \"imap\"\naddr = \"127.0.0.1:143\"\n"
+		imapProxy   = "[[server]]\ntype = \"imap_proxy\"\nname = \"imap-proxy\"\naddr = \"127.0.0.1:1143\"\nremote_addrs = [\"192.0.2.10:143\"]\n"
+		masterSASL  = "master_sasl_username = \"master\"\nmaster_sasl_password = \"secret\"\n"
+		clusterKey  = "secret_key = \"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=\"\n"
+		adminAPI    = "[[server]]\ntype = \"http_admin_api\"\nname = \"admin-api\"\naddr = \"127.0.0.1:8080\"\n"
+		userAPI     = "[[server]]\ntype = \"http_user_api\"\nname = \"user-api\"\naddr = \"127.0.0.1:8081\"\njwt_secret = \"secret\"\n"
+		tlsFiles    = "[tls]\nenabled = true\nprovider = \"file\"\ncert_file = \"/etc/sora/cert.pem\"\nkey_file = \"/etc/sora/key.pem\"\n\n"
+		letsEncrypt = "[tls]\nenabled = true\nprovider = \"letsencrypt\"\n\n[tls.letsencrypt]\nemail = \"postmaster@example.com\"\n" +
+			"domains = [\"mail.example.com\"]\nstorage_provider = \"s3\"\n"
+	)
+	tests := []struct {
+		name     string
+		content  string
+		wantWarn []string // prefixes of [WARN] lines; none for a file start-up does not warn about
+	}{
+		{
+			name: "master SASL without master_sasl_allowed_networks",
+			content: storageTOML + imap + masterSASL + "\n" +
+				"[[server]]\ntype = \"pop3\"\nname = \"pop3\"\naddr = \"127.0.0.1:110\"\n" + masterSASL + "\n" +
+				"[[server]]\ntype = \"managesieve\"\nname = \"sieve\"\naddr = \"127.0.0.1:4190\"\n" + masterSASL,
+			wantWarn: []string{
+				"[WARN] Server imap (type: imap) has 'master_sasl_password' configured without 'master_sasl_allowed_networks'",
+				"[WARN] Server pop3 (type: pop3) has 'master_sasl_password' configured without 'master_sasl_allowed_networks'",
+				"[WARN] Server sieve (type: managesieve) has 'master_sasl_password' configured without 'master_sasl_allowed_networks'",
+			},
+		},
+		{
+			// A proxy presents the master SASL credentials to its backends; it accepts none.
+			name:    "master SASL restricted to networks, and on a proxy",
+			content: storageTOML + imap + masterSASL + "master_sasl_allowed_networks = [\"192.0.2.0/24\"]\n\n" + imapProxy + masterSASL,
+		},
+		{
+			// The IMAP server clamps append_limit to the largest message Sora stores, and
+			// a session reads APPEND into its memory budget, which is then its APPENDLIMIT.
+			name: "IMAP append_limit above the largest message and above session_memory_limit",
+			content: storageTOML + imap + "append_limit = \"4gb\"\n\n" +
+				"[[server]]\ntype = \"imap\"\nname = \"imap-small\"\naddr = \"127.0.0.1:1143\"\nappend_limit = \"50mb\"\n" +
+				"[server.limits]\nsession_memory_limit = \"10mb\"\n",
+			wantWarn: []string{
+				"[WARN] Server imap (type: imap) has append_limit 4294967296 bytes, above the largest message Sora can store: start-up uses 2147483647",
+				"[WARN] Server imap (type: imap) has append_limit 2147483647 bytes, above its session_memory_limit 104857600 bytes",
+				"[WARN] Server imap-small (type: imap) has append_limit 52428800 bytes, above its session_memory_limit 10485760 bytes",
+			},
+		},
+		{
+			// session_memory_limit = "0" is no limit.
+			name: "IMAP append_limit within session_memory_limit",
+			content: storageTOML + imap + "append_limit = \"50mb\"\n[server.limits]\nsession_memory_limit = \"0\"\n\n" +
+				"[[server]]\ntype = \"imap\"\nname = \"imap-2\"\naddr = \"127.0.0.1:1143\"\nappend_limit = \"100mb\"\n",
+		},
+		{
+			// go-imap closes an idle session at its own 35m read deadline. The IMAP proxy
+			// is not built on it.
+			name: "IMAP command_timeout at or above 35m",
+			content: storageTOML + imap + "[server.timeouts]\ncommand_timeout = \"40m\"\n\n" +
+				"[[server]]\ntype = \"imap\"\nname = \"imap-2\"\naddr = \"127.0.0.1:1430\"\n[server.timeouts]\ncommand_timeout = \"34m\"\n\n" +
+				imapProxy + "[server.timeouts]\ncommand_timeout = \"40m\"\n",
+			wantWarn: []string{"[WARN] Server imap (type: imap) has 'timeouts.command_timeout' 40m0s, at or above the IMAP library's 35m0s read deadline"},
+		},
+		{
+			// A name the server does not advertise, one go-imap adds by itself, and
+			// IMAP4rev1 for one client. PREVIEW is withdrawable only when enabled.
+			name: "IMAP capabilities disabled_caps and client_filters cannot withdraw",
+			content: storageTOML + imap + "disabled_caps = [\"IDLE\", \"IDEL\", \"sasl-ir\"]\n\n" +
+				"[[server.client_filters]]\nclient_name = \"^ExampleMail$\"\ndisable_caps = [\"CONDSTORE\", \"imap4rev1\", \"ACL\", \"PREVIEW\"]\n\n" +
+				"[[server]]\ntype = \"imap\"\nname = \"imap-preview\"\naddr = \"127.0.0.1:1143\"\nenable_preview = true\ndisabled_caps = [\"preview\"]\n",
+			wantWarn: []string{
+				`[WARN] Server imap (type: imap) has "IDEL" in 'disabled_caps', which cannot disable it: it is not one this server can withdraw`,
+				`[WARN] Server imap (type: imap) has "sasl-ir" in 'disabled_caps', which cannot disable it: go-imap always advertises it with IMAP4rev1`,
+				`[WARN] Server imap (type: imap) has "imap4rev1" in the disable_caps of client_filters entry 1, which cannot disable it: go-imap selects`,
+				`[WARN] Server imap (type: imap) has "ACL" in the disable_caps of client_filters entry 1, which cannot disable it: it is not one this server can withdraw`,
+				`[WARN] Server imap (type: imap) has "PREVIEW" in the disable_caps of client_filters entry 1, which cannot disable it: it is not one this server can withdraw`,
+			},
+		},
+		{
+			name:     "User API token_duration above its maximum",
+			content:  storageTOML + imap + "\n" + userAPI + "token_duration = \"720h\"\n",
+			wantWarn: []string{"[WARN] Server user-api (type: http_user_api) has token_duration 720h0m0s, above the maximum 168h0m0s: start-up uses 168h0m0s"},
+		},
+		{
+			name: "allowed_hosts entries that match no client",
+			content: storageTOML + imap + "\n" + adminAPI + "api_key = \"key\"\nallowed_hosts = [\"127.0.0.1\", \"admin.example.com\"]\n\n" +
+				userAPI + "allowed_hosts = [\"10.1.2.0/24\", \"localhost\"]\n",
+			wantWarn: []string{
+				`[WARN] Server admin-api (type: http_admin_api) has 'allowed_hosts' entry "admin.example.com", which is not an IP address or CIDR and matches no client`,
+				`[WARN] Server user-api (type: http_user_api) has 'allowed_hosts' entry "localhost", which is not an IP address or CIDR and matches no client`,
+			},
+		},
+		{
+			// Start-up does not start an Admin API without api_key.
+			name:    "allowed_hosts of an Admin API start-up leaves out",
+			content: storageTOML + imap + "\n" + adminAPI + "allowed_hosts = [\"admin.example.com\"]\n",
+		},
+		{
+			name: "tls_cert_file and tls_key_file beside an enabled [tls]",
+			content: storageTOML + tlsFiles + imap + "tls = true\ntls_cert_file = \"/etc/sora/imap.pem\"\ntls_key_file = \"/etc/sora/imap.key\"\n\n" +
+				"[[server]]\ntype = \"pop3\"\nname = \"pop3\"\naddr = \"127.0.0.1:995\"\ntls = true\n",
+			wantWarn: []string{"[WARN] Server imap (type: imap) has 'tls_cert_file'/'tls_key_file' configured, but they are ignored: with [tls] enabled the listener uses the global [tls] certificate"},
+		},
+		{
+			name:     "Let's Encrypt without the local fallback cache",
+			content:  storageTOML + letsEncrypt + "enable_fallback = false\n\n" + imap,
+			wantWarn: []string{"[WARN] [tls.letsencrypt] enable_fallback = false: certificates are served from S3 only"},
+		},
+		{
+			// peers lists this node in the forms memberlist reads ("name/" prefix, no port),
+			// so nothing is left to join.
+			name: "[cluster] addr with a port beside the port key, and peers naming only this node",
+			content: storageTOML + "[cluster]\nenabled = true\naddr = \"192.0.2.1:7946\"\nport = 7947\npeers = [\"192.0.2.1:7946\", \"node-1/192.0.2.1\"]\n" + clusterKey + "\n" +
+				imapProxy,
+			wantWarn: []string{
+				`[WARN] [cluster] addr "192.0.2.1:7946" includes a port and port = 7947 is also set`,
+				`[WARN] [cluster] peers lists this node's own address 192.0.2.1:7946 ("192.0.2.1:7946", "node-1/192.0.2.1"): it is ignored`,
+				"[WARN] [cluster] has no peers to join: this node runs as a standalone single-node cluster",
+			},
+		},
+		{
+			name:     "[cluster] on a loopback address without peers",
+			content:  storageTOML + "[cluster]\nenabled = true\naddr = \"[::1]:7946\"\n" + clusterKey + "\n" + imapProxy,
+			wantWarn: []string{"[WARN] [cluster] addr ::1 is a loopback address", "[WARN] [cluster] has no peers to join"},
+		},
+		{
+			// A peer named by host name may or may not be this node: start-up resolves it.
+			name: "[cluster] peers naming other nodes",
+			content: storageTOML + "[cluster]\nenabled = true\naddr = \"192.0.2.1\"\nport = 7946\npeers = [\"192.0.2.1:7947\", \"node-2.example.com\"]\n" + clusterKey + "\n" +
+				imapProxy,
+		},
+		{
+			name:    "[cleanup] intervals below their minimum",
+			content: storageTOML + "[cleanup]\nwake_interval = \"30s\"\npurge_poll_interval = \"1s\"\n\n" + imap,
+			wantWarn: []string{
+				"[WARN] [cleanup] wake_interval 30s is below the minimum 1m0s: start-up uses 1m0s",
+				"[WARN] [cleanup] purge_poll_interval 1s is below the minimum 5s: start-up uses 5s",
+			},
+		},
+		{
+			// Only a mail backend runs the cleaner and the purge worker.
+			name:    "[cleanup] intervals on a proxy-only node",
+			content: storageTOML + "[cleanup]\nwake_interval = \"30s\"\npurge_poll_interval = \"1s\"\n\n" + imapProxy,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			out := configValidateOutput(t, tt.content)
+			var warnings []string
+			for _, line := range strings.Split(out, "\n") {
+				if strings.HasPrefix(line, "[WARN]") {
+					warnings = append(warnings, line)
+				}
+			}
+			for _, want := range tt.wantWarn {
+				if !slices.ContainsFunc(warnings, func(line string) bool { return strings.HasPrefix(line, want) }) {
+					t.Errorf("config validate output does not warn %q:\n%s", want, out)
+				}
+			}
+			if len(warnings) != len(tt.wantWarn) {
+				t.Errorf("config validate printed %d [WARN] lines, want %d:\n%s", len(warnings), len(tt.wantWarn), out)
+			}
+		})
+	}
 }

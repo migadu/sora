@@ -407,6 +407,25 @@ func splitClusterAddr(addr string) (host, port string) {
 	return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), ""
 }
 
+// SplitClusterPeer splits a peers entry the way memberlist's Join reads it: an
+// optional "name/" prefix, a host name or IPv4 or IPv6 address (bare or bracketed),
+// and an optional port that defaults to defaultPort, the gossip bind port. ok is
+// false when the port is not a number from 0 to 65535.
+func SplitClusterPeer(peer string, defaultPort int) (host string, port uint16, ok bool) {
+	if i := strings.Index(peer, "/"); i >= 0 {
+		peer = peer[i+1:]
+	}
+	host, portStr, err := net.SplitHostPort(peer)
+	if err != nil {
+		host, portStr = strings.TrimSuffix(strings.TrimPrefix(peer, "["), "]"), strconv.Itoa(defaultPort)
+	}
+	p, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return "", 0, false
+	}
+	return host, uint16(p), true
+}
+
 // GetBindAddr returns the bind address by parsing the addr field
 func (c *ClusterConfig) GetBindAddr() string {
 	host, _ := splitClusterAddr(c.Addr)
@@ -723,6 +742,13 @@ type CleanupConfig struct {
 	// looks for accounts marked for purging.
 	PurgePollInterval string `toml:"purge_poll_interval"`
 }
+
+// The cleaner raises a shorter wake_interval, and the purge worker a shorter
+// purge_poll_interval, to these.
+const (
+	MinCleanupWakeInterval = time.Minute
+	MinPurgePollInterval   = 5 * time.Second
+)
 
 // GetPurgePollInterval parses the purge worker's poll interval.
 func (c *CleanupConfig) GetPurgePollInterval() (time.Duration, error) {
@@ -2153,9 +2179,14 @@ func NewDefaultConfig() Config {
 }
 
 // Helper methods for ServerConfig
+
+// defaultAppendLimit is the imap append_limit when the key is absent, does not parse
+// or is not positive (server/imap DefaultAppendLimit).
+const defaultAppendLimit = 25 * 1024 * 1024
+
 func (s *ServerConfig) GetAppendLimit() (int64, error) {
 	if s.AppendLimit == "" {
-		return 25 * 1024 * 1024, nil // 25MB default
+		return defaultAppendLimit, nil
 	}
 	return helpers.ParseSize(s.AppendLimit)
 }
@@ -2267,6 +2298,14 @@ func (s *ServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
 
 // defaultTokenDuration is the http_user_api JWT lifetime when token_duration is absent.
 const defaultTokenDuration = 24 * time.Hour
+
+// MaxTokenDuration caps how long a User API JWT may live; the server lowers a longer
+// token_duration to it. JWTs are validated statelessly, so a token cannot be revoked
+// before it expires — a password change or account deletion only stops *renewal* at
+// refresh time. Clamping the duration bounds the window in which a leaked or
+// post-revocation token remains usable. Seven days is generous for an access token
+// while keeping that window finite.
+const MaxTokenDuration = 7 * 24 * time.Hour
 
 // GetTokenDuration parses token_duration (http_user_api). It takes the same
 // syntax as the other duration keys, including days ("7d"); a negative value
@@ -2444,6 +2483,12 @@ func (s *ServerConfig) GetCommandTimeoutWithDefault() time.Duration {
 	}
 	return timeout
 }
+
+// IMAPLibraryReadDeadline is the read deadline go-imap arms on authenticated
+// connections itself (RFC 3501 §5.4 autologout floor + margin). When it expires the
+// library closes the connection silently: no BYE, no timeout metric. An imap
+// command_timeout at or above it is therefore capped by the library.
+const IMAPLibraryReadDeadline = 35 * time.Minute
 
 // defaultCommandTimeout is the protocol-specific command (idle) timeout.
 func (s *ServerConfig) defaultCommandTimeout() time.Duration {
@@ -2829,7 +2874,7 @@ func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
 	if err != nil {
 		warnf("Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
-		return 25 * 1024 * 1024 // 25MB default
+		return defaultAppendLimit
 	}
 	return limit
 }
