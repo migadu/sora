@@ -1619,11 +1619,10 @@ func openImportRoot(path string) (*os.Root, error) {
 // the export writes every message and metadata file through, under openImportRoot's
 // rule for the links on the way: an export into a user's maildir in place also often
 // runs as root, and would write the account's mail into the directory the user's link
-// chooses. A directory missing on the way is created, as os.MkdirAll creates it, in
-// the directory the walk has reached: only a name of path itself is created, never one
-// that a link's target names (os.MkdirAll does not create through a link that leads
-// nowhere either), and a link is checked before the names after it. So nothing is
-// created in a directory that a refused link leads to.
+// chooses. The directories missing on the way are created, as os.MkdirAll creates
+// them, once every link on the way has been checked: only names of path itself are
+// created, never one that a link's target names (os.MkdirAll does not create through a
+// link that leads nowhere either). So a link that is refused leaves nothing created.
 func openExportRoot(path string) (*os.Root, error) {
 	return openLinkCheckedRoot(path, true)
 }
@@ -1694,10 +1693,27 @@ func openLinkCheckedRoot(path string, create bool) (*os.Root, error) {
 	for i := range steps {
 		steps[i].create = create
 	}
+	// missing are, with create, the names of path from the first one that does not
+	// exist: nothing below it exists to be checked, and a ".." after it goes back to
+	// the directory that holds it. They are created (mkdir) once the rest of path is
+	// checked, so a link the walk refuses leaves nothing created.
+	var missing []step
+	mkdir := false
 	links := 0
-	for len(steps) > 0 {
+	for len(steps) > 0 || len(missing) > 0 {
+		if len(steps) == 0 {
+			steps, missing, mkdir = missing, nil, true
+		}
 		st := steps[0]
 		steps = steps[1:]
+		if len(missing) > 0 {
+			if st.name == ".." {
+				missing = missing[:len(missing)-1]
+			} else {
+				missing = append(missing, st)
+			}
+			continue
+		}
 		cur := dirs[len(dirs)-1]
 		switch {
 		case st.link != "":
@@ -1721,6 +1737,10 @@ func openLinkCheckedRoot(path string, create bool) (*os.Root, error) {
 		name := filepath.Join(resolved, st.name)
 		info, err := cur.Lstat(st.name)
 		if st.create && errors.Is(err, fs.ErrNotExist) {
+			if !mkdir {
+				missing = append(missing, st)
+				continue
+			}
 			if err := cur.Mkdir(st.name, 0755); err != nil && !errors.Is(err, fs.ErrExist) {
 				return nil, &fs.PathError{Op: "mkdir", Path: name, Err: cause(err)}
 			}

@@ -661,8 +661,8 @@ the way to it, may be a symbolic link under the import's rule
 of the directory it leads to. A user who can replace `~/Maildir`, or a directory above it, could
 otherwise point it at another user's maildir or home and have the account's mail, Dovecot files
 and `sora-maildir.db` written there. Any other link makes the export refuse to start, naming the
-link, before anything is created. The directories missing on the way are created only after the
-links leading to them are checked, and never through a link to a directory that does not exist.
+link, before anything is created. The directories missing on the way are created only once every
+link on the way is checked, and never through a link to a directory that does not exist.
 Each exported content file (a message,
 `dovecot-keywords`, `subscriptions`, `dovecot-uidlist`) is written as a new file and renamed over
 its name, so a symbolic or hard link at that name is replaced, and the file it points to is left
