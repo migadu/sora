@@ -126,6 +126,7 @@ func TestMAILRefusesMalformedSizeParameter(t *testing.T) {
 		"MAIL FROM:<a@example.org> SIZE=1.5",
 		"MAIL FROM:<a@example.org> SIZE=0x10",
 		"MAIL FROM:<a@example.org> SIZE=000000000000000000001",    // 21 digits
+		"MAIL FROM:<a@example.org> SIZE=123456789012345678901",    // 21 digits
 		"MAIL FROM:<a@example.org> SIZE=99999999999999999999999x", // overflows before the x
 		"MAIL FROM:<a@example.org> SIZE=100 SIZE=100",
 	} {
