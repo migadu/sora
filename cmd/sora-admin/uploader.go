@@ -207,41 +207,69 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 		// (the primary at the time each was written, or the address an import ran
 		// under), and each key is judged on its own object. Keys whose object exists
 		// are finalized right away; the spool decision below sees only the residue.
-		keys, err := rdb.PendingUploadKeysWithRetry(ctx, upload.ContentHash, upload.AccountID)
-		if err != nil {
-			fmt.Printf("  [ERROR]  id=%-10d hash=%.16s... could not resolve storage keys: %v\n", upload.ID, upload.ContentHash, err)
-			skipped++
-			continue
-		}
+		//
+		// Hold the shared S3 body lock across key resolution, S3 HEAD, and
+		// CompleteS3Upload so an in-flight or quarantined deletion cannot race with
+		// Exists, and a lost lock holder cannot admit uploaded=TRUE from a stale HEAD.
 		var present, missing []string
-		checkFailed := false
-		for _, key := range keys {
-			exists, _, checkErr := s3Storage.Exists(key)
-			if checkErr != nil {
-				fmt.Printf("  [ERROR]  id=%-10d hash=%.16s... S3 check failed for %s: %v\n", upload.ID, upload.ContentHash, key, checkErr)
-				checkFailed = true
-				break
+		ran := false
+		printedErr := false
+		lockErr := rdb.ExecuteWithSharedS3ObjectLocks(ctx, upload.AccountID, []string{upload.ContentHash}, func(guarded context.Context) error {
+			ran = true
+			keys, err := rdb.PendingUploadKeysWithRetry(guarded, upload.ContentHash, upload.AccountID)
+			if err != nil {
+				fmt.Printf("  [ERROR]  id=%-10d hash=%.16s... could not resolve storage keys: %v\n", upload.ID, upload.ContentHash, err)
+				printedErr = true
+				return err
 			}
-			if exists {
-				present = append(present, key)
-			} else {
-				missing = append(missing, key)
-			}
-		}
-		if checkFailed {
-			skipped++
-			continue
-		}
-		if len(present) > 0 {
-			fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... [OK] EXISTS in S3 under %s → CompleteS3Upload\n",
-				upload.ID, upload.AccountID, upload.ContentHash, strings.Join(present, " "))
-			if !dryRun {
-				if err := rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID, present); err != nil {
-					fmt.Printf("            ERROR: %v\n", err)
-					skipped++
-					continue
+			for _, key := range keys {
+				exists, _, checkErr := s3Storage.ExistsContext(guarded, key)
+				if checkErr != nil {
+					fmt.Printf("  [ERROR]  id=%-10d hash=%.16s... S3 check failed for %s: %v\n", upload.ID, upload.ContentHash, key, checkErr)
+					printedErr = true
+					return checkErr
+				}
+				if exists {
+					present = append(present, key)
+				} else {
+					missing = append(missing, key)
 				}
 			}
+			if len(present) > 0 {
+				fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... [OK] EXISTS in S3 under %s → CompleteS3Upload\n",
+					upload.ID, upload.AccountID, upload.ContentHash, strings.Join(present, " "))
+				if !dryRun {
+					if err := rdb.CompleteS3UploadWithRetry(guarded, upload.ContentHash, upload.AccountID, present); err != nil {
+						fmt.Printf("            ERROR: %v\n", err)
+						printedErr = true
+						return err
+					}
+				}
+			} else if len(missing) == 0 {
+				// Every key this upload still had to write has its object, or nothing was
+				// left to write: finalize what remains and clear the pending row.
+				fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... nothing left to write → CompleteS3Upload\n",
+					upload.ID, upload.AccountID, upload.ContentHash)
+				if !dryRun {
+					if err := rdb.CompleteS3UploadWithRetry(guarded, upload.ContentHash, upload.AccountID, nil); err != nil {
+						fmt.Printf("            ERROR: %v\n", err)
+						printedErr = true
+						return err
+					}
+				}
+			}
+			return nil
+		})
+		if lockErr != nil {
+			if !printedErr {
+				if !ran {
+					fmt.Printf("  [ERROR]  id=%-10d hash=%.16s... could not claim S3 body lock: %v\n", upload.ID, upload.ContentHash, lockErr)
+				} else {
+					fmt.Printf("  [ERROR]  id=%-10d hash=%.16s... S3 body lock lost during check: %v\n", upload.ID, upload.ContentHash, lockErr)
+				}
+			}
+			skipped++
+			continue
 		}
 
 		staged := stagedUnknown
@@ -250,19 +278,6 @@ func resolveFailedUploads(ctx context.Context, cfg AdminConfig, dryRun bool, lim
 		}
 		switch decideResolve(len(missing) == 0, upload.InstanceID == localInstance, staged) {
 		case resolveRepair:
-			// Every key this upload still had to write has its object, or nothing was
-			// left to write: finalize what remains and clear the pending row.
-			if len(present) == 0 {
-				fmt.Printf("  [REPAIR] id=%-10d account=%-8d hash=%.16s... nothing left to write → CompleteS3Upload\n",
-					upload.ID, upload.AccountID, upload.ContentHash)
-				if !dryRun {
-					if err := rdb.CompleteS3UploadWithRetry(ctx, upload.ContentHash, upload.AccountID, nil); err != nil {
-						fmt.Printf("            ERROR: %v\n", err)
-						skipped++
-						continue
-					}
-				}
-			}
 			resolved++
 		case resolveRearm:
 			fmt.Printf("  [REARM]  id=%-10d account=%-8d hash=%.16s... body intact in %s → ResetUploadAttempts\n",
