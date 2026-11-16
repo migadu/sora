@@ -258,14 +258,28 @@ These conditions only log, and startup continues:
   `[uploader]`, `[auth_cache]` or `[database]`, where the part of the node that reads it runs. The
   `[database]` timeouts are logged at each query. A `[spam_training]` value that does not parse
   leaves spam training out, and a `max_message_size` above 2147483647 bytes is lowered to that.
+- A server, the cluster, the TLS manager or the cleaner works differently from what a setting
+  says: an `imap`, `pop3` or `managesieve` server has `master_sasl_password` without
+  `master_sasl_allowed_networks`; an `imap` server's `append_limit` is above 2147483647 bytes
+  (lowered to that) or above its `session_memory_limit` (which then is its `APPENDLIMIT`), its
+  `command_timeout` is 35 minutes or more (the IMAP library closes idle sessions at 35 minutes), or
+  `disabled_caps` or a `client_filters` entry names a capability it cannot withdraw; an
+  `http_user_api` server's `token_duration` is above 7 days (lowered to that); an `http_admin_api`
+  or `http_user_api` server's `allowed_hosts` has an entry that is not an IP address or CIDR; a
+  server with `tls = true` sets `tls_cert_file` or `tls_key_file` while `[tls]` is enabled (the
+  `[tls]` certificate is used); `[tls.letsencrypt]` has `enable_fallback = false`; `[cluster]`
+  `addr` has a port and `port` is also set, `addr` is a loopback address, or `peers` names this node
+  or leaves no other node to join; `[cleanup]` `wake_interval` is below 1 minute or
+  `purge_poll_interval` below 5 seconds (raised to that).
 
 Later steps can still fail, for example a TLS certificate that cannot be read, or a database that
 cannot be reached. Those are covered in the topic documents.
 
 `sora-admin config validate` runs every validation check in the table without starting
-anything, and reports the collected configuration warnings above as `[WARN]` lines without
-changing its success exit status. Plaintext-authentication, metrics, host-name and additional
-package-specific warnings are currently reported only at startup. See [ADMIN_CLI.md](ADMIN_CLI.md).
+anything, and reports the warnings above that follow from the file alone as `[WARN]` lines without
+changing its success exit status. The ones that depend on the host are reported only at startup:
+plaintext authentication and metrics on a publicly reachable address, the host name, and a `peers`
+entry that names this node by host name. See [ADMIN_CLI.md](ADMIN_CLI.md).
 
 ---
 
