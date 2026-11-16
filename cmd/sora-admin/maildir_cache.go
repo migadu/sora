@@ -43,15 +43,10 @@ const maildirCacheSettings = `PRAGMA busy_timeout = 5000; PRAGMA journal_mode = 
 // target); it opens the database and its -wal, -shm and -journal files with
 // O_NOFOLLOW. dir itself is trusted, as for the rest of the import.
 func openMaildirCache(dir string) (*sql.DB, error) {
-	for _, name := range []string{maildirCacheName, maildirCacheName + "-wal", maildirCacheName + "-shm", maildirCacheName + "-journal"} {
-		if info, err := os.Lstat(filepath.Join(dir, name)); err == nil && !info.Mode().IsRegular() {
-			return nil, notRegularMaildirCache(filepath.Join(dir, name), info)
-		}
-	}
-
 	// SQLite names the database by its absolute path with every link resolved. A
 	// relative dir is not cleaned (as filepath.Abs would): a ".." after a link is
-	// resolved from the link's target, as the OS does.
+	// resolved from the link's target, as the OS does. The files are checked in the
+	// resolved directory, the one the cache is opened in.
 	if !filepath.IsAbs(dir) {
 		wd, err := os.Getwd()
 		if err != nil {
@@ -62,6 +57,11 @@ func openMaildirCache(dir string) (*sql.DB, error) {
 	dir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
 		return nil, fmt.Errorf("failed to resolve maildir database directory: %w", err)
+	}
+	for _, name := range []string{maildirCacheName, maildirCacheName + "-wal", maildirCacheName + "-shm", maildirCacheName + "-journal"} {
+		if info, err := os.Lstat(filepath.Join(dir, name)); err == nil && !info.Mode().IsRegular() {
+			return nil, notRegularMaildirCache(filepath.Join(dir, name), info)
+		}
 	}
 	path := filepath.Join(dir, maildirCacheName)
 
