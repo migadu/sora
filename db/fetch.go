@@ -20,6 +20,7 @@ func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 	// THREAD use instead.
 	if !msg.NoDateHeader {
 		envelope.Date = msg.SentDate
+		envelope.DateZoneUnknown = helpers.ZoneUnknown(msg.SentDate)
 	}
 	envelope.Subject = msg.Subject
 	// RFC 9051 §7.5.2: an absent Message-ID is a NIL member, which go-imap writes for

@@ -129,10 +129,11 @@ func ParseDateHeader(value string) (time.Time, error) {
 	return t.UTC(), nil
 }
 
-// ZoneUnknown reports whether a date ParseDateHeader returned has no known zone, RFC 5322
-// §3.3 "-0000": it is in UTC (time.UTC). go-imap writes an ENVELOPE date in UTC with the
-// zone "-0000", and the binary (gob) encoding of a time.Time keeps time.UTC apart from a
-// zone of offset zero, so a stored body structure keeps it too.
+// ZoneUnknown classifies a date directly returned by ParseDateHeader: time.UTC
+// marks an unknown zone, RFC 5322 §3.3 "-0000". This transient marker must be
+// recorded before serialization: DB offsets use NULL, and attached envelopes
+// carry DateZoneUnknown explicitly through gob. A decoded time location alone
+// cannot retain this distinction when time.Local is time.UTC.
 func ZoneUnknown(t time.Time) bool {
 	return t.Location() == time.UTC
 }

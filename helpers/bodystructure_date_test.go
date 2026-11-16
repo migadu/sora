@@ -70,14 +70,14 @@ func TestSafeBodyStructureAttachedMessageObsoleteZone(t *testing.T) {
 // zone through the gob encoding the body structure is stored in. A known zone of offset
 // zero stays "+0000" through it.
 func TestSafeBodyStructureAttachedMessageUnknownZone(t *testing.T) {
-	attachedDate := func(t *testing.T, bs imap.BodyStructure) time.Time {
+	attachedEnvelope := func(t *testing.T, bs imap.BodyStructure) *imap.Envelope {
 		t.Helper()
 		mp, ok := bs.(*imap.BodyStructureMultiPart)
 		require.True(t, ok, "body structure %#v", bs)
 		require.Len(t, mp.Children, 2)
 		part, ok := mp.Children[1].(*imap.BodyStructureSinglePart)
 		require.True(t, ok && part.MessageRFC822 != nil, "part 2 %#v", mp.Children[1])
-		return part.MessageRFC822.Envelope.Date
+		return part.MessageRFC822.Envelope
 	}
 	wall := time.Date(1996, 7, 17, 2, 23, 25, 0, time.UTC)
 	for _, tc := range []struct {
@@ -102,11 +102,20 @@ func TestSafeBodyStructureAttachedMessageUnknownZone(t *testing.T) {
 
 		for _, got := range []struct {
 			name string
-			date time.Time
-		}{{"extracted", attachedDate(t, bs)}, {"stored", attachedDate(t, *stored)}} {
-			assert.True(t, got.date.Equal(wall), "%q: %s attached envelope date %v, want %v", tc.date, got.name, got.date, wall)
-			assert.Equal(t, tc.unknown, got.date.Location() == time.UTC,
-				"%q: %s attached envelope date %v: zone unknown (in UTC) = %v, want %v", tc.date, got.name, got.date, got.date.Location() == time.UTC, tc.unknown)
+			env  *imap.Envelope
+		}{{"extracted", attachedEnvelope(t, bs)}, {"stored", attachedEnvelope(t, *stored)}} {
+			assert.True(t, got.env.Date.Equal(wall), "%q: %s attached envelope date %v, want %v", tc.date, got.name, got.env.Date, wall)
+			assert.Equal(t, tc.unknown, got.env.DateZoneUnknown,
+				"%q: %s attached envelope date %v: zone unknown (in UTC) = %v, want %v", tc.date, got.name, got.env.Date, got.env.DateZoneUnknown, tc.unknown)
 		}
 	}
+}
+
+// A known fixed-zero location can decode as time.UTC when Local aliases UTC;
+// the explicit envelope hint must still keep known and unknown zones apart.
+func TestSafeBodyStructureAttachedMessageUnknownZoneLocalUTC(t *testing.T) {
+	saved := time.Local
+	time.Local = time.UTC
+	defer func() { time.Local = saved }()
+	TestSafeBodyStructureAttachedMessageUnknownZone(t)
 }

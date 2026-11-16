@@ -281,6 +281,7 @@ func TestEnvelopeDateKeepsHeaderZone(t *testing.T) {
 			assert.Equal(t, want[uid], env.Date.Format(layout), "%s uid %d: envelope date", reader, uid)
 			assert.Equal(t, inUTC[uid], env.Date.Location() == time.UTC,
 				"%s uid %d: envelope date %v in UTC (zone -0000)", reader, uid, env.Date)
+			assert.Equal(t, inUTC[uid], env.DateZoneUnknown, "%s uid %d: explicit unknown-zone hint", reader, uid)
 		}
 	}
 
@@ -308,5 +309,6 @@ func TestEnvelopeDateKeepsHeaderZone(t *testing.T) {
 		assert.Equal(t, date, env.Date.Format(layout), "GetMessageEnvelope uid %d: envelope date", uid)
 		assert.Equal(t, inUTC[uid], env.Date.Location() == time.UTC,
 			"GetMessageEnvelope uid %d: envelope date %v in UTC (zone -0000)", uid, env.Date)
+		assert.Equal(t, inUTC[uid], env.DateZoneUnknown, "GetMessageEnvelope uid %d: explicit unknown-zone hint", uid)
 	}
 }

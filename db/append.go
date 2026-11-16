@@ -546,8 +546,8 @@ func sentUTCOffset(sentDate time.Time) *int32 {
 // component parts"). A row without an offset (a zone that is unknown, one beyond
 // maxSentUTCOffset, or a row written before migration 000060) is given in UTC rather than
 // in the time.Local pgx decodes a timestamptz into, so the ENVELOPE never depends on the
-// server's TZ. go-imap writes a date in UTC with the zone "-0000": the row has no
-// information about the header's zone (RFC 5322 §3.3).
+// server's TZ. BuildEnvelope records the unknown-zone hint before encoding;
+// go-imap then writes "-0000" (RFC 5322 §3.3).
 func sentDateInHeaderZone(sentDate time.Time, offset *int32) time.Time {
 	if offset == nil {
 		return sentDate.UTC()
