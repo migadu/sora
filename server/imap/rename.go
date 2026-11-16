@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -148,6 +150,9 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		}
 	}
 
+	own := s.beginOwnTreeChange()
+	defer own.end()
+
 	// RFC 3501 §6.3.5: Renaming INBOX is special — moves messages to the new
 	// mailbox while leaving INBOX intact (empty, same UID validity).
 	if isInbox {
@@ -165,7 +170,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			if permErr := s.checkCreateRightForHierarchy(ctx, newParentPath, AccountID, AccountID); permErr != nil {
 				return permErr
 			}
-			parentID, perr := s.resolveOrCreateParentPath(ctx, newParentPath, AccountID)
+			parentID, perr := s.resolveOrCreateParentPath(ctx, newParentPath, AccountID, own)
 			if perr != nil {
 				return perr
 			}
@@ -173,10 +178,13 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		}
 
 		// 1. Create the destination mailbox, linked to its parent.
-		err = s.server.rdb.CreateMailboxWithRetry(ctx, AccountID, newName, destParentID)
+		state, createErr := s.server.rdb.CreateMailboxReturningStateWithRetry(ctx, AccountID, AccountID, newName, destParentID, "")
+		err = createErr
 		if err != nil {
 			return s.internalError("failed to create destination mailbox '%s': %v", newName, err)
 		}
+
+		own.created(*state)
 
 		// 2. Get the new mailbox ID
 		newMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, newName)
@@ -204,7 +212,10 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			if resolveErr != nil {
 				return s.internalError("failed to resolve S3 owner for INBOX rename: %v", resolveErr)
 			}
-			_, err = s.server.rdb.MoveMessagesWithRetry(ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.instanceID, nil, nil, nil)
+			writeCtx, ownMessagesDone := s.beginOwnMessages(ctx, newMailbox.ID)
+			var moved map[imap.UID]imap.UID
+			moved, err = s.server.rdb.MoveMessagesWithRetry(writeCtx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.instanceID, nil, nil, nil)
+			ownMessagesDone(slices.Collect(maps.Values(moved))...)
 		}
 		if err != nil {
 			return s.internalError("failed to move messages from INBOX to '%s': %v", newName, err)
@@ -276,7 +287,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 
 		if parentID == nil {
 			var perr error
-			if parentID, perr = s.resolveOrCreateParentPath(ctx, newParentPath, ownerAccountID); perr != nil {
+			if parentID, perr = s.resolveOrCreateParentPath(ctx, newParentPath, ownerAccountID, own); perr != nil {
 				return perr
 			}
 		}
@@ -285,7 +296,8 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// If len(newParts) <= 1, newParentMailboxID remains nil, which is correct for a top-level mailbox.
 
 	// Rename using the mailbox owner's AccountID
-	err = s.server.rdb.RenameMailboxWithRetry(ctx, oldMailbox.ID, ownerAccountID, newName, newParentMailboxID)
+	names, renameErr := s.server.rdb.RenameMailboxReturningNamesWithRetry(ctx, oldMailbox.ID, ownerAccountID, newName, newParentMailboxID)
+	err = renameErr
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxSharedBoundary) {
 			return sharedBoundaryError()
@@ -302,6 +314,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 
 	s.DebugLog("mailbox renamed", "old_name", existingName, "new_name", newName)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+	own.renamed(names)
 
 	// NOTE: the subscription follows the rename ATOMICALLY inside db.RenameMailbox
 	// (same transaction as the name update), so there is no separate call here — a
@@ -359,7 +372,7 @@ func (s *IMAPSession) lookUpNewParent(ctx context.Context, parentPath string, mb
 // both link a hierarchical target under its parent rather than storing a flat name.
 // Every level is the owner's own; foreignParentRefusal has ruled out the path
 // leading into another owner's shared mailbox.
-func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPath string, ownerAccountID int64) (*int64, error) {
+func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPath string, ownerAccountID int64, own *ownTreeChange) (*int64, error) {
 	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	id, err := s.server.rdb.GetOwnedMailboxIDByNameWithRetry(ctx, ownerAccountID, newParentPath)
 	if err == nil {
@@ -373,7 +386,8 @@ func (s *IMAPSession) resolveOrCreateParentPath(ctx context.Context, newParentPa
 	if refusal := s.sharedCreateRefusal(ctx, ownerAccountID, newParentPath, true); refusal != nil {
 		return nil, refusal
 	}
-	parentID, err := s.server.rdb.ResolveOrCreateMailboxPathWithRetry(ctx, ownerAccountID, newParentPath)
+	parentID, created, err := s.server.rdb.ResolveOrCreateMailboxPathReturningStatesWithRetry(ctx, ownerAccountID, s.AccountID(), newParentPath)
+	own.created(created...)
 	if err != nil {
 		return nil, s.internalError("failed to resolve new parent hierarchy %q: %v", newParentPath, err)
 	}

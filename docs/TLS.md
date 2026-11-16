@@ -318,7 +318,7 @@ lowercased entry name. The entries are:
 | `acme_account+key` | The Let's Encrypt account key |
 | `<token>+http-01`, `<name>+token` | Short-lived challenge material |
 
-Because every object holds a private key, Sora asks the store to encrypt it at rest on every write:
+Active cache objects can contain private keys. Sora asks the store to encrypt them at rest on every write:
 `server_side_encryption = "AES256"` by default. Set it to `"aws:kms"` with
 `server_side_encryption_kms_key_id` to use a KMS key, or to `""` to send no encryption header. Use
 `""` for stores that reject the header (for example MinIO without a KMS): such a store refuses
@@ -330,22 +330,48 @@ The S3 client uses path-style addressing and signs its requests for `region`. Wi
 bucket exists and is reachable, and stops with `failed to verify S3 bucket access: ...` if it is
 not.
 
-Each S3 request has a 5-second time limit, because a TLS handshake may be waiting on it.
+Cache reads and conditional publication/deletion units have a 5-second limit, because a TLS
+handshake may be waiting on them. Administrative historical-version cleanup has a separate
+30-second limit.
+
+Active objects retain the PEM/entry payload plus a `SORA CERTIFICATE STATE` footer. The footer
+records a publication generation and fingerprints of previously published/revoked entries; it
+contains no private-key bytes. An explicit deletion conditionally replaces the same object with
+a key-free barrier. Do not delete these barriers or restore old object versions over them.
+The bucket must enforce object-specific `If-Match` and create-only `If-None-Match: *` on PUT.
+Missing/wildcard ETags or unsupported conditional writes are not retried as unconditional writes.
 
 ### The local fallback directory
 
 Each node keeps a copy of the certificates in a local directory, `fallback_dir`
 (default `/var/lib/sora/certs`, created with mode `0700`):
 
-- A certificate a node already holds in memory is served from memory. For any other, the node
-  reads the local copy first and only goes to S3 when the local copy is missing. A node that has
-  its certificates locally keeps serving them while S3 is down.
+- A certificate a node already holds in memory is served from memory. A local file with
+  generation metadata bound to its exact bytes is also read without contacting S3, so an outage
+  does not take that node's known certificates down. Deletion on another node does not instantly
+  invalidate either copy: the successful sync/cleanup and in-memory limits below still apply.
+- A raw or pre-upgrade local file has unknown provenance. Before using it, Sora must read shared
+  state successfully. An outage is an error, not permission to serve it or order a replacement.
+  A matching current shared copy establishes its generation. An unproven different copy behind
+  a deletion barrier is moved to a private quarantine rather than served or republished.
 - A certificate found in S3 is written to the local directory at once.
 - When an S3 write fails, the certificate is written locally and Sora keeps retrying the S3 write
   until it succeeds.
 - When an S3 read fails with anything other than "not found", Sora returns an error to the
   handshake instead of ordering a new certificate, so an S3 outage does not burn Let's Encrypt
   rate limits.
+
+Local publication and removal are synchronous under a per-entry Unix lease. Server writes,
+queued fallback retries, periodic sync and `sora-admin` use the same lease and compare the
+inspected bytes/generation before replacing or removing a snapshot. The `.sora-*` files contain
+provenance, stable lock inodes, temporary files and quarantine copies; they are excluded from
+serving and bulk replay. Quarantine may retain the only valid private-key copy for manual recovery;
+it has no automatic expiry and requires operator cleanup. Explicit deletion does not erase every
+private-key copy, including quarantine, backup or historical object versions.
+
+This coordination is supported on Linux/macOS; other platforms fail closed for local mutation.
+The directory is trusted to its Unix owner. UID/mode and no-follow checks do not provide a general
+same-UID hard-link provenance guarantee.
 
 If the directory cannot be created, Sora logs an error and runs from S3 alone. With
 `enable_fallback = false` it also runs from S3 alone, logging a warning. Without the local copy
@@ -359,10 +385,30 @@ The shipped systemd unit (`dist/sora.service`) makes the file system read-only a
 
 ### The sync worker
 
-Every `sync_interval` (default `5m`) a background worker compares the local copy of each name in
-`domains` (ECDSA and RSA) with the copy in S3. If S3 holds a newer certificate, it replaces the
-local copy and logs `CertSync: Updating certificate from S3`. This is how a node picks up a
-certificate that another node renewed (section 8). `sync_interval = "0"` turns the worker off.
+Every `sync_interval` (default `5m`) a background worker checks each configured name's
+ECDSA and RSA entries. A successful shared read reconciles the publication generation before
+comparing validity dates; equal-validity certificates on opposite sides of a deletion are not
+interchangeable. Within one generation, newer local outage renewals can still publish.
+
+Explicit `tls delete` changes generation atomically with the key-free barrier. In-flight and
+queued publications keep their original generation through conditional retries, so an old A
+cannot return after A → B → delete B, even after a new replacement is stored. Expiry is rechecked
+on each retry. `tls clean` instead leaves a same-generation vacancy, allowing a valid renewal
+already held by a node to publish. Cleanup removes only the inspected expired local snapshot.
+`sync_interval = "0"` turns the worker off.
+
+Before using this deletion/cleanup protocol, quiesce and upgrade **all** server, retry-worker and
+admin binaries that can write this bucket/directory. Old writers ignore the footer and leases
+and can overwrite barriers; there is no automatic mixed-version detection. Legacy timestamp
+markers alone do not prove when an unknown local copy was issued. A legacy shared payload next
+to such a marker is ambiguous and remains unavailable until an explicit deletion establishes a
+new barrier after cutover. Cleaning its expired payload alone does not resolve that ambiguity.
+
+A node with a known local generation may keep serving it during an outage until it successfully
+observes the changed fence. Restart alone does not guarantee that observation. Certificates
+already loaded in `autocert` memory can remain in use until that process is restarted; restart
+should follow successful fence synchronization/local cleanup. This is cache revocation, not CA
+revocation or an instantaneous distributed TLS revocation guarantee.
 
 ---
 
@@ -525,14 +571,19 @@ Backend-leg keys (`remote_tls`, `remote_tls_use_starttls`, `remote_tls_verify`,
 `sora-admin tls` works on the Let's Encrypt bucket from `[tls.letsencrypt.s3]` and on the local
 directory of the host you run it on (`--cache-dir`, default `fallback_dir` or
 `/var/lib/sora/certs`). It does not touch other nodes' directories or the certificates a running
-Sora holds in memory:
+Sora holds in memory. After `delete` and `clean`, every node's sync worker removes its local copy
+of a deleted certificate instead of writing it back to S3 (section 7), but a node keeps serving a
+certificate it has already loaded until it restarts or renews it. A replacement for a deleted
+certificate is ordered only by a node that may issue (the cluster leader, or each node without
+`[cluster]`) and holds no copy: restart it once its sync has run. A node that may not issue and
+restarts before the replacement is in S3 has no certificate for the name:
 
 | Command | What it does |
 |---|---|
 | `sora-admin tls list` | Lists certificates in S3, whether each is in the local directory, and with `--details` their expiry. |
 | `sora-admin tls cache` | Copies certificates from S3 into the local directory, for example on a new node. |
-| `sora-admin tls delete --domain <name>` | Deletes a name's certificates, ECDSA and RSA, from S3 and from the local directory. `--key` deletes one object from S3 by the full key that `tls list --details` shows. |
-| `sora-admin tls clean` | Deletes inspected expired versions, or uses conditional DELETE with their ETag when no version id is available. Keeps concurrent renewals; fails safely if the required condition is unsupported (see ADMIN_CLI.md). |
+| `sora-admin tls delete --domain <name>` | Replaces a name's ECDSA and RSA entries with key-free generation barriers in S3 and conditionally removes the inspected local copies. `--key` selects one full key from `tls list --details`. |
+| `sora-admin tls clean` | Conditionally replaces an inspected expired current payload with a same-generation vacancy and removes only proved-expired immutable historical versions. Keeps concurrent renewals and retained barriers; fails safely if conditional writes are unsupported (see ADMIN_CLI.md). |
 
 Flags and output are in [ADMIN_CLI.md](ADMIN_CLI.md).
 

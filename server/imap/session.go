@@ -117,7 +117,8 @@ type IMAPSession struct {
 	// SetNotify/Close write it on the command goroutine, NotifyPoll reads it
 	// on the pump goroutine (the library stops the pump before SetNotify
 	// runs, so the watch internals are only ever touched by one goroutine,
-	// except notifyWatch.own, which notifyMutex guards as well).
+	// except the snapshot and the own changes commands record on the watch,
+	// which notifyMutex guards as well).
 	notifyMutex sync.Mutex
 	notifyWatch *notifyWatch
 
