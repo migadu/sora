@@ -1463,8 +1463,8 @@ var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t
 // first name, to a file elsewhere on the same file system, one they cannot read where
 // the system lets them link it (BSD and macOS do, as Linux does with
 // fs.protected_hardlinks = 0). The import runs with privileges the owner lacks, so any
-// file not readable by every local user (owner, group, and other read bits all set:
-// 0o444) must pass checkNamedByOwner; Unix evaluates owner, group, and other classes in
+// file without read bits set in all three Unix DAC classes (0o444) must pass
+// checkNamedByOwner; Unix evaluates owner, group, and other classes in
 // first-match order, so 0o004 alone (e.g. 0604 or 0044) still denies group members or
 // the owner. A link count is no test: Dovecot copies a message between folders as a
 // hard link (maildir_copy_with_hardlinks), and cp -al backups link every file.

@@ -132,19 +132,25 @@ other link (one pointing outside the root, or any absolute link, even to a file 
 is not read: such a message file is reported as failed by its path, and such a `cur/` or `new/` is
 skipped with a warning naming it.
 
-A hard link is another name for the same file, which the root cannot tell apart, so a message or
-metadata file that others may not read is read only if the directory holding its name (`cur/`,
-`new/`, or the folder for a metadata file) belongs to the file's owner and its Unix mode grants
-neither group nor other write access. Otherwise another user who can write in that
-directory could link in another user's file from the same file system. Such a name that is a
-symbolic link is followed only to a file below its own directory. A file anyone may read is read as
-before, and so are hard links between the owner's own files, as Dovecot's
-`maildir_copy_with_hardlinks` and `cp -al` backups make. A refused message file is reported as
-failed by its path; a refused metadata file is treated like one that cannot be read. A maildir
-extracted as root into a directory root created keeps its messages, but its top-level
-`subscriptions`, `dovecot-keywords` and `dovecot-uidlist` belong to another user than that
-directory; give the directory to the files' owner first. This ownership and mode check does not
-audit filesystem ACLs or establish who selected the import root.
+A hard link is another name for the same file, which the root cannot tell apart. A message or
+metadata file whose owner, group and other read bits are not all set (`0444`) is read only if
+the directory that actually holds the resolved file belongs to the file's owner and grants
+neither group nor other write access. For a non-root file owner, the owner-read bit must also
+be set. Unix selects one permission class, so an other-read bit alone does not make a file
+readable to its owner or group members. Hard links between the owner's own files remain
+supported, as Dovecot's `maildir_copy_with_hardlinks` and `cp -al` backups make.
+
+For such a file, every symbolic link along the path is checked, up to eight links. Each target
+must stay below the directory holding that link: absolute targets and any `..` component are
+refused. The link and its directory must belong to root or to the file's owner, and the
+directory must grant neither group nor other write access. Directories traversed after a
+link have the same owner and write-mode checks; the final directory must belong to the file's
+owner. A refused message is reported as failed by its path; a refused metadata file is treated
+like one that cannot be read. A maildir extracted as root into a directory root created keeps
+its messages, but its top-level `subscriptions`, `dovecot-keywords` and `dovecot-uidlist` may
+belong to another user than that directory; give the directory to those files' owner first.
+These checks use Unix UIDs and mode bits. They do not audit filesystem ACLs, establish who
+selected the import root, or establish access through every ancestor of that root.
 
 This policy covers source message and Dovecot metadata contents and `cur/`/`new/` listings. It
 does not change how the SQLite cache or an explicitly supplied `--paths-file` file are opened;
@@ -321,14 +327,17 @@ The file is read through its directory. The usual file from Dovecot, the user's
 `~/.dovecot.sieve`, is a symbolic link the user owns, so a link is followed only when it is
 relative and its target is within that directory, as Pigeonhole's own
 `.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
-link) is refused: nothing is stored, and the summary and the log name the file. Where Pigeonhole's script
+link) is refused: no script content is stored, and the summary and the log name the file. Where Pigeonhole's script
 directory is not below the link's directory, its link is absolute; name the script it points to
 instead. A file larger than 65536 bytes, the limit of `sora-admin sieve put`, is refused the same
-way. At most 65537 bytes are read to detect a file above the limit. As a hard link cannot be told
-apart from the file, a file others may not read is read only if the directory holding its name
-(the link's, for a link) belongs to the file's owner and its Unix mode grants neither group nor
-other write access; otherwise, as for a script only its owner may read in `/tmp`, it is refused
-in the same way.
+way. At most 65537 bytes are read to detect a file above the limit. A file without all three
+Unix DAC read bits (`0444`) uses the ownership and link-walk checks in
+[section 3](#3-the-maildir-layout-sora-reads): its resolved containing directory must belong to its owner,
+not necessarily the directory holding the first link. This permits a root-owned home with
+`.dovecot.sieve -> sieve/<name>.sieve` when `sieve/` and the script belong to the user, while
+refusing a private root-owned file hard-linked into that user's `sieve/`. The same eight-link,
+no-absolute-target, no-`..`, owner and write-mode checks apply. These are coarse Unix UID/mode
+checks, not an ACL or universal path-access audit.
 
 | Situation | Result |
 |---|---|
