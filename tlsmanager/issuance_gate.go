@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/migadu/sora/logger"
@@ -34,8 +35,10 @@ var errIssuanceDeferred = errors.New("certificate issuance deferred to the clust
 // be declined: autocert reads the cache for a certificate it does not hold in memory,
 // and orders one the moment that read reports the certificate absent.
 type issuanceGate struct {
-	underlying autocert.Cache
-	manager    *Manager
+	underlying    autocert.Cache
+	manager       *Manager
+	publicationMu sync.Mutex
+	publications  map[publicationExchange]publicationGeneration
 }
 
 func newIssuanceGate(cache autocert.Cache, m *Manager) *issuanceGate {
@@ -48,6 +51,7 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 		return data, err
 	}
 
+	g.capturePublication(ctx, name)
 	domain, isCertificate := certificateDomain(name)
 	if !isCertificate {
 		return nil, err
@@ -61,6 +65,7 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 }
 
 func (g *issuanceGate) Put(ctx context.Context, name string, data []byte) error {
+	ctx = g.publicationContext(ctx, name)
 	err := g.underlying.Put(ctx, name, data)
 	// The order is finished either way - a failed Put does not mean it is still running -
 	// so give back this variant's share of the cluster-wide claim regardless. ctx is the
@@ -211,6 +216,12 @@ func (f *issuanceFence) RoundTrip(req *http.Request) (*http.Response, error) {
 		}
 		claimed = append(claimed, ref)
 	}
+	if gate := findIssuanceGate(f.manager); gate != nil {
+		for _, domain := range domains {
+			gate.capturePublication(req.Context(), domain)
+			gate.capturePublication(req.Context(), domain+"+rsa")
+		}
+	}
 	resp, err := f.base.RoundTrip(req)
 	if err != nil || (resp != nil && resp.StatusCode >= 400) {
 		for _, d := range claimed {
@@ -262,4 +273,93 @@ func orderedDomains(req *http.Request) ([]string, error) {
 		}
 	}
 	return domains, nil
+}
+
+// The exchange's existing deadline identifies both admission and its final Put.
+// Production autocert handshakes/renewals retain that deadline throughout. A
+// recorded unknown generation stays unknown; Put must not refresh it after a delete.
+type publicationExchange struct {
+	name  string
+	until time.Time
+}
+
+func (g *issuanceGate) capturePublication(ctx context.Context, name string) {
+	until, ok := ctx.Deadline()
+	if !ok {
+		return
+	}
+	key := publicationExchange{name, until}
+	g.publicationMu.Lock()
+	if g.publications == nil {
+		g.publications = make(map[publicationExchange]publicationGeneration)
+	}
+	now := time.Now()
+	for key := range g.publications {
+		if !now.Before(key.until) {
+			delete(g.publications, key)
+		}
+	}
+	_, present := g.publications[key]
+	g.publicationMu.Unlock()
+	if present {
+		return
+	}
+	var generation publicationGeneration
+	if fc := extractFallbackCache(g.underlying); fc != nil {
+		generation, _ = fc.publicationSnapshot(ctx, name)
+	} else {
+		cache := g.underlying
+		for {
+			if p, ok := cache.(interface {
+				getSnapshot(context.Context, string) ([]byte, publicationGeneration, error)
+			}); ok {
+				_, generation, _ = p.getSnapshot(ctx, name)
+				break
+			}
+			if w, ok := cache.(cacheWrapper); ok {
+				cache = w.unwrap()
+			} else {
+				break
+			}
+		}
+	}
+	g.publicationMu.Lock()
+	if _, present := g.publications[key]; !present {
+		g.publications[key] = generation
+	}
+	g.publicationMu.Unlock()
+}
+func (g *issuanceGate) publicationContext(ctx context.Context, name string) context.Context {
+	if _, isCertificate := certificateDomain(name); !isCertificate {
+		g.capturePublication(ctx, name)
+	}
+	until, ok := ctx.Deadline()
+	if !ok {
+		return ctx
+	}
+	key := publicationExchange{name, until}
+	g.publicationMu.Lock()
+	generation, present := g.publications[key]
+	delete(g.publications, key)
+	g.publicationMu.Unlock()
+	if !present {
+		generation = publicationGeneration{}
+	}
+	return generationContext(ctx, generation)
+}
+func findIssuanceGate(m *Manager) *issuanceGate {
+	if m == nil || m.autocertMgr == nil {
+		return nil
+	}
+	cache := m.autocertMgr.Cache
+	for {
+		if gate, ok := cache.(*issuanceGate); ok {
+			return gate
+		}
+		if w, ok := cache.(cacheWrapper); ok {
+			cache = w.unwrap()
+		} else {
+			return nil
+		}
+	}
 }

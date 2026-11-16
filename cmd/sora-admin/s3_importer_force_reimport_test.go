@@ -43,6 +43,7 @@ func TestS3Importer_ForceReimportDryRunMatchesImport(t *testing.T) {
 	put := func(name string) object {
 		body := []byte("From: sender@example.org\r\n" +
 			"To: " + email + "\r\n" +
+			"Cc:\r\n" +
 			"Subject: " + name + "\r\n" +
 			"Date: Mon, 02 Nov 2026 10:00:00 +0000\r\n" +
 			"Message-ID: <force-" + name + "@example.org>\r\n" +
@@ -79,6 +80,10 @@ func TestS3Importer_ForceReimportDryRunMatchesImport(t *testing.T) {
 	first := newImporter(t, S3ImporterOptions{}, inInbox)
 	require.NoError(t, first.importFromS3())
 	require.EqualValues(t, 1, first.importedMessages)
+	var presence int16
+	require.NoError(t, rdb.GetOperationalDatabase().GetWritePool().QueryRow(ctx, "SELECT header_presence FROM messages WHERE account_id=$1 AND content_hash=$2", accountID, inInbox.hash).Scan(&presence))
+	bit, _ := helpers.HeaderPresenceBit("cc")
+	require.NotZero(t, presence&bit, "S3 import must capture present-empty Cc from newly ingested raw bytes")
 
 	// inArchive is in the account, filed in Archive (as by a Sieve fileinto).
 	_, _, err = rdb.InsertMessageWithRetry(ctx, &db.InsertMessageOptions{

@@ -374,6 +374,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			References:           references,
 			BodyStructure:        bodyStructure,
 			Recipients:           recipients,
+			HeaderPresence:       helpers.ExtractHeaderPresence(messageEntity.Header),
 			Flags:                deliveryFlags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
 			FTSRetention:         d.FTSRetention,
 			PreservedUID:         recipient.PreservedUID,
@@ -673,6 +674,7 @@ func (d *DeliveryContext) saveMessageToResolvedMailbox(ctx context.Context, reci
 			References:          references,
 			BodyStructure:       bodyStructure,
 			Recipients:          recipients,
+			HeaderPresence:      helpers.ExtractHeaderPresence(messageEntity.Header),
 			Flags:               flags,
 			FTSRetention:        d.FTSRetention,
 		},
