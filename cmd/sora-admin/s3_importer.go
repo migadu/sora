@@ -595,7 +595,7 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	mailHeader := mail.Header{Header: messageContent.Header}
 	subject, _ := mailHeader.Subject()
 	messageID, _ := mailHeader.MessageID()
-	sentDate, _ := helpers.ParseDateHeader(mailHeader.Get("Date"))
+	sentDate, sentDateUnknownZone, _ := helpers.ParseDateHeaderWithZone(mailHeader.Get("Date"))
 	inReplyTo, _ := mailHeader.MsgIDList("In-Reply-To")
 	references, _ := mailHeader.MsgIDList("References")
 
@@ -654,23 +654,24 @@ func (si *S3Importer) importS3Object(obj S3ObjectInfo) error {
 	// Insert message into database
 	msgID, uid, err := si.rdb.InsertMessageWithRetry(writeCtx,
 		&db.InsertMessageOptions{
-			AccountID:     user.AccountID(),
-			MailboxID:     mailbox.ID,
-			S3Domain:      user.Domain(),
-			S3Localpart:   user.LocalPart(),
-			MailboxName:   mailbox.Name,
-			ContentHash:   contentHash,
-			MessageID:     messageID,
-			InternalDate:  internalDate,
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: actualPlaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			References:    references,
-			BodyStructure: &bodyStructure,
-			Recipients:    recipients,
-			FTSRetention:  si.options.FTSRetention,
+			AccountID:           user.AccountID(),
+			MailboxID:           mailbox.ID,
+			S3Domain:            user.Domain(),
+			S3Localpart:         user.LocalPart(),
+			MailboxName:         mailbox.Name,
+			ContentHash:         contentHash,
+			MessageID:           messageID,
+			InternalDate:        internalDate,
+			Size:                size,
+			Subject:             subject,
+			PlaintextBody:       actualPlaintextBody,
+			SentDate:            sentDate,
+			SentDateUnknownZone: sentDateUnknownZone,
+			InReplyTo:           inReplyTo,
+			References:          references,
+			BodyStructure:       &bodyStructure,
+			Recipients:          recipients,
+			FTSRetention:        si.options.FTSRetention,
 		},
 		db.PendingUpload{
 			InstanceID:  si.options.InstanceID,
