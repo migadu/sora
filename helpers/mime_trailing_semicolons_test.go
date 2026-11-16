@@ -131,3 +131,38 @@ func TestExtractPlaintextBody_InvalidParametersKeepText(t *testing.T) {
 		})
 	}
 }
+
+// A text part whose parameters do not parse is read without its charset, so
+// it is only the text of last resort: a multipart/alternative whose text/plain
+// part is malformed is indexed from its well-formed text/html alternative, as
+// it is when the malformed part is skipped. Without a well-formed text part,
+// the malformed one is still indexed.
+func TestExtractPlaintextBody_InvalidParametersWellFormedAlternativeWins(t *testing.T) {
+	for _, tc := range []struct{ name, plainType, htmlType, want string }{
+		{"well-formed html alternative", "text/plain; charset=iso-8859-1; format", "text/html; charset=utf-8", "café words"},
+		{"no well-formed alternative", "text/plain; charset=utf-8; format", "text/html; charset=utf-8; format", "plain words"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := "From: a@example.com\r\nSubject: probe\r\nMIME-Version: 1.0\r\n" +
+				"Content-Type: multipart/alternative; boundary=b1\r\n" +
+				"\r\n" +
+				"--b1\r\n" +
+				"Content-Type: " + tc.plainType + "\r\n" +
+				"\r\n" +
+				strings.Replace(tc.want, "café", "caf\xe9", 1) + "\r\n" + // ISO-8859-1 octets
+				"--b1\r\n" +
+				"Content-Type: " + tc.htmlType + "\r\n" +
+				"\r\n" +
+				"<p>café words</p>\r\n" +
+				"--b1--\r\n"
+			entity, err := message.Read(strings.NewReader(raw))
+			if err != nil {
+				t.Fatalf("message.Read: %v", err)
+			}
+			text, err := ExtractPlaintextBody(entity)
+			if err != nil || text == nil || strings.TrimSpace(*text) != tc.want {
+				t.Errorf("ExtractPlaintextBody = %q (err %v), want %q", deref(text), err, tc.want)
+			}
+		})
+	}
+}
