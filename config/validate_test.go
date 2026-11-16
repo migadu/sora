@@ -123,10 +123,11 @@ func TestConfigValidate(t *testing.T) {
 			want: []problem{{"[auth_cache]", `cleanup_interval must be positive, got "-1h"`}}},
 		{name: "auth_cache disabled is not checked", content: "[auth_cache]\ncleanup_interval = \"0s\"\n" + imapProxy},
 		{name: "cluster.affinity cleanup_interval", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"30m\"\n" + imapBackend},
-		{name: "cluster.affinity cleanup_interval 0s", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"0s\"\n" + imapBackend,
-			want: []problem{{"[cluster.affinity]", `cleanup_interval must be positive, got "0s"`}}},
+		// The affinity manager runs its ticker at the 1h default for 0, so a file with 0
+		// starts and is not refused; a negative value reaches time.NewTicker.
+		{name: "cluster.affinity cleanup_interval 0s", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"0s\"\n" + imapBackend},
 		{name: "cluster.affinity cleanup_interval -1h", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\ncleanup_interval = \"-1h\"\n" + imapBackend,
-			want: []problem{{"[cluster.affinity]", `cleanup_interval must be positive, got "-1h"`}}},
+			want: []problem{{"[cluster.affinity]", `cleanup_interval must not be negative, got "-1h"`}}},
 		{name: "cluster.affinity disabled is not checked", content: cluster + "addr = \"10.10.10.40:7946\"\nsecret_key = \"" + validClusterKey + "\"\n\n[cluster.affinity]\nenabled = false\ncleanup_interval = \"-1h\"\n" + imapBackend},
 		{name: "cluster.affinity without cluster is not checked", content: "[cluster.affinity]\ncleanup_interval = \"-1h\"\n" + imapBackend},
 		{name: "every problem, in order", content: "[servers]\ntrusted_networks = []\n\n[relay]\ntype = \"SMTP\"\n\n[uploader]\nbatch_size = 0\n" +

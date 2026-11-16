@@ -384,10 +384,15 @@ func (c *ClusterAffinityConfig) GetCleanupInterval() (time.Duration, error) {
 	return helpers.ParseDuration(c.CleanupInterval)
 }
 
-// Validate refuses a cleanup_interval of zero or less: it is the period of the affinity
-// manager's cleanup ticker (see positiveInterval).
+// Validate refuses a negative cleanup_interval: it is the period of the affinity
+// manager's cleanup ticker, and time.NewTicker panics on it (see positiveInterval).
+// 0 is not refused: NewAffinityManagerWithStore runs the ticker at its 1h default
+// then, as it always has, so a file with 0 keeps starting.
 func (c *ClusterAffinityConfig) Validate() error {
-	return positiveInterval("cleanup_interval", c.CleanupInterval)
+	if d, err := helpers.ParseDuration(c.CleanupInterval); err == nil && d < 0 {
+		return fmt.Errorf("cleanup_interval must not be negative, got %q", c.CleanupInterval)
+	}
+	return nil
 }
 
 // positiveInterval refuses a ticker period that parses to zero or less. time.NewTicker
