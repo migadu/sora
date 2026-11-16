@@ -12,7 +12,8 @@ import (
 // --- Cleanup Worker Wrappers ---
 
 // ExecuteWithLockedS3Orphans holds the per-object advisory locks for objects and runs
-// fn with the subset that is still orphaned. Deliberately not wrapped in a retry: fn
+// fn with the subset that is still orphaned, or whose rows alone may go (see
+// db.Database.ExecuteWithLockedS3Orphans). Deliberately not wrapped in a retry: fn
 // performs the S3 deletion, which a database-level retry would replay.
 func (rd *ResilientDatabase) ExecuteWithLockedS3Orphans(ctx context.Context, objects []db.UserScopedObjectForCleanup, gracePeriod time.Duration, fn func(ctx context.Context, orphans []db.UserScopedObjectForCleanup) error) error {
 	return rd.getOperationalDatabaseForOperation(ctx, true).ExecuteWithLockedS3Orphans(ctx, objects, gracePeriod, fn)
@@ -116,4 +117,18 @@ func (rd *ResilientDatabase) ExpungeMessagesByIDsWithRetry(ctx context.Context, 
 		return 0, err
 	}
 	return result.(int64), nil
+}
+
+// ExecuteWithS3BodyCleanup is not retried: its callback can have sent storage
+// requests whose outcome is unknown. Durable intents retain that uncertainty.
+func (rd *ResilientDatabase) ExecuteWithS3BodyCleanup(ctx context.Context, objects []db.UserScopedObjectForCleanup, grace time.Duration, fn func(context.Context, []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error)) (int64, error) {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ExecuteWithS3BodyCleanup(ctx, objects, grace, fn)
+}
+
+// Reconciliation must not replay storage work automatically after an unknown result.
+func (rd *ResilientDatabase) ReconcileS3BodyDeleteIntent(ctx context.Context, hash, operationID string, drained bool, fn func(context.Context, db.S3BodyDeleteIntent, map[string]bool) error) error {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ReconcileS3BodyDeleteIntent(ctx, hash, operationID, drained, fn)
+}
+func (rd *ResilientDatabase) ListS3BodyDeleteIntents(ctx context.Context) ([]db.S3BodyDeleteIntent, error) {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ListS3BodyDeleteIntents(ctx)
 }

@@ -46,6 +46,9 @@ func (rd *ResilientDatabase) ExecuteWithS3ObjectLock(ctx context.Context, conten
 	if err := lock.Lock(lockCtx, db.GetS3ObjectLockID(accountID, contentHash)); err != nil {
 		return err // Could not acquire lock or context was canceled
 	}
+	if err := lock.CheckS3BodyClaims(lockCtx, []string{contentHash}); err != nil {
+		return err
+	}
 
 	guarded, done := lock.Guard(ctx)
 	defer done()

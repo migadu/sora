@@ -1002,3 +1002,47 @@ resume old deleters alongside new claimers or resume deletion while old work or
 write capabilities can still arrive. This runbook does not establish storage fencing
 across independent PostgreSQL writers after failover; the deployment must retain its
 existing single-writer/fencing guarantees.
+
+### An uncertain body DELETE stays quarantined
+
+The upgraded cleanup path commits a durable deletion intent (migration 72) before
+sending a message-body DELETE. The intent names the content hash, physical keys,
+and an operation UUID. If its PostgreSQL lock holder dies, a storage request times
+out, or the result/retirement commit is uncertain, the intent remains. New upload
+gates, uploaded-state finalization, COPY/MOVE object admission, restore and the
+exclusive object gate refuse that hash. Other deliveries can still stage it for a
+later upload. Neither an old timestamp, an upload lease expiring, nor a restart
+clears this fence. Cleanup retains its candidate rows when retirement cannot commit
+on the connection that held the reference lock.
+
+Inspect these records without changing anything:
+
+```sh
+sora-admin verify body-deletions
+```
+
+An operator must establish that the earlier storage operations cannot still arrive
+before reconciling one record. Stop/drain or revoke the relevant operations and
+capabilities at the provider as required; a canceled HTTP client or a dead database
+session is not that proof. Then use the exact hash and operation UUID from the
+listing, with the deletion protocol enabled:
+
+```sh
+sora-admin verify body-deletions --reconcile --content-hash HASH --operation-id UUID --storage-drained
+```
+
+Under the global hash lock this command checks current references. Bodies needed by
+references outside the original eligible expunge lifecycle must be present and pass
+their content-hash check; restore missing or corrupt bytes from a trusted copy first.
+Orphan-only keys are deleted before the exact intent is cleared. Missing/corrupt
+protected bytes, a changed UUID, a failed storage request, or a failed commit keeps
+the fence. `--storage-drained` is an explicit manual acknowledgment, not automatic
+detection of outstanding provider operations. Do not erase intent rows or downgrade
+migration 72 while they remain; its down migration refuses unresolved records.
+
+A stalled PUT that loses its pending-upload lease cannot finalize a retired row.
+If the provider accepts that PUT after cleanup has finished, it can leave an orphan
+object for later verification; the protocol does not promise to retract remote PUTs
+or external write capabilities. Retain the single-writer database and operational
+drain requirements above. The complete verify/rekey commit-fencing cohort must be
+deployed before enabling destructive cleanup.
