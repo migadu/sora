@@ -18,6 +18,9 @@ import (
 // location as time.Local. Both the SQL envelope and the gob-encoded attached
 // envelope must retain their own explicit zone status, including after COPY/MOVE.
 func TestIMAP_ExplicitEnvelopeZonesSurvivePersistenceLocalUTC(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
 	common.SkipIfDatabaseUnavailable(t)
 	const childEnv = "SORA_TEST_EXPLICIT_ENVELOPE_ZONE_LOCAL_UTC"
 	if os.Getenv(childEnv) != "1" {

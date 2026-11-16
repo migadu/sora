@@ -112,3 +112,12 @@ func TestSafeBodyStructureAttachedMessageUnknownZone(t *testing.T) {
 		}
 	}
 }
+
+// A known fixed-zero location can decode as time.UTC when Local aliases UTC;
+// the explicit envelope hint must still keep known and unknown zones apart.
+func TestSafeBodyStructureAttachedMessageUnknownZoneLocalUTC(t *testing.T) {
+	saved := time.Local
+	time.Local = time.UTC
+	defer func() { time.Local = saved }()
+	TestSafeBodyStructureAttachedMessageUnknownZone(t)
+}
