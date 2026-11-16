@@ -1551,6 +1551,34 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		}
 	}
 
+	// A depth-changing rename can make a child's new name equal another moving
+	// row's old name. The unique name index is immediate, so a bulk UPDATE may
+	// fail depending on heap order. Capture stable IDs before changing any names:
+	// shortening moves ancestors first, lengthening moves descendants first.
+	// Include deleted descendants just as childUpdate does; the live descendants
+	// have already been stabilized and locked above.
+	childBatches := [][]int64{nil}
+	if hasChildren && oldLevels != mailboxNameLevels(newName, delimiter) {
+		order := "ASC"
+		if oldLevels < mailboxNameLevels(newName, delimiter) {
+			order = "DESC"
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT array_agg(id ORDER BY id)
+			FROM mailboxes
+			WHERE account_id = $1 AND path LIKE $2 || '%' AND path != $2
+			GROUP BY cardinality(string_to_array(name, $3))
+			ORDER BY cardinality(string_to_array(name, $3)) `+order,
+			ownerAccountID, oldPath, delimiter)
+		if err != nil {
+			return fmt.Errorf("failed to group child mailboxes for rename: %w", err)
+		}
+		childBatches, err = pgx.CollectRows(rows, pgx.RowTo[[]int64])
+		if err != nil {
+			return fmt.Errorf("failed to collect child mailboxes for rename: %w", err)
+		}
+	}
+
 	// Update the target mailbox itself.
 	_, err = tx.Exec(ctx, `
 		UPDATE mailboxes
@@ -1578,31 +1606,38 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			WHERE
 				account_id = $5 AND
 				path LIKE $4 || '%' AND path != $4`
-		args := []any{newName, oldLevels, newPath, oldPath, ownerAccountID, delimiter}
+		for _, childIDs := range childBatches {
+			query := childUpdate
+			args := []any{newName, oldLevels, newPath, oldPath, ownerAccountID, delimiter}
+			if childIDs != nil {
+				query += " AND id = ANY($7::bigint[])"
+				args = append(args, childIDs)
+			}
 
-		if sharedCfg == nil {
-			_, err = tx.Exec(ctx, childUpdate, args...)
-		} else {
-			// The descendants cross the boundary with the rename (issue #1229). The live
-			// rows this UPDATE renames are classified under the names it gives them, in
-			// the same statement: a mailbox created in or moved into the subtree while
-			// the rename runs is either renamed here, and checked, or keeps its name. A
-			// check that read the subtree in an earlier statement would miss one whose
-			// insert commits between the two.
-			var rows pgx.Rows
-			rows, err = tx.Query(ctx, `WITH renamed AS (`+childUpdate+`
-				RETURNING name, is_shared, deleted_at
-			)
-			SELECT name, COALESCE(is_shared, FALSE) FROM renamed WHERE deleted_at IS NULL`, args...)
-			if err == nil {
-				var crosses bool
-				if crosses, err = crossSharedBoundary(rows, sharedCfg); err == nil && crosses {
-					return consts.ErrMailboxSharedBoundary
+			if sharedCfg == nil {
+				_, err = tx.Exec(ctx, query, args...)
+			} else {
+				// The descendants cross the boundary with the rename (issue #1229). The live
+				// rows this UPDATE renames are classified under the names it gives them, in
+				// the same statement: a mailbox created in or moved into the subtree while
+				// the rename runs is either renamed here, and checked, or keeps its name. A
+				// check that read the subtree in an earlier statement would miss one whose
+				// insert commits between the two.
+				var rows pgx.Rows
+				rows, err = tx.Query(ctx, `WITH renamed AS (`+query+`
+					RETURNING name, is_shared, deleted_at
+				)
+				SELECT name, COALESCE(is_shared, FALSE) FROM renamed WHERE deleted_at IS NULL`, args...)
+				if err == nil {
+					var crosses bool
+					if crosses, err = crossSharedBoundary(rows, sharedCfg); err == nil && crosses {
+						return consts.ErrMailboxSharedBoundary
+					}
 				}
 			}
-		}
-		if err != nil {
-			return fmt.Errorf("failed to update child mailboxes: %w", err)
+			if err != nil {
+				return fmt.Errorf("failed to update child mailboxes: %w", err)
+			}
 		}
 
 	}
