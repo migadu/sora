@@ -793,11 +793,13 @@ the pin in the same Sora pull request as the code that needs it.
 
 Use closing keywords (`Fixes #N`, `Closes`, `Resolves` and their other forms) only for the Sora
 issues the pull request resolves. GitHub reads them in the description and in the commit messages
-when the pull request merges. It closes what they name in other repositories too, and closes a
-pull request it names whether or not that one was merged. Refer to a fork pull request without a
-keyword, for example `Depends on migadu/go-imap#227`. The `Closing references` check fails a pull
-request that puts a keyword in front of another repository's issue or pull request. To run it on a
-description before you open the pull request:
+when the pull request merges, and in the title, which becomes the merge commit's message. It closes
+what they name in other repositories too, and closes a pull request it names without merging it.
+Refer to a fork pull request without a keyword, for example `Depends on migadu/go-imap#227`. The
+`Closing references` check fails a pull request whose title, description or commit messages put a
+keyword in front of another repository's issue or pull request. It cannot tell a Sora pull
+request's `#N` from an issue's, so do not put a keyword in front of a Sora pull request either. To
+run it on a description before you open the pull request:
 
 ```sh
 go run ./scripts/check-closing-refs < body.md

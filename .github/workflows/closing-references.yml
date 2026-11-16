@@ -1,9 +1,10 @@
 name: Closing references
 
 # GitHub closes what a closing keyword names when the pull request or commit carrying it
-# merges, in other repositories too, merged or not (#1646). Fail a pull request whose
-# description or commit messages put one in front of anything but this repository's
-# issues. See scripts/check-closing-refs.
+# merges, in other repositories too, and closes a pull request so named without merging it
+# (#1646). Fail a pull request whose title, description or commit messages put one in front
+# of anything but this repository's issues. The title counts because it becomes the merge
+# commit's message, or the squash commit's subject. See scripts/check-closing-refs.
 
 on:
   pull_request:
@@ -22,14 +23,15 @@ jobs:
         with:
           go-version-file: go.mod
           cache: false
-      - name: Check the description and commit messages
+      - name: Check the title, description and commit messages
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
           PR_BODY: ${{ github.event.pull_request.body }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           {
-            printf '%s\n\n' "$PR_BODY"
+            printf '%s\n\n%s\n\n' "$PR_TITLE" "$PR_BODY"
             gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits" --jq '.[].commit.message + "\n"'
           } | go run ./scripts/check-closing-refs

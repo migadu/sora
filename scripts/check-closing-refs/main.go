@@ -2,15 +2,16 @@
 // closing keyword in front of a reference to another repository, or to a pull request.
 //
 // GitHub acts on close, fix and resolve (and their -s and -d forms, in any case, with or
-// without a colon) in a pull request's description and in its commit messages when they
-// merge into the default branch. It closes what the keyword names, in other repositories
-// too, and "Merging the referencing pull request also closes the referenced pull
-// request". Sora descriptions that wrote the keyword in front of go-imap pull requests
-// closed them unmerged (#1646). A Sora pull request closes Sora issues only; it refers to
-// anything else without a keyword, for example "Depends on migadu/go-imap#227".
+// without a colon) in a pull request's description and in the commit messages that merge
+// into the default branch, which include the merge commit's message (the pull request's
+// title) or a squash commit's subject. It closes what the keyword names, in other
+// repositories too, and "Merging the referencing pull request also closes the referenced
+// pull request". Sora descriptions that wrote the keyword in front of go-imap pull
+// requests closed them unmerged (#1646). A Sora pull request closes Sora issues only; it
+// refers to anything else without a keyword, for example "Depends on migadu/go-imap#227".
 //
-// The closing-references workflow pipes a pull request's description and commit messages
-// through it. To check a description before opening the pull request:
+// The closing-references workflow pipes a pull request's title, description and commit
+// messages through it. To check a description before opening the pull request:
 //
 //	go run ./scripts/check-closing-refs < body.md
 package main
@@ -56,7 +57,7 @@ func run(in io.Reader, out io.Writer, repo string) int {
 	}
 	found := closingRefs(string(text), repo)
 	for _, ref := range found {
-		fmt.Fprintf(out, "%q closes what it names when this pull request merges, merged or not.\n", ref)
+		fmt.Fprintf(out, "%q closes what it names when this pull request merges, and a pull request it names is closed unmerged.\n", ref)
 	}
 	if len(found) > 0 {
 		fmt.Fprintf(out, "Use closing keywords only for %s issues. Refer to other pull requests and repositories without one, for example \"Depends on migadu/go-imap#227\".\n", repo)
