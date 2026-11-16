@@ -284,7 +284,7 @@ func (s *Session) handleConnection() {
 			// No DSN, as on the backend: neither issues a "delivered" DSN (RFC 3461
 			// §5.2.3), so the MTA keeps the duties of §5.2.2 (a "relayed" DSN for
 			// NOTIFY=SUCCESS). DSN parameters sent anyway get 555, as on the backend
-			// (mailParameterReply, rcptParameterReply).
+			// (mailParameters, rcptParameterReply).
 			lhlo.WriteString("250 SMTPUTF8\r\n")
 			if _, err := s.writeClientReply(lhlo.String(), false); err != nil {
 				return
@@ -321,20 +321,14 @@ func (s *Session) handleConnection() {
 				s.sendResponse("501 5.5.2 Was expecting MAIL arg syntax of FROM:<address>")
 				continue
 			}
-			// A parameter the proxy does not implement gets 555, as on the backend, and
-			// starts no transaction.
-			if param, reply := mailParameterReply(params); reply != "" {
-				s.InfoLog("MAIL refused for a parameter", "parameter", param, "response", reply)
-				s.sendResponse(reply)
-				continue
-			}
-			// The limit advertised in LHLO is the proxy's own, checked here before the MTA
+			// A parameter the proxy does not implement gets 555, as on the backend. The
+			// limit advertised in LHLO is the proxy's own, checked here before the MTA
 			// sends the body (RFC 1870 section 6.1): no recipient is routed yet, so no
 			// backend is the transaction's. A refused MAIL starts no transaction and
 			// leaves the current one alone.
-			declaredSize, reply := mailSizeParameter(params, s.settings.maxMessageSize)
+			declaredSize, param, reply := mailParameters(params, s.settings.maxMessageSize)
 			if reply != "" {
-				s.InfoLog("MAIL refused for its SIZE parameter", "limit", s.settings.maxMessageSize, "response", reply)
+				s.InfoLog("MAIL refused for a parameter", "parameter", param, "limit", s.settings.maxMessageSize, "response", reply)
 				s.sendResponse(reply)
 				continue
 			}
@@ -943,50 +937,71 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 	return address, keptParams, true
 }
 
-// mailParameterReply returns the first MAIL parameter the proxy refuses and the reply
-// refusing the command ("" for none). It takes the parameters of the extensions its LHLO
-// reply advertises: SIZE (RFC 1870, checked by mailSizeParameter); SMTPUTF8 (RFC 6531),
-// which "does not accept a value" (section 3.4); and BODY (RFC 6152), whose value is
-// "body-value = "7BIT" / "8BITMIME"" (section 2), of which "Only one BODY parameter may
-// be used in a single MAIL command" (section 3). A value it does not take is a syntax
-// error (501), but BODY=BINARYMIME belongs to an extension that is not advertised (RFC
-// 3030). That one and every other parameter, the DSN ones (RFC 3461) among them, get 555
-// 5.5.4, as on the backend. RFC 5321 section 4.1.1.11: "If the server SMTP does not
-// recognize or cannot implement one or more of the parameters associated with a
-// particular MAIL FROM or RCPT TO command, it will return code 555." A parameter with
-// "=" and no value is refused with 501 before any of that (emptyParameterValue).
-func mailParameterReply(params []string) (param, reply string) {
+// mailParameters checks the MAIL parameters in the order given and returns the size the
+// SIZE parameter declares, as given ("" for none), or the first parameter refused and
+// the reply refusing the command (reply "" for none). The first parameter refused
+// decides the reply, as on the backend, so a command with more than one wrong gets the
+// same reply every time: RFC 5321 gives 555 for a parameter the server "does not
+// recognize or cannot implement" (section 4.1.1.11) and 501 for a "Syntax error in
+// parameters or arguments" (section 4.2.2), and ranks neither above the other.
+//
+// It takes the parameters of the extensions its LHLO reply advertises. SIZE (RFC 1870):
+// 501 for a value that is not "size-value ::= 1*20DIGIT" (section 3 (4)) and for a
+// second SIZE ("Only one SIZE parameter may be specified in a single MAIL command",
+// section 6), 552 for a size above limit, the size advertised in LHLO (section 6.1 (2));
+// without a limit (limit <= 0) no SIZE is advertised and no declared size is refused as
+// too large, though syntax and uniqueness still apply. SMTPUTF8 (RFC 6531), which "does
+// not accept a value" (section 3.4). BODY (RFC 6152), whose value is "body-value =
+// "7BIT" / "8BITMIME"" (section 2), of which "Only one BODY parameter may be used in a
+// single MAIL command" (section 3). A value it does not take is a syntax error (501),
+// but BODY=BINARYMIME belongs to an extension that is not advertised (RFC 3030). That
+// one and every other parameter, the DSN ones (RFC 3461) among them, get 555 5.5.4, as
+// on the backend. RFC 5321 section 4.1.1.11: "If the server SMTP does not recognize or
+// cannot implement one or more of the parameters associated with a particular MAIL FROM
+// or RCPT TO command, it will return code 555." A parameter with "=" and no value is
+// refused with 501 before any of that (emptyParameterValue).
+func mailParameters(params []string, limit int64) (size, param, reply string) {
 	const unsupported = "555 5.5.4 MAIL FROM parameter not recognized or not implemented"
 	if p := emptyParameterValue(params); p != "" {
-		return p, "501 5.5.4 Syntax error in MAIL FROM parameters"
+		return "", p, "501 5.5.4 Syntax error in MAIL FROM parameters"
 	}
 	body, smtputf8 := false, false
 	for _, p := range params {
 		keyword, value, hasValue := strings.Cut(p, "=")
 		switch server.ToUpperASCII(keyword) {
 		case "SIZE":
+			if size != "" || len(value) == 0 || len(value) > 20 || strings.Trim(value, "0123456789") != "" {
+				return "", p, "501 5.5.4 Syntax error in SIZE parameter"
+			}
+			if limit > 0 {
+				// Twenty digits can exceed an int64: the only error left is the range.
+				if n, err := strconv.ParseInt(value, 10, 64); err != nil || n > limit {
+					return "", p, "552 5.3.4 Message size exceeds fixed maximum message size"
+				}
+			}
+			size = value
 		case "SMTPUTF8":
 			if hasValue || smtputf8 {
-				return p, "501 5.5.4 Syntax error in SMTPUTF8 parameter"
+				return "", p, "501 5.5.4 Syntax error in SMTPUTF8 parameter"
 			}
 			smtputf8 = true
 		case "BODY":
 			switch server.ToUpperASCII(value) {
 			case "7BIT", "8BITMIME":
 				if body {
-					return p, "501 5.5.4 Syntax error in BODY parameter"
+					return "", p, "501 5.5.4 Syntax error in BODY parameter"
 				}
 				body = true
 			case "BINARYMIME":
-				return p, unsupported
+				return "", p, unsupported
 			default:
-				return p, "501 5.5.4 Syntax error in BODY parameter"
+				return "", p, "501 5.5.4 Syntax error in BODY parameter"
 			}
 		default:
-			return p, unsupported
+			return "", p, unsupported
 		}
 	}
-	return "", ""
+	return size, "", ""
 }
 
 // rcptParameterReply returns the first RCPT parameter the proxy refuses and the reply
@@ -2111,36 +2126,6 @@ func hasSMTPUTF8Param(args []string) bool {
 	return false
 }
 
-// mailSizeParameter reads the SIZE parameter of MAIL (RFC 1870 section 6) and checks it
-// against limit, the size advertised in LHLO. It returns the declared size as given
-// ("" for none) and the reply refusing the command ("" for none): 501 for a value that
-// is not "size-value ::= 1*20DIGIT" (section 3 (4)) and for a second SIZE ("Only one
-// SIZE parameter may be specified in a single MAIL command", section 6), 552 for a size
-// above the limit (section 6.1 (2)). Without a limit (limit <= 0) no SIZE is advertised
-// and no declared size is refused as too large, though syntax and uniqueness still apply.
-func mailSizeParameter(args []string, limit int64) (size, reply string) {
-	for _, arg := range args {
-		key, value, _ := strings.Cut(arg, "=")
-		if !server.EqualFoldASCII(key, "SIZE") {
-			continue
-		}
-		if size != "" || len(value) == 0 || len(value) > 20 || strings.Trim(value, "0123456789") != "" {
-			return "", "501 5.5.4 Syntax error in SIZE parameter"
-		}
-		size = value
-	}
-	if size == "" {
-		return "", ""
-	}
-	if limit > 0 {
-		// Twenty digits can exceed an int64: the only error left is the range.
-		if n, err := strconv.ParseInt(size, 10, 64); err != nil || n > limit {
-			return "", "552 5.3.4 Message size exceeds fixed maximum message size"
-		}
-	}
-	return size, ""
-}
-
 // errBackendRefusedSize is the backend's 552 to the MAIL sent when connecting: its fixed
 // maximum is below the declared size (RFC 1870 section 6.1 (2)).
 var errBackendRefusedSize = errors.New("backend refused the declared message size")
@@ -2173,7 +2158,7 @@ func isSIZECapability(line string) bool {
 
 // backendMailFrom is the MAIL command sent to the backend for the current transaction.
 // The MTA's BODY parameter is not forwarded; the MAIL handler refuses every parameter
-// other than SIZE, SMTPUTF8 and BODY (mailParameterReply).
+// other than SIZE, SMTPUTF8 and BODY (mailParameters).
 // The SMTPUTF8 parameter goes with it only when the backend advertised the extension
 // (RFC 6531 §3.2): a backend without it gets the plain command and, if the envelope is
 // in fact non-ASCII, decides for itself — sora backends accept it — which is what keeps

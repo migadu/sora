@@ -302,6 +302,8 @@ github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116094727-0b0aaa23d4af h1:esW6
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116094727-0b0aaa23d4af/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116103044-679096c1387b h1:qRJsYbDLZYRS5VaT0tpfhdk9+PVjmJqGrIKeAaEAvmo=
 github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116103044-679096c1387b/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
+github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116184113-09fb37946fed h1:ndtWgAwt2aINSLLymNq4QgoDQgZJkcM5xYPhm6UlX6I=
+github.com/migadu/go-smtp v0.24.0-migadu.1.0.20261116184113-09fb37946fed/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/migadu/go-smtp v0.24.0-migadu.1/go.mod h1:3DhKoQGRMhBVSVkW1MQXML3tHhQbL6aBkscvJuak/90=
 github.com/moby/docker-image-spec v1.3.1 h1:jMKff3w6PgbfSa69GfNg+zN/XLhfXJGnEx3Nl2EsFP0=
 github.com/moby/docker-image-spec v1.3.1/go.mod h1:eKmb5VW8vQEh/BAr2yvVNvuiJuY6UIocYsFu/DxxRpo=

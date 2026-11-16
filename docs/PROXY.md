@@ -69,7 +69,8 @@ backend, a `MAIL` or `RCPT` parameter the proxy does not implement gets `555 5.5
 §4.1.1.11), `NOTIFY`, `ORCPT`, `RET`, `ENVID` and `AUTH` among them. It takes `SIZE`, `SMTPUTF8` and
 `BODY=7BIT` or `BODY=8BITMIME` on `MAIL`, and `XRCPTFORWARD` on `RCPT`, which it forwards. As on
 the backend, a malformed parameter gets `501 5.5.4`: `SMTPUTF8` with a value, or any parameter
-written with `=` and no value (RFC 5321 §4.1.2). A `MAIL`
+written with `=` and no value (RFC 5321 §4.1.2). When more than one parameter is refused, the first
+in the order sent decides the reply, as on the backend. A `MAIL`
 refused for a parameter starts no transaction; a refused `RCPT` leaves the transaction open for the
 next recipient. As on the backend, `MAIL` before `LHLO` gets `503 5.5.1`. A later `LHLO`, or a completed `STARTTLS`, starts the session over:
 the transaction in progress ends, and a held backend connection is closed, so the next recipient
