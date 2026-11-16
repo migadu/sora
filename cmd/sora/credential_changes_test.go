@@ -35,7 +35,7 @@ func (f fakeCachingServer) GetLookupCache() *lookupcache.LookupCache { return f.
 // The node's login caches are those of the running servers that have one enabled, and
 // its session registries are its connection trackers.
 func TestCredentialChangesReachEveryRunningServer(t *testing.T) {
-	cache := lookupcache.New(time.Minute, time.Minute, 10, time.Minute, time.Minute)
+	cache := lookupcache.New("test", "credential-changes", time.Minute, time.Minute, 10, time.Minute, time.Minute)
 	defer cache.Stop(t.Context())
 	tracker := server.NewConnectionTracker("IMAP", "imap", "localhost", "localhost-imap", nil, 0, 0, 0, true)
 	defer tracker.Stop()

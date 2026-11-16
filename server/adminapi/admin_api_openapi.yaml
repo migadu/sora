@@ -14,7 +14,66 @@ components:
       type: http
       scheme: bearer
       bearerFormat: API Key
-      description: "API Key for authentication. Provide as 'Bearer <API_KEY>' in the Authorization header."
+      description: >-
+        api_key or read_only_api_key, as 'Bearer <API_KEY>' in the Authorization header. The
+        read-only key grants GET operations only. A missing or non-Bearer header, or a key
+        that is neither, is answered 401; the read-only key on a write 403.
+
+  # Refusals of the access checks every request passes before its route: the client
+  # address against allowed_hosts, then the API key. Every operation can answer them.
+  responses:
+    Unauthorized:
+      description: >-
+        The Authorization header is missing or is not a Bearer header, or the key is neither
+        api_key nor read_only_api_key. The response carries the challenge
+        `WWW-Authenticate: Bearer realm="admin-api"`; for a wrong key it adds the reason
+        (RFC 6750 section 3.1): `Bearer realm="admin-api", error="invalid_token"`.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: 'Bearer realm="admin-api", error="invalid_token"'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            missing:
+              summary: No Authorization header
+              value:
+                error: "Authorization header required"
+            not_bearer:
+              summary: Not a Bearer header
+              value:
+                error: "Authorization header must be 'Bearer <token>'"
+            invalid_key:
+              summary: Wrong key
+              value:
+                error: "Invalid API key"
+    Forbidden:
+      description: >-
+        The read-only key was sent with a method other than GET, or allowed_hosts is set and
+        does not match the client address. The read-only key on a write carries the challenge
+        `WWW-Authenticate: Bearer realm="admin-api", error="insufficient_scope"` (RFC 6750
+        section 3.1). A client address refused by allowed_hosts gets no challenge.
+      headers:
+        WWW-Authenticate:
+          schema:
+            type: string
+          example: 'Bearer realm="admin-api", error="insufficient_scope"'
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          examples:
+            read_only:
+              summary: Read-only key on a write
+              value:
+                error: "API key is read-only"
+            host_not_allowed:
+              summary: Client address not in allowed_hosts
+              value:
+                error: "Host not allowed"
 
   # Reusable schemas
   schemas:
@@ -41,7 +100,7 @@ components:
           example: "s3cr3t_p4ssw0rd"
         password_hash:
           type: string
-          description: "Pre-computed password hash (bcrypt, SSHA512, etc.). Cannot be used together with password."
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       required:
         - email
@@ -60,6 +119,7 @@ components:
           format: password
         password_hash:
           type: string
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
         is_primary:
           type: boolean
         hash_type:
@@ -82,7 +142,7 @@ components:
           example: "new_s3cr3t_p4ssw0rd"
         password_hash:
           type: string
-          description: "Pre-computed password hash (bcrypt, SSHA512, etc.). Cannot be used together with password."
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       anyOf:
         - required: ["password"]
@@ -103,7 +163,7 @@ components:
           example: "s3cr3t_p4ssw0rd_for_alias"
         password_hash:
           type: string
-          description: "Pre-computed password hash (bcrypt, SSHA512, etc.) for the new credential. Cannot be used together with password."
+          description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
       required:
         - email
@@ -117,24 +177,14 @@ components:
         user_email:
           type: string
           format: email
-          description: "Terminate all connections for this user."
+          description: "End this account's sessions. Any address of the account."
           example: "user@example.com"
         protocol:
           type: string
-          description: "Terminate connections for this protocol (e.g., IMAP, POP3)."
+          description: "Kick only on the connection trackers of this protocol (IMAP, POP3, ManageSieve or LMTP), matched case-insensitively against the tracker key up to its first dash. Every tracker when omitted."
           example: "IMAP"
-        server_addr:
-          type: string
-          description: "Terminate connections to this backend server address."
-          example: "10.0.1.10:143"
-        client_addr:
-          type: string
-          description: "Terminate connections from this client IP address."
-          example: "192.168.1.100"
-        all:
-          type: boolean
-          description: "If true, terminates all connections. Use with caution."
-          example: false
+      required:
+        - user_email
 
     Account:
       type: object
@@ -150,8 +200,13 @@ components:
         deleted_at:
           type: string
           format: date-time
-          nullable: true
-          example: null
+          description: "When the account was soft-deleted. Present only while it is."
+          example: "2023-02-01T12:00:00Z"
+        purge_requested_at:
+          type: string
+          format: date-time
+          description: "When a purge was requested (`DELETE /accounts/{email}?purge=true`). Present only while the purge is pending; once it is done the account answers 404."
+          example: "2023-02-01T12:00:00Z"
         primary_email:
           type: string
           format: email
@@ -220,42 +275,13 @@ components:
 
     ConnectionInfo:
       type: object
-      description: "An account with sessions on one of this node's connection trackers: one entry per account and tracker, not per session. Accounts this node knows only through gossip are not listed."
+      description: "An account on one of this node's connection trackers: one entry per account and tracker, not per session."
       properties:
         protocol:
           type: string
           description: "The tracker key up to its first dash."
           example: "IMAP"
         instance:
-          type: string
-          description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions)."
-          example: "IMAP-node1-imap-proxy"
-        account_id:
-          type: integer
-          format: int64
-          example: 123
-        email:
-          type: string
-          description: "The address of the session that created the entry: the login address, or the recipient on an LMTP proxy."
-          example: "user@example.com"
-        local_count:
-          type: integer
-          description: "The account's sessions on this tracker."
-          example: 2
-        total_count:
-          type: integer
-          description: "local_count plus the account's sessions on the same protocol that other nodes' trackers report through gossip. Backends and LMTP proxies do not gossip, so there it equals local_count."
-          example: 3
-        last_update:
-          type: string
-          format: date-time
-          description: "When the tracker last updated the entry: a session opened or closed, or gossip about the account arrived (including the periodic full-state exchange, which changes no count)."
-
-    UserConnectionInfo:
-      type: object
-      description: "The account on one of this node's connection trackers. Unlike ConnectionInfo, protocol is the whole tracker key, and a tracker that knows the account only through gossip is listed too, with local_count 0."
-      properties:
-        protocol:
           type: string
           description: "The tracker key: <PROTOCOL>-<server name> on a backend, <PROTOCOL>-<cluster node_id>-<server name> on a proxy (the host name in place of the node_id outside cluster mode, where the LMTP proxy is the only proxy that tracks sessions)."
           example: "IMAP-node1-imap-proxy"
@@ -416,45 +442,75 @@ components:
           type: string
           format: date-time
 
+    NullTime:
+      type: object
+      description: "A time that may be unset. Valid is false when it is, and Time is then 0001-01-01T00:00:00Z."
+      properties:
+        Time:
+          type: string
+          format: date-time
+        Valid:
+          type: boolean
+
     UploaderStats:
       type: object
+      description: "The upload queue of the whole system, not only this node, split at max_attempts. The keys are Go field names."
       properties:
-        pending_count:
+        TotalPending:
           type: integer
-        failed_count:
+          format: int64
+          description: "Uploads with fewer attempts than max_attempts."
+          example: 15
+        TotalPendingSize:
           type: integer
-        in_progress_count:
+          format: int64
+          description: "Total size of those uploads (bytes)."
+          example: 1048576
+        FailedUploads:
           type: integer
-        total_processed:
-          type: integer
-        last_successful_upload:
-          type: string
-          format: date-time
-        last_failed_upload:
-          type: string
-          format: date-time
+          format: int64
+          description: "Uploads with at least max_attempts attempts."
+          example: 2
+        OldestPending:
+          allOf:
+            - $ref: '#/components/schemas/NullTime'
+          description: "When the oldest of the uploads below max_attempts was queued; not Valid when there is none."
 
     FailedUpload:
       type: object
+      description: "A queued upload with at least max_attempts attempts. The keys are Go field names."
       properties:
-        id:
+        ID:
           type: integer
           format: int64
-        content_hash:
+          example: 77
+        AccountID:
+          type: integer
+          format: int64
+          example: 1042
+        ContentHash:
           type: string
-        account_id:
+          description: "BLAKE3 hash of the message body, the last segment of its S3 key (<domain>/<local part>/<hash>)."
+        InstanceID:
+          type: string
+          description: "The node that staged the body; only that node can upload it."
+          example: "mail1"
+        Size:
           type: integer
           format: int64
-        size:
+          description: "Body size (bytes)."
+          example: 48211
+        Attempts:
           type: integer
-          format: int64
-        attempts:
-          type: integer
-        last_attempt:
+          example: 20
+        CreatedAt:
           type: string
           format: date-time
-        last_error:
+        UpdatedAt:
           type: string
+          format: date-time
+        LastAttempt:
+          $ref: '#/components/schemas/NullTime'
 
     CredentialDetails:
       type: object
@@ -566,8 +622,11 @@ components:
           example: "Meeting notes"
         MessageID:
           type: string
-          example: "<abc@example.com>"
-          description: "RFC822 Message-ID header"
+          example: "abc@example.com"
+          description: >-
+            The Message-ID header, without angle brackets. The empty string when the
+            message has no Message-ID that parses (the ID Sora stores for such a message
+            to detect duplicates is not its header and is never returned).
         InternalDate:
           type: string
           format: date-time
@@ -627,13 +686,17 @@ components:
     RestoreMessagesResponse:
       type: object
       properties:
+        email:
+          type: string
+          example: "user@example.com"
+          description: "The address in the path, as given"
         restored:
           type: integer
           example: 5
           description: "Number of messages restored"
         message:
           type: string
-          example: "Successfully restored 5 messages"
+          example: "Successfully restored 5 message(s)"
 
     DeliverMailRequest:
       type: object
@@ -957,6 +1020,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -1038,6 +1105,16 @@ paths:
                     description: "The after of the next page; absent on the last page"
         '400':
           description: after or limit out of range.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '500':
+          description: The accounts could not be read.
           content:
             application/json:
               schema:
@@ -1126,6 +1203,7 @@ paths:
             - A `credentials` entry with a `password` whose `hash_type` is not `bcrypt` or `ssha512`
             - An invalid email address
             - A `password` longer than 72 bytes hashed with bcrypt (the default), bcrypt's limit
+            - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
             - In a `credentials` array: no or several `is_primary` entries, or the same address twice
           content:
             application/json:
@@ -1144,6 +1222,10 @@ paths:
                   summary: Both password fields provided
                   value:
                     error: "Cannot specify both password and password_hash"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '409':
           description: An address already belongs to an account, or to a deleted account still in its grace period (restore or purge it first).
           content:
@@ -1183,6 +1265,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Account not found.
           content:
@@ -1249,6 +1335,7 @@ paths:
             - Both `password` and `password_hash` provided (only one allowed)
             - An invalid email address in the path
             - A `password` longer than 72 bytes (bcrypt's limit)
+            - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
           content:
             application/json:
               schema:
@@ -1262,6 +1349,10 @@ paths:
                   summary: Both password fields provided
                   value:
                     error: "Cannot specify both password and password_hash"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Account not found.
           content:
@@ -1277,8 +1368,11 @@ paths:
     delete:
       tags:
         - Account Management
-      summary: Delete an account (soft delete)
-      description: Soft deletes an account, marking it as deleted but preserving data for the grace period. The account can be restored during this time. Its open sessions are ended and its cached logins dropped, on this node's servers and their cluster peers, as `/admin/connections/kick` does.
+      summary: Delete an account (soft delete), or request its purge
+      description: |
+        Soft deletes an account, marking it as deleted but preserving data for the grace period. The account can be restored during this time. Its open sessions are ended and its cached logins dropped, on this node's servers and their cluster peers, as `/admin/connections/kick` does.
+
+        With `purge=true` it instead requests the permanent deletion of the account and everything it holds, with no grace period, and answers 202. Any node serves the request, a proxy without object storage included: the account is taken out of service (soft-deleted, which an already soft-deleted account may be), its sessions are ended and its cached logins dropped as above, and it is marked for purging. A purge worker on a node with object storage then deletes it. Until it is gone, `GET /accounts/{email}` shows `purge_requested_at`; `POST /accounts/{email}/restore` before then cancels the purge.
       parameters:
         - name: email
           in: path
@@ -1286,6 +1380,13 @@ paths:
           schema:
             type: string
             format: email
+        - name: purge
+          in: query
+          required: false
+          description: "`true` requests the purge instead of a soft delete. Any other value, or none, is a soft delete."
+          schema:
+            type: boolean
+            default: false
       responses:
         '200':
           description: Account soft-deleted successfully.
@@ -1301,12 +1402,35 @@ paths:
                   message:
                     type: string
                     example: "Account soft-deleted successfully. It will be permanently removed after the grace period."
+        '202':
+          description: With `purge=true`, the account is out of service and marked for purging.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                    example: "user@example.com"
+                  purge_requested_at:
+                    type: string
+                    format: date-time
+                    description: "When the purge was requested. A repeated request keeps the first time."
+                    example: "2026-10-17T09:12:44.120Z"
+                  message:
+                    type: string
+                    example: "Account is out of service and marked for purging; a purge worker on a node with object storage deletes it. GET /admin/accounts/{email} shows purge_requested_at until the account is gone."
         '400':
-          description: Account is already deleted, or the address does not parse.
+          description: The address does not parse, or (without `purge=true`) the account is already deleted.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Account not found.
           content:
@@ -1354,6 +1478,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Account not found.
           content:
@@ -1393,6 +1521,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -1481,7 +1613,7 @@ paths:
                         Size: 2048
                     total: 2
         '400':
-          description: Invalid request parameters.
+          description: Invalid request parameters, or the address does not parse.
           content:
             application/json:
               schema:
@@ -1491,6 +1623,10 @@ paths:
                   summary: Invalid time format
                   value:
                     error: "Invalid time format for 'since' parameter"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Account not found.
           content:
@@ -1516,7 +1652,10 @@ paths:
         - Time range (messages deleted within the range)
 
         At least one criterion must be provided. Restored messages will be assigned new UIDs but preserve all other metadata and flags.
-        If the original mailbox was deleted, it will be automatically recreated.
+        If the original mailbox was deleted, it will be automatically recreated. With [shared_mailboxes] enabled, a mailbox
+        recreated in the shared namespace is a shared mailbox of the account with owner-only rights: one entry, the owner
+        with default_rights. The ACL entries it had before it was deleted are not restored, and a shared parent's entries
+        are not copied, so other users have no access until they are granted it again (POST /admin/mailboxes/acl/grant).
 
         Large restores are processed in chunks, each committed in its own transaction. If the operation fails part-way,
         the messages restored so far are kept and the error message states how many; repeating the same request restores
@@ -1565,10 +1704,11 @@ paths:
                 success:
                   summary: Successful restoration
                   value:
+                    email: "user@example.com"
                     restored: 5
-                    message: "Successfully restored 5 messages"
+                    message: "Successfully restored 5 message(s)"
         '400':
-          description: Invalid request. No restoration criteria provided or invalid parameters.
+          description: Invalid request. No restoration criteria provided, invalid parameters, or the address does not parse.
           content:
             application/json:
               schema:
@@ -1577,7 +1717,11 @@ paths:
                 no_criteria:
                   summary: No restoration criteria
                   value:
-                    error: "Must specify either message_ids or at least one filter (mailbox, since, until)"
+                    error: "At least one filter is required (message_ids, mailbox, since, or until)"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Account not found.
           content:
@@ -1631,6 +1775,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Account not found.
           content:
@@ -1688,18 +1836,22 @@ paths:
               schema:
                 type: object
                 properties:
-                  email:
+                  new_email:
                     type: string
                     format: email
+                    description: "The added address, as the request's email gave it."
+                    example: "alias@example.com"
                   message:
                     type: string
+                    example: "Credential added successfully"
         '400':
           description: |
             Invalid request body. Common causes:
             - Missing required field `email`
             - Neither `password` nor `password_hash` provided  
             - Both `password` and `password_hash` provided (only one allowed)
-            - `email` does not parse as an address
+            - Path `email` or body `email` does not parse as an address
+            - A `password_hash` sora cannot verify (no or an unsupported scheme, data that does not decode or has the wrong length)
           content:
             application/json:
               schema:
@@ -1717,6 +1869,22 @@ paths:
                   summary: Both password fields provided
                   value:
                     error: "Cannot specify both password and password_hash"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No account in service has the address in the path; a soft-deleted account does not count.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: The address is already a credential of an account.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
           content:
@@ -1745,6 +1913,16 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CredentialDetails'
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Credential not found.
           content:
@@ -1792,8 +1970,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Credential not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
           content:
             application/json:
               schema:
@@ -1804,7 +1992,7 @@ paths:
       tags:
         - Connection Management
       summary: List the accounts with sessions on this node
-      description: One entry per account and connection tracker on this node; local_count is the number of sessions.
+      description: One entry per account and connection tracker on this node; local_count is the number of sessions. Accounts this node knows only through gossip are not listed.
       responses:
         '200':
           description: The accounts with sessions on this node's connection trackers.
@@ -1826,6 +2014,10 @@ paths:
                   note:
                     type: string
                     description: Present, with no entries, when this node has no connection trackers.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -1845,6 +2037,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ConnectionStats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -1856,8 +2052,21 @@ paths:
     post:
       tags:
         - Connection Management
-      summary: Mark connections for termination
-      description: Marks connections matching the criteria to be terminated by the server.
+      summary: End a user's sessions
+      description: |
+        Kicks the account on this node's connection trackers (or on those of one protocol)
+        and broadcasts the kick to the cluster, where each node ends the account's sessions
+        and drops its cached logins.
+        The account is kicked by its database account ID and by the ID derived from each
+        of its database addresses: a proxy keys a session that remote lookup authenticated
+        by the ID derived from the address the lookup answered, also when the database holds the
+        account. An address the database does not know (a lookup service's own account) is
+        kicked by the ID derived from it. If the lookup service answered with an address
+        the database does not hold for the account, kicking another address of the account
+        does not reach that session. Kick the lookup service's answered address explicitly
+        to reach it. When the database cannot be asked, nothing is kicked and the
+        answer is 500. The response does not count sessions: they end within seconds, as
+        each node applies the kick.
       requestBody:
         required: true
         content:
@@ -1866,7 +2075,7 @@ paths:
               $ref: '#/components/schemas/KickConnectionsRequest'
       responses:
         '200':
-          description: Connections marked successfully.
+          description: The kick was issued on the listed trackers and broadcast to the cluster.
           content:
             application/json:
               schema:
@@ -1874,16 +2083,45 @@ paths:
                 properties:
                   message:
                     type: string
-                  connections_marked:
-                    type: integer
+                    example: "User kicked successfully via gossip protocol"
+                  user:
+                    type: string
+                    format: email
+                    description: "The user_email of the request."
+                    example: "user@example.com"
+                  protocols:
+                    type: array
+                    description: "Keys of the connection trackers the kick was issued on (protocol, a dash, the server's name or instance)."
+                    items:
+                      type: string
+                    example: ["IMAP-node1-imap-proxy"]
+                  note:
+                    type: string
+                    example: "Kick event broadcast to cluster. Connections will be terminated within seconds."
         '400':
-          description: Invalid request body.
+          description: The body is not JSON, or user_email is missing, blank, or does not parse as an address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No connection tracker on this node serves the requested protocol.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
         '500':
-          description: Internal server error.
+          description: The database cannot resolve the address (nothing was kicked), or the kick could not be issued on any tracker.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: This node has no connection trackers.
           content:
             application/json:
               schema:
@@ -1894,7 +2132,7 @@ paths:
       tags:
         - Connection Management
       summary: Get connections for a specific user
-      description: One entry per connection tracker on this node that knows the account, matched case-insensitively against the entry's email, so an account whose entry was created by an alias login is found only under that alias.
+      description: Entries from this node's connection trackers, one per tracked account ID and tracker. A remote lookup service that answers different addresses of the account can produce multiple tracked IDs and entries for it. The address is resolved to its account in the database, as /connections/kick resolves it, so the account is found under any of its addresses. An entry whose email is any address of the account (case-insensitively) is listed too, which is how a session a proxy authenticated through remote lookup (keyed by an ID derived from the address the lookup answered) is found; an address unknown to the database lists the entries whose email is that address. Unlike /connections, a tracker that knows the account only through gossip is listed too, with local_count 0.
       parameters:
         - name: email
           in: path
@@ -1916,7 +2154,7 @@ paths:
                   connections:
                     type: array
                     items:
-                      $ref: '#/components/schemas/UserConnectionInfo'
+                      $ref: '#/components/schemas/ConnectionInfo'
                   count:
                     type: integer
                     description: Number of entries in connections.
@@ -1926,6 +2164,16 @@ paths:
                   note:
                     type: string
                     description: Present, with no entries, when this node has no connection trackers.
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -1974,12 +2222,20 @@ paths:
                   backend:
                     type: string
                     example: "192.168.1.10:993"
+                  found:
+                    type: boolean
+                    description: "Always true in a 200 answer; a missing affinity is a 404."
+                    example: true
         '400':
           description: Missing or invalid parameters.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: No affinity set for this user/protocol.
           content:
@@ -1988,6 +2244,12 @@ paths:
                 $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
           content:
             application/json:
               schema:
@@ -2081,8 +2343,18 @@ paths:
                   summary: Backend not configured
                   value:
                     error: "Backend 192.168.1.99:993 is not configured for protocol imap. Valid backends: [192.168.1.10:993, 192.168.1.11:993]"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
           content:
             application/json:
               schema:
@@ -2136,8 +2408,18 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '503':
+          description: Affinity manager not enabled on this server.
           content:
             application/json:
               schema:
@@ -2147,17 +2429,67 @@ paths:
     get:
       tags:
         - Affinity Management
-      summary: List all backend affinities (not implemented)
+      summary: List backend affinities
       description: |
-        Not implemented: affinities are distributed via gossip and held in memory on each node.
-        Use GET /affinity with a user and protocol to read one affinity.
+        Lists the unexpired affinities this node holds, sorted by user and protocol: those it
+        assigned and those it received by gossip. Affinities have no full-state exchange, so a
+        node that was down or joined after an affinity was gossiped does not list it, and two
+        nodes can list different sets.
+      parameters:
+        - name: protocol
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "Only affinities of this protocol (case-insensitive)"
+          example: "imap"
+        - name: backend
+          in: query
+          required: false
+          schema:
+            type: string
+          description: "Only affinities to this backend address"
+          example: "192.168.1.10:993"
       responses:
-        '501':
-          description: Listing is not implemented.
+        '200':
+          description: The affinities.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/Error'
+                type: object
+                properties:
+                  affinities:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        user:
+                          type: string
+                          format: email
+                          example: "user@example.com"
+                        protocol:
+                          type: string
+                          example: "imap"
+                        backend:
+                          type: string
+                          example: "192.168.1.10:993"
+                        assigned_at:
+                          type: string
+                          format: date-time
+                        expires_at:
+                          type: string
+                          format: date-time
+                        node_id:
+                          type: string
+                          description: "Node that assigned the affinity"
+                          example: "node-1"
+                  count:
+                    type: integer
+                    example: 1
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '503':
           description: Affinity manager not enabled on this server.
           content:
@@ -2218,6 +2550,10 @@ paths:
                             type: number
                             format: double
                             description: "broadcast_queue as a percentage of broadcast_queue_max."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -2243,6 +2579,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CacheStats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -2261,12 +2601,14 @@ paths:
       tags:
         - Cache Management
       summary: Get cache performance metrics
+      description: |
+        The cache hit and miss counts every node with a cache records in the database, newest first.
       parameters:
         - name: latest
           in: query
           schema:
             type: boolean
-          description: "If true, returns only the latest metric record for each instance."
+          description: "If true, returns only the latest metric record for each instance_id and server_hostname pair, and the other parameters are ignored."
         - name: instance_id
           in: query
           schema:
@@ -2277,13 +2619,13 @@ paths:
           schema:
             type: string
             format: date-time
-          description: "Return metrics recorded after this timestamp (RFC3339). Defaults to 24 hours ago."
+          description: "Return metrics recorded at or after this timestamp (RFC3339). Defaults to 24 hours ago."
         - name: limit
           in: query
           schema:
             type: integer
             default: 100
-          description: "Maximum number of records to return."
+          description: "Maximum number of records to return. A value that is not a positive integer means 100."
       responses:
         '200':
           description: A list of cache metrics.
@@ -2298,6 +2640,25 @@ paths:
                       $ref: '#/components/schemas/CacheMetricsRecord'
                   count:
                     type: integer
+                  instance_id:
+                    type: string
+                    description: "The instance_id parameter, empty when none was given. Absent with latest=true."
+                  since:
+                    type: string
+                    format: date-time
+                    description: "The start of the period read: the since parameter, or 24 hours before the request. Absent with latest=true."
+        '400':
+          description: since is not an RFC 3339 time.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+              example:
+                error: "Invalid since parameter format (use RFC3339)"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -2324,6 +2685,10 @@ paths:
                     $ref: '#/components/schemas/CacheStats'
                   stats_after:
                     $ref: '#/components/schemas/CacheStats'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -2352,8 +2717,11 @@ paths:
           in: query
           schema:
             type: integer
-            default: 5
-          description: "The failure threshold to consider when calculating failed counts."
+            minimum: 1
+          description: >-
+            An upload with at least this many attempts counts as failed. Defaults to the node's
+            [uploader] max_attempts, the attempt count at which the uploader stops retrying.
+            A value that is not a positive integer means the default.
         - name: failed_limit
           in: query
           schema:
@@ -2372,10 +2740,16 @@ paths:
                     $ref: '#/components/schemas/UploaderStats'
                   failed_uploads:
                     type: array
+                    description: "Only with show_failed=true. Newest first."
                     items:
                       $ref: '#/components/schemas/FailedUpload'
                   failed_count:
                     type: integer
+                    description: "Only with show_failed=true. The number of entries in failed_uploads."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -2393,14 +2767,17 @@ paths:
           in: query
           schema:
             type: integer
-            default: 5
-          description: "The failure threshold to consider when fetching failed uploads."
+            minimum: 1
+          description: >-
+            An upload with at least this many attempts counts as failed. Defaults to the node's
+            [uploader] max_attempts, the attempt count at which the uploader stops retrying.
+            A value that is not a positive integer means the default.
         - name: limit
           in: query
           schema:
             type: integer
             default: 50
-          description: "Maximum number of failed uploads to return."
+          description: "Maximum number of failed uploads to return, newest first. A value that is not a positive integer means 50."
       responses:
         '200':
           description: A list of failed uploads.
@@ -2415,6 +2792,18 @@ paths:
                       $ref: '#/components/schemas/FailedUpload'
                   count:
                     type: integer
+                  max_attempts:
+                    type: integer
+                    description: "The failure threshold applied: the max_attempts parameter or its default."
+                    example: 20
+                  limit:
+                    type: integer
+                    description: "The limit applied."
+                    example: 50
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -2463,6 +2852,10 @@ paths:
                       blocked_list:
                         type: string
                         example: "GET /admin/auth/blocked - list currently blocked addresses"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /auth/blocked:
     get:
@@ -2491,6 +2884,10 @@ paths:
                       $ref: '#/components/schemas/BlockedEntry'
                   count:
                     type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /auth-cache/stats:
     get:
@@ -2539,6 +2936,10 @@ paths:
                     example: 892451
                 required:
                   - enabled
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -2564,6 +2965,10 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SystemHealthOverview'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -2598,6 +3003,10 @@ paths:
                       $ref: '#/components/schemas/HealthStatus'
                   count:
                     type: integer
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error.
           content:
@@ -2610,6 +3019,7 @@ paths:
       tags:
         - Health Monitoring
       summary: Get health status for a component
+      description: "The current status only. One row is kept per component and server, rewritten when the status changes and every 20 checks while it holds, so there is no history: history=true is answered with 400. The sora_component_health_status metric gives the status over time."
       parameters:
         - name: hostname
           in: path
@@ -2621,46 +3031,23 @@ paths:
           required: true
           schema:
             type: string
-        - name: history
-          in: query
-          schema:
-            type: boolean
-          description: "If true, returns historical health data instead of the current status."
-        - name: since
-          in: query
-          schema:
-            type: string
-            format: date-time
-          description: "If history=true, return records after this timestamp (RFC3339). Defaults to 24 hours ago."
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 100
-          description: "If history=true, limit the number of historical records returned."
       responses:
         '200':
-          description: Current or historical health status for the component.
+          description: Current health status for the component.
           content:
             application/json:
               schema:
-                oneOf:
-                  - $ref: '#/components/schemas/HealthStatus'
-                  - type: object
-                    properties:
-                      hostname:
-                        type: string
-                      component:
-                        type: string
-                      history:
-                        type: array
-                        items:
-                          $ref: '#/components/schemas/HealthStatus'
-                      count:
-                        type: integer
-                      since:
-                        type: string
-                        format: date-time
+                $ref: '#/components/schemas/HealthStatus'
+        '400':
+          description: history=true was requested; no health history is recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Component health status not found.
           content:
@@ -2704,6 +3091,10 @@ paths:
                   timestamp:
                     type: string
                     format: date-time
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /config:
     get:
@@ -2719,20 +3110,26 @@ paths:
               schema:
                 type: object
                 properties:
-                  api_version:
-                    type: string
                   server_type:
                     type: string
+                    example: "sora-http-api"
                   features_enabled:
                     type: object
                     additionalProperties:
                       type: boolean
                   endpoints:
                     type: object
+                    description: "Every operation of this API, grouped by area: the method, the path and sometimes a note."
                     additionalProperties:
                       type: array
                       items:
                         type: string
+                    example:
+                      credential_management: ["GET /admin/credentials/{email}", "DELETE /admin/credentials/{email}"]
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
 
   /mailboxes/acl/grant:
     post:
@@ -2817,14 +3214,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Owner, mailbox or user not found, or the user's account is deleted
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '401':
-          description: Unauthorized - invalid or missing API key
           content:
             application/json:
               schema:
@@ -2896,14 +3291,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Owner not found, or the owner has no such mailbox
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '401':
-          description: Unauthorized - invalid or missing API key
           content:
             application/json:
               schema:
@@ -2974,14 +3367,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '404':
           description: Owner not found, or the owner has no such mailbox
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
-        '401':
-          description: Unauthorized - invalid or missing API key
           content:
             application/json:
               schema:
@@ -3106,11 +3497,9 @@ paths:
                   value:
                     error: "At least one recipient is required"
         '401':
-          description: Unauthorized - invalid or missing API key
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Error'
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
         '500':
           description: Internal server error
           content:

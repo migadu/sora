@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
@@ -36,6 +37,8 @@ func credentialLookupError(err error) error {
 // A failed lookup returns consts.ErrUserNotFound or an error wrapping
 // server.ErrAuthServiceUnavailable (see credentialLookupError).
 func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, address string) (accountID int64, hashedPassword string, err error) {
+	// A replica may retain a password/account state after revocation.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     2 * time.Second,
@@ -51,7 +54,7 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 	}
 
 	op := func(ctx context.Context) (any, error) {
-		id, hash, dbErr := rd.getOperationalDatabaseForOperation(ctx, false).GetCredentialForAuth(ctx, address)
+		id, hash, dbErr := rd.getOperationalDatabaseForOperation(ctx, true).GetCredentialForAuth(ctx, address)
 		if dbErr != nil {
 			return nil, dbErr
 		}
@@ -67,12 +70,30 @@ func (rd *ResilientDatabase) GetCredentialForAuthWithRetry(ctx context.Context, 
 	return cred.ID, cred.Hash, nil
 }
 
+// GetMasterLoginTargetWithRetry returns the ID of the active account a master login
+// impersonates (master username or master SASL, after the master credential checked
+// out). A failed lookup returns consts.ErrUserNotFound or an error wrapping
+// server.ErrAuthServiceUnavailable, as a credential lookup does (see
+// credentialLookupError): a master login the database cannot answer is a temporary
+// failure, not a failed login charged to the master credential.
+func (rd *ResilientDatabase) GetMasterLoginTargetWithRetry(ctx context.Context, address string) (int64, error) {
+	// A replica may retain a password/account state after revocation.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	accountID, err := rd.GetActiveAccountIDByAddressWithRetry(ctx, address)
+	if err != nil {
+		return 0, credentialLookupError(err)
+	}
+	return accountID, nil
+}
+
 // GetCredentialEpochWithRetry retrieves the account ID and the credential's
 // password epoch (updated_at) for an address with retry logic, requiring the
 // account to be active. The User API uses this to revalidate account state when
 // refreshing a JWT — rejecting refreshes for deleted accounts or after a password
 // change. See db.GetCredentialEpoch for the epoch semantics.
 func (rd *ResilientDatabase) GetCredentialEpochWithRetry(ctx context.Context, address string) (accountID int64, epoch time.Time, err error) {
+	// A replica may retain a password/account state after revocation.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     2 * time.Second,
@@ -88,7 +109,7 @@ func (rd *ResilientDatabase) GetCredentialEpochWithRetry(ctx context.Context, ad
 	}
 
 	op := func(ctx context.Context) (any, error) {
-		id, ep, dbErr := rd.getOperationalDatabaseForOperation(ctx, false).GetCredentialEpoch(ctx, address)
+		id, ep, dbErr := rd.getOperationalDatabaseForOperation(ctx, true).GetCredentialEpoch(ctx, address)
 		if dbErr != nil {
 			return nil, dbErr
 		}
@@ -108,6 +129,8 @@ func (rd *ResilientDatabase) GetCredentialEpochWithRetry(ctx context.Context, ad
 // and password epoch a User API login checks and issues its token with, requiring the
 // account to be active (see db.GetCredentialForToken).
 func (rd *ResilientDatabase) GetCredentialForTokenWithRetry(ctx context.Context, address string) (accountID int64, hashedPassword string, epoch time.Time, err error) {
+	// A replica may retain a password/account state after revocation.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     2 * time.Second,
@@ -124,7 +147,7 @@ func (rd *ResilientDatabase) GetCredentialForTokenWithRetry(ctx context.Context,
 	}
 
 	op := func(ctx context.Context) (any, error) {
-		id, hash, ep, dbErr := rd.getOperationalDatabaseForOperation(ctx, false).GetCredentialForToken(ctx, address)
+		id, hash, ep, dbErr := rd.getOperationalDatabaseForOperation(ctx, true).GetCredentialForToken(ctx, address)
 		if dbErr != nil {
 			return nil, dbErr
 		}
@@ -174,6 +197,8 @@ func (rd *ResilientDatabase) GetCredentialForTokenWithRetry(ctx context.Context,
 // a password change has made stale: the first failed login after the change
 // checks both the stale hash and the current one, and drops the stale entry.
 func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address, password string) (accountID int64, err error) {
+	// A replica may retain a password/account state after revocation.
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
 	// The cached hash Step 1 already verified the password against, and the result.
 	var mismatchedHash string
 	var mismatchErr error
@@ -197,7 +222,14 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 		// Cache miss or cache error — proceed to PostgreSQL
 	}
 
-	// --- Step 2: Fetch credentials from PostgreSQL ---
+	// Capture before the primary lookup: an invalidation during the lookup or
+	// password verification must fence its later asynchronous cache fill.
+	var cacheGeneration uint64
+	if rd.authCache != nil {
+		cacheGeneration = rd.authCache.Generation()
+	}
+
+	// --- Step 2: Fetch credentials from the primary PostgreSQL database ---
 	config := retry.BackoffConfig{
 		InitialInterval: 250 * time.Millisecond,
 		MaxInterval:     2 * time.Second,
@@ -213,7 +245,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 	}
 
 	op := func(ctx context.Context) (any, error) {
-		id, hash, dbErr := rd.getOperationalDatabaseForOperation(ctx, false).GetCredentialForAuth(ctx, address)
+		id, hash, dbErr := rd.getOperationalDatabaseForOperation(ctx, true).GetCredentialForAuth(ctx, address)
 		if dbErr != nil {
 			return nil, dbErr
 		}
@@ -256,7 +288,7 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 		go func() {
 			cacheCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 			defer cancel()
-			if putErr := rd.authCache.Put(cacheCtx, address, accountID, hashedPassword); putErr != nil {
+			if putErr := rd.authCache.PutIfGeneration(cacheCtx, address, accountID, hashedPassword, cacheGeneration); putErr != nil {
 				logger.Warn("AuthCache: Failed to cache credentials", "address", address, "error", putErr)
 			}
 		}()
@@ -285,20 +317,43 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 			defer cancel()
 
 			// Use a new resilient call for the update
-			if err := rd.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
+			if changed, err := rd.RehashCredentialWithRetry(updateCtx, address, accountID, hashedPassword, newHashedPassword); err != nil {
 				logger.Error("Rehash: Failed to update password", "address", address, "error", err)
-			} else {
+			} else if changed {
 				logger.Info("Rehash: Successfully rehashed and updated password", "address", address)
-
-				// Update the auth cache with the new hash
-				if rd.authCache != nil {
-					cacheCtx, cacheCancel := context.WithTimeout(context.Background(), 2*time.Second)
-					defer cacheCancel()
-					rd.authCache.Put(cacheCtx, address, accountID, newHashedPassword)
-				}
 			}
 		}()
 	}
 
 	return accountID, nil
+}
+
+// RehashCredentialWithRetry only upgrades the credential actually authenticated.
+// A password change, address reassignment or account deletion may have committed
+// while bcrypt was running. Rehashing must not overwrite that newer decision.
+// Like the original rehash update, this does not alter the JWT password epoch.
+func (rd *ResilientDatabase) RehashCredentialWithRetry(ctx context.Context, address string, accountID int64, oldHash, newHash string) (bool, error) {
+	config := retry.BackoffConfig{
+		InitialInterval: 250 * time.Millisecond,
+		MaxInterval:     2 * time.Second,
+		Multiplier:      1.5,
+		Jitter:          true,
+		MaxRetries:      2,
+		OperationName:   "db_auth_rehash",
+	}
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		result, err := tx.Exec(ctx, `UPDATE credentials c SET password = $1
+			WHERE LOWER(c.address) = $2 AND c.account_id = $3 AND c.password = $4
+			AND EXISTS (SELECT 1 FROM accounts a WHERE a.id = c.account_id AND a.deleted_at IS NULL)`,
+			newHash, strings.ToLower(strings.TrimSpace(address)), accountID, oldHash)
+		if err != nil {
+			return nil, err
+		}
+		return result.RowsAffected() > 0, nil
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, config, timeoutWrite, op)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
 }

@@ -79,17 +79,34 @@
 //	}
 //	`
 //
-//	env := sieveengine.NewEnv(AccountID, messageData)
-//	result, err := sieveengine.Execute(script, env)
+//	compiled, err := sieveengine.CompileScript(script, sieveengine.DefaultSieveExtensions)
 //	if err != nil {
-//		// Script error
+//		// Script does not compile: keep the message
+//	}
+//	executor := compiled.NewExecutor(accountID, vacationOracle, redirectOracle, rateLimit, rateWindow, maxHops)
+//	result, err := executor.Evaluate(ctx, sieveengine.Context{ /* envelope, header, message */ })
+//	if err != nil {
+//		// Script error: implicit keep (RFC 5228 §2.10.6)
 //	}
 //
-//	// Apply result actions: relay every redirect, then store every copy
-//	for _, addr := range result.RedirectTo {
-//		relay(addr)
+//	// Apply result actions. Write every redirect to the relay queue first, but hand
+//	// it to the relay worker only once the delivery can no longer fail: a store that
+//	// fails is retried by the sender, and a redirect handed over before it would go
+//	// out again on every retry. A target the queue cannot take keeps the message in
+//	// INBOX when nothing else stores it (RFC 5228 §4.2).
+//	commit, abort, allHeld := holdRedirects(result.RedirectTo) // RelayQueue.Hold each
+//	defer abort() // drops whatever was not handed over
+//	dests := result.Destinations(!allHeld)
+//	if len(dests) == 0 { // a redirect without :copy: nothing to store
+//		if commit() {
+//			return nil
+//		}
+//		dests = result.Destinations(true) // keep it after all
 //	}
-//	for _, dest := range result.Destinations(false) {
-//		deliverToMailbox(dest.Mailbox)
+//	for _, dest := range dests {
+//		if err := deliverToMailbox(dest.Mailbox, dest.Flags); err != nil {
+//			return err // nothing handed over yet
+//		}
 //	}
+//	commit()
 package sieveengine

@@ -88,13 +88,6 @@ Examples:
 
 	// If showing backends, use Admin API instead of database
 	if *showBackends {
-		// Check that HTTP API is configured
-		if globalConfig.HTTPAPIAddr == "" {
-			logger.Fatalf("HTTP API address not configured (set http_api_addr in config)")
-		}
-		if globalConfig.HTTPAPIKey == "" {
-			logger.Fatalf("HTTP API key not configured (set http_api_key in config)")
-		}
 		if *jsonOutput {
 			if err := showBackendHealthJSON(ctx, globalConfig); err != nil {
 				logger.Fatalf("Failed to show backend health: %v", err)

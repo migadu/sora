@@ -115,18 +115,25 @@ func TestRestoreMessagesWithRetry_Chunked(t *testing.T) {
 		"SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND message_id = $2 AND expunged_at IS NULL", inbox.ID, firstMessageID).Scan(&liveDup))
 	assert.Equal(t, 1, liveDup, "a duplicate tombstone across a chunk boundary must not produce a second live copy")
 
-	// New UIDs follow arrival order (internal_date, id) — ids were inserted in order.
+	// New UIDs follow arrival order (internal_date, id) — ids were inserted in order. Each
+	// message comes back as a new row, so the restored rows are told apart by Message-ID.
+	var arrival []string
+	for _, id := range ids[:n] {
+		var messageID string
+		require.NoError(t, rdb.GetDatabase().GetReadPool().QueryRow(ctx, "SELECT message_id FROM messages WHERE id = $1", id).Scan(&messageID))
+		arrival = append(arrival, messageID)
+	}
 	rows, err := rdb.GetDatabase().GetReadPool().Query(ctx,
-		"SELECT id FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL ORDER BY uid", inbox.ID)
+		"SELECT message_id FROM messages WHERE mailbox_id = $1 AND expunged_at IS NULL ORDER BY uid", inbox.ID)
 	require.NoError(t, err)
-	var byUID []int64
+	var byUID []string
 	for rows.Next() {
-		var id int64
-		require.NoError(t, rows.Scan(&id))
-		byUID = append(byUID, id)
+		var messageID string
+		require.NoError(t, rows.Scan(&messageID))
+		byUID = append(byUID, messageID)
 	}
 	rows.Close()
-	assert.Equal(t, ids[:n], byUID, "restored UIDs must be assigned in arrival order")
+	assert.Equal(t, arrival, byUID, "restored UIDs must be assigned in arrival order")
 
 	// Idempotent: nothing left to restore (the remaining tombstone is skipped: live copy exists).
 	restored, err = rdb.RestoreMessagesChunkedForTest(ctx, db.RestoreMessagesParams{Email: account.Email, Since: &since}, 3)
@@ -286,6 +293,6 @@ func TestRestoreMessagesWithRetry_CriteriaSkipsUnroutableRows(t *testing.T) {
 
 	var stillExpunged bool
 	require.NoError(t, rdb.GetDatabase().GetReadPool().QueryRow(ctx,
-		"SELECT expunged_at IS NOT NULL FROM messages WHERE id = $1", poisonID).Scan(&stillExpunged))
+		"SELECT expunged_at IS NOT NULL AND restored_at IS NULL FROM messages WHERE id = $1", poisonID).Scan(&stillExpunged))
 	assert.True(t, stillExpunged, "the skipped row is left exactly as it was")
 }

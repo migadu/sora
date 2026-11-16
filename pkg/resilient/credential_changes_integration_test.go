@@ -16,11 +16,9 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// Each read of credential_changes starts from the clock of the previous read less a
-// fixed window. A replica that has not replayed a change yet still answers with its own
-// clock, so once its lag exceeds the window the next read starts past the change and no
-// read of that node ever sees it: the old password keeps working from that node's caches.
-// The read must go to the primary even when the caller has not pinned it.
+// A replica must not choose either the visible events or the safe transaction
+// boundary. The operational primary is required even when the caller selects a
+// read endpoint whose feed has not replayed this committed change.
 func TestGetCredentialChangesSinceWithRetry_UsesPrimary(t *testing.T) {
 	ctx := context.Background()
 	cfg := testDatabaseConfig()
@@ -72,7 +70,7 @@ func TestGetCredentialChangesSinceWithRetry_UsesPrimary(t *testing.T) {
 		{"replica selected by caller", context.WithValue(ctx, consts.UseMasterDBKey, false)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			changes, err := rdb.GetCredentialChangesSinceWithRetry(tc.ctx, changedAt.Add(-time.Second))
+			changes, err := rdb.GetCredentialChangesSinceWithRetry(tc.ctx, 0)
 			require.NoError(t, err)
 			require.True(t, slices.Contains(changes.Accounts, accountID),
 				"a change committed on the primary is missing from the read: it came from the replica")

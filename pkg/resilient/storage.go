@@ -559,7 +559,13 @@ func (rs *ResilientS3Storage) StatObjectWithRetry(ctx context.Context, key strin
 // retried; client errors like 404 NoSuchKey fail immediately.
 func (rs *ResilientS3Storage) executeS3OperationWithRetry(ctx context.Context, breaker *circuitbreaker.CircuitBreaker, config retry.BackoffConfig, isRetryable func(error) bool, op func() (any, error), key string, operation string) (any, error) {
 	var result any
+	attempts := 0
 	err := retry.WithRetryAdvanced(ctx, func() error {
+		// Every attempt after the first repeats one that failed retryably. Counted
+		// here because sora_s3_operations_total counts the operation once.
+		if attempts++; attempts > 1 {
+			metrics.StorageRetries.WithLabelValues(operation).Inc()
+		}
 		res, cbErr := breaker.Execute(op)
 		if cbErr != nil {
 			retryable := isRetryable(cbErr)

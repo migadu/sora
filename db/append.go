@@ -92,6 +92,12 @@ const (
 
 var extraAddressesValue = strings.NewReplacer("\t", " ", "\n", " ")
 
+// ErrCopySourceChanged is returned by CopyMessages when a source row owned by another
+// account than the destination no longer has the content hash the caller made its body
+// available for under the destination owner's S3 path. Nothing is written; reading the
+// source again and copying anew can succeed.
+var ErrCopySourceChanged = errors.New("a source message changed during the copy")
+
 func truncateHash(hash string) string {
 	if len(hash) > 12 {
 		return hash[:12]
@@ -108,8 +114,24 @@ func truncateHash(hash string) string {
 // caller that loses the COMMIT acknowledgement (ErrCommitOutcomeUnknown) can read them back
 // to learn — exactly, and immune to concurrency — whether the copy actually landed. See
 // server/imap/copy.go for that resolution.
-func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string) (map[imap.UID]imap.UID, []int64, error) {
+//
+// A copy of a row owned by another account than destAccountID is re-keyed to
+// destAccountID's S3 path, where the caller must first have made the body available (its
+// object, or the staging file of the upload restagePendingUploads queues). sourceHashes
+// holds, by source UID, the content hash each such row had when the caller did so, and
+// the row is copied only if it still has it: sora-admin import rekey can rename a body's
+// hash before this copy takes its source-account lock, and a copy under the new hash would
+// point at a key nothing wrote. A renamed source fails the copy with ErrCopySourceChanged
+// before anything commits. The check is made by the INSERT, the statement that copies the
+// rows' hashes; once inserted, a copy keeps its hash whatever happens to the source.
+// destObjects names the destination bodies made to exist in S3 while tx holds their
+// shared object locks. Only those re-keyed rows are uploaded; all other re-keyed rows
+// are staged for upload, even if their source's upload finished in the meantime.
+func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string) (map[imap.UID]imap.UID, []int64, error) {
 	messageUIDMap := make(map[imap.UID]imap.UID)
+	if destObjects == nil {
+		destObjects = []string{} // = ANY(NULL) would be NULL, not false.
+	}
 	if srcMailboxID == destMailboxID {
 		return nil, nil, fmt.Errorf("source and destination mailboxes cannot be the same")
 	}
@@ -125,7 +147,8 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 
 	var messageIDs []int64
 	var sourceUIDsForMap []imap.UID
-	crossAccount := false // any source row owned by another account: see restageFTS
+	var expectedHashes []string // per message: sourceHashes, checked for re-keyed rows only
+	var rekeyed []bool          // per message: owned by another account than destAccountID
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
@@ -134,7 +157,8 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		}
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
-		crossAccount = crossAccount || sourceAccountID != destAccountID
+		expectedHashes = append(expectedHashes, sourceHashes[sourceUID])
+		rekeyed = append(rekeyed, sourceAccountID != destAccountID)
 	}
 	if err = rows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("error iterating through source messages: %w", err)
@@ -152,12 +176,18 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
 
-	// Calculate the new UIDs for the copied messages.
-	var newUIDs []int64
+	// Calculate the new UIDs for the copied messages, and split them by whether the
+	// copy is re-keyed to the destination owner (see restagePendingUploads).
+	var newUIDs, keptUIDs, rekeyedUIDs []int64
 	startUID := newHighestUID - numToCopy + 1
 	for i, sourceUID := range sourceUIDsForMap {
 		newUID := startUID + int64(i)
 		newUIDs = append(newUIDs, newUID)
+		if rekeyed[i] {
+			rekeyedUIDs = append(rekeyedUIDs, newUID)
+		} else {
+			keptUIDs = append(keptUIDs, newUID)
+		}
 		messageUIDMap[sourceUID] = imap.UID(newUID)
 	}
 
@@ -175,6 +205,11 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, err
 	}
 
+	// From here to the commit a rekey must not rename a source: the INSERT reads its hash.
+	if err := lockRekeySources(ctx, tx, srcMailboxID, uids); err != nil {
+		return nil, nil, err
+	}
+
 	// Batch insert the copied messages and their state in one round trip. The
 	// message_state INSERT is a data-modifying CTE, which PostgreSQL executes to
 	// completion exactly once regardless of whether the primary query reads its
@@ -186,8 +221,10 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	insRows, err := tx.Query(ctx, `
 		WITH src_data AS (
 			SELECT
-				m.content_hash, m.uploaded, m.message_id, m.in_reply_to,
-				m.subject, m.sent_date, m.internal_date, m.size,
+				m.content_hash,
+				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
+				m.message_id, m.in_reply_to, m."references",
+				m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
 				m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses,
 				m.id AS original_id,
@@ -195,19 +232,23 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				d.new_uid,
 				d.custom_flags_canon
 			FROM messages m
-			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[]) AS d(message_id, new_uid, custom_flags_canon) ON m.id = d.message_id
+			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::text[]) AS d(message_id, new_uid, custom_flags_canon, expected_hash) ON m.id = d.message_id
+			-- A row re-keyed to another account is copied only with the hash whose body the
+			-- caller made available under the owner's key (sourceHashes); a row left out
+			-- here fails the copy below.
+			WHERE m.account_id = $6 OR m.content_hash = d.expected_hash
 		),
 		inserted AS (
 			INSERT INTO messages (
-				account_id, content_hash, uploaded, message_id, in_reply_to,
-				subject, sent_date, internal_date, size,
+				account_id, content_hash, uploaded, message_id, in_reply_to, "references",
+				subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 				body_structure, recipients_json, s3_domain, s3_localpart,
 				subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
 				mailbox_id, mailbox_path, created_modseq, uid
 			)
 			SELECT
-				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to,
-				subject, sent_date, internal_date, size,
+				$6 AS account_id, content_hash, uploaded, message_id, in_reply_to, "references",
+				subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 				body_structure, recipients_json,
 				-- The S3 key is per row: the body lives under whatever the account's primary
 				-- address was when the source row was written, and readers build their GET
@@ -233,7 +274,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			RETURNING message_id
 		)
 		SELECT id FROM inserted ORDER BY uid
-	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, expectedHashes, destObjects)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to batch copy messages: %w", err)
 	}
@@ -250,18 +291,19 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	if err := insRows.Err(); err != nil {
 		return nil, nil, fmt.Errorf("error iterating new message ids: %w", err)
 	}
+	if len(newMessageIDs) != len(messageIDs) {
+		return nil, nil, fmt.Errorf("%w: copied %d of %d messages", ErrCopySourceChanged, len(newMessageIDs), len(messageIDs))
+	}
 
 	// Re-stage uploads for any copied rows whose body is not yet in S3, so the
 	// background uploader writes the body under the destination owner's S3 path
 	// (s3_domain/s3_localpart) and marks the new row uploaded. Without this, a
 	// cross-account copy of a not-yet-uploaded message would never reach the
 	// owner's path and would become unreadable once local staging is cleaned up.
-	// ON CONFLICT makes this a no-op for same-account copies, where the source's
-	// pending_upload already covers (content_hash, account_id).
-	if err := db.restagePendingUploads(ctx, tx, destMailboxID, newUIDs, instanceID); err != nil {
+	if err := db.restagePendingUploads(ctx, tx, destMailboxID, keptUIDs, rekeyedUIDs, instanceID); err != nil {
 		return nil, nil, err
 	}
-	if crossAccount {
+	if len(rekeyedUIDs) > 0 {
 		if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
 			return nil, nil, err
 		}
@@ -271,24 +313,45 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 }
 
 // restagePendingUploads ensures every just-inserted, not-yet-uploaded message in
-// (mailboxID, newUIDs) has a pending_upload under its own account so the uploader
-// writes the body under that account's S3 path. The local staging file must already
-// exist under FilePath(content_hash, account_id) (the caller hardlinks it for
-// cross-account inserts). instanceID must be the hostname of the server holding the
-// local file so its own worker, not a peer, picks the task up.
-func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, newUIDs []int64, instanceID string) error {
-	if len(newUIDs) == 0 {
-		return nil
+// mailboxID has a pending_upload under its own account so the uploader writes the body
+// under that account's S3 path. instanceID must be the upload instance id of the node
+// holding the local file (config.InstanceID, the key its uploader leases under), not its
+// mail hostname, so its own worker, not a peer or nobody, picks the task up.
+//
+// rekeyedUIDs are the copies of another account's rows, re-keyed to the mailbox owner. One
+// that is not uploaded is one whose body the caller has just staged on this node under
+// FilePath(content_hash, owner) (see CopyMessages), so the owner's row is re-armed for
+// this node as a fresh delivery re-arms it (InsertMessage): an existing row may be one no
+// uploader leases any more, its attempts used up or its instance gone, and left as it is
+// the copy is never uploaded and CleanupFailedUploads deletes it. DISTINCT ON because two
+// copies of one body propose the same row, which ON CONFLICT DO UPDATE refuses.
+//
+// keptUIDs are the copies of the owner's own rows. They stage nothing here: the body is
+// wherever the source was delivered, possibly another node, so an existing row is left
+// alone (DO NOTHING) rather than taken over by this one.
+func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, keptUIDs, rekeyedUIDs []int64, instanceID string) error {
+	if len(rekeyedUIDs) > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
+			SELECT DISTINCT ON (m.content_hash, m.account_id) $1, m.content_hash, m.size, NOW(), m.account_id
+			FROM messages m
+			WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
+			ON CONFLICT (content_hash, account_id) DO UPDATE
+			SET attempts = 0, instance_id = EXCLUDED.instance_id, last_attempt = NULL`,
+			instanceID, mailboxID, rekeyedUIDs); err != nil {
+			return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+		}
 	}
-	_, err := tx.Exec(ctx, `
-		INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
-		SELECT $1, m.content_hash, m.size, NOW(), m.account_id
-		FROM messages m
-		WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
-		ON CONFLICT (content_hash, account_id) DO NOTHING`,
-		instanceID, mailboxID, newUIDs)
-	if err != nil {
-		return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+	if len(keptUIDs) > 0 {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
+			SELECT $1, m.content_hash, m.size, NOW(), m.account_id
+			FROM messages m
+			WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.uploaded = FALSE AND m.expunged_at IS NULL
+			ON CONFLICT (content_hash, account_id) DO NOTHING`,
+			instanceID, mailboxID, keptUIDs); err != nil {
+			return fmt.Errorf("failed to re-stage pending uploads: %w", err)
+		}
 	}
 	return nil
 }
@@ -304,9 +367,10 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 // Callers skip it when every source row already belongs to the destination account. That
 // account's row for the body is then anchored by the source row itself, which stays in
 // messages (MOVE only expunges it, and the orphan sweep counts expunged rows), so the sweep
-// cannot delete the row and there is nothing to insert. The skip matters: the shared lock
-// below is one entry per distinct body in PostgreSQL's server-wide lock table, held until
-// commit, and a bulk same-account MOVE is the common case.
+// cannot delete the row and there is nothing to insert. A rekey, which renames the source
+// row's hash, waits for the copy (lockRekeySources) and so sees the copied rows too. The
+// skip matters: the shared lock below is one entry per distinct body in PostgreSQL's
+// server-wide lock table, held until commit, and a bulk same-account MOVE is the common case.
 //
 // Do not replace the lock with a "row already exists" pre-check. A row that exists can be an
 // orphan the sweep is about to delete, and the sweep cannot see the uncommitted message that
@@ -315,7 +379,7 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 // The new rows carry no text: the body was staged (or already indexed) when the source
 // message was delivered, so the FTS worker fills these by copying the finished vector from
 // a sibling rather than tokenising anything again. The EXISTS guard keeps us from creating
-// rows for a body that was never indexed at all -- over 64KB, empty, or already pruned --
+// rows for a body that was never indexed at all -- empty, past fts_retention, or pruned --
 // which would otherwise be queued forever and then poisoned.
 func (db *Database) restageFTS(ctx context.Context, tx pgx.Tx, mailboxID int64, newUIDs []int64) error {
 	if len(newUIDs) == 0 {
@@ -368,7 +432,8 @@ type InsertMessageOptions struct {
 	Size                 int64
 	Subject              string
 	PlaintextBody        string
-	SentDate             time.Time
+	SentDate             time.Time // The parsed Date: header; zero when none parses (see storedSentDate)
+	SentDateUnknownZone  bool      // The parser explicitly reported no known source zone
 	InReplyTo            []string
 	References           []string
 	BodyStructure        *imap.BodyStructure
@@ -450,6 +515,62 @@ func stageFTS(ctx context.Context, tx pgx.Tx, contentHash string, accountID int6
 	tx.Exec(ctx, "RELEASE SAVEPOINT "+savepoint)
 }
 
+// maxSentUTCOffset bounds the Date: header zone offsets kept in messages.sent_utc_offset, in
+// seconds. Real zones lie between -12:00 and +14:00; the RFC 5322 §3.3 grammar admits any
+// four digits. The SENT* search keys rely on the bound: they look the offset up only for
+// messages sent within this distance of the searched date (sentDayCond).
+const maxSentUTCOffset = 24 * 60 * 60
+
+// sentUTCOffset returns the messages.sent_utc_offset value for sentDate: the UTC offset, in
+// seconds, of the zone it is expressed in. Ingress passes the parsed Date: header in its own
+// zone, so sent_date plus this offset is the header's wall-clock time, whose day the SENT*
+// keys compare (RFC 9051 §6.4.4: "disregarding time and timezone"). nil (NULL, searched by
+// the UTC day) for an offset beyond maxSentUTCOffset, and for a date whose zone is unknown
+// (unknownZone, RFC 5322 §3.3 "-0000"): its UTC day is the day it names, and
+// sentDateInHeaderZone gives it back in UTC, so its ENVELOPE date keeps the zone "-0000".
+func sentUTCOffset(sentDate time.Time, unknownZone bool) *int32 {
+	if unknownZone {
+		return nil
+	}
+	_, offset := sentDate.Zone()
+	if offset < -maxSentUTCOffset || offset > maxSentUTCOffset {
+		return nil
+	}
+	o := int32(offset)
+	return &o
+}
+
+// sentDateInHeaderZone is the inverse of sentUTCOffset: messages.sent_date in the zone of
+// the Date: header it was parsed from, given that row's sent_utc_offset. The ENVELOPE date
+// is formatted from it and must name the header's own day, time of day and zone (RFC 9051
+// §7.5.2: the envelope "is computed by the server by parsing the [RFC5322] header into the
+// component parts"). A row without an offset (a zone that is unknown, one beyond
+// maxSentUTCOffset, or a row written before migration 000060) is given in UTC rather than
+// in the time.Local pgx decodes a timestamptz into, so the ENVELOPE never depends on the
+// server's TZ. Readers separately record an unknown source zone for a present
+// Date header when offset is NULL; time.Location does not carry that status.
+func sentDateInHeaderZone(sentDate time.Time, offset *int32) time.Time {
+	if offset == nil {
+		return sentDate.UTC()
+	}
+	return sentDate.In(time.FixedZone("", int(*offset)))
+}
+
+// storedSentDate returns the messages.sent_date and sent_date_unknown values for a message,
+// whose InternalDate the caller has already defaulted. A message without a Date: header that
+// parses has no sent date, and SORT and THREAD use its INTERNALDATE instead (RFC 5256 §2.2:
+// "If the sent date cannot be determined (a Date: header is missing or cannot be parsed), the
+// INTERNALDATE for that message is used as the sent date"). sent_date_unknown records that
+// sent_date is that substitute, so the ENVELOPE reports the date as NIL (RFC 9051 §7.5.2,
+// BuildEnvelope); it is NULL, not false, for every other message.
+func storedSentDate(options *InsertMessageOptions) (sentDate time.Time, unknown *bool) {
+	if options.SentDate.IsZero() {
+		t := true
+		return options.InternalDate, &t
+	}
+	return options.SentDate, nil
+}
+
 func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *InsertMessageOptions, upload PendingUpload) (messageID int64, uid int64, err error) {
 	start := time.Now()
 	defer func() {
@@ -490,6 +611,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	if options.InternalDate.IsZero() {
 		options.InternalDate = time.Now()
 	}
+	sentDate, sentDateUnknown := storedSentDate(options)
 
 	var highestUID int64
 	var uidToUse int64
@@ -671,8 +793,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	saneSubject := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(options.Subject), helpers.MaxSubjectBytes)
 	saneInReplyToStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000)
 
-	referencesStr := strings.Join(options.References, " ")
-	saneReferencesStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(referencesStr), 2000)
+	saneReferencesStr := helpers.TrimReferences(options.References, helpers.MaxReferencesBytes)
 
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 
@@ -684,9 +805,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, delivery_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, delivery_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @delivery_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @delivery_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @date_unknown, @in_reply_to, @references, @body_structure, @recipients_json, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -707,7 +828,9 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 		"internal_date":   options.InternalDate,
 		"size":            options.Size,
 		"subject":         saneSubject,
-		"sent_date":       options.SentDate,
+		"sent_date":       sentDate,
+		"sent_utc_offset": sentUTCOffset(sentDate, options.SentDateUnknownZone && !options.SentDate.IsZero()),
+		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
 		"body_structure":  bodyStructureData,
@@ -835,9 +958,10 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 	// are secured. This safely enqueues the raw payloads for the background daemon
 	// to asynchronously perform the expensive to_tsvector() conversion. If this fails, the message is still
 	// delivered and uploaded to S3 — it just won't be FTS-searchable.
-	if shouldStageFTS(options.FTSRetention, options.SentDate, time.Now()) {
+	if shouldStageFTS(options.FTSRetention, sentDate, time.Now()) {
 		// Decide what to store in messages_fts_v2.
-		// Skip very large bodies (>64KB) — the full content is always available in S3.
+		// Very large bodies (>64KB) are truncated to their first 64KB, which is all that
+		// gets indexed; the full content is always available in S3.
 		// text_body is staged in messages_fts_v2, then processed by fts_worker.
 		const maxStoredBodySize = 64 * 1024 // 64 KB
 		var textBodyArg any = sanePlaintextBody
@@ -855,7 +979,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 
 		textBodyStr, _ := textBodyArg.(string)
 		if textBodyStr != "" {
-			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, options.SentDate)
+			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, sentDate)
 		}
 	}
 
@@ -886,6 +1010,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	if options.InternalDate.IsZero() {
 		options.InternalDate = time.Now()
 	}
+	sentDate, sentDateUnknown := storedSentDate(options)
 
 	var highestUID int64
 	var uidToUse int64
@@ -1047,17 +1172,16 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 	saneSubject := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(options.Subject), helpers.MaxSubjectBytes)
 	saneInReplyToStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000)
 
-	referencesStr := strings.Join(options.References, " ")
-	saneReferencesStr := helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(referencesStr), 2000)
+	saneReferencesStr := helpers.TrimReferences(options.References, helpers.MaxReferencesBytes)
 
 	sanePlaintextBody := helpers.SanitizeUTF8(options.PlaintextBody)
 
 	err = tx.QueryRow(ctx, `
 		WITH inserted AS (
 			INSERT INTO messages
-				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+				(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
 			VALUES
-				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @in_reply_to, @references, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
+				(@account_id, @mailbox_id, @mailbox_path, @uid, @message_id, @content_hash, @s3_domain, @s3_localpart, @internal_date, @size, @subject, @sent_date, @sent_utc_offset, @date_unknown, @in_reply_to, @references, @body_structure, @recipients_json, true, nextval('messages_modseq'), @subject_sort, @from_name_sort, @from_email_sort, @to_name_sort, @to_email_sort, @cc_email_sort, @extra_addresses)
 			RETURNING id
 		)
 		INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -1077,7 +1201,9 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		"internal_date":   options.InternalDate,
 		"size":            options.Size,
 		"subject":         saneSubject,
-		"sent_date":       options.SentDate,
+		"sent_date":       sentDate,
+		"sent_utc_offset": sentUTCOffset(sentDate, options.SentDateUnknownZone && !options.SentDate.IsZero()),
+		"date_unknown":    sentDateUnknown,
 		"in_reply_to":     saneInReplyToStr,
 		"references":      saneReferencesStr,
 		"body_structure":  bodyStructureData,
@@ -1124,9 +1250,10 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBInsertFailed, err)
 	}
 
-	if shouldStageFTS(options.FTSRetention, options.SentDate, time.Now()) {
+	if shouldStageFTS(options.FTSRetention, sentDate, time.Now()) {
 		// Decide what to store in messages_fts_v2.
-		// Skip very large bodies (>64KB) — the full content is always available in S3.
+		// Very large bodies (>64KB) are truncated to their first 64KB, which is all that
+		// gets indexed; the full content is always available in S3.
 		const maxStoredBodySize = 64 * 1024 // 64 KB
 		var textBodyArg any = sanePlaintextBody
 
@@ -1145,7 +1272,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 		// expected for old/large messages and is handled gracefully downstream (unsearchable).
 		textBodyStr, _ := textBodyArg.(string)
 		if textBodyStr != "" {
-			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, options.SentDate)
+			stageFTS(ctx, tx, options.ContentHash, options.AccountID, textBodyArg, sentDate)
 		}
 	}
 
@@ -1219,6 +1346,8 @@ func (d *Database) InsertMessagesBatch(
 		ToEmailSort        string
 		CcEmailSort        string
 		ExtraAddresses     string
+		SentDate           time.Time
+		SentDateUnknown    *bool
 		AssignedUID        int64
 	}
 
@@ -1247,6 +1376,7 @@ func (d *Database) InsertMessagesBatch(
 		if opt.InternalDate.IsZero() {
 			opt.InternalDate = time.Now()
 		}
+		sentDate, sentDateUnknown := storedSentDate(opt)
 
 		saneRecipients := make([]helpers.Recipient, len(opt.Recipients))
 		for j, r := range opt.Recipients {
@@ -1298,7 +1428,7 @@ func (d *Database) InsertMessagesBatch(
 			SaneSubject:        helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(opt.Subject), helpers.MaxSubjectBytes),
 			SanePlaintextBody:  helpers.SanitizeUTF8(opt.PlaintextBody),
 			SaneInReplyToStr:   helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(inReplyToStr), 2000),
-			SaneReferencesStr:  helpers.TruncateUTF8Safe(helpers.SanitizeUTF8(strings.Join(opt.References, " ")), 2000),
+			SaneReferencesStr:  helpers.TrimReferences(opt.References, helpers.MaxReferencesBytes),
 			BodyStructureData:  bodyStructureData,
 			RecipientsJSON:     recipientsJSON,
 			CustomKeywordsJSON: customKeywordsJSON,
@@ -1310,6 +1440,8 @@ func (d *Database) InsertMessagesBatch(
 			ToEmailSort:        toEmailSort,
 			CcEmailSort:        ccEmailSort,
 			ExtraAddresses:     extraAddresses,
+			SentDate:           sentDate,
+			SentDateUnknown:    sentDateUnknown,
 		})
 		messageIDs = append(messageIDs, saneMessageID)
 		contentHashes = append(contentHashes, opt.ContentHash)
@@ -1453,9 +1585,9 @@ func (d *Database) InsertMessagesBatch(
 		batch.Queue(`
 			WITH inserted AS (
 				INSERT INTO messages
-					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
+					(account_id, mailbox_id, mailbox_path, uid, message_id, content_hash, s3_domain, s3_localpart, internal_date, size, subject, sent_date, sent_utc_offset, sent_date_unknown, in_reply_to, "references", body_structure, recipients_json, uploaded, created_modseq, subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses)
 				VALUES
-					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, nextval('messages_modseq'), $18, $19, $20, $21, $22, $23, $26)
+					($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $27, $28, $13, $14, $15, $16, $17, nextval('messages_modseq'), $18, $19, $20, $21, $22, $23, $26)
 				RETURNING id
 			)
 			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
@@ -1463,10 +1595,10 @@ func (d *Database) InsertMessagesBatch(
 			RETURNING message_id
 		`,
 			p.Opt.AccountID, mailboxID, p.SaneMailboxName, p.AssignedUID, p.SaneMessageID, p.Opt.ContentHash,
-			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.Opt.SentDate,
+			p.Opt.S3Domain, p.Opt.S3Localpart, p.Opt.InternalDate, p.Opt.Size, p.SaneSubject, p.SentDate,
 			p.SaneInReplyToStr, p.SaneReferencesStr, p.BodyStructureData, p.RecipientsJSON, uploaded, p.SubjectSort,
 			p.FromNameSort, p.FromEmailSort, p.ToNameSort, p.ToEmailSort, p.CcEmailSort,
-			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses,
+			p.BitwiseFlags, p.CustomKeywordsJSON, p.ExtraAddresses, sentUTCOffset(p.SentDate, p.Opt.SentDateUnknownZone && !p.Opt.SentDate.IsZero()), p.SentDateUnknown,
 		)
 
 		if !uploaded && p.Upload != nil {
@@ -1477,7 +1609,7 @@ func (d *Database) InsertMessagesBatch(
 			`, p.Upload.InstanceID, p.Upload.ContentHash, p.Upload.Size, p.Upload.AccountID)
 		}
 
-		if shouldStageFTS(p.Opt.FTSRetention, p.Opt.SentDate, ftsNow) {
+		if shouldStageFTS(p.Opt.FTSRetention, p.SentDate, ftsNow) {
 			const maxStoredBodySize = 64 * 1024 // 64 KB
 			var textBodyArg any = p.SanePlaintextBody
 
@@ -1496,7 +1628,7 @@ func (d *Database) InsertMessagesBatch(
 					ftsHashesSeen[p.Opt.ContentHash] = struct{}{}
 					ftsHashesToLock = append(ftsHashesToLock, p.Opt.ContentHash)
 				}
-				batch.Queue(ftsStageV2SQL, p.Opt.ContentHash, p.Opt.AccountID, textBodyArg, p.Opt.SentDate)
+				batch.Queue(ftsStageV2SQL, p.Opt.ContentHash, p.Opt.AccountID, textBodyArg, p.SentDate)
 			}
 		}
 	}
@@ -1540,7 +1672,7 @@ func (d *Database) InsertMessagesBatch(
 			}
 		}
 
-		if shouldStageFTS(p.Opt.FTSRetention, p.Opt.SentDate, ftsNow) {
+		if shouldStageFTS(p.Opt.FTSRetention, p.SentDate, ftsNow) {
 			textBodyStr, _ := p.SanePlaintextBody, false
 			if len(p.SanePlaintextBody) > 64*1024 {
 				textBodyStr = "..." // Mocked just to check if we queued it
@@ -1573,4 +1705,17 @@ func syntheticMessageID(contentHash, mailboxName string) string {
 		contentHash = fmt.Sprintf("%d", time.Now().UnixNano())
 	}
 	return fmt.Sprintf("<%s@%s.synthetic.invalid>", contentHash, mailboxName)
+}
+
+// headerMessageID is the Message-ID header a stored message_id stands for, or "" when
+// the message had no usable one. The ingress parser (mail.Header.MessageID) returns a
+// msg-id without its angle brackets, and its id-left cannot begin with '<'; only the
+// synthetic IDs stored for duplicate detection (InsertMessage, syntheticMessageID) keep
+// theirs. Every reader that reports message_id as the message's header goes through
+// this; messageIDFieldExpr is the same rule in SQL.
+func headerMessageID(stored string) string {
+	if strings.HasPrefix(stored, "<") {
+		return ""
+	}
+	return stored
 }

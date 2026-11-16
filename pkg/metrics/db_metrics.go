@@ -49,32 +49,8 @@ var (
 	)
 )
 
-// Database circuit breaker metrics
+// Database connection pool exhaustion
 var (
-	DBCircuitBreakerState = promauto.NewGaugeVec(
-		prometheus.GaugeOpts{
-			Name: "sora_db_circuit_breaker_state",
-			Help: "State of database circuit breaker (1=active, 0=inactive).",
-		},
-		[]string{"state"}, // state: "open", "closed", "half_open"
-	)
-
-	DBCircuitBreakerFailures = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "sora_db_circuit_breaker_failures_total",
-			Help: "Total number of circuit breaker failures.",
-		},
-		[]string{"role"}, // role: "read", "write"
-	)
-
-	DBConnectionAcquireTimeout = promauto.NewCounterVec(
-		prometheus.CounterOpts{
-			Name: "sora_db_connection_acquire_timeout_total",
-			Help: "Total number of database connection acquire timeouts.",
-		},
-		[]string{"role"}, // role: "read", "write"
-	)
-
 	DBPoolExhaustion = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "sora_db_pool_exhaustion_total",

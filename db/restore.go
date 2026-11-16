@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -54,7 +56,8 @@ type ListDeletedMessagesParams struct {
 const effectiveMailboxName = `COALESCE(mb.name, m.mailbox_path)`
 
 // ListDeletedMessages returns messages that have been deleted (expunged)
-// matching the given criteria
+// matching the given criteria. A message that has since been restored is live again,
+// so the expunged row it was restored from is not listed.
 func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMessagesParams) ([]DeletedMessage, error) {
 	accountID, err := restoreAccountID(ctx, d.GetReadPool(), params.Email)
 	if err != nil {
@@ -78,6 +81,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
 		WHERE m.account_id = $1
 		  AND m.expunged_at IS NOT NULL
+		  AND m.restored_at IS NULL
 	`
 
 	args := []any{accountID}
@@ -117,7 +121,8 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 	}
 	defer rows.Close()
 
-	var messages []DeletedMessage
+	// Never nil: an empty result is the JSON array [], not null.
+	messages := []DeletedMessage{}
 	for rows.Next() {
 		var msg DeletedMessage
 		err := rows.Scan(
@@ -135,6 +140,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan deleted message: %w", err)
 		}
+		msg.MessageID = headerMessageID(msg.MessageID)
 		messages = append(messages, msg)
 	}
 
@@ -182,13 +188,15 @@ func restoreAccountID(ctx context.Context, q rowQuerier, email string) (int64, e
 }
 
 // restoreFilters returns the FROM/WHERE shared by every restore query for params, and
-// its arguments. Columns and aliases follow effectiveMailboxName (m, mb).
+// its arguments. Columns and aliases follow effectiveMailboxName (m, mb). An expunged row
+// whose message has been restored (restored_at, see RestoreMessages) is no candidate.
 func restoreFilters(accountID int64, params RestoreMessagesParams) (string, []any) {
 	query := `
 		FROM messages m
 		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
 		WHERE m.account_id = $1
 		  AND m.expunged_at IS NOT NULL
+		  AND m.restored_at IS NULL
 	`
 	args := []any{accountID}
 	argPos := 2
@@ -313,6 +321,13 @@ func (d *Database) GetRestorableMessageIDs(ctx context.Context, params RestoreMe
 // RestoreMessages restores deleted messages back to their original mailboxes
 // It recreates mailboxes if they no longer exist.
 //
+// A message comes back as a new row, with a new UID, as a MOVE brings one: the expunged
+// row stays as it is, the record that its UID was expunged and when, until the cleaner
+// purges it with the other expunged rows. Every reader of that record (a session's
+// poll, QRESYNC and UID FETCH VANISHED, the sequence view of a session not yet told of
+// the expunge) keeps reporting the old UID's expunge to a client that has not seen it.
+// restored_at marks the expunged row, so it is neither listed nor restored again.
+//
 // Every candidate is handled with a fixed number of statements inside the caller's
 // transaction, so the caller must bound the batch (see RestoreMessagesWithRetry, which
 // resolves the ids first and restores them in chunks, each in its own transaction).
@@ -329,7 +344,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	}
 
 	query, args := restoreCandidatesQuery(accountID, params,
-		"m.id, "+effectiveMailboxName+", m.message_id, m.content_hash")
+		"m.id, "+effectiveMailboxName+", m.message_id, m.delivery_hash, m.content_hash")
 	rows, err := tx.Query(ctx, query, args...)
 	if err != nil {
 		return 0, fmt.Errorf("failed to query messages for restoration: %w", err)
@@ -338,10 +353,11 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 
 	// Collect messages and their target mailboxes
 	type msgToRestore struct {
-		id          int64
-		mailboxName string // effective name: live mailbox's current name, else the stored string
-		messageID   string
-		contentHash string // for the per-object lock shared with the cleaner
+		id           int64
+		mailboxName  string  // effective name: live mailbox's current name, else the stored string
+		messageID    string
+		deliveryHash *string // set by MTA delivery only; deduplicates headerless redeliveries per mailbox
+		contentHash  string  // for the per-object lock shared with the cleaner
 	}
 
 	var messagesToRestore []msgToRestore
@@ -350,7 +366,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	for rows.Next() {
 		var msg msgToRestore
 		var mailboxName *string
-		err := rows.Scan(&msg.id, &mailboxName, &msg.messageID, &msg.contentHash)
+		err := rows.Scan(&msg.id, &mailboxName, &msg.messageID, &msg.deliveryHash, &msg.contentHash)
 		if err != nil {
 			return 0, fmt.Errorf("failed to scan message for restoration: %w", err)
 		}
@@ -399,20 +415,46 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		mailboxIDMap[mailboxName] = mailboxID
 	}
 
-	// Restore messages by clearing expunged_at and updating mailbox_id
+	// Lock all target mailbox rows up-front in ascending id order before taking per-object
+	// locks or touching messages / mailbox_stats. This preserves the global lock order
+	// (mailboxes -> advisory / messages -> mailbox_stats) instead of locking mailboxes
+	// ad-hoc via the per-message highest_uid UPDATE, and serializes reading each target
+	// mailbox's keyword registry against concurrent STORE, APPEND, COPY, and MOVE writes.
+	targetMailboxIDs := make([]int64, 0, len(mailboxIDMap))
+	for _, id := range mailboxIDMap {
+		targetMailboxIDs = append(targetMailboxIDs, id)
+	}
+	slices.Sort(targetMailboxIDs)
+	targetMailboxIDs = slices.Compact(targetMailboxIDs)
+	if _, err := tx.Exec(ctx, "SELECT id FROM mailboxes WHERE id = ANY($1) ORDER BY id FOR NO KEY UPDATE", targetMailboxIDs); err != nil {
+		return 0, fmt.Errorf("failed to lock target mailboxes for restoration: %w", err)
+	}
+
+	canonicalByMailbox := make(map[int64]map[string]string, len(targetMailboxIDs))
+	for _, mailboxID := range targetMailboxIDs {
+		canonical, err := d.mailboxKeywordCanonicalMap(ctx, tx, mailboxID)
+		if err != nil {
+			return 0, fmt.Errorf("failed to read canonical keywords for mailbox %d: %w", mailboxID, err)
+		}
+		canonicalByMailbox[mailboxID] = canonical
+	}
+
+	// Restore each message as a new row in its target mailbox
 	var restoredCount int64
 	var skippedCount int64
 	for _, msg := range messagesToRestore {
 		targetMailboxID := mailboxIDMap[msg.mailboxName]
 
 		// Re-check the row under this transaction, and look for a live copy of the same
-		// Message-ID in the TARGET mailbox. It is valid to have the same Message-ID in
-		// different mailboxes (e.g. INBOX + Sent), but restoring never produces a second
-		// live copy inside one mailbox — including a copy restored earlier in this run or
-		// in a previous chunk. The row itself may have vanished since the candidate list was
-		// built (already restored by a concurrent run, or purged by the cleaner); that is a
-		// skip, not an error, so a restore is always safe to re-run.
-		// Hold the object's lock while the row comes back to life: the cleaner takes
+		// Message-ID or non-empty delivery_hash in the TARGET mailbox (headerless MTA
+		// deliveries receive a fresh synthetic Message-ID per attempt and deduplicate on
+		// delivery_hash). It is valid to have the same message in different mailboxes
+		// (e.g. INBOX + Sent), but restoring never produces a second live copy inside one
+		// mailbox — including a copy restored earlier in this run or in a previous chunk.
+		// The row itself may have vanished since the candidate list was built (already
+		// restored by a concurrent run, or purged by the cleaner); that is a skip, not an
+		// error, so a restore is always safe to re-run.
+		// Hold the object's lock while the message comes back to life: the cleaner takes
 		// the same lock (session try-lock) around "confirm orphan → delete object",
 		// so a restore can no longer slip between its check and its delete and leave a
 		// live row whose object is gone.
@@ -421,27 +463,44 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		}
 
 		var restorable bool
-		var existingCount int
+		var alreadyExists bool
+		var rawCustomFlags []byte
 		err := tx.QueryRow(ctx, `
-			SELECT EXISTS (SELECT 1 FROM messages WHERE id = $1 AND expunged_at IS NOT NULL),
-			       (SELECT COUNT(*) FROM messages
-			         WHERE account_id = $2 AND mailbox_id = $3 AND message_id = $4 AND expunged_at IS NULL)
-		`, msg.id, accountID, targetMailboxID, msg.messageID).Scan(&restorable, &existingCount)
+			SELECT EXISTS (SELECT 1 FROM messages WHERE id = $1 AND expunged_at IS NOT NULL AND restored_at IS NULL),
+			       EXISTS (
+			           SELECT 1 FROM messages
+			           WHERE account_id = $2 AND mailbox_id = $3 AND message_id = $4 AND expunged_at IS NULL
+			       ) OR (
+			           $5::text IS NOT NULL AND $5::text <> '' AND EXISTS (
+			               SELECT 1 FROM messages
+			               WHERE account_id = $2 AND mailbox_id = $3 AND delivery_hash IS NOT NULL AND delivery_hash = $5::text AND expunged_at IS NULL
+			           )
+			       ),
+			       (SELECT custom_flags FROM message_state WHERE message_id = $1)
+		`, msg.id, accountID, targetMailboxID, msg.messageID, msg.deliveryHash).Scan(&restorable, &alreadyExists, &rawCustomFlags)
 		if err != nil {
 			return 0, fmt.Errorf("failed to check restore preconditions for message %d: %w", msg.id, err)
 		}
 
 		if !restorable {
-			logger.Info("Database: skipping message restoration: message no longer expunged or already removed", "id", msg.id, "mailbox", msg.mailboxName)
+			logger.Info("Database: skipping message restoration: message already restored or removed", "id", msg.id, "mailbox", msg.mailboxName)
 			skippedCount++
 			continue
 		}
 
-		if existingCount > 0 {
+		if alreadyExists {
 			// A non-expunged copy already exists in the target mailbox, skip restoration
 			logger.Info("Database: skipping message restoration: message already exists in target mailbox", "id", msg.id, "mailbox", msg.mailboxName)
 			skippedCount++
 			continue
+		}
+
+		// Fold custom keywords onto the target mailbox's canonical case (RFC 9051 §2.3.2),
+		// sharing newly established canonical forms across the batch just as CopyMessages,
+		// MoveMessages, and InsertMessagesBatch do.
+		customFlagsJSON, err := canonicalizeRestoredCustomFlags(canonicalByMailbox[targetMailboxID], rawCustomFlags, msg.id)
+		if err != nil {
+			return 0, err
 		}
 
 		// Get next UID for the mailbox
@@ -456,34 +515,49 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 			return 0, fmt.Errorf("failed to get next UID for mailbox: %w", err)
 		}
 
-		// Restore the message's state and clear the \Deleted flag (FlagDeleted = 8,
-		// bit 3). An upsert, not an UPDATE: the row is missing for any message whose
-		// mailbox was purged by an older build (the FK cascade deleted it), and a bare
-		// UPDATE then matched nothing and reported success — leaving a live message with
-		// no state row, on which every later STORE silently did nothing. With nothing
-		// left to recover, such a message comes back unread and keyword-less.
-		_, err = tx.Exec(ctx, `
-			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			VALUES ($1, $2, 0, '[]'::jsonb, now(), nextval('messages_modseq'))
-			ON CONFLICT (message_id) DO UPDATE
-			SET mailbox_id = EXCLUDED.mailbox_id,
-			    flags = message_state.flags & ~8,
-			    flags_changed_at = EXCLUDED.flags_changed_at,
-			    updated_modseq = EXCLUDED.updated_modseq
-		`, msg.id, targetMailboxID)
-		if err != nil {
-			return 0, fmt.Errorf("failed to restore message_state for message %d: %w", msg.id, err)
-		}
-
+		// The message appears in the mailbox again, so it is created anew: a new row with
+		// a new UID and a new mod-sequence above HIGHESTMODSEQ (RFC 7162 §3.1: "When a
+		// message is appended to a mailbox (via the IMAP APPEND command, COPY to the
+		// mailbox, or using an external mechanism), the server generates a new modification
+		// sequence that is higher than the highest modification sequence of all messages in
+		// the mailbox and assigns it to the appended message"). The stats triggers count it
+		// and raise the mailbox's highest_modseq, as for a COPY. Every column of the message
+		// is carried, as COPY and MOVE carry them (TestCopyMoveCarryEveryMessageColumn), and
+		// delivery_hash too: an MTA redelivery of the message is still a duplicate of it.
+		//
+		// The expunged row is only marked restored_at, in the same statement, and stays the
+		// record of the old UID's expunge. Its state comes along without \Deleted
+		// (FlagDeleted = 8, bit 3). A message whose state row is missing (its mailbox was
+		// purged by an older build, whose FK cascade deleted it) comes back unread and
+		// keyword-less: there is nothing left to recover.
 		result, err := tx.Exec(ctx, `
-			UPDATE messages
-			SET expunged_at = NULL,
-			    expunged_modseq = NULL,
-			    mailbox_id = $2,
-			    uid = $3,
-			    updated_at = now()
-			WHERE id = $1 AND expunged_at IS NOT NULL
-		`, msg.id, targetMailboxID, nextUID)
+			WITH source AS (
+				UPDATE messages SET restored_at = now()
+				WHERE id = $1 AND expunged_at IS NOT NULL AND restored_at IS NULL
+				RETURNING *
+			),
+			restored AS (
+				INSERT INTO messages (
+					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
+					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
+					body_structure, recipients_json, s3_domain, s3_localpart,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					delivery_hash, mailbox_id, mailbox_path, uid, created_modseq
+				)
+				SELECT
+					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
+					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
+					body_structure, recipients_json, s3_domain, s3_localpart,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					delivery_hash, $2::bigint, $3::text, $4::bigint, nextval('messages_modseq')
+				FROM source
+				RETURNING id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+			SELECT r.id, $2::bigint, COALESCE(ms.flags & ~8, 0), $5::jsonb, now(), nextval('messages_modseq')
+			FROM restored r
+			LEFT JOIN message_state ms ON ms.message_id = $1
+		`, msg.id, targetMailboxID, msg.mailboxName, nextUID, customFlagsJSON)
 		if err != nil {
 			return 0, fmt.Errorf("failed to restore message %d: %w", msg.id, err)
 		}
@@ -492,28 +566,57 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	}
 
 	if skippedCount > 0 {
-		logger.Info("Database: skipped restoring messages that already exist in target mailboxes or are no longer expunged", "count", skippedCount)
-	}
-
-	// Recompute unseen_count for every touched target mailbox. The database trigger on
-	// messages joins on ms.mailbox_id = o.mailbox_id, which cannot match for an orphan
-	// (o.mailbox_id IS NULL) or cross-mailbox restore, treating every restored message
-	// as an unseen arrival and drifting unseen_count up by 1 per \Seen message.
-	for _, targetMailboxID := range mailboxIDMap {
-		if _, err := d.RecomputeMailboxUnseen(ctx, tx, targetMailboxID); err != nil {
-			return 0, fmt.Errorf("failed to recompute unseen count for mailbox %d: %w", targetMailboxID, err)
-		}
+		logger.Info("Database: skipped restoring messages that already exist in target mailboxes or were already restored or removed", "count", skippedCount)
 	}
 
 	return restoredCount, nil
 }
 
+// canonicalizeRestoredCustomFlags folds raw JSON-encoded custom_flags onto canonical
+// (the target mailbox's fold-key -> canonical-case map, mutated in place so keywords
+// new to the mailbox establish a single canonical case across the restore batch) and
+// returns a valid JSON array ("[]" when empty).
+func canonicalizeRestoredCustomFlags(canonical map[string]string, raw []byte, messageID int64) (string, error) {
+	if len(raw) == 0 {
+		return "[]", nil
+	}
+	var kws []string
+	if err := json.Unmarshal(raw, &kws); err != nil {
+		return "", fmt.Errorf("failed to unmarshal custom_flags for message %d: %w", messageID, err)
+	}
+	filtered := kws[:0]
+	for _, kw := range kws {
+		if kw == "" || strings.HasPrefix(kw, "\\") {
+			continue
+		}
+		filtered = append(filtered, kw)
+	}
+	folded := foldKeywordsWithMap(canonical, filtered)
+	if len(folded) == 0 {
+		return "[]", nil
+	}
+	encoded, err := json.Marshal(folded)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal canonical custom_flags for message %d: %w", messageID, err)
+	}
+	return string(encoded), nil
+}
+
 // restoreMailbox returns the id and path of the live mailbox called name, recreating it
 // if it was deleted — linked under its parent, which is itself recreated first if it is
-// gone too. A recreated "Parent/Child" used to land at the root: the name still showed
-// the hierarchy in LIST, but the tree is path-based, so the parent lost \HasChildren,
-// RENAME of the parent stopped carrying the child, and a later DELETE of the parent
-// succeeded and stranded it.
+// gone too. A recreated "Parent/Child" used to land at the root: the name
+// still showed the hierarchy in LIST, but the tree is path-based, so the parent lost
+// \HasChildren, RENAME of the parent stopped carrying the child, and a later DELETE of
+// the parent succeeded and stranded it.
+//
+// A name in the shared namespace of the [shared_mailboxes] config in ctx is recreated as
+// a shared mailbox of the account. Recreated personal, it sat in the shared namespace
+// where SETACL refuses to share it. The entries the deleted mailbox had went with it and
+// are not restored. Nor does it copy a live shared parent's entries, as CREATE does for
+// a new, empty mailbox (RFC 4314 section 4): a restore brings messages back, and the
+// parent may grant users that the deleted mailbox no longer did. Each level recreated
+// gets one entry, the owner's primary address with default_rights; an admin grants
+// other users access again.
 //
 // asParent takes FOR KEY SHARE on an existing mailbox that is about to receive a
 // recreated child — the same lock createMailbox takes — so the parent cannot be
@@ -541,6 +644,12 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 		}
 	}
 
+	ownerDomain, err := newMailboxOwnerDomain(ctx, tx, accountID, name)
+	if err != nil {
+		return 0, "", err
+	}
+	isShared := ownerDomain != nil
+
 	// Re-seed the RFC 6154 special-use attribute for a canonical top-level default name
 	// (consistent with CreateDefaultMailboxes / migration 000045), but ONLY if the
 	// attribute is not already held by another live mailbox — so a restore never
@@ -548,12 +657,13 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 	// ON CONFLICT tolerates a concurrent recreate of the same name; its row is then
 	// re-read below.
 	err = tx.QueryRow(ctx, `
-		INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path, special_use)
+		INSERT INTO mailboxes (account_id, name, uid_validity, created_at, updated_at, path, special_use, is_shared, owner_domain)
 		SELECT $1, $2, extract(epoch from now())::bigint, now(), now(), '',
 			CASE WHEN canon.su IS NOT NULL
 			          AND NOT EXISTS (SELECT 1 FROM mailboxes m2
 			                          WHERE m2.account_id = $1 AND m2.special_use = canon.su AND m2.deleted_at IS NULL)
-			     THEN canon.su END
+			     THEN canon.su END,
+			$3::boolean, $4::text
 		FROM (SELECT CASE LOWER($2)
 			WHEN 'sent'    THEN '\Sent'
 			WHEN 'drafts'  THEN '\Drafts'
@@ -563,7 +673,7 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 		END AS su) canon
 		ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
 		RETURNING id
-	`, accountID, name).Scan(&mailboxID)
+	`, accountID, name, isShared, ownerDomain).Scan(&mailboxID)
 	if err == pgx.ErrNoRows {
 		// Concurrent recreate won the race; use its row as it is.
 		err = tx.QueryRow(ctx, lookup, accountID, name).Scan(&mailboxID, &path)
@@ -580,6 +690,15 @@ func restoreMailbox(ctx context.Context, tx pgx.Tx, accountID int64, name string
 	path = helpers.GetMailboxPath(parentPath, mailboxID)
 	if _, err := tx.Exec(ctx, `UPDATE mailboxes SET path = $1 WHERE id = $2`, path, mailboxID); err != nil {
 		return 0, "", fmt.Errorf("failed to update path for mailbox %s: %w", name, err)
+	}
+
+	if isShared {
+		// No sharedParentID, whatever the parent is: the owner's entry only.
+		if err := grantNewSharedMailboxACL(ctx, tx, accountID, name, mailboxID, nil, *ownerDomain); err != nil {
+			return 0, "", err
+		}
+		logger.Warn("Database: restore recreated a deleted shared mailbox with owner-only rights; grant other users access again",
+			"account_id", accountID, "mailbox", name, "mailbox_id", mailboxID)
 	}
 	return mailboxID, path, nil
 }

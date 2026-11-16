@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/metrics"
@@ -96,6 +97,9 @@ type HealthCheck struct {
 }
 
 type HealthMonitor struct {
+	// hostname labels the health metrics, with the value every other sora metric of
+	// this node carries.
+	hostname        string
 	checks          map[string]*HealthCheck
 	mu              sync.RWMutex
 	overallStatus   ComponentStatus
@@ -106,6 +110,7 @@ type HealthMonitor struct {
 
 func NewHealthMonitor() *HealthMonitor {
 	return &HealthMonitor{
+		hostname:        config.ResolveMailHostname(),
 		checks:          make(map[string]*HealthCheck),
 		overallStatus:   StatusHealthy,
 		statusCallbacks: make([]func(string, ComponentStatus), 0),
@@ -225,7 +230,7 @@ func (hm *HealthMonitor) performCheck(runCtx context.Context, check *HealthCheck
 	}
 
 	// Record duration metric
-	metrics.ComponentHealthCheckDuration.WithLabelValues(check.Name, "").Observe(duration)
+	metrics.ComponentHealthCheckDuration.WithLabelValues(check.Name, hm.hostname).Observe(duration)
 
 	// Now update the check state with proper locking
 	check.CheckCount++
@@ -276,7 +281,7 @@ func (hm *HealthMonitor) performCheck(runCtx context.Context, check *HealthCheck
 	check.mu.Unlock()
 
 	// Record health check metrics
-	metrics.ComponentHealthChecks.WithLabelValues(check.Name, "", string(currentStatus)).Inc()
+	metrics.ComponentHealthChecks.WithLabelValues(check.Name, hm.hostname, string(currentStatus)).Inc()
 
 	// Update health status gauge (0=unreachable, 1=unhealthy, 2=degraded, 3=healthy)
 	var statusValue float64
@@ -290,7 +295,7 @@ func (hm *HealthMonitor) performCheck(runCtx context.Context, check *HealthCheck
 	case StatusUnreachable:
 		statusValue = 0
 	}
-	metrics.ComponentHealthStatus.WithLabelValues(check.Name, "").Set(statusValue)
+	metrics.ComponentHealthStatus.WithLabelValues(check.Name, hm.hostname).Set(statusValue)
 
 	if changed {
 		if isFirstCheck {

@@ -76,6 +76,39 @@ func ftsSourceVectorSQL(hashCol string) string {
 		  WHERE v.content_hash = ` + hashCol + ` AND v.text_body_tsv IS NOT NULL LIMIT 1))`
 }
 
+// fillWaitingFTSRows gives the rows of hashes that wait for a sibling's vector -- no text,
+// no vector, as restageFTS writes them for a copy into another account and stageFTS for a
+// body another account has indexed -- what the FTS worker would give them: the hash's vector,
+// or, while the hash's text is not tokenised yet, that text.
+//
+// Every deletion of FTS rows (the account drain, the orphan sweep, a rekey) runs it first for
+// the hashes it deletes, holding their exclusive orphan-sweep locks: the row it deletes may be
+// the only one a waiting row can be filled from, and the worker, finding none, would poison
+// the waiting row with an empty vector. The locks keep out deliveries and copies staging those
+// hashes, so every waiting row is visible here.
+//
+// It does not skip a row the worker has polled: the worker fills it from a sibling that stays
+// until this transaction commits, and the update then finds it filled. The sources are looked
+// up only for hashes that have a waiting row, so a vector is not read for every hash deleted.
+func fillWaitingFTSRows(ctx context.Context, tx pgx.Tx, hashes []string) error {
+	if len(hashes) == 0 {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE messages_fts_v2 t
+		SET text_body_tsv = s.tsv, text_body = CASE WHEN s.tsv IS NULL THEN s.text END
+		FROM (SELECT w.content_hash, `+ftsSourceVectorSQL("w.content_hash")+` AS tsv,
+		             (SELECT v.text_body FROM messages_fts_v2 v
+		               WHERE v.content_hash = w.content_hash AND v.text_body IS NOT NULL LIMIT 1) AS text
+		      FROM (SELECT DISTINCT content_hash FROM messages_fts_v2
+		             WHERE content_hash = ANY($1::text[]) AND text_body_tsv IS NULL AND text_body IS NULL) w) s
+		WHERE t.content_hash = s.content_hash AND t.text_body_tsv IS NULL AND t.text_body IS NULL
+		  AND (s.tsv IS NOT NULL OR s.text IS NOT NULL)`, hashes); err != nil {
+		return fmt.Errorf("failed to fill waiting fts rows: %w", err)
+	}
+	return nil
+}
+
 // ftsQueueItem is one polled row of the staging queue.
 type ftsQueueItem struct {
 	Hash      string

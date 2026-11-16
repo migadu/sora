@@ -7,7 +7,7 @@ import (
 )
 
 func TestLookupCache_DataRace_Get_Refresh(t *testing.T) {
-	cache := New(time.Minute, time.Minute, 100, time.Minute, time.Minute)
+	cache := New("test", "test", time.Minute, time.Minute, 100, time.Minute, time.Minute)
 	server := "server1"
 	user := "user1"
 
@@ -51,7 +51,7 @@ func TestLookupCache_DataRace_Get_Refresh(t *testing.T) {
 }
 
 func TestLookupCache_DataRace_GetOrFetch_Refresh(t *testing.T) {
-	cache := New(time.Minute, time.Minute, 100, time.Minute, time.Minute)
+	cache := New("test", "test", time.Minute, time.Minute, 100, time.Minute, time.Minute)
 	server := "server1"
 	user := "user1"
 

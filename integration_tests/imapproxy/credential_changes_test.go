@@ -54,12 +54,44 @@ func TestIMAPProxyCredentialChangesWithoutClusterOrAdminAPI(t *testing.T) {
 	proxyServer := proxy.Server.(*imapproxy.Server)
 	defer proxyServer.Stop()
 
+	authCache.Suspend()
+	identity, err := rdb.GetDatabaseIdentityWithRetry(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authCache.EnsureRevocationNamespace(ctx, identity); err != nil {
+		t.Fatal(err)
+	}
+
 	watcher := credchanges.New(rdb.GetCredentialChangesSinceWithRetry, rdb.PruneCredentialChangesWithRetry, credchanges.Sinks{
 		AuthCache: authCache,
 		LoginCaches: func() []credchanges.LoginCache {
 			return []credchanges.LoginCache{proxyServer.GetLookupCache(), backend.Server.(*imap.IMAPServer).GetLookupCache()}
 		},
 		Sessions: func() []credchanges.SessionEnder { return []credchanges.SessionEnder{tracker} },
+		Suspend: func() {
+			authCache.Suspend()
+			proxyServer.GetLookupCache().Suspend()
+			backend.Server.(*imap.IMAPServer).GetLookupCache().Suspend()
+		},
+		Synchronized: func(ctx context.Context) error {
+			if err := authCache.Resume(ctx); err != nil {
+				return err
+			}
+			proxyServer.GetLookupCache().Resume()
+			backend.Server.(*imap.IMAPServer).GetLookupCache().Resume()
+			return nil
+		},
+		Reset: func(ctx context.Context) error {
+			authCache.Suspend()
+			proxyServer.GetLookupCache().Suspend()
+			backend.Server.(*imap.IMAPServer).GetLookupCache().Suspend()
+			err := authCache.InvalidateAll(ctx)
+			proxyServer.GetLookupCache().Clear()
+			backend.Server.(*imap.IMAPServer).GetLookupCache().Clear()
+			tracker.EndAllLocalSessions()
+			return err
+		},
 	}, 0)
 	if err := watcher.Refresh(ctx); err != nil {
 		t.Fatalf("first read of credential_changes: %v", err)

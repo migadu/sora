@@ -3,57 +3,59 @@ package db
 import (
 	"context"
 	"fmt"
-	"time"
-
 	"github.com/jackc/pgx/v5"
+	"time"
 )
 
-// CredentialChanges is what credential_changes holds from a point in time on: the
-// accounts whose logins changed (a new password, a removed credential, the account taken
-// out of service), as triggers recorded them.
+// CredentialChanges is the visible primary feed at one statement snapshot.
 type CredentialChanges struct {
-	// ReadAt is the database clock at the read. The next read starts from it, less a
-	// window for transactions that were still open (see credchanges.Watcher).
+	// ReadAt is the statement's start, a lower bound on its snapshot. It is used
+	// only for retention recovery, never as an event-delivery cursor.
 	ReadAt time.Time
-	// Accounts holds every account with a change: what a node cached of its logins is
-	// stale.
-	Accounts []int64
-	// Removed holds those among them taken out of service (deleted, or marked for
-	// purging) and not restored since: their sessions end as well.
-	Removed []int64
+	// NextCursor is the snapshot xmin: every lower transaction has committed or
+	// rolled back. The next successfully applied read starts inclusively here.
+	NextCursor int64
+	Accounts   []int64
+	Removed    []int64
 }
 
-// GetCredentialChangesSince returns the accounts whose logins changed at or after since,
-// each once. It reads the pool the context selects, which must be the primary's
-// (credchanges.Watcher reads through GetCredentialChangesSinceWithRetry, which pins it):
-// the next read starts from ReadAt less a fixed window, and a replica's ReadAt is its own
-// clock however far behind its data is, so a replica lagging by more than the window
-// would make the reader step past changes for good.
-func (db *Database) GetCredentialChangesSince(ctx context.Context, since time.Time) (CredentialChanges, error) {
+// GetCredentialChangesSince reads ALL currently visible events whose writing
+// transaction is at or above cursor, even when a lower transaction is still
+// open. Event ids and timestamps do not order commits. An uncommitted writer
+// cannot fall below the returned safe xmin, so it remains eligible when it
+// commits. A caller advances its cursor only after every sink has succeeded.
+func (d *Database) GetCredentialChangesSince(ctx context.Context, cursor int64) (CredentialChanges, error) {
+	if cursor < 0 {
+		return CredentialChanges{}, fmt.Errorf("invalid credential change cursor: %d", cursor)
+	}
 	var c CredentialChanges
-	// An aggregate without GROUP BY returns its one row with no input, so the clock comes
-	// back even when nothing changed.
-	// A reader applies a change at every read for a while (see credchanges.Watcher), so
-	// an account restored meanwhile must stop counting as removed, or its new sessions
-	// would keep being ended.
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT now(),
-		       COALESCE(array_agg(DISTINCT c.account_id), '{}'),
-		       COALESCE(array_agg(DISTINCT c.account_id) FILTER (WHERE c.ends_sessions AND NOT EXISTS (
-		           SELECT 1 FROM accounts a WHERE a.id = c.account_id AND a.deleted_at IS NULL)), '{}')
-		FROM credential_changes c
-		WHERE c.changed_at >= $1
-	`, since).Scan(&c.ReadAt, &c.Accounts, &c.Removed)
+	err := d.GetWritePool().QueryRow(ctx, `
+  WITH boundary AS MATERIALIZED (
+   SELECT statement_timestamp() AS read_at,
+          pg_snapshot_xmin(pg_current_snapshot())::text::bigint AS next_cursor
+  )
+  SELECT b.read_at, b.next_cursor,
+         COALESCE(array_agg(DISTINCT c.account_id ORDER BY c.account_id) FILTER (WHERE c.id IS NOT NULL), '{}'),
+         COALESCE(array_agg(DISTINCT c.account_id ORDER BY c.account_id) FILTER (WHERE c.ends_sessions AND NOT EXISTS (
+          SELECT 1 FROM accounts a WHERE a.id=c.account_id AND a.deleted_at IS NULL)), '{}')
+  FROM boundary b
+  LEFT JOIN credential_changes c ON c.writer_xid >= $1
+  GROUP BY b.read_at,b.next_cursor
+ `, cursor).Scan(&c.ReadAt, &c.NextCursor, &c.Accounts, &c.Removed)
 	if err != nil {
 		return CredentialChanges{}, fmt.Errorf("failed to read credential changes: %w", err)
 	}
 	return c, nil
 }
 
-// PruneCredentialChanges deletes the changes recorded before the given time and returns
-// how many there were.
-func (db *Database) PruneCredentialChanges(ctx context.Context, tx pgx.Tx, before time.Time) (int64, error) {
-	tag, err := tx.Exec(ctx, `DELETE FROM credential_changes WHERE changed_at < $1`, before)
+// PruneCredentialChanges first observes only rows committed and visible to the
+// primary, then deletes rows observed before the cutoff. An event's writer may
+// have remained open arbitrarily long: changed_at never makes it pruneable.
+func (d *Database) PruneCredentialChanges(ctx context.Context, tx pgx.Tx, before time.Time) (int64, error) {
+	if _, err := tx.Exec(ctx, `UPDATE credential_changes SET first_observed_at=clock_timestamp() WHERE first_observed_at IS NULL`); err != nil {
+		return 0, fmt.Errorf("failed to observe credential changes: %w", err)
+	}
+	tag, err := tx.Exec(ctx, `DELETE FROM credential_changes WHERE first_observed_at < $1`, before)
 	if err != nil {
 		return 0, fmt.Errorf("failed to prune credential changes: %w", err)
 	}

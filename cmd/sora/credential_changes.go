@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/lookupcache"
 	"github.com/migadu/sora/server/credchanges"
@@ -19,25 +20,20 @@ type loginCacheHolder interface {
 	GetLookupCache() *lookupcache.LookupCache
 }
 
-// startCredentialChanges makes changed credentials hold on this node: every
-// credchanges.PollInterval it reads credential_changes and drops the changed accounts from
-// the persistent auth cache and from the lookup cache of every running server, and ends
-// this node's sessions of accounts taken out of service. It does nothing on a node without
-// a database (a proxy that only uses remote lookup), whose cached logins answer to the
-// lookup service and expire with the cache's positive_ttl.
-//
-// The first read happens before it returns, and before any server starts: the persistent
-// auth cache survives a restart, so it may hold a login that changed while the node was
-// down. That read goes back the cache's max_age (capped to credchanges.Retention where the
-// cache is opened). If it fails, the next one starts from the same point.
+// startCredentialChanges synchronizes the primary revocation feed before serving
+// cached logins. Initialization/read/sink failures keep caches suspended; normal
+// primary authentication remains available. Remote-only nodes have no local feed.
 func startCredentialChanges(ctx context.Context, deps *serverDependencies) {
 	if deps.resilientDB == nil {
 		return
 	}
 
 	sinks := credchanges.Sinks{
-		LoginCaches: deps.loginCaches,
-		Sessions:    deps.sessionEnders,
+		LoginCaches:  deps.loginCaches,
+		Sessions:     deps.sessionEnders,
+		Suspend:      deps.suspendCredentialCaches,
+		Synchronized: deps.resumeCredentialCaches,
+		Reset:        deps.resetCredentialState,
 	}
 	var lookback time.Duration
 	if deps.authCacheInstance != nil {
@@ -45,29 +41,92 @@ func startCredentialChanges(ctx context.Context, deps *serverDependencies) {
 		lookback = deps.authCacheInstance.MaxAge()
 	}
 
-	w := credchanges.New(deps.resilientDB.GetCredentialChangesSinceWithRetry, deps.resilientDB.PruneCredentialChangesWithRetry, sinks, lookback)
+	// The first successful primary identity read binds persisted cache rows to
+	// this logical database and tracking migration. Old/unrelated cache rows are
+	// flushed atomically while suspended; failed setup is retried by the watcher.
+	namespaceEnsured := false
+	load := func(ctx context.Context, cursor int64) (db.CredentialChanges, error) {
+		if !namespaceEnsured && deps.authCacheInstance != nil {
+			identity, err := deps.resilientDB.GetDatabaseIdentityWithRetry(ctx)
+			if err != nil {
+				return db.CredentialChanges{}, err
+			}
+			if err := deps.authCacheInstance.EnsureRevocationNamespace(ctx, identity); err != nil {
+				return db.CredentialChanges{}, err
+			}
+			namespaceEnsured = true
+		}
+		return deps.resilientDB.GetCredentialChangesSinceWithRetry(ctx, cursor)
+	}
+	w := credchanges.New(load, deps.resilientDB.PruneCredentialChangesWithRetry, sinks, lookback)
 	readCtx, cancel := context.WithTimeout(ctx, credentialChangesInitialReadTimeout)
 	err := w.Refresh(readCtx)
 	cancel()
 	if err != nil {
-		logger.Warn("Credential changes: initial read failed - the persistent auth cache may hold logins changed while this node was down, until a read succeeds", "error", err)
+		logger.Warn("Credential changes: initial synchronization failed; login caches remain suspended and authentication falls back to primary reads", "error", err)
 	}
 	go w.Run(ctx, credchanges.PollInterval)
 }
 
-// loginCaches returns the lookup cache of every running server that has one.
-func (deps *serverDependencies) loginCaches() []credchanges.LoginCache {
+// lookupCaches returns a snapshot, including caches introduced by reload.
+func (deps *serverDependencies) lookupCaches() []*lookupcache.LookupCache {
 	deps.runningServersMux.Lock()
 	defer deps.runningServersMux.Unlock()
-	var caches []credchanges.LoginCache
-	for _, s := range deps.runningServers {
-		if holder, ok := s.(loginCacheHolder); ok {
+	var caches []*lookupcache.LookupCache
+	for _, srv := range deps.runningServers {
+		if holder, ok := srv.(loginCacheHolder); ok {
 			if c := holder.GetLookupCache(); c != nil {
 				caches = append(caches, c)
 			}
 		}
 	}
 	return caches
+}
+
+func (deps *serverDependencies) loginCaches() []credchanges.LoginCache {
+	var result []credchanges.LoginCache
+	for _, c := range deps.lookupCaches() {
+		result = append(result, c)
+	}
+	return result
+}
+
+func (deps *serverDependencies) suspendCredentialCaches() {
+	if deps.authCacheInstance != nil {
+		deps.authCacheInstance.Suspend()
+	}
+	for _, c := range deps.lookupCaches() {
+		c.Suspend()
+	}
+}
+
+func (deps *serverDependencies) resumeCredentialCaches(ctx context.Context) error {
+	if deps.authCacheInstance != nil {
+		if err := deps.authCacheInstance.Resume(ctx); err != nil {
+			return err
+		}
+	}
+	for _, c := range deps.lookupCaches() {
+		c.Resume()
+	}
+	return nil
+}
+
+// A retention/clock gap has lost account-level attribution: clear all local
+// verdicts and terminate all local sessions before acknowledging a fresh cursor.
+func (deps *serverDependencies) resetCredentialState(ctx context.Context) error {
+	deps.suspendCredentialCaches()
+	var firstErr error
+	if deps.authCacheInstance != nil {
+		firstErr = deps.authCacheInstance.InvalidateAll(ctx)
+	}
+	for _, c := range deps.lookupCaches() {
+		c.Clear()
+	}
+	for _, tracker := range deps.connectionTrackersSnapshot() {
+		tracker.EndAllLocalSessions()
+	}
+	return firstErr
 }
 
 // sessionEnders returns the connection tracker of every running server that has one.

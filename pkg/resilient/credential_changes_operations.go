@@ -21,15 +21,13 @@ var credentialChangesRetryConfig = retry.BackoffConfig{
 	OperationName:   "db_credential_changes",
 }
 
-// GetCredentialChangesSinceWithRetry returns the accounts whose logins changed since the
-// given time (see db.GetCredentialChangesSince). One attempt only, on the primary: each
-// read starts from the clock of the previous one less a fixed window, and a replica
-// answers with its own clock whatever it has replayed, so a replica lagging by more than
-// that window would make the reader step past a change that no later read sees.
-func (rd *ResilientDatabase) GetCredentialChangesSinceWithRetry(ctx context.Context, since time.Time) (db.CredentialChanges, error) {
+// GetCredentialChangesSinceWithRetry reads the snapshot-safe credential feed
+// from the operational primary. One attempt only: a watcher retries without
+// advancing its acknowledged transaction cursor when any application step fails.
+func (rd *ResilientDatabase) GetCredentialChangesSinceWithRetry(ctx context.Context, cursor int64) (db.CredentialChanges, error) {
 	masterCtx := context.WithValue(ctx, consts.UseMasterDBKey, true)
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).GetCredentialChangesSince(ctx, since)
+		return rd.getOperationalDatabaseForOperation(ctx, true).GetCredentialChangesSince(ctx, cursor)
 	}
 	result, err := rd.executeReadWithRetry(masterCtx, credentialChangesRetryConfig, timeoutRead, op)
 	if err != nil {

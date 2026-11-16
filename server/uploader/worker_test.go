@@ -99,11 +99,18 @@ func (m *mockDB) GetUploaderStatsWithRetry(ctx context.Context, maxAttempts int)
 	return &db.UploaderStats{}, nil
 }
 
-func (m *mockDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int) (UploadBacklog, error) {
+// PendingUploadBacklog answers from PendingUploadBacklogFunc and then, like the real
+// query once its totals are read, ends the measurement window through changed.
+func (m *mockDB) PendingUploadBacklog(ctx context.Context, instanceID string, maxAttempts int, changed func() []StagedBody) (UploadBacklog, error) {
+	var backlog UploadBacklog
 	if m.PendingUploadBacklogFunc != nil {
-		return m.PendingUploadBacklogFunc(ctx, instanceID, maxAttempts)
+		var err error
+		if backlog, err = m.PendingUploadBacklogFunc(ctx, instanceID, maxAttempts); err != nil {
+			return UploadBacklog{}, err
+		}
 	}
-	return UploadBacklog{}, nil
+	changed()
+	return backlog, nil
 }
 
 func (m *mockDB) RecordInstanceHeartbeatWithRetry(ctx context.Context, instanceID string) error {
@@ -245,8 +252,8 @@ func TestRemoveLocalFile(t *testing.T) {
 	baseDir := t.TempDir()
 	worker := &UploadWorker{path: baseDir}
 
-	t.Run("removes file and empty parents", func(t *testing.T) {
-		dir := filepath.Join(baseDir, "123", "subdir")
+	t.Run("removes file and keeps the account directory", func(t *testing.T) {
+		dir := filepath.Join(baseDir, "123")
 		err := os.MkdirAll(dir, 0755)
 		require.NoError(t, err)
 
@@ -260,11 +267,7 @@ func TestRemoveLocalFile(t *testing.T) {
 		_, err = os.Stat(filePath)
 		assert.True(t, os.IsNotExist(err), "file should be removed")
 		_, err = os.Stat(dir)
-		assert.True(t, os.IsNotExist(err), "parent dir should be removed")
-		_, err = os.Stat(filepath.Dir(dir))
-		assert.True(t, os.IsNotExist(err), "grandparent dir should be removed")
-		_, err = os.Stat(baseDir)
-		assert.NoError(t, err, "base dir should not be removed")
+		assert.NoError(t, err, "account dir must stay: a delivery may be about to stage into it (#573)")
 	})
 
 	t.Run("does not remove non-empty parent", func(t *testing.T) {

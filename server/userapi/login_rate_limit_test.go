@@ -12,12 +12,8 @@ import (
 	"github.com/migadu/sora/server"
 )
 
-// TestLoginFromBlockedIPIsRefused verifies that a login with the right password is
-// refused while its source address is blocked, and that it does not lift the block.
-// Regression test for #351: a login answered from the auth cache (which the User API no
-// longer has) skipped CanAttemptAuth and recorded a success, which deleted the address's
-// block. The server has no database, so a refused login must be answered before the
-// handler reaches it.
+// A blocked login must be refused before any credential work and must not clear
+// its source block. With no database configured, reaching it panics and fails.
 func TestLoginFromBlockedIPIsRefused(t *testing.T) {
 	const clientIP = "203.0.113.7"
 	limiter := server.NewAuthRateLimiter("user-api", "test", "", server.AuthRateLimiterConfig{
@@ -45,7 +41,7 @@ func TestLoginFromBlockedIPIsRefused(t *testing.T) {
 	func() {
 		defer func() {
 			if p := recover(); p != nil {
-				t.Errorf("the login of a blocked address went on to the database: %v", p)
+				t.Errorf("the login of a blocked address reached the database: %v", p)
 			}
 		}()
 		s.handleLogin(rec, req)
