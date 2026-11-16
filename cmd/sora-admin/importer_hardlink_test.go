@@ -361,3 +361,367 @@ func TestScanMaildirRefusesPrivateHardLinkInGroupWritableDirectory(t *testing.T)
 		})
 	}
 }
+
+// ownedByUID makes the entries at paths (without following symbolic links) appear to
+// belong to uid (fileUID).
+func ownedByUID(t *testing.T, uid uint32, paths ...string) {
+	t.Helper()
+	var entries []fs.FileInfo
+	for _, path := range paths {
+		info, err := os.Lstat(path)
+		require.NoError(t, err)
+		entries = append(entries, info)
+	}
+	prevFileUID := fileUID
+	t.Cleanup(func() { fileUID = prevFileUID })
+	fileUID = func(info fs.FileInfo) uint32 {
+		for _, entry := range entries {
+			if os.SameFile(info, entry) {
+				return uid
+			}
+		}
+		return prevFileUID(info)
+	}
+}
+
+// Unix evaluates owner, group, and other permission classes in strict first-match order:
+// a file with mode 0604 or 0404 (other-read set, group-read clear) denies read access to
+// every member of its group, so only 0444 makes a file readable by every local user.
+func TestScanMaildirAndSieveRefuseNegativeGroupPermissionHardLinks(t *testing.T) {
+	const name = "1700000002.M2P1.host:2,S"
+
+	for _, mode := range []os.FileMode{0604, 0404} {
+		t.Run("maildir hard link/"+mode.String(), func(t *testing.T) {
+			maildir := newMaildirWith(t, nil)
+			secret := outsideFile(t, cachedSizeMessage("GroupExcluded", 100))
+			require.NoError(t, os.Chmod(secret, mode))
+			ownedByAnotherUser(t, secret)
+			link := filepath.Join(maildir, "cur", name)
+			require.NoError(t, os.Link(secret, link))
+
+			importer := newTestModeImporter(t, maildir, newMockResilientDatabase(), ImporterOptions{})
+			require.NoError(t, importer.scanMaildir())
+
+			assert.Empty(t, scannedMessages(t, importer), "hard link with mode %04o was cached", mode)
+			if reasons := failureReasons(importer, link); assert.Len(t, reasons, 1) {
+				assert.Contains(t, reasons[0], "another user")
+			}
+		})
+
+		t.Run("sieve hard link/"+mode.String(), func(t *testing.T) {
+			secret := outsideFile(t, []byte("keep;\n"))
+			require.NoError(t, os.Chmod(secret, mode))
+			ownedByAnotherUser(t, secret)
+			sievePath := filepath.Join(t.TempDir(), ".dovecot.sieve")
+			require.NoError(t, os.Link(secret, sievePath))
+
+			rdb := &sieveRecordingDB{mockResilientDatabase: newMockResilientDatabase()}
+			importer := newTestModeImporter(t, newMaildirWith(t, nil), rdb, ImporterOptions{SievePath: sievePath})
+			require.NoError(t, importer.lookupAccount())
+
+			err := importer.importSieveScript()
+			if assert.Error(t, err, "sieve hard link with mode %04o was read", mode) {
+				assert.Contains(t, err.Error(), "another user")
+			}
+			assert.Empty(t, rdb.stored)
+		})
+	}
+
+	t.Run("group-writable directory with 0604 file", func(t *testing.T) {
+		maildir := newMaildirWith(t, nil)
+		directory := filepath.Join(maildir, "cur")
+		require.NoError(t, os.Chmod(directory, 0770))
+		secret := outsideFile(t, cachedSizeMessage("GroupExcluded", 100))
+		require.NoError(t, os.Chmod(secret, 0604))
+		ownedByAnotherUser(t, directory, secret)
+		link := filepath.Join(directory, name)
+		require.NoError(t, os.Link(secret, link))
+
+		importer := newTestModeImporter(t, maildir, newMockResilientDatabase(), ImporterOptions{})
+		require.NoError(t, importer.scanMaildir())
+
+		assert.Empty(t, scannedMessages(t, importer))
+		if reasons := failureReasons(importer, link); assert.Len(t, reasons, 1) {
+			assert.Contains(t, reasons[0], "group or others may write")
+		}
+	})
+
+	t.Run("owner's own 0604 file in non-writable directory is read", func(t *testing.T) {
+		maildir := newMaildirWith(t, nil)
+		own := filepath.Join(maildir, "cur", name)
+		require.NoError(t, os.WriteFile(own, cachedSizeMessage("Own0604", 100), 0604))
+		require.NoError(t, os.Chmod(own, 0604))
+
+		importer := newTestModeImporter(t, maildir, newMockResilientDatabase(), ImporterOptions{})
+		require.NoError(t, importer.scanMaildir())
+
+		assert.Equal(t, map[string]string{own: "INBOX"}, scannedMessages(t, importer))
+		assert.Empty(t, importer.failedPaths)
+	})
+}
+
+// A non-root owner matches the owner permission class even when group or other read bits
+// are set: without 0400, the file's own owner cannot read it.
+func TestImportRefusesOwnerUnreadableFiles(t *testing.T) {
+	for _, mode := range []os.FileMode{0000, 0200, 0040, 0044, 0004} {
+		t.Run(mode.String(), func(t *testing.T) {
+			dir := t.TempDir()
+			require.NoError(t, os.Chmod(dir, 0700))
+			path := filepath.Join(dir, "msg")
+			require.NoError(t, os.WriteFile(path, []byte("secret"), 0600))
+			require.NoError(t, os.Chmod(path, mode))
+			ownedByUID(t, 1000, dir, path)
+
+			info, err := os.Stat(path)
+			require.NoError(t, err)
+			root, err := os.OpenRoot(dir)
+			require.NoError(t, err)
+			defer root.Close()
+
+			err = checkNamedByOwner(root, "msg", info)
+			if assert.ErrorIs(t, err, errAnotherUsersFile, "mode %04o was accepted for non-root owner", mode) {
+				assert.Contains(t, err.Error(), "owner may not read")
+			}
+		})
+	}
+
+	t.Run("non-root owner with 0400 is allowed", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.Chmod(dir, 0700))
+		path := filepath.Join(dir, "msg")
+		require.NoError(t, os.WriteFile(path, []byte("own"), 0400))
+		require.NoError(t, os.Chmod(path, 0400))
+		ownedByUID(t, 1000, dir, path)
+
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		root, err := os.OpenRoot(dir)
+		require.NoError(t, err)
+		defer root.Close()
+
+		assert.NoError(t, checkNamedByOwner(root, "msg", info))
+	})
+
+	t.Run("root owner with 0000 in root directory is allowed", func(t *testing.T) {
+		dir := t.TempDir()
+		require.NoError(t, os.Chmod(dir, 0700))
+		path := filepath.Join(dir, "msg")
+		require.NoError(t, os.WriteFile(path, []byte("root"), 0600))
+		require.NoError(t, os.Chmod(path, 0000))
+		ownedByUID(t, 0, dir, path)
+
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		root, err := os.OpenRoot(dir)
+		require.NoError(t, err)
+		defer root.Close()
+
+		assert.NoError(t, checkNamedByOwner(root, "msg", info))
+	})
+}
+
+// When a symbolic link below the import root delegates to a subdirectory (such as
+// /home/alice/.dovecot.sieve -> sieve/managesieve.sieve under a root-owned ChrootDirectory
+// home), checkNamedByOwner must verify the directory that actually holds the target file.
+func TestImportSieveAndMaildirCheckTargetDirectoryOfSymbolicLink(t *testing.T) {
+	const secret = "root:secret-hash:19000:0:99999:7:::\n"
+
+	t.Run("root home link into user sieve directory refuses root hard link", func(t *testing.T) {
+		home := t.TempDir()
+		require.NoError(t, os.Chmod(home, 0755))
+		sieveDir := filepath.Join(home, "sieve")
+		require.NoError(t, os.Mkdir(sieveDir, 0700))
+		shadow := outsideFile(t, []byte(secret))
+		require.NoError(t, os.Chmod(shadow, 0600))
+		target := filepath.Join(sieveDir, "managesieve.sieve")
+		require.NoError(t, os.Link(shadow, target))
+		sievePath := filepath.Join(home, ".dovecot.sieve")
+		require.NoError(t, os.Symlink(filepath.Join("sieve", "managesieve.sieve"), sievePath))
+
+		ownedByUID(t, 1000, sieveDir)
+		ownedByUID(t, 0, home, sievePath, shadow)
+
+		rdb := &sieveRecordingDB{mockResilientDatabase: newMockResilientDatabase()}
+		importer := newTestModeImporter(t, newMaildirWith(t, nil), rdb, ImporterOptions{SievePath: sievePath})
+		require.NoError(t, importer.lookupAccount())
+
+		err := importer.importSieveScript()
+		if assert.Error(t, err, "root's file hard-linked in user's sieve/ was read") {
+			assert.Contains(t, err.Error(), "another user")
+		}
+		assert.Empty(t, rdb.stored)
+	})
+
+	t.Run("root home link into user sieve directory allows user private script", func(t *testing.T) {
+		home := t.TempDir()
+		require.NoError(t, os.Chmod(home, 0755))
+		sieveDir := filepath.Join(home, "sieve")
+		require.NoError(t, os.Mkdir(sieveDir, 0700))
+		target := filepath.Join(sieveDir, "managesieve.sieve")
+		require.NoError(t, os.WriteFile(target, []byte("keep;\n"), 0600))
+		sievePath := filepath.Join(home, ".dovecot.sieve")
+		require.NoError(t, os.Symlink(filepath.Join("sieve", "managesieve.sieve"), sievePath))
+
+		ownedByUID(t, 1000, sieveDir, target)
+		ownedByUID(t, 0, home, sievePath)
+
+		rdb := &sieveRecordingDB{mockResilientDatabase: newMockResilientDatabase()}
+		importer := newTestModeImporter(t, newMaildirWith(t, nil), rdb, ImporterOptions{SievePath: sievePath})
+		require.NoError(t, importer.lookupAccount())
+
+		require.NoError(t, importer.importSieveScript())
+		assert.Equal(t, []string{"keep;\n"}, rdb.stored)
+	})
+
+	t.Run("link into group-writable sieve subdirectory is refused", func(t *testing.T) {
+		home := t.TempDir()
+		require.NoError(t, os.Chmod(home, 0700))
+		sieveDir := filepath.Join(home, "sieve")
+		require.NoError(t, os.Mkdir(sieveDir, 0770))
+		require.NoError(t, os.Chmod(sieveDir, 0770))
+		target := filepath.Join(sieveDir, "managesieve.sieve")
+		require.NoError(t, os.WriteFile(target, []byte("keep;\n"), 0600))
+		sievePath := filepath.Join(home, ".dovecot.sieve")
+		require.NoError(t, os.Symlink(filepath.Join("sieve", "managesieve.sieve"), sievePath))
+
+		rdb := &sieveRecordingDB{mockResilientDatabase: newMockResilientDatabase()}
+		importer := newTestModeImporter(t, newMaildirWith(t, nil), rdb, ImporterOptions{SievePath: sievePath})
+		require.NoError(t, importer.lookupAccount())
+
+		err := importer.importSieveScript()
+		if assert.Error(t, err, "private script in group-writable sieve/ was read") {
+			assert.Contains(t, err.Error(), "group or others may write")
+		}
+		assert.Empty(t, rdb.stored)
+	})
+
+	t.Run("user-owned link in root home to root subdirectory is refused", func(t *testing.T) {
+		home := t.TempDir()
+		require.NoError(t, os.Chmod(home, 0755))
+		rootSub := filepath.Join(home, "root_secrets")
+		require.NoError(t, os.Mkdir(rootSub, 0700))
+		shadow := filepath.Join(rootSub, "shadow")
+		require.NoError(t, os.WriteFile(shadow, []byte(secret), 0600))
+		sievePath := filepath.Join(home, ".dovecot.sieve")
+		require.NoError(t, os.Symlink(filepath.Join("root_secrets", "shadow"), sievePath))
+
+		ownedByUID(t, 1000, sievePath)
+		ownedByUID(t, 0, home, rootSub, shadow)
+
+		rdb := &sieveRecordingDB{mockResilientDatabase: newMockResilientDatabase()}
+		importer := newTestModeImporter(t, newMaildirWith(t, nil), rdb, ImporterOptions{SievePath: sievePath})
+		require.NoError(t, importer.lookupAccount())
+
+		err := importer.importSieveScript()
+		if assert.Error(t, err, "user's link to root's private file was read") {
+			assert.Contains(t, err.Error(), "another user")
+		}
+		assert.Empty(t, rdb.stored)
+	})
+
+	t.Run("non-root other user home link into user sieve directory is refused", func(t *testing.T) {
+		home := t.TempDir()
+		require.NoError(t, os.Chmod(home, 0755))
+		sieveDir := filepath.Join(home, "sieve")
+		require.NoError(t, os.Mkdir(sieveDir, 0700))
+		target := filepath.Join(sieveDir, "managesieve.sieve")
+		require.NoError(t, os.WriteFile(target, []byte("keep;\n"), 0600))
+		sievePath := filepath.Join(home, ".dovecot.sieve")
+		require.NoError(t, os.Symlink(filepath.Join("sieve", "managesieve.sieve"), sievePath))
+
+		ownedByUID(t, 1000, sieveDir, target)
+		ownedByUID(t, 1001, home, sievePath)
+
+		rdb := &sieveRecordingDB{mockResilientDatabase: newMockResilientDatabase()}
+		importer := newTestModeImporter(t, newMaildirWith(t, nil), rdb, ImporterOptions{SievePath: sievePath})
+		require.NoError(t, importer.lookupAccount())
+
+		err := importer.importSieveScript()
+		if assert.Error(t, err) {
+			assert.Contains(t, err.Error(), "another user")
+		}
+		assert.Empty(t, rdb.stored)
+	})
+
+	t.Run("link using dotdot through symlinked subdirectory is refused", func(t *testing.T) {
+		const sentName = "1700000009.M9P1.host:2,S"
+		maildir := newMaildirWith(t, nil)
+		addMaildirFolder(t, maildir, ".Sent", sentName, cachedSizeMessage("DotDotSent", 100))
+		sentPath := filepath.Join(maildir, ".Sent", "cur", sentName)
+		require.NoError(t, os.Chmod(sentPath, 0600))
+
+		curDir := filepath.Join(maildir, "cur")
+		upLink := filepath.Join(curDir, ".up")
+		require.NoError(t, os.Symlink("../cur", upLink))
+		msgLink := filepath.Join(curDir, "1700000002.M2P1.host:2,S")
+		require.NoError(t, os.Symlink(".up/../.Sent/cur/"+sentName, msgLink))
+
+		importer := newTestModeImporter(t, maildir, newMockResilientDatabase(), ImporterOptions{})
+		require.NoError(t, importer.scanMaildir())
+
+		assert.Equal(t, map[string]string{sentPath: "Sent"}, scannedMessages(t, importer))
+		if reasons := failureReasons(importer, msgLink); assert.Len(t, reasons, 1) {
+			assert.Contains(t, reasons[0], "not found below the directory that holds its name")
+		}
+	})
+}
+
+// A symbolic link on an intermediate directory component (such as .Sent/cur) must not
+// escape its folder or vouch for another user's private directory.
+func TestScanMaildirRefusesPrivateFilesThroughSymlinkedMessageDirectory(t *testing.T) {
+	const name = "1700000002.M2P1.host:2,S"
+
+	t.Run("cur linked out of folder to another user's directory in maildir", func(t *testing.T) {
+		maildir := newMaildirWith(t, nil)
+		rootSecrets := filepath.Join(maildir, "root_secrets")
+		require.NoError(t, os.Mkdir(rootSecrets, 0700))
+		secret := filepath.Join(rootSecrets, name)
+		require.NoError(t, os.WriteFile(secret, cachedSizeMessage("RootSecret", 100), 0600))
+
+		sentFolder := filepath.Join(maildir, ".Sent")
+		require.NoError(t, os.MkdirAll(filepath.Join(sentFolder, "new"), 0700))
+		require.NoError(t, os.MkdirAll(filepath.Join(sentFolder, "tmp"), 0700))
+		require.NoError(t, os.Chmod(sentFolder, 0700))
+		curLink := filepath.Join(sentFolder, "cur")
+		require.NoError(t, os.Symlink(filepath.Join("..", "root_secrets"), curLink))
+
+		ownedByUID(t, 1000, sentFolder, curLink)
+		ownedByUID(t, 0, maildir, rootSecrets, secret)
+
+		importer := newTestModeImporter(t, maildir, newMockResilientDatabase(), ImporterOptions{})
+		require.NoError(t, importer.scanMaildir())
+
+		assert.Empty(t, scannedMessages(t, importer), "root's private file was cached via .Sent/cur -> ../root_secrets")
+		msgPath := filepath.Join(sentFolder, "cur", name)
+		if reasons := failureReasons(importer, msgPath); assert.Len(t, reasons, 1) {
+			assert.Contains(t, reasons[0], "not found below the directory that holds its name")
+		}
+	})
+
+	t.Run("cur linked to root subdirectory inside user's folder", func(t *testing.T) {
+		maildir := newMaildirWith(t, nil)
+		sentFolder := filepath.Join(maildir, ".Sent")
+		require.NoError(t, os.MkdirAll(filepath.Join(sentFolder, "new"), 0700))
+		require.NoError(t, os.MkdirAll(filepath.Join(sentFolder, "tmp"), 0700))
+		require.NoError(t, os.Chmod(sentFolder, 0700))
+
+		subSecrets := filepath.Join(sentFolder, "sub_secrets")
+		require.NoError(t, os.Mkdir(subSecrets, 0700))
+		secret := filepath.Join(subSecrets, name)
+		require.NoError(t, os.WriteFile(secret, cachedSizeMessage("RootSecret", 100), 0600))
+		curLink := filepath.Join(sentFolder, "cur")
+		require.NoError(t, os.Symlink("sub_secrets", curLink))
+
+		ownedByUID(t, 1000, maildir, sentFolder, curLink)
+		ownedByUID(t, 0, subSecrets, secret)
+
+		importer := newTestModeImporter(t, maildir, newMockResilientDatabase(), ImporterOptions{})
+		require.NoError(t, importer.scanMaildir())
+
+		assert.Empty(t, scannedMessages(t, importer), "root's private file was cached via .Sent/cur -> sub_secrets")
+		msgPath := filepath.Join(sentFolder, "cur", name)
+		if reasons := failureReasons(importer, msgPath); assert.Len(t, reasons, 1) {
+			assert.Contains(t, reasons[0], "another user")
+		}
+	})
+}
