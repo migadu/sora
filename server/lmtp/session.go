@@ -990,6 +990,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
+	headerPresence := helpers.ExtractHeaderPresence(messageContent.Header)
 
 	// Classify and extract the final stored MIME once, after editheader, and
 	// reuse both results for every destination. The structure
@@ -1089,7 +1090,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	for _, dest := range resolvedDestinations {
 		mailboxNames = append(mailboxNames, dest.Mailbox)
 		err = s.saveMessageToMailbox(ctx, dest.Target, fullMessageBytes, contentHash, deliveryHash,
-			subject, messageID, sentDate, sentDateUnknownZone, inReplyTo, references, bodyStructure, plaintextBody, recipients, storedFlags(dest.Destination))
+			subject, messageID, sentDate, sentDateUnknownZone, inReplyTo, references, bodyStructure, plaintextBody, recipients, headerPresence, storedFlags(dest.Destination))
 		if err == nil {
 			continue
 		}
@@ -1301,7 +1302,7 @@ func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveeng
 func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMailbox,
 	fullMessageBytes []byte, contentHash string, deliveryHash string, subject string, messageID string,
 	sentDate time.Time, sentDateUnknownZone bool, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
-	plaintextBody *string, recipients []helpers.Recipient,
+	plaintextBody *string, recipients []helpers.Recipient, headerPresence *int16,
 	flags []imap.Flag) error {
 
 	// Create a context for read operations that respects session pinning
@@ -1355,6 +1356,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMa
 			References:          references,
 			BodyStructure:       bodyStructure,
 			Recipients:          recipients,
+			HeaderPresence:      headerPresence,
 			Flags:               flags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
 			FTSRetention:        s.backend.ftsRetention,
 		},
