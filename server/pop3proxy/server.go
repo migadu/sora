@@ -54,25 +54,26 @@ func (s *POP3ProxyServer) loadSettings() *reloadableSettings {
 }
 
 type POP3ProxyServer struct {
-	name               string // Server name for logging
-	addr               string
-	hostname           string
-	rdb                *resilient.ResilientDatabase
-	appCtx             context.Context
-	cancel             context.CancelFunc
-	tlsConfig          *tls.Config
-	useStartTLS        bool // tlsConfig upgrades a plaintext listener on STLS instead of wrapping it
-	masterUsername     string
-	masterPassword     string
-	connManager        *proxy.ConnectionManager
-	connTracker        *server.ConnectionTracker
-	sessions           server.SessionGroup // Session goroutines, which Stop drains
-	enableAffinity     bool
-	authLimiter        server.AuthLimiter
-	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	remotelookupConfig *config.RemoteLookupConfig
-	remoteUseXCLIENT   bool // Whether backend supports XCLIENT command for forwarding
-	remoteUseUTF8      bool // Whether pool backends support POP3 UTF8; gates CAPA advertisement and the pre-auth UTF8 mirror
+	name                                  string // Server name for logging
+	addr                                  string
+	hostname                              string
+	rdb                                   *resilient.ResilientDatabase
+	appCtx                                context.Context
+	cancel                                context.CancelFunc
+	tlsConfig                             *tls.Config
+	useStartTLS                           bool // tlsConfig upgrades a plaintext listener on STLS instead of wrapping it
+	masterUsername                        string
+	masterPassword                        string
+	connManager                           *proxy.ConnectionManager
+	connTracker                           *server.ConnectionTracker
+	sessions                              server.SessionGroup // Session goroutines, which Stop drains
+	enableAffinity                        bool
+	authLimiter                           server.AuthLimiter
+	trustedProxies                        []string // CIDR blocks for trusted proxies that can forward parameters
+	remotelookupConfig                    *config.RemoteLookupConfig
+	remoteUseXCLIENT                      bool // Whether backend supports XCLIENT command for forwarding
+	remoteSkipForwardingWithProxyProtocol bool // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	remoteUseUTF8                         bool // Whether pool backends support POP3 UTF8; gates CAPA advertisement and the pre-auth UTF8 mirror
 
 	// Connection limiting
 	limiter *server.ConnectionLimiter
@@ -154,40 +155,41 @@ func (mw *maskingWriter) Write(p []byte) (n int, err error) {
 }
 
 type POP3ProxyServerOptions struct {
-	Name                     string // Server name for logging
-	InsecureAuth             bool   // Allow PLAIN auth over non-TLS connections
-	Debug                    bool
-	TLS                      bool
-	TLSCertFile              string
-	TLSKeyFile               string
-	TLSVerify                bool
-	TLSUseStartTLS           bool        // Plaintext listener offering STLS (RFC 2595) instead of implicit TLS; requires TLS
-	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
-	RemoteAddrs              []string
-	Pools                    []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
-	RemotePort               int              // Default port for backends if not in address
-	RemoteTLS                bool
-	RemoteTLSUseStartTLS     bool // Dial the backend in plaintext and upgrade with STLS after its greeting (requires RemoteTLS)
-	RemoteTLSVerify          bool
-	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
-	RemoteUseProxyProtocol   bool
-	MasterUsername           string
-	MasterPassword           string
-	MasterSASLUsername       string
-	MasterSASLPassword       string
-	ConnectTimeout           time.Duration
-	AuthIdleTimeout          time.Duration
-	CommandTimeout           time.Duration // Idle timeout
-	AbsoluteSessionTimeout   time.Duration // Maximum total session duration
-	MinBytesPerMinute        int64         // Minimum throughput
-	EnableAffinity           bool
-	EnableBackendHealthCheck bool           // Enable backend health checking (default: true)
-	RemoteDNSRefresh         *time.Duration // Backend DNS re-resolution interval; nil = default, 0 = pin to the startup resolution
-	AuthRateLimit            server.AuthRateLimiterConfig
-	RemoteLookup             *config.RemoteLookupConfig
-	TrustedProxies           []string // CIDR blocks for trusted proxies that can forward parameters
-	RemoteUseXCLIENT         bool     // Whether backend supports XCLIENT command for forwarding
-	RemoteUseUTF8            bool     // Whether pool backends support POP3 UTF8 (RFC 6856): advertise UTF8/LANG in CAPA and mirror UTF8 to them. Enable ONLY when every backend is sora (see buildLibServer).
+	Name                                  string // Server name for logging
+	InsecureAuth                          bool   // Allow PLAIN auth over non-TLS connections
+	Debug                                 bool
+	TLS                                   bool
+	TLSCertFile                           string
+	TLSKeyFile                            string
+	TLSVerify                             bool
+	TLSUseStartTLS                        bool        // Plaintext listener offering STLS (RFC 2595) instead of implicit TLS; requires TLS
+	TLSConfig                             *tls.Config // Global TLS config from TLS manager (optional)
+	RemoteAddrs                           []string
+	Pools                                 []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
+	RemotePort                            int              // Default port for backends if not in address
+	RemoteTLS                             bool
+	RemoteTLSUseStartTLS                  bool // Dial the backend in plaintext and upgrade with STLS after its greeting (requires RemoteTLS)
+	RemoteTLSVerify                       bool
+	RemoteTLSCAFile                       string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
+	RemoteUseProxyProtocol                bool
+	MasterUsername                        string
+	MasterPassword                        string
+	MasterSASLUsername                    string
+	MasterSASLPassword                    string
+	ConnectTimeout                        time.Duration
+	AuthIdleTimeout                       time.Duration
+	CommandTimeout                        time.Duration // Idle timeout
+	AbsoluteSessionTimeout                time.Duration // Maximum total session duration
+	MinBytesPerMinute                     int64         // Minimum throughput
+	EnableAffinity                        bool
+	EnableBackendHealthCheck              bool           // Enable backend health checking (default: true)
+	RemoteDNSRefresh                      *time.Duration // Backend DNS re-resolution interval; nil = default, 0 = pin to the startup resolution
+	AuthRateLimit                         server.AuthRateLimiterConfig
+	RemoteLookup                          *config.RemoteLookupConfig
+	TrustedProxies                        []string // CIDR blocks for trusted proxies that can forward parameters
+	RemoteUseXCLIENT                      bool     // Whether backend supports XCLIENT command for forwarding
+	RemoteSkipForwardingWithProxyProtocol bool     // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	RemoteUseUTF8                         bool     // Whether pool backends support POP3 UTF8 (RFC 6856): advertise UTF8/LANG in CAPA and mirror UTF8 to them. Enable ONLY when every backend is sora (see buildLibServer).
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol        bool   // Enable PROXY protocol support for incoming connections
@@ -356,30 +358,31 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	}
 
 	srv := &POP3ProxyServer{
-		name:                       options.Name,
-		hostname:                   hostname,
-		addr:                       addr,
-		rdb:                        rdb,
-		appCtx:                     serverCtx,
-		cancel:                     serverCancel,
-		useStartTLS:                options.TLS && options.TLSUseStartTLS, // config warns when tls_use_starttls lacks tls
-		masterUsername:             options.MasterUsername,
-		masterPassword:             options.MasterPassword,
-		connManager:                connManager,
-		enableAffinity:             options.EnableAffinity,
-		authLimiter:                authLimiter,
-		trustedProxies:             options.TrustedProxies,
-		remotelookupConfig:         options.RemoteLookup,
-		remoteUseXCLIENT:           options.RemoteUseXCLIENT,
-		remoteUseUTF8:              options.RemoteUseUTF8,
-		limiter:                    limiter,
-		lookupCache:                lookupCache,
-		positiveRevalidationWindow: positiveRevalidationWindow,
-		listenBacklog:              listenBacklog,
-		insecureAuth:               options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
-		debugWriter:                debugWriter,
-		activeSessions:             make(map[*POP3ProxySession]struct{}),
-		proxyReader:                proxyReader,
+		name:                                  options.Name,
+		hostname:                              hostname,
+		addr:                                  addr,
+		rdb:                                   rdb,
+		appCtx:                                serverCtx,
+		cancel:                                serverCancel,
+		useStartTLS:                           options.TLS && options.TLSUseStartTLS, // config warns when tls_use_starttls lacks tls
+		masterUsername:                        options.MasterUsername,
+		masterPassword:                        options.MasterPassword,
+		connManager:                           connManager,
+		enableAffinity:                        options.EnableAffinity,
+		authLimiter:                           authLimiter,
+		trustedProxies:                        options.TrustedProxies,
+		remotelookupConfig:                    options.RemoteLookup,
+		remoteUseXCLIENT:                      options.RemoteUseXCLIENT,
+		remoteSkipForwardingWithProxyProtocol: options.RemoteSkipForwardingWithProxyProtocol,
+		remoteUseUTF8:                         options.RemoteUseUTF8,
+		limiter:                               limiter,
+		lookupCache:                           lookupCache,
+		positiveRevalidationWindow:            positiveRevalidationWindow,
+		listenBacklog:                         listenBacklog,
+		insecureAuth:                          options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured
+		debugWriter:                           debugWriter,
+		activeSessions:                        make(map[*POP3ProxySession]struct{}),
+		proxyReader:                           proxyReader,
 	}
 	srv.settings.Store(&reloadableSettings{
 		maxAuthErrors:          options.MaxAuthErrors,

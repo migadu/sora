@@ -99,6 +99,7 @@ func (p *backendPool) stamp(info *UserRoutingInfo) {
 	info.RemoteTLSVerify = p.settings.TLSVerify
 	info.RemoteUseProxyProtocol = p.settings.UseProxyProtocol
 	info.RemoteUseIDCommand = p.settings.UseIDCommand
+	info.RemoteSkipForwardingWithProxyProtocol = p.settings.SkipForwardingWithProxyProtocol
 	info.RemoteUseXCLIENT = p.settings.UseXCLIENT
 	info.RemoteUseUTF8 = p.settings.UseUTF8
 }
@@ -1253,6 +1254,25 @@ func (cm *ConnectionManager) backendTLSSettings(routingInfo *UserRoutingInfo, ad
 	return cm.remoteTLS, cm.remoteTLSUseStartTLS, cm.remoteTLSVerify
 }
 
+// useProxyProtocol is the remote_use_proxy_protocol a connection to addr uses, by the
+// rule of backendTLSSettings: a route carries its own backend-leg settings for the backend
+// the remote lookup named, and for every member of the named pool routing confined it to
+// (which stamped that pool's settings on it). Otherwise the manager's own apply.
+func (cm *ConnectionManager) useProxyProtocol(routingInfo *UserRoutingInfo, addr string) bool {
+	if routingInfo.UsesRouteSettings(addr) {
+		return routingInfo.RemoteUseProxyProtocol
+	}
+	return cm.remoteUseProxyProtocol
+}
+
+// SendsProxyHeader reports whether ConnectWithProxy, given these client and server
+// addresses, starts its connection to addr for this route with a PROXY header. The header
+// names the client. IMAP/POP3 use this same decision for explicitly configured
+// forwarding suppression; the default preserves configured ID/XCLIENT metadata.
+func (cm *ConnectionManager) SendsProxyHeader(routingInfo *UserRoutingInfo, addr, clientIP string, clientPort int, serverIP string, serverPort int) bool {
+	return cm.useProxyProtocol(routingInfo, addr) && clientIP != "" && clientPort > 0 && serverIP != "" && serverPort > 0
+}
+
 // BackendStartTLSConfig returns the config the protocol layer upgrades a connection
 // ConnectWithProxy returned for addr with, by its protocol's STARTTLS, right after the
 // greeting: nil when that connection needs none (implicit TLS, which the dial did, or a
@@ -1902,23 +1922,18 @@ func (cm *ConnectionManager) dialWithProxy(ctx context.Context, addr, clientIP s
 
 	logger.Debug("Connected to backend", "resolved_addr", resolvedAddr, "local", server.GetAddrString(conn.LocalAddr()), "remote", server.GetAddrString(conn.RemoteAddr()))
 
-	// Determine effective settings for this connection.
-	// Default to the connection manager's global settings.
-	useProxyProtocol := cm.remoteUseProxyProtocol
+	// Determine effective settings for this connection: the route's or the manager's own
+	// (useProxyProtocol, backendTLSSettings).
+	useProxyProtocol := cm.useProxyProtocol(routingInfo, addr)
 	remoteTLS, remoteTLSUseStartTLS, remoteTLSVerify := cm.backendTLSSettings(routingInfo, addr)
-
-	// A route carries its own backend-leg settings for the backend the remote lookup named,
-	// and for every member of the named pool routing confined it to (which stamped that
-	// pool's settings on it). Otherwise the proxy server's own settings apply.
 	if routingInfo.UsesRouteSettings(addr) {
-		useProxyProtocol = routingInfo.RemoteUseProxyProtocol
 		logger.Debug("Using remotelookup settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
 	} else {
 		logger.Debug("Using global settings", "addr", addr, "remoteTLS", remoteTLS, "remoteTLSUseStartTLS", remoteTLSUseStartTLS, "remoteTLSVerify", remoteTLSVerify, "useProxyProtocol", useProxyProtocol)
 	}
 
 	// If we have client IP information and PROXY protocol is enabled, send PROXY protocol header
-	if useProxyProtocol && clientIP != "" && clientPort > 0 && serverIP != "" && serverPort > 0 {
+	if cm.SendsProxyHeader(routingInfo, addr, clientIP, clientPort, serverIP, serverPort) {
 		logger.Debug("ConnectionManager: Sending PROXY v2 header", "client_ip", clientIP, "client_port", clientPort, "server_ip", serverIP, "server_port", serverPort)
 
 		// Extract JA4 fingerprint and session ID from routingInfo if available

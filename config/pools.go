@@ -28,13 +28,14 @@ type PoolConfig struct {
 	// a pool for every user runs without any fallback at all.
 	Default bool `toml:"default"`
 
-	RemoteTLS              bool  `toml:"remote_tls"`
-	RemoteTLSUseStartTLS   bool  `toml:"remote_tls_use_starttls"` // IMAP/POP3/LMTP/ManageSieve; the User API proxy has no STARTTLS
-	RemoteTLSVerify        *bool `toml:"remote_tls_verify"`       // default true
-	RemoteUseProxyProtocol bool  `toml:"remote_use_proxy_protocol"`
-	RemoteUseIDCommand     bool  `toml:"remote_use_id_command"` // IMAP only
-	RemoteUseXCLIENT       bool  `toml:"remote_use_xclient"`    // POP3/LMTP only
-	RemoteUseUTF8          bool  `toml:"remote_use_utf8"`       // POP3 only; sora backends only
+	RemoteTLS                             bool  `toml:"remote_tls"`
+	RemoteTLSUseStartTLS                  bool  `toml:"remote_tls_use_starttls"` // IMAP/POP3/LMTP/ManageSieve; the User API proxy has no STARTTLS
+	RemoteTLSVerify                       *bool `toml:"remote_tls_verify"`       // default true
+	RemoteUseProxyProtocol                bool  `toml:"remote_use_proxy_protocol"`
+	RemoteUseIDCommand                    bool  `toml:"remote_use_id_command"`                      // IMAP only
+	RemoteSkipForwardingWithProxyProtocol bool  `toml:"remote_skip_forwarding_with_proxy_protocol"` // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	RemoteUseXCLIENT                      bool  `toml:"remote_use_xclient"`                         // POP3/LMTP only
+	RemoteUseUTF8                         bool  `toml:"remote_use_utf8"`                            // POP3 only; sora backends only
 	// RemoteTLSCAFile is a PEM file of CA certificates this pool's backends are verified
 	// against (private-CA or self-signed backends), on every proxy; empty = system roots.
 	RemoteTLSCAFile string `toml:"remote_tls_ca_file"`
