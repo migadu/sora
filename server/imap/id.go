@@ -175,7 +175,12 @@ func (s *IMAPSession) processForwardingParameters(forwardingFields map[string]st
 		}
 	}
 
-	s.DebugLog("processed forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "proxy_ip", s.ProxyIP, "session_id", forwardingParams.SessionID, "ttl", forwardingParams.ProxyTTL, "ja4", s.ja4Fingerprint)
+	// An imap_proxy names its session in x-session-id: logged as on the "connected" line
+	// for a PROXY v2 header, it leads from the proxy's session=<id> to this session.
+	if forwardingParams.SessionID != "" {
+		s.InfoLog("forwarding parameters accepted", "proxy_session", forwardingParams.SessionID)
+	}
+	s.DebugLog("processed forwarding parameters", "client_ip", forwardingParams.OriginatingIP, "client_port", forwardingParams.OriginatingPort, "proxy_ip", s.ProxyIP, "ttl", forwardingParams.ProxyTTL, "ja4", s.ja4Fingerprint)
 }
 
 // dropForwardingLoop ends a connection whose proxy TTL has run out. ID cannot answer

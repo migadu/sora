@@ -70,6 +70,9 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 
 	selectedMailboxID = s.selectedMailbox.ID
 	selectedMailboxOwnerID = s.selectedMailbox.AccountID
+	// RFC 3501 §6.4.6: the new flags are returned "as if a FETCH of those
+	// flags was done", \Recent included.
+	recentAbove := s.recentFlagAboveLocked()
 	view := s.seqViewLocked()
 	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release()
@@ -184,7 +187,7 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 			m := w.CreateMessage(modified.seq)
 
 			if !sanitizedStoreFlags.Silent {
-				m.WriteFlags(modified.flags)
+				m.WriteFlags(withRecentFlag(modified.flags, modified.uid, recentAbove))
 			}
 			m.WriteUID(modified.uid)
 			// RFC 7162 §3.2: include MODSEQ in the STORE-triggered FETCH reply only

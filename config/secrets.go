@@ -249,9 +249,9 @@ func maskSingleURL(value string) (string, bool) {
 	if strings.Contains(rest, "://") && !hasQuery {
 		return SecretMask, true
 	}
-	// An unencoded "/" or "#" in the password ends the authority early, leaving the
-	// "@" in the path or fragment, and the parser takes the start of the password
-	// for a port and refuses the URL. So any "@" after the scheme is checked here.
+	// An unencoded "/", "?" or "#" in the password ends the authority early, leaving
+	// the "@" in the path, query or fragment, and the parser takes the start of the
+	// password for a port and refuses the URL. So any "@" after the scheme is checked here.
 	if !strings.Contains(rest, "@") && !hasQuery {
 		return value, false
 	}
@@ -262,11 +262,11 @@ func maskSingleURL(value string) (string, bool) {
 		return SecretMask, true
 	}
 	// Unless that start of the password is a number, or empty: then it is a valid
-	// port and the URL parses, with the rest of the password and its "@" in the path
-	// or fragment. Mask such a URL whole too, as the parser cannot tell it from a
-	// host with a port and an "@" in its path.
+	// port and the URL parses, with the rest of the password and its "@" in the path,
+	// query or fragment. Mask such a URL whole too, as the parser cannot tell it from
+	// a host with a port and an "@" in its path, query or fragment.
 	if u.User == nil && hasPortSeparator(u.Host) &&
-		(strings.Contains(u.EscapedPath(), "@") || strings.Contains(u.EscapedFragment(), "@")) {
+		(strings.Contains(u.EscapedPath(), "@") || strings.Contains(u.RawQuery, "@") || strings.Contains(u.EscapedFragment(), "@")) {
 		return SecretMask, true
 	}
 	if u.User == nil && u.RawQuery == "" {
@@ -393,15 +393,17 @@ func isURLListSep(b byte) bool {
 // (server/proxy/http_remotelookup.go): placeholders, never credentials.
 var urlTemplates = map[string]bool{"$email": true, "$ip": true}
 
-// maskQueryValues masks every non-empty value of a raw query, as written, so a
-// percent-encoded value is masked whole. Only "&" separates parameters: a ";" stays
-// inside the masked value. A component without "=" is masked whole, since it may
-// be a bare token.
+// maskQueryValues masks every value of a raw query, as written, so a percent-encoded
+// value is masked whole. Only "&" separates parameters: a ";" stays inside the masked
+// value. A component that may be a bare token is masked whole, name included: one
+// without "=", and one whose value is empty or only "=" signs, since a base64 token
+// ends in "=" padding (RFC 4648 section 4) and "dGhpcw==" is no name "dGhpcw". So a
+// parameter with an empty value, such as "debug=", is shown masked too.
 func maskQueryValues(rawQuery string) string {
 	params := strings.Split(rawQuery, "&")
 	for i, param := range params {
 		prefix, value := "", param
-		if name, v, ok := strings.Cut(param, "="); ok {
+		if name, v, ok := strings.Cut(param, "="); ok && strings.Trim(v, "=") != "" {
 			prefix, value = name+"=", v
 		}
 		if value != "" && !urlTemplates[value] {

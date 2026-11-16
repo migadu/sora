@@ -11,7 +11,7 @@ import (
 
 // obsZones maps the obsolete alphabetic zones RFC 5322 §4.3 gives a meaning to the
 // numeric zone each one is "semantically equivalent to". ABNF strings are case
-// insensitive (RFC 5234 §2.3), so the keys are upper case and lookups fold case.
+// insensitive (RFC 5234 §2.3), so the keys are upper case and lookups fold ASCII case.
 var obsZones = map[string]string{
 	"UT": "+0000", "GMT": "+0000",
 	"EDT": "-0400", "EST": "-0500",
@@ -20,31 +20,62 @@ var obsZones = map[string]string{
 	"PDT": "-0700", "PST": "-0800",
 }
 
-// alphabeticZone matches a date-time (RFC 5322 §3.3) up to the end of its time-of-day
-// (the field's first colon is the one after the hour) and the run of letters that follows
-// it after any folding white space: the zone.
-var alphabeticZone = regexp.MustCompile(`^[^:]*\d:\d{2}(?::\d{2})?([ \t]*)([A-Za-z]+)`)
+// zoneToken matches a date-time (RFC 5322 §3.3) up to the end of its time-of-day (the
+// field's first colon is the one after the hour), the white space after it, and the zone:
+// the token there, up to white space or a comment, when it begins with a letter or a sign.
+var zoneToken = regexp.MustCompile(`^[^:]*\d:\d{2}(?::\d{2})?([ \t]*)([A-Za-z+-][^ \t(]*)`)
+
+// numericZone matches a zone of a sign and four digits (RFC 5322 §3.3), which net/mail
+// reads, as it does the digits of one with more after them.
+var numericZone = regexp.MustCompile(`^[+-]\d{4}`)
 
 // obsYear matches a date-time (RFC 5322 §3.3) up to a year of two or three digits
 // (obs-year, §4.3): the digits right before the hour, which the field's first colon
 // follows.
 var obsYear = regexp.MustCompile(`^[^:]*[ \t](\d{2,3})[ \t]+\d{1,2}:`)
 
-// gmtHourOffset matches a zone of GMT and a signed hour other than zero, the form
-// time.Parse (and so net/mail.ParseDate) accepts after GMT: GMT+1, GMT-05, GMT+0001.
-var gmtHourOffset = regexp.MustCompile(`^GMT[+-]0*[1-9]`)
+// leapSecond matches a date-time (RFC 5322 §3.3) up to the seconds of its time-of-day
+// (the field's first colon is the one after the hour) when they are 60: a leap second.
+var leapSecond = regexp.MustCompile(`^[^:]*\d:\d{2}:(60)(?:\D|$)`)
 
-// ParseDateHeader parses the value of a Date: header field (RFC 5322 §3.3), like
-// net/mail.ParseDate but reading an alphabetic zone by RFC 5322 §4.3 instead of by the
-// host's time zone, a two- or three-digit year by §4.3 too, and comments and white
-// space between the tokens.
+// ParseDateHeader parses a Date: header without returning its source-zone metadata.
+// Call ParseDateHeaderWithZone when the distinction between a known zero offset and
+// an unknown zone must be preserved.
+func ParseDateHeader(value string) (time.Time, error) {
+	date, _, err := ParseDateHeaderWithZone(value)
+	return date, err
+}
+
+// ParseDateHeaderWithZone parses the value of a Date: header field (RFC 5322 §3.3), like
+// net/mail.ParseDate but reading the zone by RFC 5322 instead of by the host's time zone,
+// a two- or three-digit year by §4.3 too, and comments and white space between the
+// tokens.
 //
-// net/mail.ParseDate gives an alphabetic zone the offset it has in time.Local, and
-// offset zero when time.Local does not know it: PDT is 02:23:25 UTC on a server in UTC,
-// and EST in July is given in EDT on one in America/New_York. Here the zone is replaced
-// by its numeric equivalent before parsing: the ten names of §4.3 by their offsets, and
-// the military zones and any other name by "-0000", which §4.3 says they "SHOULD all be
-// considered equivalent to" without out-of-band information.
+// The returned boolean reports an unknown source zone independently of the returned
+// time's Location. An unknown-zone date is given in UTC; a known zone keeps its parsed
+// offset. Parse errors return false. The zone is the token after the time of day:
+//
+//   - A sign and four digits is read by net/mail; "-0000" is the unknown zone (§3.3:
+//     "the date-time contains no information about the local time zone").
+//   - One of the ten names of §4.3 (UT, GMT, EST, ..., PDT, in any case) is its offset.
+//     net/mail gives a name the offset it has in time.Local, and offset zero when
+//     time.Local does not know it: PDT is 02:23:25 UTC on a server in UTC, and EST in
+//     July is given in EDT on one in America/New_York.
+//   - Any other token beginning with a letter or sign is unknown: the military zones
+//     and other names, which §4.3 says
+//     "SHOULD all be considered equivalent to "-0000"" without out-of-band information,
+//     and every zone that is not RFC 5322's at all (zone = (FWS ( "+" / "-" ) 4DIGIT) /
+//     obs-zone): GMT+1, GMT+0200, UTC-0500, PDT+0400, a sign with fewer than four digits
+//     (+01), a name run into another (CET/CEST). RFC 5256 §2.2: "If the time zone is
+//     invalid, the date and time SHOULD be treated as UTC." The date and time of day
+//     are kept as written: net/mail read +01 and CET/CEST in time.Local, and GMT+1 as
+//     the time of day in UTC labelled with +0100, neither reading of GMT+1.
+//     ASCII control bytes in that token invalidate the Date field instead of being
+//     discarded by the unknown-zone replacement.
+//   - Unless a token with a sign follows it after white space or a comment, as in
+//     "02:23:25 PM -0700": the grammar has one zone after the time of day ("time =
+//     time-of-day zone"), and the letters before the offset can change the time itself.
+//     Such a field is not parsed.
 //
 // net/mail.ParseDate reads a two-digit year with time.Parse's "06", which puts 00-68 in
 // 20xx, and does not parse a three-digit year (tm_year written as is after 1999). §4.3
@@ -57,18 +88,21 @@ var gmtHourOffset = regexp.MustCompile(`^GMT[+-]0*[1-9]`)
 // are each "[CFWS] ... [CFWS]"), so they are first reduced to the separators net/mail's
 // layouts have.
 //
-// GMT with a signed hour other than zero (GMT+1) is not parsed. It is no zone of RFC
-// 5322 (§3.3; the obs-zone names of §4.3 are alphabetic) and has no single meaning, an
-// offset of +0100 or, as a POSIX TZ, UTC-1. net/mail.ParseDate takes the time of day as
-// UTC and labels it with the offset, a time of day neither reading gives.
-func ParseDateHeader(value string) (time.Time, error) {
+// A time-of-day whose second is 60, a leap second (§3.3: "the time-of-day MUST be in the
+// range 00:00:00 through 23:59:60"), is read as second 59 of the same minute, as Dovecot
+// reads it: time.Time cannot hold second 60, and net/mail.ParseDate does not parse it.
+func ParseDateHeaderWithZone(value string) (time.Time, bool, error) {
 	// Unfold exactly as net/mail does, without turning an unpaired CR or LF
 	// before the zone into valid white space during the replacement below.
 	unfolded := strings.ReplaceAll(value, "\r\n", "")
 	if strings.ContainsAny(unfolded, "\r\n") {
-		return mail.ParseDate(value)
+		date, err := mail.ParseDate(value)
+		return date, false, err
 	}
 	unfolded = normalizeCFWS(unfolded)
+	if m := leapSecond.FindStringSubmatchIndex(unfolded); m != nil {
+		unfolded = unfolded[:m[2]] + "59" + unfolded[m[3]:]
+	}
 	if m := obsYear.FindStringSubmatchIndex(unfolded); m != nil {
 		year, _ := strconv.Atoi(unfolded[m[2]:m[3]])
 		if m[3]-m[2] == 2 && year < 50 {
@@ -78,38 +112,43 @@ func ParseDateHeader(value string) (time.Time, error) {
 		}
 		unfolded = unfolded[:m[2]] + strconv.Itoa(year) + unfolded[m[3]:]
 	}
-	if m := alphabeticZone.FindStringSubmatchIndex(unfolded); m != nil {
-		end := m[5]
-		// Replace a whole zone token only. For example, PDT+0400 is not PDT:
-		// net/mail would discard the suffix after a numeric replacement. Keep
-		// its existing behavior for extensions it accepts, such as GMT+0000
-		// (unfolded is the value net/mail would see, with the separators and
-		// the year rewritten).
-		if end < len(unfolded) && unfolded[end] != ' ' && unfolded[end] != '\t' && unfolded[end] != '(' {
-			// Except GMT with a signed hour other than zero (see above), which
-			// time.Parse builds in UTC and only labels with the offset: 12:00:00
-			// GMT+1 would be 13:00:00 +0100. Like GMT+0200, which net/mail rejects,
-			// it leaves the sent date unknown.
-			if gmtHourOffset.MatchString(unfolded[m[4]:]) {
-				return time.Time{}, errors.New("mail: GMT with an hour offset is not an RFC 5322 zone")
+	unknown := false
+	if m := zoneToken.FindStringSubmatchIndex(unfolded); m != nil {
+		token, end := unfolded[m[4]:m[5]], m[5]
+		if numericZone.MatchString(token) {
+			unknown = strings.HasPrefix(token, "-0000")
+		} else {
+			ascii := true
+			for i := 0; i < len(token); i++ {
+				if token[i] < 0x20 || token[i] == 0x7f {
+					return time.Time{}, false, errors.New("mail: control character in Date: zone")
+				}
+				if token[i] >= 0x80 {
+					ascii = false
+				}
 			}
-			return mail.ParseDate(unfolded)
+			if rest := strings.TrimLeft(unfolded[end:], " \t"); rest != "" && (rest[0] == '+' || rest[0] == '-') {
+				return time.Time{}, false, errors.New("mail: a numeric offset after the Date: zone")
+			}
+			zone, ok := "", false
+			if ascii {
+				zone, ok = obsZones[strings.ToUpper(token)]
+			}
+			if !ok {
+				zone, unknown = "-0000", true
+			}
+			// An obs-zone needs no white space before it, a numeric zone does.
+			unfolded = unfolded[:m[2]] + " " + zone + unfolded[end:]
 		}
-		// Nor are the letters the zone when a numeric offset follows them after
-		// white space or a comment, as in "02:23:25 PM -0700": the grammar has one
-		// zone after the time of day ("time = time-of-day zone"), and net/mail
-		// would discard the offset after the replacement.
-		if rest := strings.TrimLeft(unfolded[end:], " \t"); rest != "" && (rest[0] == '+' || rest[0] == '-') {
-			return mail.ParseDate(unfolded)
-		}
-		zone, ok := obsZones[strings.ToUpper(unfolded[m[4]:end])]
-		if !ok {
-			zone = "-0000"
-		}
-		// An obs-zone needs no white space before it, a numeric zone does.
-		unfolded = unfolded[:m[2]] + " " + zone + unfolded[end:]
 	}
-	return mail.ParseDate(unfolded)
+	t, err := mail.ParseDate(unfolded)
+	if err != nil {
+		return t, false, err
+	}
+	if unknown {
+		t = t.UTC()
+	}
+	return t, unknown, nil
 }
 
 // normalizeCFWS returns an unfolded date-time with every comment (RFC 5322 §3.2.2) and
@@ -156,11 +195,15 @@ func normalizeCFWS(s string) string {
 func isDigit(c byte) bool { return '0' <= c && c <= '9' }
 
 // commentLen returns the length of the comment s starts with, nested comments and
-// quoted-pairs included (RFC 5322 §3.2.2), or 0 if it does not close.
+// quoted-pairs included (RFC 5322 §3.2.2), or 0 if it is malformed or
+// does not close. An unquoted NUL is not ctext, including obsolete ctext;
+// a quoted NUL remains allowed by obs-qp (§4.1).
 func commentLen(s string) int {
 	depth := 0
 	for i := 0; i < len(s); i++ {
 		switch s[i] {
+		case 0:
+			return 0
 		case '\\':
 			i++
 		case '(':

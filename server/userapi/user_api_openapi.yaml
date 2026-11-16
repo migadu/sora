@@ -997,14 +997,14 @@ components:
                 type: string
 
     Unauthorized:
-      description: Unauthorized - invalid or missing JWT token
+      description: Unauthorized - invalid or missing JWT token, or a refused login
       headers:
         WWW-Authenticate:
           description: >-
-            On Bearer-protected endpoints (RFC 9110 section 15.5.2, RFC 6750 section 3):
-            Bearer realm="user-api" for a request without a bearer token,
-            with error="invalid_token" added when a token was sent and refused.
-            The public JSON login and refresh endpoints do not send this header.
+            Sent with every 401 (RFC 9110 section 15.5.2, RFC 6750 section 3):
+            Bearer realm="user-api" for a request without a bearer token, a refused
+            login included, with error="invalid_token" added when a token was sent
+            and refused, in the Authorization header or as the token of a refresh.
           schema:
             type: string
             example: Bearer realm="user-api", error="invalid_token"

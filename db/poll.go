@@ -18,7 +18,8 @@ type MessageUpdate struct {
 	SeqNum          uint32
 	BitwiseFlags    int // Matches the 'flags' column type in messages table (INTEGER)
 	IsExpunge       bool
-	IsNew           bool // Created after sinceModSeq; announced via EXISTS rather than FlagChange
+	IsNew           bool // Created after sinceModSeq, independently of any later flag changes
+	FlagsAreInitial bool // Known to still have the state installed at creation; NULL legacy versions are unknown
 	CustomFlags     []string
 	EffectiveModSeq uint64 // The modseq that triggered this update
 }
@@ -135,15 +136,15 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 	// Phase 1: Fetch Raw Changes
 	// Instead of a massive CTE pipeline, we directly pull exactly the messages that changed.
 	rows, err := tx.Query(ctx, `
-		SELECT uid, expunged_at, flags, custom_flags, created, updated, expunged FROM (
-			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq as created, ms.updated_modseq as updated, m.expunged_modseq as expunged
+		SELECT uid, expunged_at, flags, custom_flags, created, updated, expunged, initial FROM (
+			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq as created, ms.updated_modseq as updated, m.expunged_modseq as expunged, ms.initial_modseq as initial
 			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			-- New messages: created since the client's last sync and still active. The expunged_at IS NULL
 			-- guard drops create+expunge-in-window phantoms (created since, already gone) which the client
 			-- never saw -- reporting them would desync the client's sequence numbers.
 			WHERE m.mailbox_id = $1 AND m.created_modseq > $2 AND m.expunged_at IS NULL
 			UNION
-			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
+			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq, ms.initial_modseq
 			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			-- Only report expunges for messages the client already knew about (created at or before its
 			-- last-seen modseq). A message created AND expunged within this poll window was never sent to
@@ -151,12 +152,12 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			-- numbers against a message it never saw -> tracker desync (Outlook stops showing new mail).
 			WHERE m.mailbox_id = $1 AND m.expunged_modseq > $2 AND m.created_modseq <= $2
 			UNION
-			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
+			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq, ms.initial_modseq
 			FROM message_state ms JOIN messages m ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			-- Flag updates only for active messages; an expunge is reported by the branch above.
 			WHERE ms.mailbox_id = $1 AND ms.updated_modseq > $2 AND m.expunged_at IS NULL
 			UNION
-			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq
+			SELECT m.uid, m.expunged_at, ms.flags, ms.custom_flags, m.created_modseq, ms.updated_modseq, m.expunged_modseq, ms.initial_modseq
 			FROM messages m LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 			-- The create+expunge-in-window phantoms themselves: never reported, read only so the
 			-- cursor can pass them (MailboxPoll.PhantomModSeq).
@@ -178,8 +179,9 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 		var created sql.NullInt64
 		var updated sql.NullInt64
 		var expunged sql.NullInt64
+		var initial sql.NullInt64
 
-		if err := rows.Scan(&uid, &expungedAt, &flags, &customFlagsJSON, &created, &updated, &expunged); err != nil {
+		if err := rows.Scan(&uid, &expungedAt, &flags, &customFlagsJSON, &created, &updated, &expunged, &initial); err != nil {
 			return nil, fmt.Errorf("failed to scan raw change: %w", err)
 		}
 
@@ -217,6 +219,7 @@ func (db *Database) PollMailbox(ctx context.Context, mailboxID int64, sinceModSe
 			BitwiseFlags:    bitwise,
 			IsExpunge:       expungedAt.Valid,
 			IsNew:           !expungedAt.Valid && created.Valid && uint64(created.Int64) > sinceModSeq,
+			FlagsAreInitial: initial.Valid && updated.Valid && initial.Int64 == updated.Int64,
 			CustomFlags:     customFlags,
 			EffectiveModSeq: effective,
 		})

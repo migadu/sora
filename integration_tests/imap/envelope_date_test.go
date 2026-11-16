@@ -206,6 +206,12 @@ func TestIMAP_EnvelopeDateKeepsHeaderZone(t *testing.T) {
 // one in America/New_York, and a military or lower-case zone did not parse at all (NIL).
 // At most one of PDT and EST can be the server's in July, so a zone looked up in the
 // server's zone fails at least one of them.
+//
+// A zone that is malformed or not defined keeps the date and time as written, with the
+// zone "-0000" (RFC 5256 section 2.2: "If the time zone is invalid, the date and time
+// SHOULD be treated as UTC"; RFC 5322 section 3.3: "-0000" says the date-time "contains no
+// information about the local time zone"). Such dates were NIL (GMT+1, PDT+0400), read in
+// the server's zone (+01, CET/CEST), or written "+0000" (Z, CET).
 func TestIMAP_EnvelopeDateObsoleteZone(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	server, account := common.SetupIMAPServer(t)
@@ -220,18 +226,28 @@ func TestIMAP_EnvelopeDateObsoleteZone(t *testing.T) {
 		{"Wed, 17 Jul 1996 02:23:25 EST", `"Wed, 17 Jul 1996 02:23:25 -0500"`},
 		{"Wed, 17 Jan 1996 02:23:25 CST (Central Standard Time)", `"Wed, 17 Jan 1996 02:23:25 -0600"`},
 		{"Wed, 17 Jul 1996 02:23:25 pdt", `"Wed, 17 Jul 1996 02:23:25 -0700"`},
-		{"Wed, 17 Jul 1996 02:23:25 Z", `"Wed, 17 Jul 1996 02:23:25 +0000"`},
-		{"Wed, 17 Jan 1996 02:23:25 CET", `"Wed, 17 Jan 1996 02:23:25 +0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 Z", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		{"Wed, 17 Jan 1996 02:23:25 CET", `"Wed, 17 Jan 1996 02:23:25 -0000"`},
 		{"Wed, 17 Jul 1996 02:23:25\r\n\tpdt", `"Wed, 17 Jul 1996 02:23:25 -0700"`},
-		// A name prefix must not turn an invalid field into a parsed Date.
-		{"Wed, 17 Jul 1996 02:23:25 PDT+0400", "NIL"},
-		{"Wed, 17 Jul 1996 02:23:25 PDT0", "NIL"},
+		// A name prefix with more after it is a malformed zone, not the name.
+		{"Wed, 17 Jul 1996 02:23:25 PDT+0400", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 PDT0", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
 		// GMT with a signed hour is no RFC 5322 zone and has no single meaning (+0100,
 		// or UTC-1 as a POSIX TZ). net/mail read these as 03:23:25 +0100 and as
 		// 21:23:25 -0500 the day before.
-		{"Wed, 17 Jul 1996 02:23:25 GMT+1", "NIL"},
-		{"Wed, 17 Jul 1996 02:23:25 GMT-5", "NIL"},
-		{"Wed, 17 Jul 1996 02:23:25 GMT+0000", `"Wed, 17 Jul 1996 02:23:25 +0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 GMT+1", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 GMT-5", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 GMT+0000", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		// net/mail read these in the server's zone.
+		{"Wed, 17 Jul 1996 02:23:25 +01", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		{"Wed, 17 Jan 1996 02:23:25 CET/CEST", `"Wed, 17 Jan 1996 02:23:25 -0000"`},
+		// "-0000" itself, and "+0000", Universal Time.
+		{"Wed, 17 Jul 1996 02:23:25 -0000", `"Wed, 17 Jul 1996 02:23:25 -0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 +0000", `"Wed, 17 Jul 1996 02:23:25 +0000"`},
+		{"Wed, 17 Jul 1996 02:23:25 GMT", `"Wed, 17 Jul 1996 02:23:25 +0000"`},
+		// Letters before a numeric offset are not read (they can change the time).
+		{"Wed, 17 Jul 1996 02:23:25 PM -0700", "NIL"},
+		{"Wed, 17 Jul 1996 02:23:25 GMT+1 -0700", "NIL"},
 	}
 	for i, d := range dates {
 		rc.append(fmt.Sprintf("a%d", i), "INBOX", "From: alice@example.com\r\nTo: bob@example.com\r\n"+
@@ -245,5 +261,51 @@ func TestIMAP_EnvelopeDateObsoleteZone(t *testing.T) {
 	for i, d := range dates {
 		assert.Contains(t, untagged[i], "(ENVELOPE ("+d.envelope+" ",
 			"Date: %s must be read at its RFC 5322 offset: %s", d.header, untagged[i])
+	}
+}
+
+// TestIMAP_DateUnknownZoneSortAndSearch: a Date: whose zone is malformed or not defined is
+// the sent date as written, at UTC, for SORT (RFC 5256 section 2.2: "If the time zone is
+// invalid, the date and time SHOULD be treated as UTC") and for the SENT* search keys
+// (RFC 9051 section 6.4.4: "Messages whose [RFC5322] Date: header field (disregarding time
+// and timezone) is ..."). Before, GMT-5 and PDT+0400 were not parsed: SORT used the
+// INTERNALDATE, the APPEND time, and SENTON did not find the message at all.
+func TestIMAP_DateUnknownZoneSortAndSearch(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	rc := dialRaw(t, server.Address)
+	defer rc.conn.Close()
+	rc.login(account)
+
+	// Appended in this order; the written times put them in the order 3, 1, 4, 2.
+	for i, date := range []string{
+		"Tue, 01 Jan 2019 23:30:00 GMT-5",    // 1: 23:30 on 1 Jan (04:30 on 2 Jan as -0500)
+		"Wed, 02 Jan 2019 00:30:00 PDT+0400", // 2: 00:30 on 2 Jan
+		"Tue, 01 Jan 2019 23:00:00 +0000",    // 3
+		"Wed, 02 Jan 2019 00:00:00 CET/CEST", // 4: 00:00 on 2 Jan
+	} {
+		rc.append(fmt.Sprintf("a%d", i), "INBOX", "From: alice@example.com\r\nTo: bob@example.com\r\n"+
+			fmt.Sprintf("Subject: unknown zone %d\r\nDate: %s\r\n\r\nbody\r\n", i+1, date))
+	}
+	_, tagged := rc.cmd("s", "SELECT INBOX")
+	require.Contains(t, tagged, "OK")
+
+	untagged, tagged := rc.cmd("o", "SORT (DATE) UTF-8 ALL")
+	require.Contains(t, tagged, "OK")
+	assert.Equal(t, []string{"* SORT 3 1 4 2"}, untagged, "SORT (DATE) by the written times")
+
+	for _, tc := range []struct {
+		key, want string
+	}{
+		{"SENTON 1-Jan-2019", "* SEARCH 1 3"},
+		{"SENTON 2-Jan-2019", "* SEARCH 2 4"},
+		{"SENTBEFORE 2-Jan-2019", "* SEARCH 1 3"},
+		{"SENTSINCE 2-Jan-2019", "* SEARCH 2 4"},
+	} {
+		untagged, tagged := rc.cmd("f", "SEARCH "+tc.key)
+		require.Contains(t, tagged, "OK", tc.key)
+		assert.Equal(t, []string{tc.want}, untagged, tc.key)
 	}
 }

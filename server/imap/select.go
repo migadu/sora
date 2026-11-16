@@ -23,15 +23,12 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 
 	// Prevent selecting the shared namespace root
 	// The namespace root (e.g., "Shared") should only be a container, not a selectable mailbox
-	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
-		sharedPrefix := strings.TrimSuffix(s.server.config.SharedMailboxes.NamespacePrefix, "/")
-		if strings.EqualFold(mboxName, sharedPrefix) {
-			s.DebugLog("cannot select shared namespace root", "mailbox", mboxName)
-			return nil, &imap.Error{
-				Type: imap.StatusResponseTypeNo,
-				Code: imap.ResponseCodeCannot,
-				Text: "The shared namespace root cannot be selected. Select mailboxes under it instead",
-			}
+	if s.server.config != nil && s.server.config.SharedMailboxes.IsNamespaceRoot(mboxName) {
+		s.DebugLog("cannot select shared namespace root", "mailbox", mboxName)
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeCannot,
+			Text: "The shared namespace root cannot be selected. Select mailboxes under it instead",
 		}
 	}
 
@@ -288,8 +285,11 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 		return nil, &imap.Error{Type: imap.StatusResponseTypeNo, Text: "Session closed during select operation"}
 	}
 
-	// SEARCH RECENT, NEW and OLD answer from this (see recent.go).
+	// SEARCH RECENT, NEW and OLD answer from this (see recent.go), and Poll
+	// keeps the RECENT count with it.
 	s.recentAboveUID = recentAbove
+	s.numRecent = numRecent
+	s.recentUnsent.Store(false)
 
 	// Only a read-write selection advances the session and server baselines.
 	// EXAMINE must preserve Recent for both later opens in this session and other
@@ -381,6 +381,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 			selectData.Modified = make([]imap.SelectModifiedData, 0, len(changedMsgs))
 
 			// For QRESYNC, we report messages that still exist (not expunged)
+			recentFlagAbove := s.recentFlagAboveLocked()
 			for _, msg := range changedMsgs {
 				if msg.SeqNum == 0 {
 					s.WarnLog("skipping modified message with invalid sequence number 0", "uid", msg.UID)
@@ -389,7 +390,7 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 				selectData.Modified = append(selectData.Modified, imap.SelectModifiedData{
 					SeqNum: msg.SeqNum,
 					UID:    msg.UID,
-					Flags:  msg.Flags,
+					Flags:  withRecentFlag(msg.Flags, msg.UID, recentFlagAbove),
 					ModSeq: msg.ModSeq,
 				})
 			}

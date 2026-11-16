@@ -156,6 +156,85 @@ func TestTLSCacheMissingVariantIsNotAFailure(t *testing.T) {
 	}
 }
 
+// TestTLSCacheDomainFailsWhenNothingIsInS3: tls cache --domain for a name with neither
+// certificate in S3 must fail and name it, as tls delete --domain does, instead of
+// "Not found: 2" and exit status 0 (#1759).
+func TestTLSCacheDomainFailsWhenNothingIsInS3(t *testing.T) {
+	_, endpoint := newTLSStubS3(t)
+	cfg := tlsTestConfig(endpoint)
+	cacheDir := t.TempDir()
+
+	err := cacheTLSCertificates(context.Background(), cfg, cacheDir, "Mail.Example.com", false)
+	if err == nil {
+		t.Fatal("cacheTLSCertificates --domain succeeded although no certificate for the domain is in S3")
+	}
+	if !strings.Contains(err.Error(), "mail.example.com") {
+		t.Errorf("error %q does not name the domain mail.example.com", err)
+	}
+	if got := localNames(t, cacheDir); len(got) != 0 {
+		t.Errorf("local cache = %v, want it empty", got)
+	}
+}
+
+// TestTLSCacheDomainFoundInS3IsNotAFailure: with --domain, one certificate of the name
+// in S3 is enough, also an expired one that is therefore not cached; the RSA one is
+// often absent.
+func TestTLSCacheDomainFoundInS3IsNotAFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		entry    string        // the one entry in S3
+		notAfter time.Duration // its expiry, from now
+		want     []string      // the local cache afterwards
+	}{
+		{"ECDSA only", "mail.example.com", 60 * 24 * time.Hour, []string{"mail.example.com"}},
+		{"RSA only", "mail.example.com+rsa", 60 * 24 * time.Hour, []string{"mail.example.com+rsa"}},
+		{"expired", "mail.example.com", -time.Hour, nil},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, endpoint := newTLSStubS3(t)
+			cfg := tlsTestConfig(endpoint)
+			useRSA := strings.HasSuffix(tt.entry, "+rsa")
+			putServerEntry(t, cfg, tt.entry, tlsCleanAutocertEntry(t, "mail.example.com", useRSA, time.Now().Add(tt.notAfter)))
+			cacheDir := t.TempDir()
+
+			if err := cacheTLSCertificates(context.Background(), cfg, cacheDir, "mail.example.com", false); err != nil {
+				t.Fatalf("cacheTLSCertificates --domain: %v", err)
+			}
+			if got := localNames(t, cacheDir); !slices.Equal(got, tt.want) {
+				t.Errorf("local cache = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestTLSCacheAllDomainsNotInS3IsNotAFailure: without --domain, a configured domain
+// with no certificate in S3 (not issued yet) is no failure, even when no configured
+// domain has one.
+func TestTLSCacheAllDomainsNotInS3IsNotAFailure(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		stored []string // the entries in S3
+	}{
+		{"none issued", nil},
+		{"one of two issued", []string{"mail.example.com"}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			_, endpoint := newTLSStubS3(t)
+			cfg := tlsTestConfig(endpoint)
+			cfg.TLS.LetsEncrypt.Domains = []string{"mail.example.com", "imap.example.com"}
+			putServerCertificates(t, cfg, tt.stored...)
+			cacheDir := t.TempDir()
+
+			if err := cacheTLSCertificates(context.Background(), cfg, cacheDir, "", false); err != nil {
+				t.Fatalf("cacheTLSCertificates: %v", err)
+			}
+			if got := localNames(t, cacheDir); !slices.Equal(got, tt.stored) {
+				t.Errorf("local cache = %v, want %v", got, tt.stored)
+			}
+		})
+	}
+}
+
 // TestTLSCacheFailsWhenACertificateIsCorrupt: when S3 answers 200 OK with empty,
 // truncated, or unparseable certificate bytes, tls cache must reject that entry,
 // refuse to write the corrupt payload into the local fallback cache, name the S3

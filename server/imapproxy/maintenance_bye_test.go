@@ -67,7 +67,8 @@ func newProxiedSession(t *testing.T) *proxiedSession {
 	srv.activeSessions[s] = struct{}{}
 	p := &proxiedSession{s: s, backend: backendEnd, client: clientEnd, clientEnded: make(chan struct{})}
 
-	go func() { s.startProxy(); s.close() }()
+	sessionEnded := make(chan struct{})
+	go func() { defer close(sessionEnded); s.startProxy(); s.close() }()
 	go func() {
 		defer close(p.clientEnded)
 		buf := make([]byte, 4096)
@@ -97,7 +98,18 @@ func newProxiedSession(t *testing.T) *proxiedSession {
 			}
 		}
 	}()
-	t.Cleanup(func() { backendEnd.Close(); clientEnd.Close() })
+	// The session ends before the cleanups registered ahead of this one run (cleanups run
+	// last in, first out): withCloseGrace's restore must not write the variables the
+	// session reads while it is still running.
+	t.Cleanup(func() {
+		backendEnd.Close()
+		clientEnd.Close()
+		select {
+		case <-sessionEnded:
+		case <-time.After(5 * time.Second):
+			t.Error("session still running 5s after the backend and the client closed")
+		}
+	})
 
 	// Proxying from here on (the drain only targets sessions past their login).
 	waitFor(t, func() bool { return len(srv.MaintenanceTargets()) == 1 }, "the session to be proxying")
@@ -169,6 +181,30 @@ func withCloseGrace(t *testing.T, d time.Duration) {
 	savedGrace, savedLinger := maintenanceCloseGrace, maintenanceLinger
 	maintenanceCloseGrace, maintenanceLinger = d, 200*time.Millisecond
 	t.Cleanup(func() { maintenanceCloseGrace, maintenanceLinger = savedGrace, savedLinger })
+}
+
+// A test's session has ended before the cleanups the test registered ahead of
+// newProxiedSession run, among them withCloseGrace's restore of the variables the session
+// reads. This test returns with its session closing for maintenance: the session reaches
+// endForMaintenance, which reads maintenanceLinger, only once the backend's end closes.
+func TestProxiedSession_EndsBeforeEarlierCleanups(t *testing.T) {
+	withCloseGrace(t, 5*time.Second)
+	var srv *Server
+	t.Cleanup(func() {
+		if srv == nil {
+			return
+		}
+		srv.activeSessionsMu.RLock()
+		defer srv.activeSessionsMu.RUnlock()
+		if len(srv.activeSessions) != 0 {
+			t.Error("the session was still running when the test's earlier cleanups ran")
+		}
+	})
+	p := newProxiedSession(t)
+	srv = p.s.server
+	p.send(t, "* 1 FETCH (BODY[] {64}\r\n0123456789")
+
+	p.s.closeForMaintenance()
 }
 
 // A BYE never lands inside a response: with a literal under way it waits for the end of

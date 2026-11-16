@@ -213,7 +213,7 @@ func TestSyntheticMessageIDNotReportedAsHeader(t *testing.T) {
 			var storedID string
 			var expungedAt *time.Time
 			require.NoError(t, db.GetReadPool().QueryRow(ctx,
-				`SELECT message_id, expunged_at FROM messages WHERE id = $1`, m.rowID).Scan(&storedID, &expungedAt))
+				`SELECT message_id, expunged_at FROM messages WHERE id = $1`, restoredCopyID(t, db, m.rowID)).Scan(&storedID, &expungedAt))
 			assert.Nil(t, expungedAt, "row id %d should be restored", m.rowID)
 			assert.True(t, strings.HasPrefix(storedID, "<"), "stored synthetic message_id %q for row %d", storedID, m.rowID)
 		}

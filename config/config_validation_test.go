@@ -280,7 +280,7 @@ func TestWarnUnusedConfigOptions_RemoteStartTLS(t *testing.T) {
 		{
 			name: "user_api_proxy with remote_lookup remote_tls_use_starttls",
 			serverConfig: ServerConfig{Type: "user_api_proxy", Name: "user-api-proxy-test", RemoteTLS: true,
-				RemoteLookup: &RemoteLookupConfig{RemoteTLS: true, RemoteTLSUseStartTLS: true}},
+				RemoteLookup: &RemoteLookupConfig{RemoteTLSUseStartTLS: true}},
 			wantWarning: "'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy",
 		},
 	}

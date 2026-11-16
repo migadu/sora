@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -14,7 +16,7 @@ import (
 const loadConfigHelperEnv = "SORA_LOAD_CONFIG_HELPER_PATH"
 
 // TestLoadAndValidateConfigHelper is not a test: it is the server's start-up
-// configuration check, run by TestStartupRefusesUnsupportedRelayType and
+// configuration check, run by checkStartupConfig and
 // TestStartupRefusesIncompleteServerBlock in a process of its own because a refused
 // configuration exits.
 func TestLoadAndValidateConfigHelper(t *testing.T) {
@@ -24,6 +26,50 @@ func TestLoadAndValidateConfigHelper(t *testing.T) {
 	}
 	cfg := config.NewDefaultConfig()
 	loadAndValidateConfig(path, &cfg, errors.NewErrorHandler())
+}
+
+// checkStartupConfig runs the start-up configuration check on content in a process of
+// its own, with a [logging] section that writes JSON to a file. It reports whether
+// start-up refused the file, and returns the problems the refusal logged to that file,
+// one "<section>: <reason>" per line: the reason start-up stops goes where [logging]
+// says, not to stderr (#1762). out is what the process wrote to stdout and stderr.
+func checkStartupConfig(t *testing.T, content string) (refused bool, problems string, out []byte) {
+	t.Helper()
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "sora.log")
+	path := filepath.Join(dir, "config.toml")
+	content = fmt.Sprintf("[logging]\noutput = %q\nformat = \"json\"\n\n", logPath) + content
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(os.Args[0], "-test.run=^TestLoadAndValidateConfigHelper$")
+	cmd.Env = append(os.Environ(), loadConfigHelperEnv+"="+path)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return false, "", out
+	}
+	if _, exited := err.(*exec.ExitError); !exited {
+		t.Fatalf("start-up check did not run: %v\n%s", err, out)
+	}
+	data, err := os.ReadFile(logPath)
+	if err != nil && !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	var b strings.Builder
+	for _, line := range strings.Split(string(data), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			t.Errorf("the JSON log file has a line that is not JSON (%v): %q", err, line)
+			continue
+		}
+		if rec["level"] == "ERROR" && rec["msg"] == "Invalid configuration" {
+			fmt.Fprintf(&b, "%v: %v\n", rec["field"], rec["error"])
+		}
+	}
+	return true, b.String(), out
 }
 
 // TestStartupRefusesUnsupportedRelayType: a [relay] type other than "smtp" or "http"
@@ -56,25 +102,19 @@ func TestStartupRefusesUnsupportedRelayType(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "config.toml")
 			content := storageTOML + tt.relay + "\n[[server]]\ntype = \"lmtp\"\nname = \"lmtp\"\naddr = \"127.0.0.1:0\"\n"
-			if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			cmd := exec.Command(os.Args[0], "-test.run=^TestLoadAndValidateConfigHelper$")
-			cmd.Env = append(os.Environ(), loadConfigHelperEnv+"="+path)
-			out, err := cmd.CombinedOutput()
+			refused, problems, out := checkStartupConfig(t, content)
 			if tt.wantErr == "" {
-				if err != nil {
-					t.Fatalf("start-up refused a valid configuration: %v\n%s", err, out)
+				if refused {
+					t.Fatalf("start-up refused a valid configuration:\n%s%s", problems, out)
 				}
 				return
 			}
-			if err == nil {
+			if !refused {
 				t.Fatalf("start-up went on; want it refused with %q", tt.wantErr)
 			}
-			if !strings.Contains(string(out), tt.wantErr) {
-				t.Errorf("start-up refused, but the output does not say %q:\n%s", tt.wantErr, out)
+			if !strings.Contains(problems, tt.wantErr) {
+				t.Errorf("start-up refused, but the log does not say %q:\nlog:\n%s\noutput:\n%s", tt.wantErr, problems, out)
 			}
 		})
 	}

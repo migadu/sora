@@ -71,8 +71,6 @@ func TestImporter_Resilience(t *testing.T) {
 	options := ImporterOptions{
 		DryRun:        false,
 		PreserveFlags: true,
-		ShowProgress:  false,
-		ForceReimport: false,
 		CleanupDB:     true,
 		Dovecot:       true,
 		PreserveUIDs:  true,
@@ -144,7 +142,10 @@ func TestImporter_Resilience(t *testing.T) {
 			t.Fatalf("scanMaildir failed: %v", err)
 		}
 
-		// Run syncMailboxState
+		// Run syncMailboxState, for the account Run would look up first
+		if err := importer.lookupAccount(); err != nil {
+			t.Fatalf("lookupAccount failed: %v", err)
+		}
 		err = importer.syncMailboxState()
 		if err != nil {
 			t.Fatalf("syncMailboxState failed: %v", err)

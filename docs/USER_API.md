@@ -83,24 +83,13 @@ allowed_origins = ["https://webmail.example.com"]
 | `proxy_protocol` | `false` | Expect a PROXY protocol header on each connection, from an address in `[servers] trusted_networks`. The client address in it is then used for `allowed_hosts` and rate limiting. See [PROXY.md](PROXY.md). |
 | `proxy_protocol_timeout` | `"5s"` | How long to wait for that header. |
 | `[server.auth_rate_limit]` | off | Login rate limiting and progressive delays. The keys are in [AUTHENTICATION.md](AUTHENTICATION.md). |
-| `[server.lookup_cache]` | off | A cache of login results, see below. |
+| `[server.lookup_cache]` | ignored | Accepted for compatibility, with a warning; every login reads the primary credential. |
 
-**`[server.lookup_cache]`** keeps successful logins in memory. A repeated login with the same
-password, while the cached entry is younger than `positive_revalidation_window`, skips the
-credential lookup and the password check. Every other login is checked against the database.
-
-| Key | Default | Meaning |
-|---|---|---|
-| `enabled` | `false` | Turn the cache on. |
-| `positive_ttl` | `"5m"` | How long a successful login stays in the cache. |
-| `negative_ttl` | `"1m"` | How long a failed login stays in the cache. A cached failure never refuses a login; the next attempt is checked again. |
-| `max_size` | `10000` | Most entries. |
-| `cleanup_interval` | `"5m"` | How often expired entries are removed. |
-| `positive_revalidation_window` | `"30s"` | A cached success is used only while it is younger than this. |
-
-The durations here take Go units or whole days, like the other durations; a value that does not
-parse means the default. A
-password change drops the account's cached logins.
+The User API does not cache password verdicts. Each login reads the password hash and credential
+epoch together from the primary, so a password change cannot pair an old cached verdict with a
+new token epoch. Token refresh also checks the primary. Configuring `[server.lookup_cache]` on
+this backend has no effect and produces a warning. The User API **proxy** can still cache route
+lookups ([section 12](#12-the-user-api-proxy)).
 
 The HTTP server's limits are fixed: 10 seconds for the request headers, 30 seconds to read
 the request, 30 seconds to write the response (this bounds a `/raw` download), 120 seconds for
@@ -145,7 +134,7 @@ Response `200`:
 |---|---|---|
 | 400 | `Invalid request body` | Not JSON. |
 | 400 | `Email and password are required` | A field is missing or empty. |
-| 401 | `Invalid credentials` | Unknown address, deleted account, wrong password, or the client is blocked by the rate limiter. The four look the same on purpose. |
+| 401 | `Invalid credentials` | Unknown address, deleted account, wrong password, or the client is blocked by the rate limiter. The four look the same on purpose, `WWW-Authenticate: Bearer realm="user-api"` included (section 3.2). |
 | 429 | `Too many concurrent authentication attempts. Please try again later.` | Too many logins are waiting out a progressive delay at once. |
 | 503 | `Service unavailable` | Database error, a stored password hash that cannot be verified, or the request was cancelled while it waited out a delay. Not counted as a failed login. |
 | 500 | `Token generation failed` | Signing error. |
@@ -168,6 +157,12 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
 | No header | 401 | `{"error":"Authorization header required"}` |
 | Not `Bearer <token>` | 401 | `{"error":"Authorization header must be 'Bearer <token>'"}` |
 | Bad signature, expired, wrong issuer, not HS256 | 401 | `{"error":"Invalid or expired token"}` |
+
+Every `401` of the API carries the challenge `WWW-Authenticate: Bearer realm="user-api"`
+(RFC 9110 section 15.5.2). When the request presented a token and it was refused (the last
+row, or a refused refresh in 3.3), the challenge adds `error="invalid_token"` (RFC 6750
+section 3.1); a request without a token, and a refused login, get it without. Web clients
+on another origin can read the header: it is in `Access-Control-Expose-Headers`.
 
 On these requests the server checks the token only: its HS256 signature with `jwt_secret`, its
 expiry, and its issuer. It does **not** look up the account. A token keeps working until it
@@ -194,7 +189,7 @@ the login response, with the current `account_id`. Otherwise it is
 | Status | Body `error` |
 |---|---|
 | 400 | `Invalid request body`, `Token is required` |
-| 401 | `Invalid or expired token` |
+| 401 | `Invalid or expired token`, with `WWW-Authenticate: Bearer realm="user-api", error="invalid_token"` |
 | 503 | `Service unavailable` (database error while checking the account) |
 | 500 | `Token generation failed` |
 
@@ -863,8 +858,8 @@ Each body is `{"error":"message"}` with the message below. Set the proxy's
 | 502 | `Bad gateway` | The backend request failed. |
 | 500 | `Internal server error` | The backend request could not be constructed. |
 
-Backend responses are passed through unchanged. Protected bearer-token errors carry a
-`WWW-Authenticate: Bearer` challenge; public JSON login and refresh errors do not.
+Backend responses are passed through unchanged. Every 401 carries the
+`WWW-Authenticate` challenge a backend sends for the same refusal (section 3.2).
 
 A CORS preflight (`OPTIONS`) needs no token, on any path. It is answered with the backend's
 CORS headers, as when the backend is reached directly, so browser clients on another origin can
@@ -894,7 +889,7 @@ call the API through the proxy.
 | `tls_verify` | `false` | Require client certificates. |
 | `tls_default_domain` | none | Certificate name for clients without SNI, with the `[tls]` manager. |
 | `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). |
-| `[server.lookup_cache]` | off | Caches lookup answers; same keys and defaults as in section 2. |
+| `[server.lookup_cache]` | off | Caches route lookup answers; keys and defaults are described in [CONFIGURATION.md](CONFIGURATION.md#910-lookup-cache-serverlookup_cache). The proxy checks no passwords and warns if `positive_revalidation_window` is set. |
 | `[server.auth_rate_limit]` | off | Login rate limiting of every login through the proxy (12.1). The keys are in [AUTHENTICATION.md](AUTHENTICATION.md). Blocked clients show at `GET /admin/auth/blocked?protocol=userapi_proxy`. |
 
 `allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy; set in its block,

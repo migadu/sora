@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/helpers"
 )
 
 // GetMailboxByNameForRight resolves a named mailbox for an operation whose ACL
@@ -16,6 +17,13 @@ import (
 // A fallback returns identity, owner, UIDVALIDITY and path only; callers must
 // recheck authorization because a normal namespace winner may lack the right.
 func (db *Database) GetMailboxByNameForRight(ctx context.Context, accountID int64, name string, right ACLRight) (*DBMailbox, error) {
+	// A name PostgreSQL cannot hold names no mailbox, as in GetMailboxByName: the
+	// fallback below would fail with SQLSTATE 22021. ESEARCH IN (MAILBOXES ...)
+	// passes the client's names here, and a name of no mailbox is ignored there,
+	// not answered NO [SERVERBUG].
+	if !helpers.MailboxNameStorable(name) {
+		return nil, consts.ErrMailboxNotFound
+	}
 	mailbox, err := db.GetMailboxByName(ctx, accountID, name)
 	if !errors.Is(err, consts.ErrMailboxNotFound) {
 		return mailbox, err

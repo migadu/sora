@@ -116,8 +116,7 @@ func (m *ctxAwareDB) GetAccountIDByAddressWithRetry(ctx context.Context, address
 }
 
 // failingAccountLookupDB fails every account lookup, as a database that stays
-// unreachable past the retries does: orphan recovery treats that as non-fatal, and
-// the insert phase loses the whole batch.
+// unreachable past the retries does: the run stops before it scans the maildir.
 type failingAccountLookupDB struct {
 	*mockResilientDatabase
 }
@@ -192,14 +191,13 @@ func TestImportCleanupDBOnlyAfterSuccessfulRun(t *testing.T) {
 		assert.Equal(t, 2, pending, "the messages the interruption left out are recorded for the next run")
 	})
 
-	t.Run("run whose batch insert failed as a whole fails and keeps the database", func(t *testing.T) {
+	t.Run("run whose account lookup failed fails and keeps the database", func(t *testing.T) {
 		maildirPath := newCleanupDBMaildir(t, 2)
 		rdb := &failingAccountLookupDB{newMockResilientDatabase()}
 		importer := newCleanupDBImporter(t, context.Background(), maildirPath, rdb, nil)
 
 		err := importer.Run()
 		require.Error(t, err, "a run that imported none of its messages reported success")
-		assert.Equal(t, int64(2), importer.failedMessages)
 		assert.FileExists(t, filepath.Join(maildirPath, "sora-maildir.db"),
 			"a failed run removed the import database")
 	})

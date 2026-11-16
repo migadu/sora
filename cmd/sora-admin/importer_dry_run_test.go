@@ -336,7 +336,7 @@ func TestS3Importer_DryRunChangesNothing(t *testing.T) {
 	}
 	before := accountMailboxState(t, rdb, accountID)
 
-	si, err := NewS3Importer(ctx, rdb, nil, S3ImporterOptions{Email: email, DryRun: true, CleanupDB: true})
+	si, err := NewS3Importer(ctx, rdb, nil, S3ImporterOptions{Email: email, DryRun: true, Workers: 1, CleanupDB: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -347,6 +347,9 @@ func TestS3Importer_DryRunChangesNothing(t *testing.T) {
 		VALUES (?, ?, ?, ?, ?, ?, ?)`, "example.com/dryrun-s3/"+hash, 100, "2026-11-01T12:00:00Z", "etag",
 		"example.com", "dryrun-s3", hash); err != nil {
 		t.Fatal(err)
+	}
+	if err := si.lookupAccount(); err != nil {
+		t.Fatalf("lookupAccount: %v", err)
 	}
 	if err := si.performDryRun(); err != nil {
 		t.Fatalf("dry run: %v", err)

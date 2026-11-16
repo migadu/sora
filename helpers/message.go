@@ -184,9 +184,9 @@ func ValidateBodyStructure(bs *imap.BodyStructure) error {
 }
 
 // extractOptions reads the Date: of an attached message/rfc822 or message/global part,
-// whose envelope the body structure stores, with ParseDateHeader like the message's own.
+// whose envelope the body structure stores, with ParseDateHeaderWithZone like the message's own.
 // go-imap's default is net/mail, which reads an obsolete zone such as PDT in time.Local.
-var extractOptions = &imapserver.ExtractOptions{ParseDate: ParseDateHeader}
+var extractOptions = &imapserver.ExtractOptions{ParseDateWithZone: ParseDateHeaderWithZone}
 
 // ExtractBodyStructure is imapserver.ExtractBodyStructure with the envelope dates of
 // attached messages read by ParseDateHeader, indirected so tests can exercise

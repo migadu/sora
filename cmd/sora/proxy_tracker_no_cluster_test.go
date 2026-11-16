@@ -30,7 +30,7 @@ func TestProxyPerUserLimitsWithoutClusterAreReported(t *testing.T) {
 				t.Cleanup(func() { logger.Swap(prev) })
 
 				sink := &trackerSink{}
-				tracker, _ := startConnectionTrackerForProxy(protocol, "proxy-619", "mail", tc.perUser, tc.perUIP, nil, nil, sink)
+				tracker, _ := startConnectionTrackerForProxy(protocol, "proxy-619", "mail", tc.perUser, tc.perUIP, nil, nil, nil, sink)
 				if tracker != nil {
 					tracker.Stop()
 					t.Fatalf("%s proxy without a cluster got a connection tracker", protocol)

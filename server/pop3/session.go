@@ -45,6 +45,7 @@ var (
 )
 
 type POP3Session struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	server           *POP3Server
 	conn             net.Conn     // Connection to the client
@@ -104,7 +105,11 @@ var (
 	errServerBusy      = &pop3server.Error{Code: "SYS/TEMP", Message: "Server busy, please try again"}
 	errInMaintenance   = &pop3server.Error{Code: "SYS/TEMP", Message: "Server in maintenance, please try again later"}
 	errMailboxTooBig   = &pop3server.Error{Code: "SYS/TEMP", Message: "Mailbox too large to open in this session"}
-	errBodyTooBig      = &pop3server.Error{Code: "SYS/TEMP", Message: "Message too large to retrieve in this session"}
+
+	// errBodyTooBig and errBodyMemoryBusy refuse a body the session memory budget
+	// cannot hold (bodyOverBudget).
+	errBodyTooBig     = &pop3server.Error{Code: "SYS/PERM", Message: "Message too large for the session memory limit"}
+	errBodyMemoryBusy = &pop3server.Error{Code: "SYS/TEMP", Message: "Session memory limit reached, please try again later"}
 
 	// errTooManyConnections refuses a login over max_connections_per_user or
 	// max_connections_per_user_per_ip, with the reply pop3_proxy sends.
@@ -213,6 +218,7 @@ func (s *POP3Session) loadMessagesIfNeeded(ctx context.Context) error {
 }
 
 func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, password string, isSASL bool) (int64, error) {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 	start := time.Now()
 	defer func() {
 		metrics.CriticalOperationDuration.WithLabelValues("pop3_authentication").Observe(time.Since(start).Seconds())
@@ -933,15 +939,16 @@ func (s *POP3Session) Quit(ctx context.Context) (int, error) {
 }
 
 func (s *POP3Session) SetLanguage(ctx context.Context, lang string) (string, error) {
-	langTag := strings.ToLower(lang)
-	if langTag != "en" && langTag != "*" && langTag != "i-default" {
+	// A language range is ASCII (RFC 4647 section 2.1), matched case-insensitively.
+	isDefault := server.EqualFoldASCII(lang, "i-default")
+	if !isDefault && lang != "*" && !server.EqualFoldASCII(lang, "en") {
 		return "", &pop3server.Error{Message: "Unsupported language"}
 	}
 
 	s.mutex.Lock()
 	defer s.mutex.Unlock()
 
-	if langTag == "i-default" {
+	if isDefault {
 		s.language = "i-default"
 	} else {
 		s.language = "en"
@@ -1084,9 +1091,7 @@ func (s *POP3Session) getMessageBody(ctx context.Context, msg *db.POP3Message) (
 	// body is already resident — too late to prevent the OOM. msg.Size is the stored
 	// metadata size, so this bounds the single allocation. (security-audit M13)
 	if s.memTracker != nil && msg.Size > 0 && !s.memTracker.CanAllocate(int64(msg.Size)) {
-		metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-		s.WarnLog("session memory limit exceeded", "uid", msg.UID, "size", msg.Size)
-		return nil, errBodyTooBig
+		return nil, s.bodyOverBudget(msg.UID, msg.Size)
 	}
 
 	data, err := s.loadMessageBody(ctx, msg)
@@ -1097,12 +1102,31 @@ func (s *POP3Session) getMessageBody(ctx context.Context, msg *db.POP3Message) (
 	// Single accounting point for every source in loadMessageBody (cache, S3, disk).
 	if s.memTracker != nil {
 		if allocErr := s.memTracker.Allocate(int64(len(data))); allocErr != nil {
-			metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
-			s.WarnLog("session memory limit exceeded", "uid", msg.UID, "size", len(data), "error", allocErr)
-			return nil, errBodyTooBig
+			return nil, s.bodyOverBudget(msg.UID, len(data))
 		}
 	}
 	return data, nil
+}
+
+// bodyOverBudget answers RETR or TOP of a body of size bytes the session memory budget
+// refused. The body is held beside the session's message list, so a body that does not
+// fit beside it can never be retrieved until an operator raises session_memory_limit:
+// RFC 3206 section 4 SYS/PERM, "problems which are unlikely to be resolved without
+// intervention", such as "system configuration errors". One that fits is refused only
+// because other data of the session holds the budget now: SYS/TEMP, "a problem which is
+// likely to be temporary in nature", such as "insufficient free disk or memory".
+func (s *POP3Session) bodyOverBudget(uid imap.UID, size int) *pop3server.Error {
+	s.mutex.RLock()
+	need := int64(size) + s.messagesMemBytes
+	s.mutex.RUnlock()
+	limit := s.memTracker.MaxAllowed()
+	perr := errBodyMemoryBusy
+	if limit > 0 && need > limit {
+		perr = errBodyTooBig
+	}
+	metrics.SessionMemoryLimitExceeded.WithLabelValues("pop3", s.server.name, s.server.hostname).Inc()
+	s.WarnLog("session memory limit exceeded", "uid", uid, "size", size, "bytes", need, "limit", limit, "code", perr.Code)
+	return perr
 }
 
 // loadMessageBody returns the raw message body from the fastest available source.
@@ -1371,7 +1395,7 @@ func (s *POP3Session) startTerminationPoller() {
 	conn := s.conn
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done

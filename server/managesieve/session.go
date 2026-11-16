@@ -27,6 +27,7 @@ const ManageSieveMaxLineLength = 8192 // ManageSieve commands can be longer than
 // logic — authentication (incl. master credentials), script storage in
 // PostgreSQL, go-sieve validation, quotas, rate limiting, and metrics.
 type ManageSieveSession struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server.Session
 	mutex         sync.RWMutex
 	mutexHelper   *server.MutexTimeoutHelper
@@ -88,6 +89,7 @@ func authUnavailable(err error) bool {
 // per-command context: it aborts delay waits and DB calls promptly when the
 // connection or server goes away mid-command.
 func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, authnID, password string) error {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 	start := time.Now()
 	success := false
 	outcome := "failure"
@@ -494,6 +496,7 @@ func (s *ManageSieveSession) refuseLikeWrongPassword(ctx context.Context, authnP
 // accepted. The library has already handled unquoting and the TLS and
 // re-authentication gates. ctx is the library's per-command context.
 func (s *ManageSieveSession) Login(ctx context.Context, username, password string) error {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 	start := time.Now()
 
 	netConn := s.conn
@@ -654,7 +657,7 @@ func (s *ManageSieveSession) completeAuthentication(ctx context.Context, address
 	// Acquire write lock for updating session authentication state
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(ctx)
 	if !acquired {
-		s.WarnLog("failed to acquire write lock", "operation", "authenticate")
+		s.WarnLog("failed to acquire write lock", "operation", "authenticate", "address", address.BaseAddress(), "method", method)
 		return errServerBusy
 	}
 	defer release()
@@ -1141,7 +1144,7 @@ func (s *ManageSieveSession) startTerminationPoller() {
 	conn := s.conn
 
 	// Register session for kick notifications and get a channel that closes on kick
-	kickChan := s.server.connTracker.RegisterSession(accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(accountID, s.authSessionGeneration)
 
 	go func() {
 		// Unregister when done

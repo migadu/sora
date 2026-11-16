@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 )
@@ -34,6 +35,35 @@ func (s *IMAPSession) refusedInMaintenance(address string) *imap.Error {
 		Type: imap.StatusResponseTypeNo,
 		Code: imap.ResponseCodeUnavailable,
 		Text: "Server in maintenance, please try again later",
+	}
+}
+
+// loginSetupError answers and logs a post-credential-check session setup failure
+// before s.Session.User is populated, naming the account address and auth method
+// while preserving internalError's canceled, transient, and server-bug replies.
+func (s *IMAPSession) loginSetupError(msg, address, method string, err error) *imap.Error {
+	if errors.Is(err, context.Canceled) {
+		s.InfoLog(msg, "address", address, "method", method, "error", err)
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Command aborted",
+		}
+	}
+
+	s.WarnLog(msg, "address", address, "method", method, "error", err)
+
+	if isTransientError(db.ClassifyDBError(err)) {
+		return &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Code: imap.ResponseCodeUnavailable,
+			Text: "Service temporarily unavailable, please try again later",
+		}
+	}
+
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeServerBug,
+		Text: fmt.Sprintf("%s: %v", msg, err),
 	}
 }
 
@@ -74,6 +104,9 @@ func (s *IMAPSession) Login(ctx context.Context, address, password string) error
 // this, AUTHENTICATE would apply both twice — roughly doubling auth latency and
 // double-counting against the rate limiter relative to LOGIN.
 func (s *IMAPSession) login(ctx context.Context, address, password, authzid string, applyGate bool) error {
+	if applyGate {
+		s.authSessionGeneration = s.server.connTracker.SessionGeneration()
+	}
 	authStart := time.Now()
 
 	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
@@ -320,14 +353,14 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 
 	// Ensure the default mailboxes (INBOX/Sent/Drafts/Archive/Junk/Trash, consts.DefaultMailboxes) exist
 	if err := s.createDefaultMailboxes(ctx, AccountID); err != nil {
-		return s.internalError("failed to create default mailboxes: %v", err)
+		return s.loginSetupError("failed to create default mailboxes", addressParsed.BaseAddress(), method, err)
 	}
 
 	// Get primary email address for this account
 	// User.Address should always be the primary address (not the login address with +alias)
 	primaryAddr, err := s.server.rdb.GetPrimaryEmailForAccountWithRetry(ctx, AccountID)
 	if err != nil {
-		return s.internalError("failed to get primary email: %v", err)
+		return s.loginSetupError("failed to get primary email", addressParsed.BaseAddress(), method, err)
 	}
 
 	// Record successful authentication: a master login under the master credential's

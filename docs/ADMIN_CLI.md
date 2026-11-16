@@ -478,6 +478,80 @@ sora-admin --config config.toml mailbox fix-utf7 --email user@example.com
 
 Names that do not decode, or decode to themselves, are reported as `SKIP`.
 
+### mailbox repair-hierarchy
+
+Finds mailboxes whose place in the hierarchy disagrees with their name and, with `--apply`,
+repairs them. Clients find a mailbox by its name (LIST, SELECT, APPEND, Sieve `fileinto`), while
+`\HasChildren`, the renaming of children on RENAME and the refusal to DELETE a mailbox with
+children follow its place in the hierarchy. Where the two disagree, LIST shows the mailbox without
+its parent, the parent shows no children, and a RENAME of the parent leaves the mailbox behind.
+
+```sh
+sora-admin --config config.toml mailbox repair-hierarchy
+sora-admin --config config.toml mailbox repair-hierarchy --email user@example.com --apply
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--email` | all accounts | Limit to one account. Optional for this subcommand. |
+| `--apply` | `false` | Repair. Without it the command is a dry run: it changes nothing and prints `WOULD REPAIR` lines for what `--apply` does. |
+| `--batch-size` | `1000` | Accounts read per query when walking all accounts (1 to 10000). |
+
+It reports these problems (the second column of each line):
+
+| Problem | Meaning |
+|---|---|
+| `root_with_delimiter` | A name with `/` at the top level, such as `Parent/Child` with no parent. |
+| `detached` | Below a mailbox that is not its name's parent, such as `Alpha/Beta` below `Gamma`. Only the top of such a subtree is listed. |
+| `parent_deleted` | Below a deleted mailbox. |
+| `parent_missing` | Below a mailbox that does not exist. |
+| `bad_path` | The stored hierarchy path is malformed or contains anything except canonical lowercase ASCII hex. Reported only (`REPORT`); nothing is changed. |
+
+What `--apply` does with each one (`REPAIRED`):
+
+- It moves the mailbox, with every mailbox below it, under the mailbox whose name is its name's
+  parent part: `Parent/Child` under `Parent`, and a name without `/` to the top level. Names, ids,
+  UIDVALIDITY, messages, flags and subscriptions stay as they are, so clients do not resync.
+- A missing parent is created as IMAP CREATE creates it (RFC 9051 section 6.3.4), empty and
+  unsubscribed. The line names the mailboxes created.
+
+A mailbox is left alone (`MANUAL`) when no mailbox has its name's parent part and its place gives
+it another name: `Alpha/Beta` below `Gamma` with no `Alpha`, or `X/a/Beta` below `X`, whose place
+makes it `X/Beta`. A CREATE that raced a RENAME of the parent, or a later RENAME, left it so, and
+only the user knows which name is right. The line shows the name its place gives it. Fix it with
+`mailbox rename` to the right name; the rename links it under that name's parent and creates the
+parent if needed.
+
+Each account is repaired in a transaction of its own, which locks the account's mailboxes while it
+runs, and is rolled back unless every mailbox it repaired comes out right. Run it again after
+`--apply`: only `MANUAL` and `REPORT` lines are left. The exit status is `1` only when an account
+fails; `MANUAL` and `REPORT` lines do not change it.
+
+### mailbox repair-unseen
+
+Finds mailboxes whose cached unseen count (served by STATUS, LIST and NOTIFY) is higher than
+the number of unseen messages they hold, and with `--apply` recomputes it. Older builds left
+such counts when the failed-upload cleanup, `uploader resolve` or an importer rollback
+hard-deleted an unseen message. A count that has gone negative is repaired by the server
+itself.
+
+```sh
+sora-admin --config config.toml mailbox repair-unseen
+sora-admin --config config.toml mailbox repair-unseen --apply
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--email` | all accounts | Limit to one account. Optional for this subcommand. |
+| `--apply` | `false` | Repair the mailboxes found. Without it, print `WOULD REPAIR` lines and change nothing. |
+| `--batch-size` | `200` | Mailboxes checked per batch. |
+| `--start-after` | `0` | Resume after this mailbox id. |
+
+Mailboxes are checked in id order. After each batch the command prints the id to pass to
+`--start-after` if it is interrupted. Each repair is a short transaction that holds only that
+mailbox's lock, so it can run while the servers are serving mail. It is safe to run again: a
+repaired mailbox is not reported any more.
+
 ---
 
 ## 7. messages
@@ -525,7 +599,10 @@ sora-admin --config config.toml messages restore --email user@example.com --ids 
   they all apply.
 - Without `--confirm`, the command lists up to ten of the matching messages and asks
   `Continue with restoration? (yes/no)`. Only `yes` or `y` continues.
-- A mailbox that no longer exists is created again. Restored messages get new UIDs.
+- A mailbox that no longer exists is created again. Restored messages get new UIDs and new
+  mod-sequences, so IMAP clients are told of them as new messages. The expunge of the old UID
+  stays on record until the cleaner removes it, so a client not yet told of it still is.
+- A restored message has a new id: deleted again, `list-deleted` shows it under that id.
 - With sharing enabled in the config file you pass, a mailbox recreated in the shared namespace
   is a shared mailbox of the account, as `mailbox create` makes one, and so is a parent recreated
   there. Each one starts with owner-only rights: one entry, the owner's primary address with
@@ -718,6 +795,13 @@ sora-admin --config config.toml uploader resolve
 "This host" is the instance ID from `[uploader] instance_id`, or the hostname when unset. The
 spool is `[uploader] path`, with the server's default when unset. Run `resolve` on the backend
 that owns the uploads, with its own config file. Always look at a `--dry-run` first.
+
+With the default `[uploader] path`, `resolve`, `--dry-run` included, refuses to run while
+`/tmp/sora/uploads`, the default of earlier releases, still holds staged bodies: they are not in
+the spool it checks, so `[DELETE]` would take them for lost. Unlike the server, it counts a file
+there whoever owns it, and refuses when it cannot read a directory there: it cannot tell which
+user the server stages as. It fails with `Failed to resolve uploads:` and an error that names
+the old spool ([OPERATIONS.md](OPERATIONS.md#5-what-a-restart-loses-and-keeps)).
 
 ---
 
@@ -997,6 +1081,12 @@ the server creates it, and given to the owner of the directory it is created in:
 default `/var/lib/sora/certs`, the owner of `/var/lib/sora`, the server's user under
 `dist/sora.service`. A directory created in a sticky directory such as `/tmp` stays yours.
 
+`cache` counts a certificate that is not in S3 under `Not found` and goes on: a configured
+domain may not have been issued yet, and the RSA certificate exists only once a client has
+asked for one. With `--domain`, it exits `1` when neither certificate of that domain is in S3,
+as `delete --domain` does. A certificate that cannot be downloaded, does not parse, or cannot
+be written exits `1` as well; the others are still cached.
+
 ---
 
 ## 22. config
@@ -1005,7 +1095,7 @@ Checks and prints a config file. These subcommands read only the file.
 
 | Subcommand | Flags | What it does |
 |---|---|---|
-| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys) and runs the checks `sora` makes on the file before it starts anything ([CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), without connecting to anything. Prints `[OK] Configuration is valid!` and the servers, or a `[FAIL]` line for each problem. Exits `1` on errors. |
+| `validate` | | Loads the file with the server's loader (warnings for unknown and duplicate keys) and runs the checks `sora` makes on the file before it starts anything ([CONFIGURATION.md section 4](CONFIGURATION.md#4-checks-at-startup)), without connecting to anything. Reports the listed file-only warning classes as `[WARN]` (unsupported Sieve extension names including ManageSieve proxies, broad trusted networks, unused server keys, session-memory shortfalls, inactive feature settings, values that do not parse, and the server, cluster, TLS and cleaner settings listed there), then prints `[OK] Configuration is valid!` and the servers, or a `[FAIL]` line for each problem. Exits `1` on errors, not on warnings. |
 | `dump` | `--format` (`toml` or `json`, default `toml`), `--mask-secrets` (default `true`) | Prints the configuration as loaded, with defaults applied. |
 
 `--mask-secrets` masks the database passwords, `[s3]` access key, secret key and encryption key,
@@ -1013,6 +1103,15 @@ the `[tls]` certificate and key paths, the Let's Encrypt S3 keys, `[cluster] sec
 `[admin_cli] api_key`, `[relay] auth_token`, `[spam_training] auth_token`, and the `api_key`,
 `jwt_secret`, `master_password`, `master_sasl_password` and remote lookup `auth_token` of each
 `[[server]]`.
+
+In every other setting that holds a URL, such as `[relay] http_url`, `[spam_training] endpoint`
+or the remote lookup `url`, it masks the userinfo and the value of each query parameter, and keeps
+the scheme, host, port, path, fragment and parameter names. The remote lookup `$email` and `$ip`
+placeholders are shown. A query component that may be a bare token is masked whole, name
+included: one without `=`, and one whose value is empty or only `=` signs, as a base64 token
+ending in `=` padding looks like a name with such a value. A URL with userinfo or a query that
+does not parse is masked whole. The server's log lines and errors show these endpoints masked the
+same way. `--mask-secrets=false` prints every value as configured.
 
 See [CONFIGURATION.md](CONFIGURATION.md) for the file itself.
 
@@ -1027,7 +1126,7 @@ upgrades.
 | Subcommand | Flags | What it does |
 |---|---|---|
 | `up` | | Applies every pending migration. |
-| `down` | `--limit N` (default `1`), `--all` | Reverts the last N migrations, or all of them. No prompt. |
+| `down` | `--limit N` (default `1`), `--all` | Reverts the last N migrations, or with `--all` every migration after 000001. 000001, the initial schema, is never reverted: a `--limit` that reaches it is refused. No prompt. |
 | `version` | | Prints the current version and whether it is dirty. Safe while servers run: a plain read of `schema_migrations`, no lock. |
 | `force VERSION` | | Records VERSION as the current version and clears the dirty flag, without running anything. |
 

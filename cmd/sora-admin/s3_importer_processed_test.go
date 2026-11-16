@@ -44,7 +44,9 @@ func TestS3ImporterMarksEveryObjectProcessed(t *testing.T) {
 	defer si.Close()
 
 	// Objects under another user's prefix fail in importS3Object before it reaches the
-	// database or S3, so the run needs neither.
+	// database or S3, so the run needs neither past the account Run looks up first.
+	si.rdb = &s3ImportTestDB{}
+	require.NoError(t, si.lookupAccount())
 	const n = 2000
 	insertS3Objects(t, si, "example.org", "other", n)
 	// Empty the WAL of the inserts, so that it holds only the run's updates.

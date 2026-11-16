@@ -68,6 +68,32 @@ func (rd *ResilientDatabase) GetOwnedMailboxIDByNameWithRetry(ctx context.Contex
 	return result.(int64), nil
 }
 
+// MailboxNameIsBelowWithRetry reports whether name is below mbox in its owner's
+// hierarchy, as the database resolves names. Which names are one mailbox is the
+// database's call, LOWER(name) under its collation, which no Go case mapping
+// matches (under ICU "İx" is not "ix", and "ας" is "ΑΣ"). lower() leaves the
+// hierarchy delimiters alone, so of the leading parts of name only the one with as
+// many levels as mbox's name can name mbox: that one is looked up, on the primary,
+// and the mailbox found compared with mbox.
+func (rd *ResilientDatabase) MailboxNameIsBelowWithRetry(ctx context.Context, name string, mbox *db.DBMailbox) (bool, error) {
+	delim := string(consts.MailboxDelimiter)
+	levels := strings.Count(mbox.Name, delim) + 1
+	parts := strings.Split(name, delim)
+	if len(parts) <= levels {
+		return false, nil
+	}
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	id, err := rd.GetOwnedMailboxIDByNameWithRetry(ctx, mbox.AccountID, strings.Join(parts[:levels], delim))
+	switch {
+	case err == nil:
+		return id == mbox.ID, nil
+	case errors.Is(err, consts.ErrMailboxNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // HasLiveDescendantsWithRetry reports whether any live mailbox sits below the given path.
 func (rd *ResilientDatabase) HasLiveDescendantsWithRetry(ctx context.Context, accountID int64, path string) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
@@ -475,6 +501,19 @@ func (rd *ResilientDatabase) ReconcileNegativeMailboxStatsWithRetry(ctx context.
 	return rd.getOperationalDatabaseForOperation(ctx, true).ReconcileNegativeMailboxStats(ctx)
 }
 
+// FindExcessUnseenCountsWithRetry checks one batch of mailboxes for a cached unseen_count
+// above the live count (see db.FindExcessUnseenCounts).
+func (rd *ResilientDatabase) FindExcessUnseenCountsWithRetry(ctx context.Context, accountID, afterMailboxID int64, limit int) (db.UnseenExcessBatch, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).FindExcessUnseenCounts(ctx, accountID, afterMailboxID, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return db.UnseenExcessBatch{}, err
+	}
+	return result.(db.UnseenExcessBatch), nil
+}
+
 func (rd *ResilientDatabase) GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetPrimaryEmailForAccount(ctx, accountID)
@@ -691,6 +730,34 @@ func (rd *ResilientDatabase) GetSubscribedMailboxNamesWithRetry(ctx context.Cont
 		return nil, nil
 	}
 	return result.([]string), nil
+}
+
+// GetSubscribedMailboxNamesByKeyWithRetry returns every subscribed name for the
+// account keyed by LOWER(mailbox_name) as the database computes it.
+func (rd *ResilientDatabase) GetSubscribedMailboxNamesByKeyWithRetry(ctx context.Context, accountID int64) (map[string]string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetSubscribedMailboxNamesByKey(ctx, accountID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	names, _ := result.(map[string]string)
+	return names, nil
+}
+
+// MailboxNameKeysWithRetry returns, in order, the key of each of names: LOWER(name)
+// as the database computes it (db.MailboxNameKeys).
+func (rd *ResilientDatabase) MailboxNameKeysWithRetry(ctx context.Context, names []string) ([]string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).MailboxNameKeys(ctx, names)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	keys, _ := result.([]string)
+	return keys, nil
 }
 
 // HasMailboxWithSpecialUseWithRetry reports whether the account already has a live

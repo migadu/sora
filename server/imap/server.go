@@ -633,41 +633,10 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		warmupMaxConcurrent:          warmupMaxConcurrent,
 		warmupQueue:                  warmupQueue,
 		warmupSemaphore:              warmupSemaphore,
-		// No AUTH= entry: go-imap advertises AUTH= from the session's
-		// AuthenticateMechanisms and never reads it from this set, so one here
-		// would let disabled_caps and client_filters report it removed while
-		// it stays advertised and usable.
-		caps: imap.CapSet{
-			imap.CapIMAP4rev1:                 struct{}{},
-			imap.CapIMAP4rev2:                 struct{}{},
-			imap.CapLiteralPlus:               struct{}{},
-			imap.CapSASLIR:                    struct{}{},
-			imap.CapMove:                      struct{}{},
-			imap.CapIdle:                      struct{}{},
-			imap.CapUIDPlus:                   struct{}{},
-			imap.CapESearch:                   struct{}{},
-			imap.CapSearchRes:                 struct{}{},
-			imap.CapESort:                     struct{}{},
-			imap.CapSort:                      struct{}{},
-			imap.CapSortDisplay:               struct{}{},
-			imap.CapSpecialUse:                struct{}{},
-			imap.CapCreateSpecialUse:          struct{}{},
-			imap.CapListStatus:                struct{}{},
-			imap.CapListExtended:              struct{}{}, // listed so a session without IMAP4rev2 keeps it (disableCapabilities)
-			imap.CapStatusSize:                struct{}{},
-			imap.CapBinary:                    struct{}{},
-			imap.CapCondStore:                 struct{}{},
-			imap.CapQResync:                   struct{}{},
-			imap.CapNotify:                    struct{}{},
-			imap.CapChildren:                  struct{}{},
-			imap.CapID:                        struct{}{},
-			imap.CapNamespace:                 struct{}{},
-			imap.CapMetadata:                  struct{}{},
-			imap.Cap("THREAD=REFERENCES"):     struct{}{},
-			imap.Cap("THREAD=REFS"):           struct{}{},
-			imap.Cap("THREAD=ORDEREDSUBJECT"): struct{}{},
-			imap.Cap("MULTISEARCH"):           struct{}{},
-		},
+		// The set disabled_caps and client_filters withdraw from, with PREVIEW
+		// when enable_preview: answering it for mail that is not on this node
+		// costs an S3 download per message.
+		caps:            config.IMAPServerCaps(options.Preview.Enabled),
 		masterUsername:  options.MasterUsername,
 		masterPassword:  options.MasterPassword,
 		authIdleTimeout: options.AuthIdleTimeout,
@@ -688,13 +657,6 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Apply operator-configured per-command timeout overrides on top of defaults.
 	if len(options.CommandTimeoutOverrides) > 0 {
 		s.commandTimeouts.ApplyOverrides(options.CommandTimeoutOverrides)
-	}
-
-	// PREVIEW is opt-in: answering it for mail that is not on this node costs an
-	// S3 download per message. Like every capability it can still be removed
-	// per client (client_filters) or globally (disabled_caps).
-	if options.Preview.Enabled {
-		s.caps[imap.CapPreview] = struct{}{}
 	}
 
 	// Pre-compile regex patterns for capability filters for performance and correctness.
@@ -740,13 +702,8 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 		// Only add the filter if all regex patterns are valid
 		if isValid {
 			for _, capStr := range filter.DisableCaps {
-				c := config.IMAPCap(capStr)
-				if c == imap.CapIMAP4rev1 {
-					logger.Warn("IMAP: Capability filter cannot disable IMAP4rev1, go-imap selects connection protocol version from server-global capabilities", "name", name, "entry", i+1, "capability", capStr, "reason", filter.Reason)
-				} else if _, ok := alwaysAdvertisedCaps[c]; ok {
-					logger.Warn("IMAP: Capability filter cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "entry", i+1, "capability", capStr, "reason", filter.Reason)
-				} else if !s.caps.Has(c) {
-					logger.Warn("IMAP: Capability filter cannot disable capability, it is not one this server can withdraw", "name", name, "entry", i+1, "capability", capStr, "reason", filter.Reason)
+				if why := config.IMAPCapNotWithdrawn(s.caps, capStr, true); why != "" {
+					logger.Warn("IMAP: Capability filter cannot disable capability, "+why, "name", name, "entry", i+1, "capability", capStr, "reason", filter.Reason)
 				}
 			}
 			validFilters = append(validFilters, filter)
@@ -759,11 +716,8 @@ func New(appCtx context.Context, name, hostname, imapAddr string, s3 *storage.S3
 	// Remove globally disabled capabilities from the server
 	if len(options.DisabledCaps) > 0 {
 		for _, capStr := range options.DisabledCaps {
-			c := config.IMAPCap(capStr)
-			if _, ok := alwaysAdvertisedCaps[c]; ok {
-				logger.Warn("IMAP: Cannot disable capability, go-imap always advertises it with IMAP4rev1", "name", name, "capability", capStr)
-			} else if !s.caps.Has(c) {
-				logger.Warn("IMAP: Cannot disable capability, it is not one this server can withdraw", "name", name, "capability", capStr)
+			if why := config.IMAPCapNotWithdrawn(s.caps, capStr, false); why != "" {
+				logger.Warn("IMAP: Cannot disable capability, "+why, "name", name, "capability", capStr)
 			}
 		}
 		if removed := disableCapabilities(s.caps, options.DisabledCaps); len(removed) > 0 {
@@ -1136,7 +1090,7 @@ func (s *IMAPServer) reportCommandTimeout(timeout time.Duration) {
 	// connections (RFC 3501 §5.4 autologout floor + margin) and closes
 	// silently — no BYE, no timeout metric — when it expires. A knob at or
 	// above that value is therefore silently capped by the library.
-	if timeout >= 35*time.Minute {
+	if timeout >= config.IMAPLibraryReadDeadline {
 		logger.Warn("IMAP: command_timeout is at or above the protocol library's 35m read deadline; idle sessions will be closed silently at 35m instead", "name", s.name, "command_timeout", timeout)
 	}
 }
@@ -1848,10 +1802,6 @@ func (s *IMAPServer) filterCapabilitiesForClientExcept(sessionCaps imap.CapSet, 
 	return disabledCaps, keptCaps
 }
 
-// alwaysAdvertisedCaps aliases config.IMAPAlwaysAdvertisedCaps so server startup
-// and config validation share one definition.
-var alwaysAdvertisedCaps = config.IMAPAlwaysAdvertisedCaps
-
 // capImplies delegates to config.IMAPCapImplies.
 func capImplies(by, c imap.Cap) bool {
 	return config.IMAPCapImplies(by, c)
@@ -1992,7 +1942,8 @@ func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 	return nil
 }
 
-// GetLookupCache returns the lookup cache for testing purposes
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
 func (s *IMAPServer) GetLookupCache() *lookupcache.LookupCache {
 	return s.lookupCache
 }
@@ -2015,6 +1966,8 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 		return 0, "main_db", "transient_error", err
 	}
 
+	cacheGeneration := s.lookupCache.Generation()
+
 	// Check cache first if enabled
 	if s.lookupCache != nil {
 		cachedAccountID, found, cacheErr := s.lookupCache.Authenticate(address, password)
@@ -2033,6 +1986,8 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 		logger.Debug("Authentication: cache miss, checking database", "address", address)
 	}
 
+	cacheGeneration = s.lookupCache.Generation()
+
 	// Fetch credentials from database (no caching - we handle that here)
 	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, address)
 	if err != nil {
@@ -2049,7 +2004,7 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 		// Cache negative result if enabled (user not found)
 		if s.lookupCache != nil {
 			// AuthUserNotFound = 1 (from lookupcache package)
-			s.lookupCache.SetFailure(address, 1)
+			s.lookupCache.SetFailureIfGeneration(cacheGeneration, address, 1)
 		}
 		return 0, "main_db", "user_not_found", err
 	}
@@ -2069,14 +2024,14 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 		// Cache negative result for invalid password if enabled
 		// AuthInvalidPassword = 2 (from lookupcache package)
 		if s.lookupCache != nil {
-			s.lookupCache.SetFailure(address, 2)
+			s.lookupCache.SetFailureIfGeneration(cacheGeneration, address, 2)
 		}
 		return 0, "main_db", "invalid_password", err
 	}
 
 	// Cache successful authentication if enabled
 	if s.lookupCache != nil {
-		s.lookupCache.SetSuccess(address, accountID, hashedPassword, password)
+		s.lookupCache.SetSuccessIfGeneration(cacheGeneration, address, accountID, hashedPassword, password)
 	}
 
 	// Asynchronously rehash if needed
@@ -2096,10 +2051,10 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 				newHashedPassword = string(newHash)
 			}
 
-			// Update password in database
-			if err := s.rdb.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
+			// Upgrade only the account/address/hash actually authenticated.
+			if changed, err := s.rdb.RehashCredentialWithRetry(updateCtx, address, accountID, hashedPassword, newHashedPassword); err != nil {
 				logger.Error("Rehash: Failed to update password", "address", address, "error", err)
-			} else {
+			} else if changed {
 				logger.Info("Rehash: Successfully rehashed and updated password", "address", address)
 				// Invalidate cache entry since password hash changed
 				if s.lookupCache != nil {

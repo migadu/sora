@@ -21,8 +21,8 @@ func TestList_ReturnChildrenWithChildrenDisabled(t *testing.T) {
 	}
 
 	mboxes := []*db.DBMailbox{
-		{ID: 1, Name: "Parent", HasChildren: true, Subscribed: true},
-		{ID: 2, Name: "Parent/Child", Subscribed: true},
+		{ID: 1, Name: "Parent", NameKey: "parent", HasChildren: true, Subscribed: true},
+		{ID: 2, Name: "Parent/Child", NameKey: "parent/child", Subscribed: true},
 	}
 	subscribed := map[string]string{"parent": "Parent", "parent/child": "Parent/Child"}
 	want := map[string]imap.MailboxAttr{
@@ -80,7 +80,7 @@ func TestList_ReturnChildrenWithChildrenDisabled(t *testing.T) {
 func TestList_ReturnChildrenOnNonExistentNames(t *testing.T) {
 	mboxes := []*db.DBMailbox{
 		// Visible without its parent, as a shared mailbox granted on its own.
-		{ID: 1, Name: "Shared/Team/Sub", Subscribed: true},
+		{ID: 1, Name: "Shared/Team/Sub", NameKey: "shared/team/sub", Subscribed: true},
 	}
 	subscribed := map[string]string{"gone": "Gone", "shared/team/sub": "Shared/Team/Sub"}
 	recursive := &imap.ListOptions{SelectSubscribed: true, SelectRecursiveMatch: true, ReturnChildren: true}

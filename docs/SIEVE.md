@@ -95,7 +95,7 @@ delivery is refused up front.
 | ManageSieve (`managesieve` server) | `max_script_size` in the `[[server]]` block, default `16kb` | See [section 9](#9-managesieve). |
 | User API `/user/filters` | 64 KB, fixed | Names may use letters, digits, `-`, `_` and `.`, up to 128 characters. See [USER_API.md](USER_API.md). |
 | `sora-admin sieve put` | 64 KB, fixed | Reads the script from `--file` or standard input. See [ADMIN_CLI.md](ADMIN_CLI.md). |
-| Import from Dovecot (`--sieve`) | | See [IMPORT_EXPORT.md](IMPORT_EXPORT.md). |
+| Import from Dovecot (`--sieve`) | 64 KB, fixed | See [IMPORT_EXPORT.md](IMPORT_EXPORT.md). |
 
 `sora-admin sieve` also has `list`, `show`, `delete`, `activate`, `deactivate` and `rename`.
 
@@ -341,9 +341,17 @@ Every run, default or user, is counted in `sora_sieve_executions_total{protocol,
 `100ms` and `60s`. An empty, unparsable, zero or negative value means the default. The value is
 read at startup; a change needs a restart.
 
-The budget also caps the wait for a single `:regex` or `:matches` match. Each run is also bounded
-by the time left on the LMTP `DATA` command, if that is shorter (`timeouts.lmtp_command_timeouts`,
-see [PROTOCOLS.md](PROTOCOLS.md)).
+The budget also supplies the deadline for a single `:regex` or `:matches` match. Inputs
+larger than 1 KB are matched synchronously through a reader that checks the deadline as
+input advances, roughly every 64 bytes. A stopped match returns a timeout only after the matching
+work has ended; it leaves no background match goroutine. These checks are cooperative,
+so work can continue until the next check. Inputs up to 1 KB and pattern compilation run
+inline, bounded by the input, pattern and program limits below; the budget is not a strict
+wall-clock cap for those operations. Cancellation after the last sampled input read can
+race with normal match completion.
+
+Each run also receives the time left on the LMTP `DATA` command, if that is shorter
+(`timeouts.lmtp_command_timeouts`, see [PROTOCOLS.md](PROTOCOLS.md)).
 
 ### Fixed interpreter limits
 
@@ -358,7 +366,12 @@ These come from go-sieve and are not configurable.
 | Variable name length | 32 bytes | The script fails. |
 | Variable value length | 4000 bytes | The value is cut. |
 | Regex pattern length | 1000 bytes | The script fails. |
+| Estimated compiled cost of a `:regex` key | 10000 weighted program-cost units; a counted repeat such as `a{100}` multiplies the repeated cost | The script fails. |
 | Text fed to one regex or `:matches` match | 256 KB | The text is cut, the match goes on. |
+
+The regex program estimate also accounts for character-class ranges and case folding. It is
+neither an exact VM instruction count nor a heap byte cap. The execution budget remains
+cooperative, with the inline-match and compilation limits described above.
 
 ---
 
@@ -400,7 +413,8 @@ redirect actions in one run make the run fail, and the message is then handled a
 - Envelope recipient: the redirect address.
 - Body and headers: the message as Sora stored it (with `Received:`, `Delivered-To:` and any
   header edits), plus two headers on top:
-  - `X-Sora-Loop: <n>`, the previous hop count plus one.
+  - `X-Sora-Loop: <n>`, the hop count the message arrived with plus one. It is counted before
+    the script's header edits, so a script that deletes `X-Sora-Loop` does not reset it.
   - `X-Redirected-By: <primary address of the account that owns the script>`. Any
     `X-Redirected-By` already in the message is removed first.
 

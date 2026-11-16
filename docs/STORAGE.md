@@ -606,8 +606,9 @@ set, for example to `"365d"`, each cleanup cycle expunges every message whose ro
 than that, in every mailbox of every account.
 
 - The age counts from when Sora created the message row (`messages.created_at`). Delivery,
-  APPEND, import, COPY and MOVE all create a new row, so each of them starts a new clock for
-  that copy. The `Date:` header and the IMAP internal date do not matter.
+  APPEND, import, COPY, MOVE and a restore (`sora-admin messages restore`, the Admin API) all
+  create a new row, so each of them starts a new clock for that copy. The `Date:` header and
+  the IMAP internal date do not matter.
 - The cycle expunges in batches of 1000, pauses 2 seconds between batches, and spends at most
   30 seconds. What does not fit waits for the next cycle.
 - Expunged mail then waits the normal `grace_period` before its body is removed. So mail is
@@ -639,6 +640,9 @@ worker deletes a message that is not uploaded when both of these hold:
 A node that has never written a heartbeat or taken a lease counts as alive, because Sora
 cannot tell whether it is gone. Deleting mail by mistake is permanent; keeping it costs only
 disk.
+
+The worker never waits for a folder that another session is changing at that moment (a
+delivery, a flag change, an expunge). It leaves that folder's messages for a later cycle.
 
 With the defaults this means:
 
@@ -854,7 +858,7 @@ Metrics and log lines:
 | The S3 bucket | **Yes** | Every uploaded body. Use your provider's replication or versioning, or copy the bucket. |
 | `[s3] encryption_key` | **Yes, apart from the bucket** | Without it, an encrypted bucket is unreadable. |
 | The config file and TLS keys | Yes | |
-| `[uploader] path` | Keep it on durable storage instead | It holds the only copy of mail not yet in S3: normally for seconds, during an S3 outage for hours. A periodic backup of it is of little use. Do not put it on `tmpfs` or under a `/tmp` that is cleared at boot (the default is `/tmp/sora/uploads`). |
+| `[uploader] path` | Keep it on durable storage instead | It holds the only copy of mail not yet in S3: normally for seconds, during an S3 outage for hours. A periodic backup of it is of little use. Do not put it on `tmpfs` or under a `/tmp` that is cleared at boot (the default is `/var/spool/sora/uploads`). |
 | `[local_cache] path` | No | Rebuilt from S3. |
 | Auth cache, affinity cache | No | Rebuilt. See [PROXY.md](PROXY.md). |
 | `[relay.queue] path` | See [RELAY.md](RELAY.md) | Outgoing redirects and vacation replies. |
@@ -957,12 +961,12 @@ Required on every storage node.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | `"/tmp/sora/cache"` | Cache directory. Created if missing. Put it on the same filesystem as `[uploader] path`. |
+| `path` | string | `"/var/cache/sora/cache"` | Cache directory. Created if missing. Put it on the same filesystem as `[uploader] path`. |
 | `capacity` | size | `"1gb"` | Total size the cache is kept within. |
 | `max_object_size` | size | `"5mb"` | Largest body cached, after an upload, an S3 read or a warmup. Also the default of the IMAP server's `preview_s3_max_size`. |
-| `purge_interval` | duration | `"12h"` | How often the cache is trimmed and cleaned. |
+| `purge_interval` | duration | `"12h"` | How often the cache is trimmed and cleaned. Must be positive. |
 | `orphan_cleanup_age` | duration | `"30d"` | Unread time after which a cached body of deleted mail is removed. |
-| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are written to `cache_metrics`. |
+| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are written to `cache_metrics`. Must be positive. |
 | `metrics_retention` | duration | `"30d"` | How long `cache_metrics` rows are kept. |
 | `enable_warmup` | bool | `true` | Preload recent mail at IMAP login. |
 | `warmup_message_count` | int | `50` | Messages per mailbox to preload. |
@@ -971,13 +975,15 @@ Required on every storage node.
 | `warmup_timeout` | duration | `"5m"` | Longest time one warmup may run. |
 | `warmup_interval` | duration | `"24h"` | Shortest interval between two warmups of one account. |
 
-An invalid duration or size in this section is logged as a warning and the default is used.
+An invalid duration or size in this section is logged as a warning and the default is used. A
+`purge_interval` or `metrics_interval` of zero or less is refused at start-up and by
+`sora-admin config validate` when the node has a mail backend (`imap`, `lmtp`, or `pop3`).
 
 ### `[uploader]`
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | `"/tmp/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. |
+| `path` | string | `"/var/spool/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. |
 | `instance_id` | string | the hostname | The node's [instance ID](ARCHITECTURE.md#8-node-identity), the owner of its pending uploads. Unique per `sora` process, stable across restarts. |
 | `batch_size` | int | `10` | Pending rows taken per database query. Each body is still its own S3 request. Must be positive. |
 | `concurrency` | int | `20` | Uploads in flight at once. Must be positive. |
@@ -1020,3 +1026,44 @@ limit of `0` turns that check off. An overwrite counts only its change in size, 
 frees its slot. The count and size limits refuse only a command that raises the count or the
 size, so an account already past one (the limit was lowered) can still delete, overwrite and
 shrink entries to get back under it.
+
+
+### Forward-only header presence (migration70)
+
+Newly ingested messages record whether the supported searchable fields exist,
+independently of empty values or address parsing. This covers From, To, Cc, Bcc,
+Sender, Reply-To, Subject, Message-ID, In-Reply-To and References. An explicit
+`HEADER <name> ""` uses this presence metadata; address shorthand retains the
+meaning of the currently represented ENVELOPE address lists. The inherited
+empty-group ENVELOPE representation limitation is not changed here. Nonempty
+header terms and unsupported field names retain their existing search behavior.
+
+This change is forward-only. There is no historical or lazy backfill and no S3
+read to repair old metadata. A NULL `messages.header_presence` means unknown,
+and those rows keep their prior search results (including known empty-term
+inaccuracies). COPY, MOVE and restore preserve that unknown state even though
+they create a new row or UID. Mail newly ingested through APPEND, LMTP, HTTP
+or either importer records final headers, after Sieve edits where applicable;
+old writers during a rolling upgrade and severely malformed APPEND headers
+accepted with degraded metadata can still produce unknown rows.
+
+For large databases, follow the concurrent covering-index preparation in
+`db/migrations/000070_messages_header_presence.up.sql` before upgrading. The
+migration refuses an unprepared blocking rebuild. Existing bodies, flags, UIDs,
+MODSEQs, search caches and content hashes are not rewritten.
+
+### Initial flag-state versions (migration71)
+
+A new UID and a later flag change can arrive between the same two polls. The
+nullable `message_state.initial_modseq` records the flag version installed by
+that row's INSERT; a trigger keeps it unchanged on UPDATE. Poll suppresses the
+initial flags of a newly announced message, while a later STORE still produces
+FlagChange or keeps the reported CONDSTORE watermark below a filtered change.
+This also covers an own APPEND whose MessageNew FETCH is suppressed.
+
+Existing state rows remain NULL and follow the conservative flag-update path.
+There is no backfill or body read. All writers get this metadata from the INSERT
+trigger, including older servers during a rolling upgrade. COPY, MOVE and restore
+install a fresh state row and initial version; they do not reuse the source's
+version. Rolling migration71 back removes this knowledge; applying it again
+leaves those existing rows unknown rather than inferring their original flags.

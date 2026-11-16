@@ -56,38 +56,37 @@ type reloadableSettings struct {
 
 // Server represents a User API proxy server
 type Server struct {
-	name                       string
-	hostname                   string // labels the metrics, like every other server's hostname
-	addr                       string
-	connManager                *proxy.ConnectionManager
-	remoteUseProxyProtocol     bool // the server's own PROXY-header setting; a named pool's setting overrides it per route
-	remoteTLS                  bool // the server's own backend TLS setting; a named pool's setting overrides it per route
-	remoteTLSVerify            bool // the server's own backend certificate check; likewise
-	lookupLocalUsers           bool // a user the remote lookup does not know is routed into the default pool
-	rdb                        *resilient.ResilientDatabase
-	routingLookup              proxy.UserRoutingLookup  // RemoteLookup client for user routing (optional)
-	affinityManager            *server.AffinityManager  // Affinity manager for sticky routing (optional)
-	lookupCache                *lookupcache.LookupCache // Route lookup cache (optional)
-	positiveRevalidationWindow time.Duration            // Revalidation window for cached routes
-	tls                        bool
-	tlsCertFile                string
-	tlsKeyFile                 string
-	tlsVerify                  bool
-	tlsConfig                  *tls.Config // Global TLS config from TLS manager (optional)
-	trustedProxies             []string    // CIDR blocks for trusted proxies
-	limiter                    *server.ConnectionLimiter
-	authLimiter                *server.AuthRateLimiter // login rate limit (auth_rate_limit); nil when off
+	name                   string
+	hostname               string // labels the metrics, like every other server's hostname
+	addr                   string
+	connManager            *proxy.ConnectionManager
+	remoteUseProxyProtocol bool // the server's own PROXY-header setting; a named pool's setting overrides it per route
+	remoteTLS              bool // the server's own backend TLS setting; a named pool's setting overrides it per route
+	remoteTLSVerify        bool // the server's own backend certificate check; likewise
+	lookupLocalUsers       bool // a user the remote lookup does not know is routed into the default pool
+	rdb                    *resilient.ResilientDatabase
+	routingLookup          proxy.UserRoutingLookup  // RemoteLookup client for user routing (optional)
+	affinityManager        *server.AffinityManager  // Affinity manager for sticky routing (optional)
+	lookupCache            *lookupcache.LookupCache // Route lookup cache (optional)
+	tls                    bool
+	tlsCertFile            string
+	tlsKeyFile             string
+	tlsVerify              bool
+	tlsConfig              *tls.Config // Global TLS config from TLS manager (optional)
+	trustedProxies         []string    // CIDR blocks for trusted proxies
+	limiter                *server.ConnectionLimiter
+	authLimiter            *server.AuthRateLimiter // login rate limit (auth_rate_limit); nil when off
 	// connReleases holds the connection-limiter release callback for each live
 	// connection, keyed by net.Conn, so the slot is freed on StateClosed/
 	// StateHijacked. Without this the limiter counter only ever increments and
 	// the proxy eventually refuses every connection (permanent DoS).
 	connReleases   map[net.Conn]func()
 	connReleasesMu sync.Mutex
-	httpServer   *http.Server
-	shutdownMu   sync.Mutex
-	shutdownDone chan struct{}
-	ctx          context.Context
-	cancel       context.CancelFunc
+	httpServer     *http.Server
+	shutdownMu     sync.Mutex
+	shutdownDone   chan struct{}
+	ctx            context.Context
+	cancel         context.CancelFunc
 
 	// Base transports retain the server's dial policy. Proxied requests use a
 	// bounded cache partitioned by pool, verification policy and DNS snapshot;
@@ -364,7 +363,6 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 	// Initialize route lookup cache if configured
 	var lookupCache *lookupcache.LookupCache
-	var positiveRevalidationWindow time.Duration
 	if opts.LookupCache != nil && opts.LookupCache.Enabled && !proxy.RemoteLookupUsesClientIP(opts.RemoteLookup) {
 		lookupCacheConfig := opts.LookupCache
 
@@ -374,10 +372,10 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 
 		maxSize := lookupCacheConfig.GetMaxSize()
 
-		positiveRevalidationWindow = lookupCacheConfig.GetPositiveRevalidationWindowWithDefault(opts.Name)
-
-		lookupCache = lookupcache.New("userapi_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, positiveRevalidationWindow)
-		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize, "positive_revalidation_window", positiveRevalidationWindow)
+		// The cache holds routes and checks no passwords (the backend checks the
+		// login), so it has no positive_revalidation_window (0).
+		lookupCache = lookupcache.New("userapi_proxy", opts.Name, positiveTTL, negativeTTL, maxSize, cleanupInterval, 0)
+		logger.Info("User API Proxy: Route lookup cache enabled", "name", opts.Name, "positive_ttl", positiveTTL, "negative_ttl", negativeTTL, "max_size", maxSize)
 	}
 
 	// Every login passes the proxy and some reach no backend (routeAuthRequest), so the
@@ -394,35 +392,34 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, opts ServerOp
 	}
 
 	s := &Server{
-		name:                       opts.Name,
-		hostname:                   hostname,
-		addr:                       opts.Addr,
-		connManager:                connManager,
-		remoteUseProxyProtocol:     opts.RemoteUseProxyProtocol,
-		remoteTLS:                  opts.RemoteTLS,
-		remoteTLSVerify:            opts.RemoteTLSVerify,
-		lookupLocalUsers:           opts.RemoteLookup != nil && opts.RemoteLookup.ShouldLookupLocalUsers(),
-		rdb:                        rdb,
-		routingLookup:              routingLookup,
-		affinityManager:            opts.AffinityManager,
-		lookupCache:                lookupCache,
-		positiveRevalidationWindow: positiveRevalidationWindow,
-		tls:                        opts.TLS,
-		tlsCertFile:                opts.TLSCertFile,
-		tlsKeyFile:                 opts.TLSKeyFile,
-		tlsVerify:                  opts.TLSVerify,
-		tlsConfig:                  opts.TLSConfig,
-		trustedProxies:             opts.TrustedProxies,
-		limiter:                    limiter,
-		authLimiter:                authLimiter,
-		transport:                  transport,
-		transports:                 transports,
-		newTransport:               newTransport,
-		poolTransports:             make(map[backendTransportKey]*http.Transport),
-		proxyReader:                proxyReader,
-		ctx:                        ctx,
-		cancel:                     cancel,
-		connReleases:               make(map[net.Conn]func()),
+		name:                   opts.Name,
+		hostname:               hostname,
+		addr:                   opts.Addr,
+		connManager:            connManager,
+		remoteUseProxyProtocol: opts.RemoteUseProxyProtocol,
+		remoteTLS:              opts.RemoteTLS,
+		remoteTLSVerify:        opts.RemoteTLSVerify,
+		lookupLocalUsers:       opts.RemoteLookup != nil && opts.RemoteLookup.ShouldLookupLocalUsers(),
+		rdb:                    rdb,
+		routingLookup:          routingLookup,
+		affinityManager:        opts.AffinityManager,
+		lookupCache:            lookupCache,
+		tls:                    opts.TLS,
+		tlsCertFile:            opts.TLSCertFile,
+		tlsKeyFile:             opts.TLSKeyFile,
+		tlsVerify:              opts.TLSVerify,
+		tlsConfig:              opts.TLSConfig,
+		trustedProxies:         opts.TrustedProxies,
+		limiter:                limiter,
+		authLimiter:            authLimiter,
+		transport:              transport,
+		transports:             transports,
+		newTransport:           newTransport,
+		poolTransports:         make(map[backendTransportKey]*http.Transport),
+		proxyReader:            proxyReader,
+		ctx:                    ctx,
+		cancel:                 cancel,
+		connReleases:           make(map[net.Conn]func()),
 	}
 	connManager.OnMaintenanceChange(s.closeBackendIdleConnections)
 	s.settings.Store(&reloadableSettings{jwtSecret: opts.JWTSecret, allowedOrigins: opts.AllowedOrigins})
@@ -608,7 +605,7 @@ func (s *Server) setupHandler() http.Handler {
 			}
 			if errors.Is(err, errRefreshTokenRefused) {
 				logger.Warn("User API Proxy: Authentication failed", "name", s.name, "path", r.URL.Path, "error", err)
-				s.writeError(w, r, "Invalid or expired token", http.StatusUnauthorized)
+				s.writeUnauthorized(w, r, err)
 				return
 			}
 			if errors.Is(err, errLoginRefused) {
@@ -643,11 +640,13 @@ func (s *Server) writeError(w http.ResponseWriter, r *http.Request, msg string, 
 }
 
 // writeLoginRefused answers a login the proxy refuses itself (errLoginRefused) as a
-// backend answers a wrong password (userapi handleLogin): 401 {"error": "Invalid
-// credentials"} with the backend's headers. Unlike writeError it sets no
-// X-Content-Type-Options, which the backend's answer lacks: a header only the proxy sets
-// would show that no backend was asked, and so what the lookup said of the address.
+// backend answers a wrong password (userapi writeLoginRefused): 401 {"error": "Invalid
+// credentials"} with the backend's headers, its Bearer challenge without an error code
+// included. Unlike writeError it sets no X-Content-Type-Options, which the backend's
+// answer lacks: a header only the proxy sets, or one only the backend sets, would show
+// that no backend was asked, and so what the lookup said of the address.
 func (s *Server) writeLoginRefused(w http.ResponseWriter, r *http.Request) {
+	server.SetBearerChallenge(w.Header(), server.UserAPIRealm, "")
 	s.writeUserAPIError(w, r, "Invalid credentials", http.StatusUnauthorized)
 }
 
@@ -946,6 +945,8 @@ func (s *Server) getBackendForUser(ctx context.Context, email string, accountID 
 // forAuth is set for a login or refresh, which carries no token yet: anyone can name any
 // user in one, so it reads affinity but never writes it (no gossip per made-up user).
 func (s *Server) routeUser(ctx context.Context, email string, accountID int64, forAuth bool) (backendRoute, error) {
+	cacheGeneration := s.lookupCache.Generation()
+
 	named := s.connManager.HasNamedPools()
 	poolName := ""
 	havePool := false
@@ -1011,7 +1012,7 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			}
 			// A flat list is one pool: route into it, as before pools; nothing is cached.
 		case routingInfo == nil && result == proxy.AuthUserNotFound:
-			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, IsNegative: true})
+			s.cacheRoute(cacheGeneration, email, &lookupcache.CacheEntry{AccountID: accountID, IsNegative: true})
 			notFound = true
 		case routingInfo == nil && result == proxy.AuthFailed:
 			// 401/403: the lookup refuses the account, a verdict and not an outage, with
@@ -1035,7 +1036,7 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			}
 			// The answer is cached as given, in maintenance or not: routing decides each
 			// time, so the pin returns the user to its backend once maintenance ends.
-			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, ServerAddress: routingInfo.ServerAddress})
+			s.cacheRoute(cacheGeneration, email, &lookupcache.CacheEntry{AccountID: accountID, ServerAddress: routingInfo.ServerAddress})
 			if s.connManager.InMaintenance(routingInfo.ServerAddress) {
 				logger.Info("User API Proxy: Remote lookup backend in maintenance - routing among its siblings", "name", s.name, "user", email, "backend", routingInfo.ServerAddress)
 				poolName, havePool, pinInMaintenance = s.connManager.PoolOfBackend(routingInfo.ServerAddress), true, true
@@ -1051,7 +1052,7 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 			return s.serverRoute(routingInfo.ServerAddress), nil
 		default:
 			poolName, havePool = routingInfo.PoolName, true
-			s.cacheRoute(email, &lookupcache.CacheEntry{AccountID: accountID, PoolName: routingInfo.PoolName})
+			s.cacheRoute(cacheGeneration, email, &lookupcache.CacheEntry{AccountID: accountID, PoolName: routingInfo.PoolName})
 		}
 	}
 	if notFound && !s.lookupLocalUsers {
@@ -1131,12 +1132,12 @@ func (s *Server) routeUser(ctx context.Context, email string, accountID int64, f
 
 // cacheRoute remembers a lookup answer for the configured positive TTL (negative TTL for
 // a user the lookup does not know), if the lookup cache is enabled.
-func (s *Server) cacheRoute(email string, entry *lookupcache.CacheEntry) {
+func (s *Server) cacheRoute(generation uint64, email string, entry *lookupcache.CacheEntry) {
 	if s.lookupCache == nil {
 		return
 	}
 	// ExpiresAt left zero: Set applies the configured TTL
-	s.lookupCache.Set(s.name, email, entry)
+	s.lookupCache.SetIfGeneration(generation, s.name, email, entry)
 }
 
 // proxyRequest proxies the request to the backend. login is the login attempt r is, if
@@ -1275,11 +1276,12 @@ var (
 	errNotBearerAuth = errors.New("authorization header must be 'Bearer <token>'")
 )
 
-// writeUnauthorized answers r, whose token extractAndValidateToken refused with err, as
-// the User API answers the same refusal (userapi jwtAuthMiddleware), so a token the proxy
-// refuses is answered as a backend answers it: the same message and the same Bearer
-// challenge, which RFC 9110 section 15.5.2 requires on every 401. A request without a
-// bearer token gets the challenge without an error code, a refused token
+// writeUnauthorized answers r, whose token extractAndValidateToken refused with err (or
+// whose refresh token peekAuthIdentity refused, errRefreshTokenRefused), as the User API
+// answers the same refusal (userapi jwtAuthMiddleware, handleRefreshToken), so a token
+// the proxy refuses is answered as a backend answers it: the same message and the same
+// Bearer challenge, which RFC 9110 section 15.5.2 requires on every 401. A request
+// without a bearer token gets the challenge without an error code, a refused token
 // error="invalid_token" (RFC 6750 section 3.1).
 func (s *Server) writeUnauthorized(w http.ResponseWriter, r *http.Request, err error) {
 	msg, errorCode := "Invalid or expired token", server.BearerInvalidToken
@@ -1423,3 +1425,6 @@ func (s *Server) Stop() error {
 
 	return nil
 }
+
+// GetLookupCache exposes the route cache for database credential revocation/reset.
+func (s *Server) GetLookupCache() *lookupcache.LookupCache { return s.lookupCache }

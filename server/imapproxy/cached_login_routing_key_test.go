@@ -174,3 +174,10 @@ func TestCachedLoginReplaysUncachedLogin(t *testing.T) {
 		t.Errorf("per-user connections counted under %q: %v, want 0 (the +detail form names no user of its own)", detailed, got)
 	}
 }
+
+// This immutable replay fixture never mutates cache state; guarded fills retain
+// the existing no-op Put behavior while satisfying the mandatory fence contract.
+func (c *replayAuthCache) Generation() uint64 { return 0 }
+func (c *replayAuthCache) PutIfGeneration(ctx context.Context, address string, accountID int64, hash string, _ uint64) error {
+	return c.Put(ctx, address, accountID, hash)
+}

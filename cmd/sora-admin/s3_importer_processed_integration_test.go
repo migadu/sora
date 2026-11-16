@@ -53,6 +53,9 @@ func TestS3Importer_MarksImportedObjectsProcessed(t *testing.T) {
 	}
 	si.totalObjects = n
 
+	if err := si.lookupAccount(); err != nil {
+		t.Fatalf("lookupAccount: %v", err)
+	}
 	if err := si.importFromS3(); err != nil {
 		t.Fatalf("import: %v", err)
 	}

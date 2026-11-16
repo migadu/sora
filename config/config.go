@@ -384,6 +384,28 @@ func (c *ClusterAffinityConfig) GetCleanupInterval() (time.Duration, error) {
 	return helpers.ParseDuration(c.CleanupInterval)
 }
 
+// Validate refuses a negative cleanup_interval: it is the period of the affinity
+// manager's cleanup ticker, and time.NewTicker panics on it (see positiveInterval).
+// 0 is not refused: NewAffinityManagerWithStore runs the ticker at its 1h default
+// then, as it always has, so a file with 0 keeps starting.
+func (c *ClusterAffinityConfig) Validate() error {
+	if d, err := helpers.ParseDuration(c.CleanupInterval); err == nil && d < 0 {
+		return fmt.Errorf("cleanup_interval must not be negative, got %q", c.CleanupInterval)
+	}
+	return nil
+}
+
+// positiveInterval refuses a ticker period that parses to zero or less. time.NewTicker
+// panics on one, and the tickers these periods drive run in goroutines start-up starts,
+// so the panic stops the server. A value that does not parse takes its default with a
+// warning (Config.Warnings), and "" is the default.
+func positiveInterval(key, value string) error {
+	if d, err := helpers.ParseDuration(value); err == nil && d <= 0 {
+		return fmt.Errorf("%s must be positive, got %q", key, value)
+	}
+	return nil
+}
+
 // ClusterConfig holds cluster coordination configuration using gossip protocol
 type ClusterConfig struct {
 	Enabled           bool                       `toml:"enabled"`                  // Enable cluster mode
@@ -405,6 +427,25 @@ func splitClusterAddr(addr string) (host, port string) {
 		return h, p
 	}
 	return strings.TrimSuffix(strings.TrimPrefix(addr, "["), "]"), ""
+}
+
+// SplitClusterPeer splits a peers entry the way memberlist's Join reads it: an
+// optional "name/" prefix, a host name or IPv4 or IPv6 address (bare or bracketed),
+// and an optional port that defaults to defaultPort, the gossip bind port. ok is
+// false when the port is not a number from 0 to 65535.
+func SplitClusterPeer(peer string, defaultPort int) (host string, port uint16, ok bool) {
+	if i := strings.Index(peer, "/"); i >= 0 {
+		peer = peer[i+1:]
+	}
+	host, portStr, err := net.SplitHostPort(peer)
+	if err != nil {
+		host, portStr = strings.TrimSuffix(strings.TrimPrefix(peer, "["), "]"), strconv.Itoa(defaultPort)
+	}
+	p, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
+		return "", 0, false
+	}
+	return host, uint16(p), true
 }
 
 // GetBindAddr returns the bind address by parsing the addr field
@@ -724,6 +765,13 @@ type CleanupConfig struct {
 	PurgePollInterval string `toml:"purge_poll_interval"`
 }
 
+// The cleaner raises a shorter wake_interval, and the purge worker a shorter
+// purge_poll_interval, to these.
+const (
+	MinCleanupWakeInterval = time.Minute
+	MinPurgePollInterval   = 5 * time.Second
+)
+
 // GetPurgePollInterval parses the purge worker's poll interval.
 func (c *CleanupConfig) GetPurgePollInterval() (time.Duration, error) {
 	if c.PurgePollInterval == "" {
@@ -870,6 +918,16 @@ func (c *LocalCacheConfig) GetPurgeInterval() (time.Duration, error) {
 		c.PurgeInterval = "12h"
 	}
 	return helpers.ParseDuration(c.PurgeInterval)
+}
+
+// Validate refuses a purge_interval or metrics_interval of zero or less: they are the
+// periods of a mail backend's cache purge loop and cache metrics writer (see
+// positiveInterval).
+func (c *LocalCacheConfig) Validate() error {
+	if err := positiveInterval("purge_interval", c.PurgeInterval); err != nil {
+		return err
+	}
+	return positiveInterval("metrics_interval", c.MetricsInterval)
 }
 
 // GetOrphanCleanupAge parses the orphan cleanup age duration
@@ -1119,6 +1177,11 @@ type LookupCacheConfig struct {
 	MaxSize                    int    `toml:"max_size"`                     // Maximum number of cached entries (default: 50000)
 	CleanupInterval            string `toml:"cleanup_interval"`             // How often to clean expired entries (default: "5m")
 	PositiveRevalidationWindow string `toml:"positive_revalidation_window"` // How long to wait before revalidating positive cache with different password (default: "30s")
+
+	// positiveRevalidationWindowSet records that the table names
+	// positive_revalidation_window, which the defaults otherwise fill in; the LMTP
+	// and User API proxies do not apply it.
+	positiveRevalidationWindowSet bool
 }
 
 // DefaultLookupCacheConfig returns sensible defaults for authentication and routing lookup caching
@@ -1148,6 +1211,11 @@ func (c *LookupCacheConfig) UnmarshalTOML(data any) error {
 		return err
 	}
 	*c = LookupCacheConfig(decoded)
+	for key := range data.(map[string]any) { // decodeTable checked it is a table
+		if strings.EqualFold(key, "positive_revalidation_window") {
+			c.positiveRevalidationWindowSet = true
+		}
+	}
 	return nil
 }
 
@@ -1827,12 +1895,12 @@ type AdminCLIConfig struct {
 // SieveConfig holds Sieve script engine configuration
 type SieveConfig struct {
 	EnabledExtensions []string `toml:"enabled_extensions"` // List of enabled Sieve extensions (empty = the default set, without editheader)
-	MaxExecutionTime  string   `toml:"max_execution_time"` // Per-script execution budget, also the per-match regex soft-wait cap (e.g. "2s"); default 2s
+	MaxExecutionTime  string   `toml:"max_execution_time"` // Cooperative script budget and large-input regex deadline (e.g. "2s"); default 2s
 }
 
-// GetMaxExecutionTime returns the per-script Sieve execution budget. This bounds total
-// script execution (CPU/resource-exhaustion guard) and is also used as the per-match
-// regex soft-wait cap. Default 2s; an empty or invalid value falls back to the default.
+// GetMaxExecutionTime returns the cooperative Sieve script execution budget and
+// large-input regex deadline. Short matches and compilation still run inline under
+// fixed size limits. Default 2s; an empty or invalid value falls back to the default.
 func (s *SieveConfig) GetMaxExecutionTime() time.Duration {
 	const def = 2 * time.Second
 	if s.MaxExecutionTime == "" {
@@ -1887,6 +1955,12 @@ func (a *AuthCacheConfig) GetCleanupInterval() (time.Duration, error) {
 		return defaultAuthCacheCleanupInterval, nil
 	}
 	return helpers.ParseDuration(a.CleanupInterval)
+}
+
+// Validate refuses a cleanup_interval of zero or less: it is the period of the auth
+// cache's cleanup loop (see positiveInterval).
+func (a *AuthCacheConfig) Validate() error {
+	return positiveInterval("cleanup_interval", a.CleanupInterval)
 }
 
 // GetCleanupIntervalWithDefault returns cleanup_interval, or its default if the value cannot be parsed.
@@ -2143,9 +2217,14 @@ func NewDefaultConfig() Config {
 }
 
 // Helper methods for ServerConfig
+
+// defaultAppendLimit is the imap append_limit when the key is absent, does not parse
+// or is not positive (server/imap DefaultAppendLimit).
+const defaultAppendLimit = 25 * 1024 * 1024
+
 func (s *ServerConfig) GetAppendLimit() (int64, error) {
 	if s.AppendLimit == "" {
-		return 25 * 1024 * 1024, nil // 25MB default
+		return defaultAppendLimit, nil
 	}
 	return helpers.ParseSize(s.AppendLimit)
 }
@@ -2193,19 +2272,32 @@ func (s *ServerConfig) GetMaxScriptSize() (int64, error) {
 // is an error: start-up falls back to the default (GetMaxMessageSizeWithDefault), a
 // reload keeps the running limit.
 func (s *ServerConfig) GetMaxMessageSize() (int64, error) {
+	size, err := s.configuredMaxMessageSize()
+	if err != nil {
+		return 0, err
+	}
+	if size > consts.MaxStoredMessageSize {
+		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
+		return consts.MaxStoredMessageSize, nil
+	}
+	return size, nil
+}
+
+// defaultMaxMessageSize is max_message_size when omitted, zero or, at start-up, invalid.
+const defaultMaxMessageSize = 50 * 1024 * 1024
+
+// configuredMaxMessageSize is max_message_size as the file sets it, before
+// GetMaxMessageSize caps it, and without its warning.
+func (s *ServerConfig) configuredMaxMessageSize() (int64, error) {
 	if s.MaxMessageSize == "" {
-		return 50 * 1024 * 1024, nil // 50MB default
+		return defaultMaxMessageSize, nil
 	}
 	size, err := helpers.ParseSize(s.MaxMessageSize)
 	if err != nil {
 		return 0, err
 	}
 	if size == 0 {
-		return 50 * 1024 * 1024, nil
-	}
-	if size > consts.MaxStoredMessageSize {
-		warnf("max_message_size %d for server '%s' exceeds the largest message sora can store; clamping to %d", size, s.Name, consts.MaxStoredMessageSize)
-		return consts.MaxStoredMessageSize, nil
+		return defaultMaxMessageSize, nil
 	}
 	return size, nil
 }
@@ -2244,6 +2336,14 @@ func (s *ServerConfig) GetAuthIdleTimeout() (time.Duration, error) {
 
 // defaultTokenDuration is the http_user_api JWT lifetime when token_duration is absent.
 const defaultTokenDuration = 24 * time.Hour
+
+// MaxTokenDuration caps how long a User API JWT may live; the server lowers a longer
+// token_duration to it. JWTs are validated statelessly, so a token cannot be revoked
+// before it expires — a password change or account deletion only stops *renewal* at
+// refresh time. Clamping the duration bounds the window in which a leaked or
+// post-revocation token remains usable. Seven days is generous for an access token
+// while keeping that window finite.
+const MaxTokenDuration = 7 * 24 * time.Hour
 
 // GetTokenDuration parses token_duration (http_user_api). It takes the same
 // syntax as the other duration keys, including days ("7d"); a negative value
@@ -2339,12 +2439,67 @@ func (s *ServerConfig) GetMaxRedirectHops() int {
 	return helpers.DefaultMaxRedirectHops
 }
 
+// defaultSessionMemoryLimit is session_memory_limit when the block leaves it out, and
+// what an imap or pop3 server uses when it does not parse.
+const defaultSessionMemoryLimit = 100 * 1024 * 1024
+
 // GetSessionMemoryLimit parses the session memory limit
 func (s *ServerConfig) GetSessionMemoryLimit() (int64, error) {
 	if s.Limits != nil && s.Limits.SessionMemoryLimit != "" {
 		return helpers.ParseSize(s.Limits.SessionMemoryLimit)
 	}
-	return 100 * 1024 * 1024, nil // Default: 100MB
+	return defaultSessionMemoryLimit, nil
+}
+
+// SessionMemoryShortfall is an imap or pop3 server whose session_memory_limit is below
+// the max_message_size of an lmtp server in the same file.
+type SessionMemoryShortfall struct {
+	Server, Type       string
+	SessionMemoryLimit int64
+	LMTPServer         string
+	MaxMessageSize     int64
+}
+
+// SessionMemoryShortfalls returns the enabled imap and pop3 servers whose
+// session_memory_limit is set (not "0") and below the largest max_message_size of the
+// file's enabled lmtp servers, with that lmtp server. An IMAP FETCH or POP3 RETR holds
+// the whole body in the session's memory budget, so such a server never fetches a
+// message delivered between the two sizes.
+func (c *Config) SessionMemoryShortfalls() []SessionMemoryShortfall {
+	servers := c.GetAllServers()
+	var lmtp string
+	var maxMessageSize int64
+	for i := range servers {
+		if servers[i].Type != "lmtp" {
+			continue
+		}
+		// The lmtp server's limit as GetMaxMessageSizeWithDefault sets it, without logging
+		// again what its start function and Warnings report.
+		size, err := servers[i].configuredMaxMessageSize()
+		if err != nil {
+			size = defaultMaxMessageSize
+		}
+		if size = min(size, consts.MaxStoredMessageSize); size > maxMessageSize {
+			lmtp, maxMessageSize = servers[i].Name, size
+		}
+	}
+	var shortfalls []SessionMemoryShortfall
+	for i := range servers {
+		if servers[i].Type != "imap" && servers[i].Type != "pop3" {
+			continue
+		}
+		limit, err := servers[i].GetSessionMemoryLimit()
+		if err != nil {
+			limit = defaultSessionMemoryLimit
+		}
+		if limit > 0 && limit < maxMessageSize {
+			shortfalls = append(shortfalls, SessionMemoryShortfall{
+				Server: servers[i].Name, Type: servers[i].Type, SessionMemoryLimit: limit,
+				LMTPServer: lmtp, MaxMessageSize: maxMessageSize,
+			})
+		}
+	}
+	return shortfalls
 }
 
 // GetCommandTimeout parses the command timeout duration with protocol-specific defaults
@@ -2366,6 +2521,12 @@ func (s *ServerConfig) GetCommandTimeoutWithDefault() time.Duration {
 	}
 	return timeout
 }
+
+// IMAPLibraryReadDeadline is the read deadline go-imap arms on authenticated
+// connections itself (RFC 3501 §5.4 autologout floor + margin). When it expires the
+// library closes the connection silently: no BYE, no timeout metric. An imap
+// command_timeout at or above it is therefore capped by the library.
+const IMAPLibraryReadDeadline = 35 * time.Minute
 
 // defaultCommandTimeout is the protocol-specific command (idle) timeout.
 func (s *ServerConfig) defaultCommandTimeout() time.Duration {
@@ -2751,7 +2912,7 @@ func (s *ServerConfig) GetAppendLimitWithDefault() int64 {
 	limit, err := s.GetAppendLimit()
 	if err != nil {
 		warnf("Failed to parse append limit for server '%s': %v, using default (25MB)", s.Name, err)
-		return 25 * 1024 * 1024 // 25MB default
+		return defaultAppendLimit
 	}
 	return limit
 }
@@ -2789,7 +2950,7 @@ func (s *ServerConfig) GetMaxMessageSizeWithDefault() int64 {
 	size, err := s.GetMaxMessageSize()
 	if err != nil {
 		warnf("Failed to parse max message size for server '%s': %v, using default (50MB)", s.Name, err)
-		return 52428800 // 50MB default
+		return defaultMaxMessageSize
 	}
 	return size
 }
@@ -2985,6 +3146,16 @@ func (s *ServerConfig) Validate() error {
 	if s.MasterSASLUsername != "" && s.MasterSASLPassword == "" {
 		return fmt.Errorf("server %q: master_sasl_username is set but master_sasl_password is empty; refusing to start (an empty password would allow impersonation of any account)", s.Name)
 	}
+	// These servers build their master SASL gate from the list with the same parser and
+	// refuse to start on an entry that is not an IP address or CIDR, rather than drop it
+	// and admit master logins from sources the operator meant to exclude. Other types do
+	// not read the key; WarnUnusedConfigOptions says so.
+	switch s.Type {
+	case "imap", "pop3", "managesieve":
+		if _, err := helpers.ParseTrustedNetworks(s.MasterSASLAllowedNetworks); err != nil {
+			return fmt.Errorf("server %q: invalid master_sasl_allowed_networks: %w", s.Name, err)
+		}
+	}
 
 	if s.AuthRateLimit != nil {
 		if err := s.AuthRateLimit.Validate(); err != nil {
@@ -3088,6 +3259,12 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it%s", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "), serverTypeKeyNotes[k.name])
 		}
 	}
+	// A type that does not read the table at all was told so about the table above.
+	for _, k := range serverTableKeys {
+		if k.set(s) && slices.Contains(k.tableReadBy, s.Type) && !slices.Contains(k.appliedBy, s.Type) {
+			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it%s", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "), serverTypeKeyNotes[k.name])
+		}
+	}
 	// Only these filter clients by address. Every other type, the User API proxy
 	// included, serves every client whatever the list says.
 	if len(s.AllowedHosts) > 0 {
@@ -3151,7 +3328,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 			logger("WARNING: Server %s (type: %s) has 'remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends: 'remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
 		}
 		if s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSUseStartTLS {
-			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends: 'remote_lookup.remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
+			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_tls_use_starttls' configured, but the User API proxy speaks HTTP to its backends and dials a backend a lookup names with the block's own settings: 'remote_tls' alone selects HTTPS, there is no STARTTLS", s.Name, s.Type)
 		}
 	} else {
 		// STARTTLS is a way of doing remote_tls: without it the backend leg is plaintext.
@@ -3287,7 +3464,7 @@ var serverTypeKeys = []struct {
 	// the Admin API and the metrics listener look up no credentials to cache.
 	{"remote_lookup", func(s *ServerConfig) bool { return s.RemoteLookup != nil }, proxyServerTypes},
 	{"auth_rate_limit", func(s *ServerConfig) bool { return s.AuthRateLimit != nil }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "http_user_api", "user_api_proxy"}},
-	{"lookup_cache", func(s *ServerConfig) bool { return s.LookupCache != nil }, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_user_api", "user_api_proxy"}},
+	{"lookup_cache", func(s *ServerConfig) bool { return s.LookupCache != nil }, lookupCacheServerTypes},
 	// Session timeouts. The LMTP backend's command_timeout is its idle timeout, and
 	// the LMTP proxy's timeouts are auth_idle_timeout and absolute_session_timeout.
 	// The HTTP servers time out no sessions, and each per-command table is its own
@@ -3308,20 +3485,56 @@ var serverTypeKeys = []struct {
 	{"proxy_protocol_timeout", func(s *ServerConfig) bool { return s.ProxyProtocolTimeout != "" }, listenerServerTypes},
 }
 
-// serverTypeKeyNotes ends the warning about a serverTypeKeys key with the setting
-// that applies in its place.
+// serverTableKeys is each [server.remote_lookup] and [server.lookup_cache] key that
+// only some of the server types reading its table read, with the types reading the
+// table and those reading the key. WarnUnusedConfigOptions reports one set on a type
+// that reads the table but not the key. A new key of either table that not every
+// reader of the table reads belongs here; remote_lookup.remote_tls_use_starttls has a
+// warning of its own, as the User API proxy has no STARTTLS at all.
+var serverTableKeys = []struct {
+	name        string
+	set         func(*ServerConfig) bool
+	tableReadBy []string
+	appliedBy   []string
+}{
+	// Only the LMTP proxy answers for a recipient the lookup does not know.
+	{"remote_lookup.user_not_found_response", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.UserNotFoundResponse != "" }, proxyServerTypes, []string{"lmtp_proxy"}},
+	// The backend leg to a backend the lookup names, read where the [[server]] key of
+	// the same name is. The User API proxy dials it with the block's own settings.
+	{"remote_lookup.remote_tls", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteTLS }, proxyServerTypes, lineProxyServerTypes},
+	{"remote_lookup.remote_tls_verify", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSVerify != nil }, proxyServerTypes, lineProxyServerTypes},
+	{"remote_lookup.remote_use_proxy_protocol", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseProxyProtocol }, proxyServerTypes, lineProxyServerTypes},
+	{"remote_lookup.remote_use_id_command", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseIDCommand }, proxyServerTypes, []string{"imap_proxy"}},
+	{"remote_lookup.remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseXCLIENT }, proxyServerTypes, []string{"pop3_proxy", "lmtp_proxy"}},
+	{"remote_lookup.remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteLookup != nil && s.RemoteLookup.RemoteUseUTF8 }, proxyServerTypes, []string{"pop3_proxy"}},
+	// These route-only proxies check no passwords, so have none to revalidate.
+	{"lookup_cache.positive_revalidation_window", func(s *ServerConfig) bool {
+		return s.LookupCache != nil && s.LookupCache.positiveRevalidationWindowSet
+	}, lookupCacheServerTypes, []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}},
+}
+
+// serverTypeKeyNotes ends the warning about a serverTypeKeys or serverTableKeys key
+// with the setting that applies in its place, or why none does.
 var serverTypeKeyNotes = map[string]string{
-	"supported_extensions": "; a ManageSieve server advertises the [sieve] enabled_extensions",
+	"supported_extensions":                      "; a ManageSieve server advertises the [sieve] enabled_extensions",
+	"remote_lookup.remote_tls":                  "; the User API proxy dials a backend a lookup names with the block's own 'remote_tls'",
+	"remote_lookup.remote_tls_verify":           "; the User API proxy dials a backend a lookup names with the block's own 'remote_tls_verify'",
+	"remote_lookup.remote_use_proxy_protocol":   "; the User API proxy dials a backend a lookup names with the block's own 'remote_use_proxy_protocol'",
+	"lookup_cache.positive_revalidation_window": "; LMTP and User API proxies cache routes without checking passwords",
 }
 
 // loginServerTypes are the IMAP, POP3 and ManageSieve servers and proxies, the line
 // protocols with a password login (the HTTP User API's login reads none of the keys
-// they share); proxyServerTypes dial backends; listenerServerTypes serve TLS and read
-// PROXY headers on the listener (every type but metrics).
+// they share); proxyServerTypes dial backends, lineProxyServerTypes over the mail
+// protocols; lookupCacheServerTypes cache credential or route lookups;
+// listenerServerTypes serve TLS and read PROXY headers on the listener (every type but
+// metrics).
 var (
-	loginServerTypes    = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
-	proxyServerTypes    = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
-	listenerServerTypes = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_admin_api", "http_user_api", "user_api_proxy"}
+	loginServerTypes       = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy"}
+	proxyServerTypes       = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+	lineProxyServerTypes   = []string{"imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy"}
+	lookupCacheServerTypes = []string{"imap", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "user_api_proxy"}
+	listenerServerTypes    = []string{"imap", "lmtp", "pop3", "managesieve", "imap_proxy", "pop3_proxy", "managesieve_proxy", "lmtp_proxy", "http_admin_api", "http_user_api", "user_api_proxy"}
 )
 
 // serverLimitKeys is every [server.limits] key with the server types whose start
@@ -3483,10 +3696,13 @@ type Problem struct {
 // Validate runs the shared configuration checks used by sora before service setup and
 // by `sora-admin config validate`, returning every problem these checks find.
 //
-// What a node does not run is not checked: [uploader] and [cleanup] only with a mail
-// backend, [database] only with a server that queries it, [s3] only on a node that
-// connects to it, [cluster] and [tls] only when enabled. Service setup still checks
-// external connectivity and the node's disk; passing Validate does not check those.
+// What a node does not run is not checked: [uploader], [cleanup] and [local_cache] only
+// with a mail backend, [database] only with a server that queries it, [s3] only on a node
+// that connects to it, [cluster], [tls] and [auth_cache] only when enabled, and
+// [cluster.affinity] only when it and [cluster] are enabled. Validate connects to nothing and
+// does not look at the node's disk. Service setup connects to the database and the
+// certificate store and checks the disk; S3 and a remote lookup are first reached when
+// used, so neither passing Validate nor a clean start shows that they can be reached.
 func (c *Config) Validate() []Problem {
 	var problems []Problem
 	add := func(section string, err error) {
@@ -3554,6 +3770,12 @@ func (c *Config) Validate() []Problem {
 		add("[uploader]", c.Uploader.Validate())
 		// The cleaner takes [cleanup]; delivery takes its fts_retention too.
 		add("[cleanup]", c.Cleanup.Validate())
+		// The cache purge loop and the cache metrics writer.
+		add("[local_cache]", c.LocalCache.Validate())
+	}
+	// Any node with the auth cache enabled runs its cleanup loop.
+	if c.AuthCache.Enabled {
+		add("[auth_cache]", c.AuthCache.Validate())
 	}
 
 	if user := c.DatabaseUser(); user != nil {
@@ -3582,6 +3804,10 @@ func (c *Config) Validate() []Problem {
 		add("[s3]", c.S3.Validate())
 	}
 	add("[cluster]", c.Cluster.Validate())
+	// With [cluster.affinity] enabled = false there is no affinity manager.
+	if c.Cluster.Enabled && c.Cluster.Affinity.Enabled {
+		add("[cluster.affinity]", c.Cluster.Affinity.Validate())
+	}
 	add("[tls]", c.TLS.Validate())
 
 	return problems

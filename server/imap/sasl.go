@@ -1,6 +1,7 @@
 package imap
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net"
@@ -24,7 +25,8 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 
 	switch mechanism {
 	case "PLAIN":
-		return sasl.NewPlainServer(func(identity, username, password string) error {
+		return &plainServer{session: s, Server: sasl.NewPlainServer(func(identity, username, password string) error {
+			s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 			// SASL PLAIN payload: [authorization-identity] \0 authentication-identity \0 password
 			// callback `identity`: authorization-identity (user to act as, can be empty)
 			// callback `username`: authentication-identity (user whose credentials are provided)
@@ -164,12 +166,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// User.Address should always be the primary address
 					primaryAddr, primErr := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
 					if primErr != nil {
-						return s.internalError("failed to get primary email: %v", primErr)
+						return s.loginSetupError("failed to get primary email", address.BaseAddress(), "master", primErr)
 					}
 
 					// Ensure default mailboxes for the impersonated user
 					if dbErr := s.createDefaultMailboxes(s.ctx, AccountID); dbErr != nil {
-						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
+						return s.loginSetupError("failed to prepare impersonated user session", address.BaseAddress(), "master", dbErr)
 					}
 
 					return s.completeAuthentication(AccountID, address, primaryAddr, "master", authStart, false)
@@ -270,12 +272,12 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// User.Address should always be the primary address
 					primaryAddr, primErr := s.server.rdb.GetPrimaryEmailForAccountWithRetry(s.ctx, AccountID)
 					if primErr != nil {
-						return s.internalError("failed to get primary email: %v", primErr)
+						return s.loginSetupError("failed to get primary email", address.BaseAddress(), "master", primErr)
 					}
 
 					// Ensure default mailboxes for the impersonated user
 					if dbErr := s.createDefaultMailboxes(s.ctx, AccountID); dbErr != nil {
-						return s.internalError("failed to prepare impersonated user session: %v", dbErr)
+						return s.loginSetupError("failed to prepare impersonated user session", address.BaseAddress(), "master", dbErr)
 					}
 
 					return s.completeAuthentication(AccountID, address, primaryAddr, "master", authStart, false)
@@ -325,7 +327,7 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			// signal for the AUTHENTICATE path.
 			s.DebugLog("proceeding with regular authentication", "username", username)
 			return s.login(s.ctx, username, password, identity, false)
-		}), nil
+		})}, nil
 	default:
 		s.DebugLog("unsupported authentication mechanism", "mechanism", mechanism)
 		return nil, &imap.Error{
@@ -334,6 +336,31 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 			Text: "Unsupported authentication mechanism",
 		}
 	}
+}
+
+// plainServer refuses a PLAIN message that is not three NUL-separated fields
+// (RFC 4616 §2) before go-sasl sees it. go-sasl reports one with a plain
+// error, which go-imap answers NO [SERVERBUG] and logs as a server failure,
+// when it is the client's error. The answer is the IMAP proxy's (session.go),
+// so a client gets the same one from either. No credential is checked, as
+// before.
+type plainServer struct {
+	sasl.Server
+	session *IMAPSession
+}
+
+func (p *plainServer) Next(response []byte) ([]byte, bool, error) {
+	// nil means no initial response, answered with the empty challenge. A
+	// zero-length message (an initial response of "=", or an empty reply) is
+	// malformed.
+	if response != nil && bytes.Count(response, []byte{0}) != 2 {
+		p.session.DebugLog("malformed SASL PLAIN message")
+		return nil, true, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Invalid SASL PLAIN response",
+		}
+	}
+	return p.Server.Next(response)
 }
 
 // refuseLikeWrongPassword refuses a login that must not succeed with what regular

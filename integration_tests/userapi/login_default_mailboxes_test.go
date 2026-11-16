@@ -40,18 +40,17 @@ func TestUserAPILoginCreatesDefaultMailboxes(t *testing.T) {
 		api.requireDefaultMailboxes(t)
 	})
 
-	// A login answered from the lookup cache runs no credential query, and must
-	// create the mailboxes too.
-	t.Run("lookup cache", func(t *testing.T) {
+	// A legacy cache configuration is ignored: login must check the current
+	// password and still create the missing default mailboxes.
+	t.Run("configured lookup cache is ignored", func(t *testing.T) {
 		rdb := common.SetupTestDatabase(t)
 		lookupCache := config.DefaultLookupCacheConfig()
 		api := startDefaultMailboxesAPI(t, rdb, &lookupCache)
 		accountID, email, password := createAccountWithoutMailboxes(t, rdb)
 
-		api.JWTToken = api.loginFor(t, email, password) // from the database; caches the login
+		api.JWTToken = api.loginFor(t, email, password) // from the primary
 		dropMailboxes(t, rdb, accountID)
-		// Only the cache still knows this password, so the next login's 200 shows
-		// it came from the cache.
+		// The old password must be refused even with lookup_cache enabled.
 		otherHash, err := db.GenerateBcryptHash("an0ther-p4ssword")
 		if err != nil {
 			t.Fatalf("hash another password: %v", err)
@@ -60,7 +59,10 @@ func TestUserAPILoginCreatesDefaultMailboxes(t *testing.T) {
 			t.Fatalf("change the stored password: %v", err)
 		}
 
-		api.JWTToken = api.loginFor(t, email, password)
+		if status := api.loginStatus(t, email, password); status != http.StatusUnauthorized {
+			t.Fatalf("old password status%d, want401", status)
+		}
+		api.JWTToken = api.loginFor(t, email, "an0ther-p4ssword")
 		api.requireDefaultMailboxes(t)
 	})
 

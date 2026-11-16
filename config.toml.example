@@ -490,7 +490,7 @@ sync_failure_counts = true                      # Synchronize progressive delay 
 [cluster.affinity]
 enabled = true                                  # Enable cluster-wide server affinity (default: true)
 ttl = "24h"                                     # How long affinity persists (default: "24h")
-cleanup_interval = "1h"                         # How often to clean up expired affinities (default: "1h")
+cleanup_interval = "1h"                         # How often to clean up expired affinities (default: "1h"; "0" means "1h"; negative stops startup)
 # cache_path = "/var/cache/sora/affinity_cache.db" # SQLite path for persistent affinity (survives restarts)
 
 # EXAMPLE USAGE (Multi-instance deployment):
@@ -569,8 +569,8 @@ cleanup_interval = "1h"                         # How often to clean up expired 
 [auth_cache]
 enabled = true                     # Enable persistent auth cache (default: false)
 path = "/var/cache/sora/auth_cache.db" # SQLite database path (default: "/var/cache/sora/auth_cache.db"). Fast storage (SSD) recommended.
-max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h)
-cleanup_interval = "1h"            # How often to purge expired/unused entries (default: 1 hour)
+max_age = "24h"                    # Max age for cached entries before re-fetching (default: 24h; capped at 168h credential-feed retention)
+cleanup_interval = "1h"            # How often to purge expired/unused entries (default: 1 hour; must be positive)
 purge_unused = "168h"              # Purge entries unused for this duration (default: 7 days)
 
 
@@ -599,9 +599,9 @@ refuse_after = "30s"               # How long a backend in maintenance still acc
 path = "/var/cache/sora/cache" # Filesystem path for cache storage (default: "/var/cache/sora/cache"). Must be writable. Fast storage (SSD) recommended.
 capacity = "1gb"              # Maximum total cache size (e.g., "100mb", "1gb"). LRU eviction when exceeded.
 max_object_size = "5mb"       # Maximum size for individual cached objects. Prevents large messages from dominating cache. Also capped at capacity/256 (the cache's 256 shards each hold that much).
-metrics_interval = "5m"       # How often cache hit/miss ratios are stored in the database.
+metrics_interval = "5m"       # How often cache hit/miss ratios are stored in the database. Must be positive.
 metrics_retention = "30d"     # How long to retain cache metrics in the database.
-purge_interval = "12h"        # How often to run cache cleanup (orphaned and stale entry removal, capacity re-check). Capacity is also enforced as objects are added.
+purge_interval = "12h"        # How often to run cache cleanup (orphaned and stale entry removal, capacity re-check). Must be positive. Capacity is also enforced as objects are added.
 orphan_cleanup_age = "30d"    # Minimum age before orphaned cache entries (for deleted DB messages) are removed.
 
 # --- CACHE WARMUP ---
@@ -846,10 +846,11 @@ enabled_extensions = []
 # To enable header editing (allows users to modify message headers via SIEVE):
 # enabled_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables", "relational", "copy", "regex", "date", "index", "editheader", "mailbox", "subaddress", "encoded-character", "comparator-i;octet", "comparator-i;ascii-casemap", "comparator-i;ascii-numeric", "comparator-i;unicode-casemap", "body", "mime", "foreverypart", "extracttext", "reject", "ereject"]
 
-# Per-script execution budget (CPU/resource-exhaustion guard). This is also used as
-# the per-match soft-wait cap for :matches / :regex evaluation, so a large but
-# input-bounded body match completes within the budget instead of failing. Clamped to
-# [100ms, 60s]. Default: 2s.
+# Per-script execution budget (CPU/resource-exhaustion guard). For :matches /
+# :regex inputs over 1 KB, the matcher checks the deadline as it reads and stops
+# at a subsequent input check. Smaller matches and pattern compilation run inline,
+# bounded by the input/pattern/program limits; this is not a strict wall-clock cap.
+# Clamped to [100ms, 60s]. Default: 2s.
 # max_execution_time = "2s"
 
 # IMPORTANT NOTES:
@@ -1058,6 +1059,12 @@ append_limit = "25mb"         # Maximum message size for IMAP APPEND, advertised
                               # session's memory budget, so APPENDLIMIT is never above
                               # [server.limits] session_memory_limit (default 100mb); a warning
                               # at startup says when that lowers it.
+                              # FETCH holds the whole body in that budget too: a message that
+                              # can never fit it (or a BODY[TEXT] copy that cannot fit beside
+                              # its body) is answered NO [LIMIT], one the session is only short
+                              # of room for at the moment NO [UNAVAILABLE]. Keep
+                              # session_memory_limit above the lmtp servers' max_message_size;
+                              # startup and reload warn when it is below the largest one.
 
 # --- MASTER USER AUTHENTICATION ---
 master_username = ""          # Master username for administrative IMAP access (e.g., for proxies).
@@ -1372,11 +1379,12 @@ auth_rate_limit.max_username_entries = 50000      # Max username tracking entrie
 # Cache authentication results to reduce database queries and improve performance.
 # ENABLED BY DEFAULT with sensible settings. Only configure to override defaults or disable;
 # keys left out of the table keep their defaults (a table without "enabled" leaves it on).
-# Exception: http_user_api and user_api_proxy cache only when the table is present.
+# Exception: user_api_proxy caches routes only when the table is present.
+# http_user_api ignores this table: each login reads its hash and token epoch from the primary.
 # [server.lookup_cache]
 # enabled = true                          # Enable authentication and routing lookup caching for this server (default: true)
 # positive_ttl = "5m"                     # How long to cache successful authentications (default: 5m)
-#                                         # Longer TTL = better performance, but password changes take time to propagate
+#                                         # Database-backed changes invalidate through the primary feed; external lookup changes follow its own cache policy
 # negative_ttl = "1m"                     # How long to cache failed auth attempts (default: 1m)
 #                                         # Helps mitigate brute force attacks by preventing repeated database queries
 #                                         # Note: Brute force protection itself is handled by protocol-level rate limiting
@@ -1424,6 +1432,9 @@ proxy_protocol_timeout = "5s"
 # --- MESSAGE SIZE LIMITING ---
 # Maximum size for incoming LMTP messages to prevent memory exhaustion attacks.
 # Advertised in LHLO as "SIZE <n>"; MAIL ... SIZE= above it is refused with 552.
+# IMAP and POP3 never fetch a message larger than their limits.session_memory_limit
+# (IMAP NO [LIMIT], POP3 -ERR [SYS/PERM]); startup and reload warn about an imap or pop3
+# server whose limit is below this.
 max_message_size = "50mb"     # Maximum message size (default: 50MB; 0 also means 50MB, there is no unlimited)
 
 # --- SIEVE REDIRECT LIMITS ---
