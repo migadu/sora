@@ -734,10 +734,9 @@ func (si *S3Importer) importStoredBody(ctx context.Context, obj S3ObjectInfo, us
 		bodyStructure = fallback
 	}
 
-	extractedPlaintext, err := helpers.ExtractPlaintextBody(messageContent)
-	var actualPlaintextBody string
-	if err == nil && extractedPlaintext != nil {
-		actualPlaintextBody = *extractedPlaintext
+	actualPlaintextBody, extractErr := helpers.FTSPlaintextBody(messageContent)
+	if extractErr != nil {
+		logger.Debug("Plaintext extraction encountered errors", "key", obj.Key, "error", extractErr)
 	}
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)

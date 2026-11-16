@@ -2647,10 +2647,9 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		bodyStructure = fallback
 	}
 
-	extractedPlaintext, _ := helpers.ExtractPlaintextBody(messageContent)
-	var plaintextBody string
-	if extractedPlaintext != nil {
-		plaintextBody = *extractedPlaintext
+	plaintextBody, extractErr := helpers.FTSPlaintextBody(messageContent)
+	if extractErr != nil {
+		logger.Debug("Plaintext extraction encountered errors", "file", filename, "error", extractErr)
 	}
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
