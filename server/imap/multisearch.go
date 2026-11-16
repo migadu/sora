@@ -246,8 +246,8 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 		if m == nil {
 			return
 		}
-		// RFC 5465 §6.2–§6.6, RFC 7377 §2.2: every source specifier matches
-		// selectable mailboxes only; omit the \Noselect shared namespace root.
+		// Apply Sora's \Noselect shared-root policy to message searches too.
+		// NOTIFY tree-event source matching remains separate.
 		if s.server.config != nil && s.server.config.SharedMailboxes.IsNamespaceRoot(m.Name) {
 			return
 		}

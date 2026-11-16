@@ -218,8 +218,8 @@ func newSearchSourceTestSession(t *testing.T, rdb *resilient.ResilientDatabase, 
 
 // TestResolveSearchSourceExcludesNoSelectSharedRoot verifies that ESEARCH IN (...)
 // omits the \Noselect shared namespace root across SUBTREE, SUBTREE-ONE,
-// SUBSCRIBED, and MAILBOXES (RFC 5465 §6.4–§6.6, RFC 7377 §2.2: every source
-// specifier matches selectable mailboxes only), while keeping selectable
+// SUBSCRIBED, and MAILBOXES under Sora's hierarchy-only shared-root policy,
+// while keeping selectable
 // mailboxes under the shared root, personal mailboxes with lookalike names, and
 // the personal mailbox of the same name when shared mailboxes are disabled.
 func TestResolveSearchSourceExcludesNoSelectSharedRoot(t *testing.T) {
@@ -416,8 +416,8 @@ func TestResolveSearchSourceExcludesNoSelectSharedRoot(t *testing.T) {
 }
 
 // TestNotifyEventsForMailboxNoSelectSharedRoot verifies that NOTIFY omits
-// message events (MessageNew, MessageExpunge, FlagChange — which produce STATUS
-// responses forbidden on \Noselect mailboxes, RFC 5465 §5.1–§5.3, §6.4–§6.6) on
+// message events (MessageNew, MessageExpunge and FlagChange, whose unselected
+// mailbox notifications use STATUS) on
 // the \Noselect shared namespace root across SUBTREE, SUBSCRIBED, and MAILBOXES,
 // while preserving hierarchy events (MailboxName and SubscriptionChange,
 // RFC 5465 §5.4–§5.5).

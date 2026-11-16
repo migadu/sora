@@ -99,8 +99,8 @@ func startSharedIMAPServerOnDB(t *testing.T, rdb *resilient.ResilientDatabase, s
 	return address
 }
 
-// TestIMAP_SharedNamespaceRootNoSelect_ESearchAndNotify verifies RFC 5465
-// §5.1–§5.5, §6.4–§6.6 and RFC 7377 §2.2 on the \Noselect shared namespace root:
+// TestIMAP_SharedNamespaceRootNoSelect_ESearchAndNotify verifies Sora's
+// hierarchy-only shared-root message policy while retaining NOTIFY tree events:
 //
 //   - While shared mailboxes are disabled, "Shared" is a selectable personal
 //     mailbox and is included in ESEARCH and NOTIFY STATUS.

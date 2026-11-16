@@ -265,11 +265,10 @@ func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sh
 	var events map[imap.NotifyEvent]bool
 	add := func(item *imap.NotifyItem) {
 		for _, ev := range item.Events {
-			// RFC 5465 §5.1–§5.3, §6.4–§6.6: message events apply only to
-			// selectable mailboxes (their notification for unselected mailboxes
-			// is a STATUS response, forbidden on \Noselect containers), whereas
-			// tree events (MailboxName, SubscriptionChange, §5.4–§5.5) still
-			// report \Noselect hierarchy containers.
+			// Sora treats the configured shared root as hierarchy-only. Omit
+			// its message events, whose unselected-mailbox responses use STATUS;
+			// retain MailboxName and SubscriptionChange tree events
+			// (RFC 5465 §5.4–§5.5) for the \Noselect container.
 			if nonSelectable && (ev == imap.NotifyEventMessageNew ||
 				ev == imap.NotifyEventMessageExpunge ||
 				ev == imap.NotifyEventFlagChange) {
