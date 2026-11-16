@@ -24,14 +24,17 @@ const (
 )
 
 // bodySectionCacheKey identifies a body section independently of its <offset.size>
-// slice, so successive chunk requests for the same section share one entry. It returns
-// an empty key for a message without a content hash, which disables the cache: without
-// the hash there is nothing that ties the retained bytes to the message.
+// slice, so successive chunk requests for the same section share one entry. The
+// HEADER.FIELDS and HEADER.FIELDS.NOT names come off the wire as astrings and may hold a
+// space, '|' or ']', so each name is quoted and each list labelled: no two different
+// lists share a key. It returns an empty key for a message without a content hash,
+// which disables the cache: without the hash there is nothing that ties the retained
+// bytes to the message.
 func bodySectionCacheKey(contentHash string, section *imap.FetchItemBodySection) string {
 	if contentHash == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s|%s|%v|%v|%v", contentHash, section.Specifier, section.Part,
+	return fmt.Sprintf("%s|%s|%v|fields=%q|not=%q", contentHash, section.Specifier, section.Part,
 		section.HeaderFields, section.HeaderFieldsNot)
 }
 
