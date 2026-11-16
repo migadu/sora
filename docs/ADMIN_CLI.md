@@ -1081,6 +1081,12 @@ the server creates it, and given to the owner of the directory it is created in:
 default `/var/lib/sora/certs`, the owner of `/var/lib/sora`, the server's user under
 `dist/sora.service`. A directory created in a sticky directory such as `/tmp` stays yours.
 
+`cache` counts a certificate that is not in S3 under `Not found` and goes on: a configured
+domain may not have been issued yet, and the RSA certificate exists only once a client has
+asked for one. With `--domain`, it exits `1` when neither certificate of that domain is in S3,
+as `delete --domain` does. A certificate that cannot be downloaded, does not parse, or cannot
+be written exits `1` as well; the others are still cached.
+
 ---
 
 ## 22. config
