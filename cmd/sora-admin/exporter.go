@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1195,6 +1196,12 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 				used[idx] = true
 			}
 		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		// A file that is there but is not read (a link, a FIFO, a file with more than
+		// one link) is replaced without its numbering, so the letters of files an
+		// earlier run wrote may name other keywords now.
+		logger.Warn("Existing dovecot-keywords not read; it is replaced and its keyword numbering is not kept",
+			"mailbox", mailboxName, "path", filepath.Join(exporter.root.Name(), keywordsName), "error", err)
 	}
 
 	names := make([]string, 0, len(seen))
@@ -1251,7 +1258,13 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 // (openExportEntry).
 func mergeUIDMappings(root *os.Root, dir string, current []UIDFileMapping) []UIDFileMapping {
 	existing, err := parseDovecotUIDListFile(openExportEntry(root, filepath.Join(dir, "dovecot-uidlist"), false))
-	if err != nil || existing == nil || len(existing.UIDMappings) == 0 {
+	if err != nil {
+		// Dovecot then gives new UIDs to the files of earlier runs that the file listed.
+		logger.Warn("Existing dovecot-uidlist not read; it is replaced without the entries of earlier runs",
+			"path", filepath.Join(root.Name(), dir, "dovecot-uidlist"), "error", err)
+		return current
+	}
+	if existing == nil || len(existing.UIDMappings) == 0 {
 		return current
 	}
 	usedUID := make(map[uint32]bool, len(current))
