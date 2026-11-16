@@ -67,7 +67,8 @@ func newProxiedSession(t *testing.T) *proxiedSession {
 	srv.activeSessions[s] = struct{}{}
 	p := &proxiedSession{s: s, backend: backendEnd, client: clientEnd, clientEnded: make(chan struct{})}
 
-	go func() { s.startProxy(); s.close() }()
+	sessionEnded := make(chan struct{})
+	go func() { defer close(sessionEnded); s.startProxy(); s.close() }()
 	go func() {
 		defer close(p.clientEnded)
 		buf := make([]byte, 4096)
@@ -97,7 +98,18 @@ func newProxiedSession(t *testing.T) *proxiedSession {
 			}
 		}
 	}()
-	t.Cleanup(func() { backendEnd.Close(); clientEnd.Close() })
+	// The session ends before the cleanups registered ahead of this one run (cleanups run
+	// last in, first out): withCloseGrace's restore must not write the variables the
+	// session reads while it is still running.
+	t.Cleanup(func() {
+		backendEnd.Close()
+		clientEnd.Close()
+		select {
+		case <-sessionEnded:
+		case <-time.After(5 * time.Second):
+			t.Error("session still running 5s after the backend and the client closed")
+		}
+	})
 
 	// Proxying from here on (the drain only targets sessions past their login).
 	waitFor(t, func() bool { return len(srv.MaintenanceTargets()) == 1 }, "the session to be proxying")
