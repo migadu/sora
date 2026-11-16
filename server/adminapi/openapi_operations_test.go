@@ -2,6 +2,7 @@ package adminapi
 
 import (
 	"encoding/json"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -59,19 +60,53 @@ func section(op, key string, indent int) string {
 	return s
 }
 
-// openAPIResponses returns the status codes op documents, each with the top-level
-// properties of its JSON body: the inline schema's, or the referenced component's.
-func openAPIResponses(t *testing.T, op string) map[string][]string {
+// openAPIResponseBlocks returns the YAML of each response op documents, by status code.
+// A response that refers to a components/responses entry is that entry, indented as if
+// it were written in the operation.
+func openAPIResponseBlocks(t *testing.T, op string) map[string]string {
 	t.Helper()
 	responses := section(op, "responses", 6)
 	codes := regexp.MustCompile(`(?m)^ {8}'(\d{3})':\s*$`).FindAllStringSubmatchIndex(responses, -1)
-	documented := make(map[string][]string)
+	blocks := make(map[string]string)
 	for i, m := range codes {
 		end := len(responses)
 		if i+1 < len(codes) {
 			end = codes[i+1][0]
 		}
 		body := responses[m[1]:end]
+		if ref := regexp.MustCompile(`^\n {10}\$ref: '#/components/responses/([A-Za-z]+)'`).FindStringSubmatch(body); ref != nil {
+			body = componentResponse(t, ref[1])
+		}
+		blocks[responses[m[2]:m[3]]] = body
+	}
+	return blocks
+}
+
+// componentResponse returns the YAML of a components/responses entry, indented as a
+// response written in an operation.
+func componentResponse(t *testing.T, name string) string {
+	t.Helper()
+	spec, err := os.ReadFile("admin_api_openapi.yaml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, components, ok := strings.Cut(string(spec), "\ncomponents:\n")
+	if !ok {
+		t.Fatal("components section not found in admin_api_openapi.yaml")
+	}
+	block := section(section(components, "responses", 2), name, 4)
+	if block == "" {
+		t.Fatalf("%s response not found in admin_api_openapi.yaml components", name)
+	}
+	return "\n" + regexp.MustCompile(`(?m)^`).ReplaceAllString(block, "    ")
+}
+
+// openAPIResponses returns the status codes op documents, each with the top-level
+// properties of its JSON body: the inline schema's, or the referenced component's.
+func openAPIResponses(t *testing.T, op string) map[string][]string {
+	t.Helper()
+	documented := make(map[string][]string)
+	for code, body := range openAPIResponseBlocks(t, op) {
 		var props []string
 		if ref := regexp.MustCompile(`\n {14}schema:\n {16}\$ref: '#/components/schemas/([A-Za-z]+)'`).FindStringSubmatch(body); ref != nil {
 			props = schemaProperties(t, ref[1])
@@ -81,7 +116,7 @@ func openAPIResponses(t *testing.T, op string) map[string][]string {
 			}
 			sort.Strings(props)
 		}
-		documented[responses[m[2]:m[3]]] = props
+		documented[code] = props
 	}
 	return documented
 }
@@ -89,7 +124,7 @@ func openAPIResponses(t *testing.T, op string) map[string][]string {
 // openAPIQueryParameters returns the names of op's query parameters.
 func openAPIQueryParameters(op string) []string {
 	var names []string
-	for _, m := range regexp.MustCompile(`\n {8}- name: ([A-Za-z_]+)\n {10}in: query\n`).FindAllStringSubmatch(section(op, "parameters", 6), -1) {
+	for _, m := range regexp.MustCompile(`\n {8}- name: ([A-Za-z_]+)\n {10}in: query\n`).FindAllStringSubmatch("\n"+section(op, "parameters", 6), -1) {
 		names = append(names, m[1])
 	}
 	sort.Strings(names)
@@ -131,10 +166,9 @@ func stringLiteral(e ast.Expr) (string, bool) {
 	return s, err == nil
 }
 
-// handlerResponses returns each status the handlers answer with s.writeJSON or
-// s.writeError, with the top-level keys of that body: "error" for writeError, the keys
-// of the map literal for writeJSON.
-func handlerResponses(t *testing.T, handlers ...*ast.FuncDecl) map[string][]string {
+// writeCalls calls visit with each s.writeJSON and s.writeError call in the handlers and
+// the status it writes, a net/http status constant.
+func writeCalls(t *testing.T, handlers []*ast.FuncDecl, visit func(fn *ast.FuncDecl, call *ast.CallExpr, code int)) {
 	t.Helper()
 	statusCodes := make(map[string]int)
 	for code := 100; code < 600; code++ {
@@ -142,8 +176,6 @@ func handlerResponses(t *testing.T, handlers ...*ast.FuncDecl) map[string][]stri
 			statusCodes["Status"+strings.NewReplacer(" ", "", "-", "").Replace(text)] = code
 		}
 	}
-
-	written := make(map[string][]string)
 	for _, fn := range handlers {
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
@@ -161,41 +193,146 @@ func handlerResponses(t *testing.T, handlers ...*ast.FuncDecl) map[string][]stri
 			if code == 0 {
 				t.Fatalf("%s: status argument %#v is not a net/http status constant; teach this test", fn.Name.Name, call.Args[1])
 			}
-			keys := []string{"error"}
-			if sel.Sel.Name == "writeJSON" {
-				body, ok := call.Args[2].(*ast.CompositeLit)
-				if ok {
-					_, ok = body.Type.(*ast.MapType)
-				}
-				if !ok {
-					t.Fatalf("%s: writeJSON body is not a map literal; teach this test", fn.Name.Name)
-				}
-				keys = nil
-				for _, elt := range body.Elts {
-					key, ok := stringLiteral(elt.(*ast.KeyValueExpr).Key)
-					if !ok {
-						t.Fatalf("%s: writeJSON body has a key that is not a string literal", fn.Name.Name)
-					}
-					keys = append(keys, key)
-				}
-				sort.Strings(keys)
-			}
-			c := strconv.Itoa(code)
-			if prev, seen := written[c]; seen && !slices.Equal(prev, keys) {
-				t.Fatalf("%s: status %s is written with keys %v and %v", fn.Name.Name, c, prev, keys)
-			}
-			written[c] = keys
+			visit(fn, call, code)
 			return true
 		})
 	}
+}
+
+// mapLiteralKeys returns the keys of a map literal, which must be string literals.
+func mapLiteralKeys(t *testing.T, fn *ast.FuncDecl, e ast.Expr) ([]string, bool) {
+	t.Helper()
+	lit, ok := e.(*ast.CompositeLit)
+	if ok {
+		_, ok = lit.Type.(*ast.MapType)
+	}
+	if !ok {
+		return nil, false
+	}
+	var keys []string
+	for _, elt := range lit.Elts {
+		key, ok := stringLiteral(elt.(*ast.KeyValueExpr).Key)
+		if !ok {
+			t.Fatalf("%s: writeJSON body has a key that is not a string literal", fn.Name.Name)
+		}
+		keys = append(keys, key)
+	}
+	return keys, true
+}
+
+// mapVariableKeys returns the keys a map variable of fn is given: those of the map
+// literal it is declared with (name := map[...]...{...}) and those it is assigned
+// (name["key"] = ...).
+func mapVariableKeys(t *testing.T, fn *ast.FuncDecl, name string) []string {
+	t.Helper()
+	var keys []string
+	declared := false
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		assign, ok := n.(*ast.AssignStmt)
+		if !ok || len(assign.Lhs) != 1 || len(assign.Rhs) != 1 {
+			return true
+		}
+		switch lhs := assign.Lhs[0].(type) {
+		case *ast.Ident:
+			if lhs.Name == name && assign.Tok == token.DEFINE {
+				lit, ok := mapLiteralKeys(t, fn, assign.Rhs[0])
+				if !ok {
+					t.Fatalf("%s: writeJSON body %s is not declared with a map literal; teach this test", fn.Name.Name, name)
+				}
+				keys = append(keys, lit...)
+				declared = true
+			}
+		case *ast.IndexExpr:
+			if ident, ok := lhs.X.(*ast.Ident); ok && ident.Name == name {
+				key, ok := stringLiteral(lhs.Index)
+				if !ok {
+					t.Fatalf("%s: writeJSON body %s is given a key that is not a string literal", fn.Name.Name, name)
+				}
+				keys = append(keys, key)
+			}
+		}
+		return true
+	})
+	if !declared {
+		t.Fatalf("%s: writeJSON body %s is not declared in the handler; teach this test", fn.Name.Name, name)
+	}
+	return keys
+}
+
+// handlerResponses returns each status the handlers answer with s.writeJSON or
+// s.writeError, with the top-level keys its bodies can carry: "error" for writeError,
+// the keys of the map literal for writeJSON, or of the map variable it is built in.
+func handlerResponses(t *testing.T, handlers ...*ast.FuncDecl) map[string][]string {
+	t.Helper()
+	written := make(map[string][]string)
+	writeCalls(t, handlers, func(fn *ast.FuncDecl, call *ast.CallExpr, code int) {
+		keys := []string{"error"}
+		if call.Fun.(*ast.SelectorExpr).Sel.Name == "writeJSON" {
+			var ok bool
+			if keys, ok = mapLiteralKeys(t, fn, call.Args[2]); !ok {
+				ident, isIdent := call.Args[2].(*ast.Ident)
+				if !isIdent {
+					t.Fatalf("%s: writeJSON body is not a map literal or variable; teach this test", fn.Name.Name)
+				}
+				keys = mapVariableKeys(t, fn, ident.Name)
+			}
+		}
+		c := strconv.Itoa(code)
+		for _, key := range keys {
+			if !slices.Contains(written[c], key) {
+				written[c] = append(written[c], key)
+			}
+		}
+		sort.Strings(written[c])
+	})
 	return written
 }
 
+// handlerErrors returns the messages the handlers answer with s.writeError, by status.
+// Messages that are not string literals are left out.
+func handlerErrors(t *testing.T, handlers ...*ast.FuncDecl) map[string][]string {
+	t.Helper()
+	messages := make(map[string][]string)
+	writeCalls(t, handlers, func(fn *ast.FuncDecl, call *ast.CallExpr, code int) {
+		if call.Fun.(*ast.SelectorExpr).Sel.Name != "writeError" {
+			return
+		}
+		if msg, ok := stringLiteral(call.Args[2]); ok {
+			messages[strconv.Itoa(code)] = append(messages[strconv.Itoa(code)], msg)
+		}
+	})
+	return messages
+}
+
+// accessMiddleware returns the middleware every request passes before the router looks
+// at its path: the allowed_hosts check and the API key check.
+func accessMiddleware(t *testing.T) []*ast.FuncDecl {
+	t.Helper()
+	return []*ast.FuncDecl{handlerFunc(t, "allowedHostsMiddleware"), handlerFunc(t, "authMiddleware")}
+}
+
 // handlerQueryParameters returns the query parameters the handlers read with
-// r.URL.Query().Get.
+// r.URL.Query().Get, or with Get on a variable holding r.URL.Query().
 func handlerQueryParameters(handlers ...*ast.FuncDecl) []string {
+	isQuery := func(e ast.Expr) bool {
+		call, ok := e.(*ast.CallExpr)
+		if !ok {
+			return false
+		}
+		sel, ok := call.Fun.(*ast.SelectorExpr)
+		return ok && sel.Sel.Name == "Query"
+	}
 	var names []string
 	for _, fn := range handlers {
+		queries := make(map[string]bool)
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			if assign, ok := n.(*ast.AssignStmt); ok && len(assign.Lhs) == 1 && len(assign.Rhs) == 1 && isQuery(assign.Rhs[0]) {
+				if ident, ok := assign.Lhs[0].(*ast.Ident); ok {
+					queries[ident.Name] = true
+				}
+			}
+			return true
+		})
 		ast.Inspect(fn.Body, func(n ast.Node) bool {
 			call, ok := n.(*ast.CallExpr)
 			if !ok || len(call.Args) != 1 {
@@ -205,11 +342,7 @@ func handlerQueryParameters(handlers ...*ast.FuncDecl) []string {
 			if !ok || get.Sel.Name != "Get" {
 				return true
 			}
-			query, ok := get.X.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			if sel, ok := query.Fun.(*ast.SelectorExpr); !ok || sel.Sel.Name != "Query" {
+			if ident, ok := get.X.(*ast.Ident); !isQuery(get.X) && (!ok || !queries[ident.Name]) {
 				return true
 			}
 			if name, ok := stringLiteral(call.Args[0]); ok && !slices.Contains(names, name) {
@@ -251,12 +384,14 @@ func handlerRequestFields(t *testing.T, fn *ast.FuncDecl, request any) []string 
 }
 
 // These operations answer JSON objects built in the handler, not typed structs, so the
-// wire format is pinned to the handler's source: the status codes it answers with and
-// the keys of each body must be what the spec documents, the query parameters it reads
-// must be the operation's, and the request fields it reads the request schema's. The
-// spec had documented keys no handler sent (connections_marked, email), left out
-// statuses the handlers answer (404, 409, 503), described request filters the kick
-// ignores (server_addr, client_addr, all), and had no purge=true mode at all.
+// wire format is pinned to the handler's source: the status codes it and the access
+// middleware answer with and the keys each body can carry must be what the spec
+// documents, the query parameters it reads must be the operation's, and the request
+// fields it reads the request schema's. The spec had documented keys no handler sent
+// (connections_marked, email), left out keys the handlers send (instance_id, since,
+// max_attempts, limit, email) and statuses they answer (400, 404, 409, 500, 503),
+// described request filters the kick ignores (server_addr, client_addr, all), and had
+// no purge=true mode at all.
 func TestOpenAPIOperationsMatchHandlers(t *testing.T) {
 	for _, tc := range []struct {
 		method, path string
@@ -266,6 +401,12 @@ func TestOpenAPIOperationsMatchHandlers(t *testing.T) {
 		{"POST", "/connections/kick", []string{"handleKickConnections"}, KickConnectionsRequest{}},
 		{"POST", "/accounts/{email}/credentials", []string{"handleAddCredential"}, AddCredentialRequest{}},
 		{"DELETE", "/accounts/{email}", []string{"handleDeleteAccount", "handlePurgeAccount"}, nil},
+		{"POST", "/accounts/{email}/messages/restore", []string{"handleRestoreMessages"}, nil},
+		{"DELETE", "/credentials/{email}", []string{"handleDeleteCredential"}, nil},
+		{"GET", "/usage/accounts", []string{"handleAccountUsage"}, nil},
+		{"GET", "/cache/metrics", []string{"handleCacheMetrics"}, nil},
+		{"GET", "/uploader/status", []string{"handleUploaderStatus"}, nil},
+		{"GET", "/uploader/failed", []string{"handleFailedUploads"}, nil},
 	} {
 		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
 			op := openAPIOperation(t, tc.method, tc.path)
@@ -275,7 +416,7 @@ func TestOpenAPIOperationsMatchHandlers(t *testing.T) {
 			}
 
 			documented := openAPIResponses(t, op)
-			written := handlerResponses(t, fns...)
+			written := handlerResponses(t, append(accessMiddleware(t), fns...)...)
 			var codes []string
 			for code := range written {
 				codes = append(codes, code)
@@ -313,6 +454,66 @@ func TestOpenAPIOperationsMatchHandlers(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// Every request passes allowedHostsMiddleware and authMiddleware before the router looks
+// at its path, so every operation can be refused by them: 401 for a missing or non-Bearer
+// Authorization header or a wrong key, 403 for the read-only key on a write or a client
+// outside allowed_hosts. The spec once documented these on four operations only and 403
+// on none. This pins every operation to the statuses and messages the middleware answers
+// with.
+func TestOpenAPIDocumentsAccessRefusalsOnEveryOperation(t *testing.T) {
+	middleware := accessMiddleware(t)
+	refusals := handlerResponses(t, middleware...)
+	messages := handlerErrors(t, middleware...)
+	if len(refusals) == 0 {
+		t.Fatal("found no responses in the access middleware")
+	}
+	var problems []string
+	for path, methods := range openAPIOperations(t) {
+		for _, method := range methods {
+			op := openAPIOperation(t, method, path)
+			documented := openAPIResponses(t, op)
+			blocks := openAPIResponseBlocks(t, op)
+			for code, keys := range refusals {
+				if spec, ok := documented[code]; !ok {
+					problems = append(problems, fmt.Sprintf("%s %s does not document %s", method, path, code))
+					continue
+				} else if !slices.Equal(spec, keys) {
+					problems = append(problems, fmt.Sprintf("%s %s documents %s with %v, the middleware answers %v", method, path, code, spec, keys))
+				}
+				for _, msg := range messages[code] {
+					if !strings.Contains(blocks[code], msg) {
+						problems = append(problems, fmt.Sprintf("%s %s: %s does not mention %q", method, path, code, msg))
+					}
+				}
+			}
+		}
+	}
+	sort.Strings(problems)
+	if len(problems) > 0 {
+		t.Fatalf("operations that do not document the access middleware's refusals:\n  %s", strings.Join(problems, "\n  "))
+	}
+}
+
+// The uploader endpoints' max_attempts defaults to the node's [uploader] max_attempts
+// (config.DefaultUploaderMaxAttempts unless configured), the attempt count at which the
+// uploader stops retrying. The spec documented a fixed default of 5, so a client that
+// sent the documented default listed as failed the uploads still being retried.
+func TestOpenAPIUploaderMaxAttemptsDefault(t *testing.T) {
+	for _, path := range []string{"/uploader/status", "/uploader/failed"} {
+		_, param, ok := strings.Cut(section(openAPIOperation(t, "GET", path), "parameters", 6), "- name: max_attempts\n")
+		if !ok {
+			t.Fatalf("GET %s does not document max_attempts", path)
+		}
+		param, _, _ = strings.Cut(param, "- name: ")
+		if strings.Contains(param, "default:") {
+			t.Errorf("GET %s documents a fixed max_attempts default; the server applies [uploader] max_attempts:\n%s", path, param)
+		}
+		if !strings.Contains(param, "[uploader] max_attempts") {
+			t.Errorf("GET %s max_attempts does not say it defaults to [uploader] max_attempts:\n%s", path, param)
+		}
 	}
 }
 

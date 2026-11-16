@@ -372,6 +372,46 @@ backends = ["10.0.0.1:143", "10.0.0.1"]
 			want: "listed more than once",
 		},
 		{
+			// The loader trims the ends of every string; whitespace inside a backend was
+			// kept, and the proxy dialed a name that never resolves (#1322).
+			name: "space before the port",
+			toml: `
+[[pool]]
+name = "sora0"
+default = true
+backends = ["192.0.2.10", "192.0.2.11 :143"]
+`,
+			want: `[[pool]] "sora0": backend "192.0.2.11 :143" contains whitespace`,
+		},
+		{
+			name: "space inside a host name",
+			toml: `
+[[pool]]
+name = "sora0"
+backends = ["backend .example.com"]
+`,
+			want: `[[pool]] "sora0": backend "backend .example.com" contains whitespace`,
+		},
+		{
+			name: "tab inside a backend",
+			toml: `
+[[pool]]
+name = "sora0"
+backends = ["192.0.2.10:\t143"]
+`,
+			want: `[[pool]] "sora0": backend "192.0.2.10:\t143" contains whitespace`,
+		},
+		{
+			// Trimmed at load: " 192.0.2.10" is "192.0.2.10".
+			name: "same host once with a leading space",
+			toml: `
+[[pool]]
+name = "sora0"
+backends = ["192.0.2.10", " 192.0.2.10"]
+`,
+			want: `[[pool]] "sora0": backend "192.0.2.10" is listed more than once`,
+		},
+		{
 			name: "STARTTLS without TLS",
 			toml: `
 [[pool]]

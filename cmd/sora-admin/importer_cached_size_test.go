@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -115,6 +116,7 @@ func TestImportRefusesAFileGrownAboveTheLimitSinceTheScan(t *testing.T) {
 	grownPath := filepath.Join(maildirPath, "cur", "1700000002.M2P1.host:2,S")
 
 	importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{MaxMessageSize: limit})
+	require.NoError(t, importer.lookupAccount())
 	require.NoError(t, importer.scanMaildir())
 	require.NoError(t, os.WriteFile(grownPath, cachedSizeMessage("Grown", 2*limit), 0644))
 
@@ -170,6 +172,55 @@ func TestImportChecksCurrentBytesForUnscannedCachedFile(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, int64(2), importer.importedMessages)
 				assert.Zero(t, importer.failedMessages)
+			}
+		})
+	}
+}
+
+// The upload reads every file it imports again, and that file may have grown since the
+// scan sized it, or this run's scan may not have visited it (--paths-file). Refusing a
+// file above the import message limit must cost memory in proportion to that limit, not
+// to the file: reading all of it first lets each upload worker allocate a whole changed
+// file, or a compressed one's full expansion up to the 256 MiB decompression bound (#834).
+func TestUploadReadsNoMoreOfAChangedFileThanTheLimit(t *testing.T) {
+	const limit = 4 << 10
+	const grown = 64 << 20
+	const ceiling = 4 << 20
+	for _, tc := range []struct {
+		name string
+		grow func(t *testing.T, path string)
+	}{
+		{"plain file grown", func(t *testing.T, path string) {
+			require.NoError(t, os.Truncate(path, grown))
+		}},
+		{"compressed file", func(t *testing.T, path string) {
+			onDisk := gzipOfSize(t, "From: sender@example.com\r\nSubject: Grown\r\n\r\n", grown)
+			require.NoError(t, os.WriteFile(path, onDisk, 0644))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			maildirPath, name := newSingleMessageMaildir(t, cachedSizeMessage("Grown", 100))
+			path := filepath.Join(maildirPath, "cur", name)
+			importer := newTestModeImporter(t, maildirPath, newMockResilientDatabase(), ImporterOptions{MaxMessageSize: limit})
+			require.NoError(t, importer.scanMaildir())
+			var msg msgInfo
+			require.NoError(t, importer.sqliteDB.QueryRow(`SELECT path, filename, hash, size, mailbox FROM messages`).
+				Scan(&msg.path, &msg.filename, &msg.hash, &msg.size, &msg.mailbox))
+			tc.grow(t, path)
+
+			runtime.GC()
+			var before, after runtime.MemStats
+			runtime.ReadMemStats(&before)
+			uploaded := importer.uploadBatchToS3([]msgInfo{msg})
+			runtime.ReadMemStats(&after)
+
+			assert.Empty(t, uploaded, "uploaded a message above the limit")
+			if reasons := failureReasons(importer, path); assert.Len(t, reasons, 1) {
+				assert.Contains(t, reasons[0], "message too large")
+			}
+			if alloc := after.TotalAlloc - before.TotalAlloc; alloc > ceiling {
+				t.Errorf("refusing a %d-byte message above the %d-byte limit allocated %d bytes, want under %d",
+					grown, limit, alloc, ceiling)
 			}
 		})
 	}

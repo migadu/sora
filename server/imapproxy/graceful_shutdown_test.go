@@ -93,6 +93,7 @@ func TestSendGracefulShutdownBye_ByeWrittenBeforeClose(t *testing.T) {
 		cancel:        sessionCancel,
 		username:      "test@example.com",
 		startTime:     time.Now(),
+		greeted:       true,
 	}
 	srv.addSession(session)
 
@@ -199,6 +200,7 @@ func TestSendGracefulShutdownBye_CleanByeDuringActiveTransfer(t *testing.T) {
 		cancel:        sessionCancel,
 		username:      "test@example.com",
 		startTime:     time.Now(),
+		greeted:       true,
 	}
 	srv.addSession(session)
 
@@ -322,6 +324,7 @@ func TestSendGracefulShutdownBye_IdleSession(t *testing.T) {
 		cancel:        sessionCancel,
 		username:      "idle@example.com",
 		startTime:     time.Now(),
+		greeted:       true,
 	}
 	srv.addSession(session)
 

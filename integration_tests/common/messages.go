@@ -51,8 +51,8 @@ func MultipartWithPDF(to, subject, bodyText string, pdfSize int) string {
 	}, "\r\n")
 }
 
-// SieveRawMessageCase is one delivery whose filing depends on the Sieve body or size
-// test seeing the message as it is stored: Sieve used to be handed the extracted
+// SieveRawMessageCase is one delivery whose filing depends on the Sieve body, size or
+// header tests seeing the message as it is stored: Sieve used to be handed the extracted
 // search text instead, which has no MIME structure and is far smaller than the message.
 type SieveRawMessageCase struct {
 	Name    string
@@ -161,6 +161,38 @@ func SieveRawMessageCases() []SieveRawMessageCase {
 			Script: `require ["body", "fileinto"]; if body :contains "hello world" { fileinto "Archive"; }`,
 			Message: func(to, subject string) string {
 				return Base64TextMessage(to, subject, "hello world")
+			},
+			Mailbox: "Archive",
+		},
+		{
+			Name:   "body text of a base64 message with CTE comments",
+			Script: `require ["body", "fileinto"]; if body :contains "hello world" { fileinto "Archive"; }`,
+			Message: func(to, subject string) string {
+				return strings.Replace(Base64TextMessage(to, subject, "hello world"),
+					"Content-Transfer-Encoding: base64\r\n", "Content-Transfer-Encoding: (encoded) BASE64 (comment)\r\n", 1)
+			},
+			Mailbox: "Archive",
+		},
+		{
+			Name:   "body text of quoted-printable with nested CTE comments",
+			Script: `require ["body", "fileinto"]; if body :contains "hello world" { fileinto "Archive"; }`,
+			Message: func(to, subject string) string {
+				return strings.Replace(QuotedPrintableHTMLMessage(to, subject, "<p>hello=20world</p>"),
+					"Content-Transfer-Encoding: quoted-printable\r\n", "Content-Transfer-Encoding: (outer (nested)) Quoted-Printable (comment)\r\n", 1)
+			},
+			Mailbox: "Archive",
+		},
+		{
+			// The header tests read the stored message's fields too. "X(a" and "x(A"
+			// are one name under i;ascii-casemap (RFC 5228 §2.7), but go-message does
+			// not canonicalize a name holding "(", so they were two keys of the
+			// header map and one field's value was lost. :index (RFC 5260 §6) counts
+			// both fields, in message order.
+			Name:   "header fields whose names differ in ASCII case only",
+			Script: `require ["index", "fileinto"]; if allof (header :index 1 "x(a" "1", header :index 2 "x(a" "2") { fileinto "Archive"; }`,
+			Message: func(to, subject string) string {
+				return strings.Replace(Base64TextMessage(to, subject, "hello world"),
+					"MIME-Version: 1.0\r\n", "X(a: 1\r\nMIME-Version: 1.0\r\nx(A: 2\r\n", 1)
 			},
 			Mailbox: "Archive",
 		},

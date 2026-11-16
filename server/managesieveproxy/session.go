@@ -32,6 +32,7 @@ import (
 // authenticates the backend, then hijacks the raw client socket and relays
 // bytes bidirectionally.
 type Session struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server                *Server
 	settings              *reloadableSettings     // the settings its protocol server was built with (see reloadableSettings)
 	msConn                *managesieveserver.Conn // library connection (Hijack seam)
@@ -56,7 +57,7 @@ type Session struct {
 	proxyInfo             *server.ProxyProtocolInfo
 	gracefulShutdown      bool   // Set during server shutdown to prevent copy goroutine from closing clientConn
 	submittedUsername     string // Username exactly as submitted by the client (lookup-cache key)
-	connRejected          bool   // True when connTracker.RegisterConnection rejected this session (close() must not unregister)
+	connRegistered        bool   // connTracker.RegisterConnection accepted this session: close() unregisters only then
 }
 
 var _ managesieveserver.Session = (*Session)(nil)
@@ -75,12 +76,14 @@ func (s *Session) Close() error {
 // (the library's command loop is parked in this call until the relay
 // finishes; returning triggers session teardown).
 //
-// The authorization identity is deliberately ignored (pre-migration parity):
-// impersonation is only meaningful on the backend, where the proxy
-// re-authenticates with master SASL credentials.
-func (s *Session) AuthenticatePlain(_ context.Context, _, username, password string) error {
+// The proxy logs in to the backend as the account the credentials log in to, so
+// an authorization identity naming any other account is refused (see below).
+func (s *Session) AuthenticatePlain(_ context.Context, authzID, username, password string) error {
 	authStart := time.Now()
-	if err := s.authenticateUser(username, password, authStart); err != nil {
+	if err := s.authenticateUserWithAuthzID(authzID, username, password, authStart); err != nil {
+		if errors.Is(err, errAuthorizationFailed) {
+			return &managesieveserver.Error{Message: `"Proxy authentication requires master credentials"`}
+		}
 		s.DebugLog("authentication failed", "error", err)
 		// Rate limiter blocked the attempt: reply with the same line as a bad
 		// password (indistinguishable — a distinguishable throttle reply is an
@@ -116,9 +119,6 @@ func (s *Session) AuthenticatePlain(_ context.Context, _, username, password str
 	// backend connection.
 	if err := s.registerConnection(); err != nil {
 		s.InfoLog("connection rejected by connection tracker", "error", err)
-		// Mark as rejected so close() does not decrement a slot this session
-		// never held (which would erode the account's limit).
-		s.connRejected = true
 		return &managesieveserver.Error{Code: "TRYLATER", Message: "Too many connections", Close: true}
 	}
 
@@ -230,8 +230,41 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 	s.getLogger().ErrorLog(msg, keyvals...)
 }
 
+var errAuthorizationFailed = errors.New("authorization failed")
+
+// authorizeIdentity verifies that the authenticated credentials for username
+// (which resolve to resolvedEmail for backend impersonation) are permitted to
+// act as authzID (RFC 4616 section 2). Refused only after credentials check out
+// and before session state, rate-limiter success, or login/connection metrics
+// are recorded.
+func (s *Session) authorizeIdentity(authzID, username, resolvedEmail, method string) error {
+	if authzID != "" && authzID != username && authzID != resolvedEmail {
+		s.username = resolvedEmail
+		s.InfoLog("authorization failed", "address", resolvedEmail, "authzid", authzID, "method", method)
+		return errAuthorizationFailed
+	}
+	return nil
+}
+
 // authenticateUser authenticates the user against the database.
 func (s *Session) authenticateUser(username, password string, authStart time.Time) error {
+	return s.authenticateUserWithAuthzID("", username, password, authStart)
+}
+
+func (s *Session) authenticateUserWithAuthzID(authzID, username, password string, authStart time.Time) (retErr error) {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
+	cacheGeneration := s.server.lookupCache.Generation()
+
+	defer func() {
+		if retErr != nil {
+			s.submittedUsername = ""
+			s.username = ""
+			s.accountID = 0
+			s.isRemoteLookupAccount = false
+			s.routingInfo = nil
+		}
+	}()
+
 	// Remember the username exactly as submitted: the lookup cache is keyed on
 	// it (every Set below uses it), so invalidation must use the same value —
 	// not the resolved s.username, which can differ for token/master/+detail logins.
@@ -269,6 +302,11 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// bucket by varying the target, leaving the proxy's tenant-wide password unmetered.
 	// Decided here, from the raw identity, so check site and record sites cannot drift.
 	authKey := server.AuthRateLimitKeyWithMaster(username, s.server.masterUsername)
+	// A success is recorded under the master credential's key only for a master
+	// login. The master form with any other password is the base address's own login
+	// (#949), and its success, recorded under the master credential's key, would
+	// clear that key's failed guesses at the master password.
+	successKey := server.AuthSuccessRateLimitKey(username, password, s.server.masterUsername, s.server.masterPassword)
 
 	// Use configured remotelookup timeout instead of hardcoded value
 	authTimeout := s.server.connManager.GetRemoteLookupTimeout()
@@ -283,7 +321,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	// meant the delay never fired in exactly the deployment proxies exist for.
 	realClientIP, _ := server.GetConnectionIPs(s.clientConn, s.proxyInfo)
 	remoteAddr := &server.StringAddr{Addr: realClientIP}
-	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "MANAGESIEVE-PROXY"); err != nil {
+	if err := server.ApplyAuthenticationDelay(s.ctx, s.server.authLimiter, remoteAddr, "managesieve_proxy"); err != nil {
 		if errors.Is(err, server.ErrDelayQueueFull) {
 			// Delay queue full - reject immediately to prevent goroutine exhaustion
 			s.InfoLog("delay queue full, rejecting connection", "username", username)
@@ -358,15 +396,20 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					s.DebugLog("cache hit - positive entry with matching password", "username", username, "age", time.Since(cached.CreatedAt))
 					metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "hit").Inc()
 
+					// The resolved address when the entry has one; otherwise keep
+					// the base address set above.
+					resolvedEmail := s.username
+					if cached.ActualEmail != "" {
+						resolvedEmail = cached.ActualEmail
+					}
+					if err := s.authorizeIdentity(authzID, username, resolvedEmail, "cache"); err != nil {
+						return err
+					}
+
 					// Populate session with cached routing info
 					s.accountID = cached.AccountID
 					s.isRemoteLookupAccount = cached.FromRemoteLookup
-
-					// The resolved address when the entry has one; otherwise s.username
-					// keeps the base address set above.
-					if cached.ActualEmail != "" {
-						s.username = cached.ActualEmail
-					}
+					s.username = resolvedEmail
 
 					// Rebuild the routing info from the entry whether it carries an explicit
 					// server, a pool name, or neither (a locally found user): a session that
@@ -378,7 +421,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 					s.routingInfo = proxy.RouteFromCache(cached)
 
 					// Track successful authentication using resolved email
-					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 					metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 					if addr, err := server.NewAddress(s.username); err == nil {
 						metrics.TrackDomainConnection("managesieve_proxy", addr.Domain())
@@ -396,8 +439,10 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 					return nil // Authentication complete from cache
 				} else {
-					// Different password on positive cache - revalidate if old enough
-					if cached.IsOld(s.server.positiveRevalidationWindow) {
+					// Different password on positive cache - revalidate if old enough, or if
+					// the two passwords are the master username form's two credentials (#949)
+					if cached.IsOld(s.server.positiveRevalidationWindow) ||
+						proxy.MasterFormOtherCredential(username, password, cached.PasswordDigest, s.server.masterUsername, s.server.masterPassword) {
 						s.DebugLog("cache hit - positive entry with different password (old enough to revalidate)", "username", username, "age", time.Since(cached.CreatedAt))
 						metrics.LookupCacheResults.WithLabelValues("managesieve_proxy", "revalidate_positive_different_pw").Inc()
 						// The database or the remote lookup decides this password, so drop
@@ -440,15 +485,22 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		if len(s.server.masterUsername) > 0 && checkMasterCredential(parsedAddr.Suffix(), s.server.masterUsername) {
 			// Suffix matches master username - validate master password locally
 			if len(s.server.masterPassword) == 0 || !checkMasterCredential(password, s.server.masterPassword) {
-				// Wrong master password - fail immediately
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
-				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
-				return consts.ErrAuthenticationFailed
+				// Not the master password: the base address's own login, checked below
+				// exactly as under any other suffix, with the same lookup, password
+				// verification and lookup-cache entry, and under the same submitted name
+				// (the lookup service may route or refuse tokens differently). A distinct
+				// reply, a quicker one (#801), or a refusal of the account's own password
+				// (#949) confirms a guessed master username. Its failure is still recorded
+				// under authKey, the master credential's key; only a success is the
+				// account's (successKey).
+				s.DebugLog("master username without the master password, checked like another suffix", "address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = username
+			} else {
+				// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
+				s.DebugLog("master username authentication successful, using base address for routing", "address", parsedAddr.BaseAddress())
+				usernameForRemoteLookup = parsedAddr.BaseAddress()
+				masterAuthValidated = true
 			}
-			// Master credentials validated - use base address (without @MASTER suffix) for remotelookup
-			s.DebugLog("master username authentication successful, using base address for routing", "address", parsedAddr.BaseAddress())
-			usernameForRemoteLookup = parsedAddr.BaseAddress()
-			masterAuthValidated = true
 		} else {
 			// Suffix doesn't match master username - treat as token
 			// Send FULL username (including @TOKEN) to remotelookup for validation
@@ -508,12 +560,9 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			switch authResult {
 			case proxy.AuthSuccess:
 				// RemoteLookup returned success - use routing info
-				s.DebugLog("remotelookup successful", "account_id", routingInfo.AccountID, "master_auth_validated", masterAuthValidated)
+				s.DebugLog("remotelookup successful", "master_auth_validated", masterAuthValidated)
 				s.DebugLog("remotelookup routing", "server", routingInfo.ServerAddress, "tls", routingInfo.RemoteTLS, "starttls", routingInfo.RemoteTLSUseStartTLS, "tls_verify", routingInfo.RemoteTLSVerify, "proxy_protocol", routingInfo.RemoteUseProxyProtocol)
 				metrics.RemoteLookupResult.WithLabelValues("managesieve", "success").Inc()
-				s.accountID = routingInfo.AccountID
-				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
-				s.routingInfo = routingInfo
 
 				// Determine the resolved email for caching and backend impersonation
 				// Use ActualEmail from remotelookup response if available, otherwise derive from username
@@ -525,7 +574,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				} else {
 					resolvedEmail = username // Fallback to original
 				}
-				s.username = resolvedEmail // Use for backend impersonation
 
 				// Cache successful authentication with routing info
 				// CRITICAL: Cache key is submitted username (e.g., "user@TOKEN")
@@ -539,11 +587,24 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 						IsNegative:     false,
 					}
 					proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
-					s.server.lookupCache.Set(s.server.name, username, entry)
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, entry)
 				}
 
+				method := "remotelookup"
+				if masterAuthValidated {
+					method = "master"
+				}
+				if err := s.authorizeIdentity(authzID, username, resolvedEmail, method); err != nil {
+					return err
+				}
+
+				s.accountID = routingInfo.AccountID
+				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
+				s.routingInfo = routingInfo
+				s.username = resolvedEmail // Use for backend impersonation
+
 				// Use resolvedEmail for rate limiting (not submitted username with token)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 
 				// For metrics, use resolvedEmail for accurate tracking
@@ -553,10 +614,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				}
 
 				// Single consolidated log for authentication success
-				method := "remotelookup"
-				if masterAuthValidated {
-					method = "master"
-				}
 				duration := time.Since(authStart)
 				s.InfoLog("authentication successful",
 					"address", s.username,
@@ -572,12 +629,12 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 				// For master username, this shouldn't happen (password already validated)
 				// For others, reject immediately
 				if masterAuthValidated {
-					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "user", username)
+					s.WarnLog("remotelookup failed but master auth was already validated - routing issue", "username", username)
 				}
 
 				// Cache negative result (wrong password)
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthFailed,
 						IsNegative:     true,
@@ -615,7 +672,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 						db.DummyVerifyPassword(password)
 					}
 					if s.server.lookupCache != nil {
-						s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+						s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 							PasswordDigest: lookupcache.NewPasswordDigest(password),
 							Result:         lookupcache.AuthUserNotFound,
 							IsNegative:     true,
@@ -663,7 +720,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 			// temporary failure (NO (TRYLATER)), not a failed login charged to the master
 			// credential.
 			if server.IsTemporaryAuthFailure(err) {
-				s.WarnLog("authentication unavailable", "method", "master", "user", address.BaseAddress(), "error", err)
+				s.WarnLog("authentication unavailable", "method", "master", "error", err)
 				metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "unavailable").Inc()
 				return server.ErrAuthServiceUnavailable
 			}
@@ -702,7 +759,7 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 
 			if isDefinitiveFailure {
 				if s.server.lookupCache != nil {
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthFailed,
 						IsNegative:     true,
@@ -722,6 +779,27 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		}
 	}
 
+	// Cache successful authentication (main DB)
+	if s.server.lookupCache != nil {
+		s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
+			AccountID:        accountID,
+			PasswordDigest:   lookupcache.NewPasswordDigest(password),
+			ServerAddress:    "", // Will be populated by affinity/routing in next connection
+			Result:           lookupcache.AuthSuccess,
+			FromRemoteLookup: false,
+			IsNegative:       false,
+		})
+	}
+
+	resolvedEmail := address.BaseAddress()
+	method := "main_db"
+	if masterAuthValidated {
+		method = "master"
+	}
+	if err := s.authorizeIdentity(authzID, username, resolvedEmail, method); err != nil {
+		return err
+	}
+
 	s.accountID = accountID
 	s.isRemoteLookupAccount = false
 	// A session that reaches DetermineRoute with no routing info has the routing lookup
@@ -731,18 +809,14 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 	s.routingInfo = &proxy.UserRoutingInfo{
 		AccountID: accountID,
 	}
-	s.username = address.BaseAddress() // Set username for backend impersonation (without +detail)
-	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, true)
+	s.username = resolvedEmail // Set username for backend impersonation (without +detail)
+	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
 	metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "success").Inc()
 	metrics.TrackDomainConnection("managesieve_proxy", address.Domain())
 	// The base address, the name a lookup-cache hit replaying this login counts the user under.
-	metrics.TrackUserActivity("managesieve_proxy", address.BaseAddress(), "connection", 1)
+	metrics.TrackUserActivity("managesieve_proxy", resolvedEmail, "connection", 1)
 
 	// Single consolidated log for authentication success
-	method := "main_db"
-	if masterAuthValidated {
-		method = "master"
-	}
 	duration := time.Since(authStart)
 	s.InfoLog("authentication successful",
 		"address", s.username,
@@ -750,18 +824,6 @@ func (s *Session) authenticateUser(username, password string, authStart time.Tim
 		"method", method,
 		"cached", false,
 		"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
-
-	// Cache successful authentication (main DB)
-	if s.server.lookupCache != nil {
-		s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
-			AccountID:        accountID,
-			PasswordDigest:   lookupcache.NewPasswordDigest(password),
-			ServerAddress:    "", // Will be populated by affinity/routing in next connection
-			Result:           lookupcache.AuthSuccess,
-			FromRemoteLookup: false,
-			IsNegative:       false,
-		})
-	}
 
 	return nil
 }
@@ -817,7 +879,7 @@ func (s *Session) connectToBackendAndAuth() error {
 	conn, actualAddr, err := s.server.connManager.ConnectWithProxy(
 		connectCtx,
 		preferredAddr,
-		clientHost, clientPort, serverHost, serverPort, s.routingInfo,
+		clientHost, clientPort, serverHost, serverPort, s.routingInfo.ForDial(s.listenerConn, s.sessionID),
 	)
 	if err != nil {
 		metrics.ProxyBackendConnections.WithLabelValues("managesieve", "failure").Inc()
@@ -887,14 +949,14 @@ func (s *Session) connectToBackendAndAuth() error {
 		}
 		backendWriter.Flush()
 
-		// Read STARTTLS response (bounded)
-		response, err := server.ReadBoundedLine(backendReader, 8192)
+		// Read the STARTTLS response (bounded), with any literal its text is sent as
+		response, err := readBackendRecord(backendReader)
 		if err != nil {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: failed to read STARTTLS response: %w", server.ErrBackendConnectionFailed, err)
 		}
 
-		if !strings.HasPrefix(strings.TrimSpace(response), "OK") {
+		if backendStatus(response) != "OK" {
 			s.backendConn.Close()
 			return fmt.Errorf("%w: backend STARTTLS failed: %s", server.ErrBackendConnectionFailed, strings.TrimSpace(response))
 		}
@@ -938,40 +1000,56 @@ func (s *Session) connectToBackendAndAuth() error {
 	return s.authenticateToBackend()
 }
 
+// backendStatus returns the status of a backend response line: "OK", "NO" or "BYE", or
+// "" when the line is none of them. RFC 5804 section 4: response-ok = "OK" [SP "("
+// resp-code ")"] [SP string] CRLF, response-nobye = ("NO" / "BYE") likewise, and
+// "Implementations MUST accept these strings in a case-insensitive fashion". The atom
+// begins at column 0 and ends at SP or CRLF, and the length check keeps the folding
+// ASCII-only so a multi-byte fold-equivalent such as U+212A (KELVIN SIGN) cannot match.
+func backendStatus(line string) string {
+	atom, _, _ := strings.Cut(strings.TrimRight(line, "\r\n"), " ")
+	for _, status := range []string{"OK", "NO", "BYE"} {
+		if len(atom) == len(status) && strings.EqualFold(atom, status) {
+			return status
+		}
+	}
+	return ""
+}
+
 // readBackendCapabilities reads a capability list from the backend (its greeting, or the
 // list it re-issues after STARTTLS) up to the response that ends it: RFC 5804 section 4,
 // response-capability = *(single-capability) response-oknobye. A capability name is a
-// quoted or literal string, so a record whose first atom is OK, NO or BYE (case-insensitive,
-// section 4) is that response. Literal data must be consumed before another record's
-// status is inspected. NO or BYE is the backend refusing the connection (a sora
-// backend over its max_connections_per_ip answers NO (TRYLATER)): it ends the read at once
-// with the backend's line instead of being read past until EOF or the read deadline.
-// The argument what names the list in a read error.
+// quoted or literal string, so a record with a backendStatus is that response. Literal
+// data must be consumed before another record's status is inspected. NO or BYE is the
+// backend refusing the connection (a sora backend over its max_connections_per_ip answers
+// NO (TRYLATER)): it ends the read at once with the backend's line instead of being read
+// past until EOF or the read deadline. The argument what names the list in a read error.
 func (s *Session) readBackendCapabilities(r *bufio.Reader, what string) error {
 	for {
 		// Bounded: a misbehaving backend must not be able to grow the buffer
 		// without limit with a newline-less stream inside the deadline window.
-		line, err := readBackendCapabilityRecord(r)
+		line, err := readBackendRecord(r)
 		if err != nil {
 			return fmt.Errorf("%w: failed to read backend %s: %w", server.ErrBackendConnectionFailed, what, err)
 		}
-		line = strings.TrimSpace(line)
-		status, _, _ := strings.Cut(line, " ")
-		switch {
-		case strings.EqualFold(status, "OK"):
+		switch backendStatus(line) {
+		case "OK":
 			return nil
-		case strings.EqualFold(status, "NO"), strings.EqualFold(status, "BYE"):
+		case "NO", "BYE":
+			line = strings.TrimSpace(line)
 			s.WarnLog("backend refused the connection", "backend", s.serverAddr, "response", line)
 			return fmt.Errorf("%w: backend refused the connection: %s", server.ErrBackendConnectionFailed, line)
 		}
 	}
 }
 
-// readBackendCapabilityRecord returns the first physical line after consuming a
-// whole capability or terminal response, including server literals. Literal
-// contents may contain CRLF and status words; none begin a new response. Keep the
-// existing 8 KiB bound across the complete record, including literal contents.
-func readBackendCapabilityRecord(r *bufio.Reader) (string, error) {
+// readBackendRecord returns the first physical line after consuming a whole
+// capability line or response, including server literals: a capability's value and
+// the text of an OK, NO or BYE are strings, which may be literal-s2c (RFC 5804
+// section 4). Literal contents may contain CRLF and status words; none begin a new
+// response. Keep the existing 8 KiB bound across the complete record, including
+// literal contents.
+func readBackendRecord(r *bufio.Reader) (string, error) {
 	remaining := 8192
 	line, err := server.ReadBoundedLine(r, remaining)
 	if err != nil {
@@ -1032,8 +1110,9 @@ func (s *Session) authenticateToBackend() error {
 	// Bound the backend auth-response read; cleared on success before the relay phase (M6).
 	s.backendConn.SetReadDeadline(time.Now().Add(backendHandshakeTimeout(s.server.connManager.GetConnectTimeout())))
 
-	// Read authentication response (bounded)
-	response, err := server.ReadBoundedLine(backendReader, 8192)
+	// Read the authentication response (bounded), with any literal its text is sent as:
+	// what is left in the reader goes to the client once the relay starts.
+	response, err := readBackendRecord(backendReader)
 	if err != nil {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		s.invalidateLookupCache("backend auth read error")
@@ -1042,7 +1121,7 @@ func (s *Session) authenticateToBackend() error {
 
 	s.DebugLog("Backend auth response", "response", strings.TrimSpace(response))
 
-	if !strings.HasPrefix(response, "OK") {
+	if backendStatus(response) != "OK" {
 		// CRITICAL: Invalidate cache on backend authentication failure
 		// This ensures the next request does fresh remotelookup/database lookup
 		// to pick up backend changes (e.g., domain moved to different server)
@@ -1251,9 +1330,13 @@ func (s *Session) close() {
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits
 	// Background goroutine was causing leaks when server shutdown or high load prevented execution
 	// NOTE: accountID can be 0 for remotelookup accounts, so we don't check accountID > 0
-	// Skip unregister when registration was rejected; otherwise we would
-	// decrement a slot this session never held (limit erosion for the account).
-	if s.server.connTracker != nil && !s.connRejected {
+	// Only a session the tracker registered unregisters. The account ID is set
+	// as soon as the client's credentials are accepted, before the backend leg
+	// and the registration: a session whose backend leg failed, or whose
+	// registration was refused, holds no slot, and unregistering it would free
+	// the slot of another session of the account from the same IP.
+	if s.server.connTracker != nil && s.connRegistered {
+		s.connRegistered = false // the slot is released once, however often close() runs
 		// Use a new background context for this final operation, as s.ctx is likely already cancelled.
 		// UnregisterConnection is fast (in-memory only), so this won't block for long
 		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
@@ -1288,7 +1371,10 @@ func (s *Session) registerConnection() error {
 
 	// Use cached client address (real IP) to match UnregisterConnection in close()
 	if s.server.connTracker != nil {
-		return s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "ManageSieve", s.clientAddr)
+		if err := s.server.connTracker.RegisterConnection(ctx, s.accountID, s.username, "ManageSieve", s.clientAddr); err != nil {
+			return err
+		}
+		s.connRegistered = true
 	}
 	return nil
 }
@@ -1302,7 +1388,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 	}
 
 	// Register for kick notifications
-	kickChan := s.server.connTracker.RegisterSession(s.accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(s.accountID, s.authSessionGeneration)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 
 	for {

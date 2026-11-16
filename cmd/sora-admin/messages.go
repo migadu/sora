@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 )
@@ -130,7 +132,10 @@ func handleRestoreMessages(ctx context.Context) {
 
 This command restores deleted (expunged) messages back to their original mailboxes.
 If the original mailbox no longer exists, it will be recreated. Messages are
-assigned new UIDs in their target mailboxes.
+assigned new UIDs in their target mailboxes. A mailbox recreated in the shared
+namespace is a shared mailbox of the account that only the owner can open: it
+gets neither the ACL entries it had nor its parent's. Grant access again with
+'acl grant'.
 
 Large restores are processed in chunks, each committed separately. If the run
 fails part-way, the messages restored so far are kept and the error says how
@@ -413,8 +418,11 @@ func restoreMessages(ctx context.Context, cfg AdminConfig, email string, mailbox
 
 	// Perform restoration. Restores run in chunks, each in its own transaction, so a
 	// failure part-way leaves the already-restored messages in place; re-running the same
-	// command restores the remainder (already-live messages are skipped).
-	count, err := rdb.RestoreMessagesWithRetry(ctx, params)
+	// command restores the remainder (already-live messages are skipped). With the shared
+	// mailbox config in the context, a deleted mailbox in the shared namespace comes back
+	// as a shared mailbox of the account, as `mailbox create` makes one.
+	restoreCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: cfg.SharedMailboxes})
+	count, err := rdb.RestoreMessagesWithRetry(restoreCtx, params)
 	if err != nil {
 		if count > 0 {
 			return fmt.Errorf("%w; the %d restored message(s) are kept — re-run the same command to restore the rest", err, count)

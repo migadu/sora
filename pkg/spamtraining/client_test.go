@@ -458,9 +458,9 @@ func TestOpenCircuitBreakerSkipsTheFetch(t *testing.T) {
 
 // TestSubmitTrainingDoesNotFollowRedirects: a 3xx answer to the training POST is not
 // an accepted submission. Followed, a 301/302/303 turns the POST into a body-less GET
-// whose 2xx counted as accepted, and a 307/308 replayed the message and the bearer
-// token to the Location. The 3xx itself must be reported as a failure naming the
-// Location.
+// whose 2xx counted as accepted, and a 307/308 replayed the message to the Location
+// (with the bearer token when the Location is the same host or a subdomain). The 3xx
+// itself must be reported as a failure naming the Location.
 func TestSubmitTrainingDoesNotFollowRedirects(t *testing.T) {
 	for _, status := range []int{
 		http.StatusMovedPermanently,
@@ -509,6 +509,45 @@ func TestSubmitTrainingDoesNotFollowRedirects(t *testing.T) {
 			}
 			if n := landingHits.Load(); n != 0 {
 				t.Errorf("Location was requested %d time(s), want 0 (redirects must not be followed)", n)
+			}
+		})
+	}
+}
+
+// TestSubmitTrainingAccepts2xx: a 2xx answer to the training POST is still an accepted
+// submission, so the redirect check does not reject the normal path.
+func TestSubmitTrainingAccepts2xx(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusAccepted, http.StatusNoContent} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var posts atomic.Int32
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost && r.Header.Get("Authorization") == "Bearer training-token" {
+					posts.Add(1)
+				}
+				w.WriteHeader(status)
+			}))
+			defer srv.Close()
+
+			c, err := NewClient(&config.SpamTrainingConfig{
+				Enabled:   true,
+				Endpoint:  srv.URL + "/train",
+				AuthToken: "training-token",
+			})
+			if err != nil {
+				t.Fatalf("NewClient: %v", err)
+			}
+			t.Cleanup(c.Close)
+
+			if err := c.SubmitTraining(context.Background(), &TrainingRequest{
+				Type:      TrainingTypeHam,
+				Message:   "Subject: x\r\n\r\nbody",
+				User:      "user@example.com",
+				Timestamp: time.Now(),
+			}); err != nil {
+				t.Fatalf("SubmitTraining after a %d = %v, want nil", status, err)
+			}
+			if n := posts.Load(); n != 1 {
+				t.Errorf("endpoint received %d authorized POST(s), want 1", n)
 			}
 		})
 	}

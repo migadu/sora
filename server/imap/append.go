@@ -85,6 +85,12 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		metrics.CommandDuration.WithLabelValues("imap", "APPEND").Observe(time.Since(start).Seconds())
 	}
 
+	if imapErr := s.sharedRootDestinationRefusal("APPEND", mboxName); imapErr != nil {
+		s.classifyAndTrackError("APPEND", nil, imapErr)
+		recordMetrics(imapErr)
+		return nil, imapErr
+	}
+
 	// Create a context that signals to use the master DB if the session is pinned.
 	readCtx := ctx
 	if s.useMasterDB.Load() {
@@ -209,6 +215,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// Parse message headers (this does not consume the body)
 	var subject, messageID string
 	var sentDate time.Time
+	var sentDateUnknownZone bool
 	var inReplyTo []string
 	var references []string
 	var actualPlaintextBody string
@@ -218,7 +225,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		mailHeader := mail.Header{Header: messageContent.Header}
 		subject, _ = mailHeader.Subject()
 		messageID, _ = mailHeader.MessageID()
-		sentDate, _ = mailHeader.Date()
+		sentDate, sentDateUnknownZone, _ = helpers.ParseDateHeaderWithZone(mailHeader.Get("Date"))
 		inReplyTo, _ = mailHeader.MsgIDList("In-Reply-To")
 		references, _ = mailHeader.MsgIDList("References")
 
@@ -239,21 +246,16 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		recipients = helpers.ExtractRecipients(messageContent.Header)
 	}
 
-	// RFC 3501 §6.3.11: when the APPEND command supplies an explicit date-time,
-	// that value MUST be used as INTERNALDATE regardless of the message's own
-	// Date: header.  The Date: header value is kept separately as SentDate.
-	internalDate := options.Time // APPEND command date-time (may be zero)
+	// RFC 9051 §6.3.12: "If a date-time is specified, the internal date SHOULD be
+	// set in the resulting message; otherwise, the internal date of the resulting
+	// message is set to the current date and time by default." The Date: header
+	// never sets INTERNALDATE; it is kept separately as SentDate.
+	internalDate := options.Time
 	if internalDate.IsZero() {
-		internalDate = sentDate // fall back to message's Date: header
+		internalDate = time.Now()
 	}
-	if internalDate.IsZero() {
-		internalDate = time.Now() // last-resort: current time
-	}
-	// sentDate is kept as-is (from the message's Date: header) for SentDate.
-	// If the message had no Date: header at all, align SentDate with internalDate.
-	if sentDate.IsZero() {
-		sentDate = internalDate
-	}
+	// sentDate stays zero without a Date: header that parses: the insert stores the
+	// INTERNALDATE as the sent date and the ENVELOPE reports the date as NIL.
 
 	// Extract body structure with panic recovery for malformed messages
 	// Attachment classification reads the raw message separately, so a
@@ -309,7 +311,10 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		// an uploader reading the old one keeps its inode.
 		filePath, err = s.server.uploader.StoreLocally(contentHash, destAccountID, fullMessageBytes)
 		if err != nil {
-			ierr := s.internalError("failed to save message to disk: %v", err)
+			// The error names spool files, which mean nothing to the client: log it
+			// and answer with the cause only.
+			s.WarnLog("failed to save message to disk", "error", err)
+			ierr := s.internalError("failed to save message to disk: %v", helpers.FileErrorCause(err))
 			recordMetrics(ierr)
 			return nil, ierr
 		}
@@ -326,7 +331,8 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		s.DebugLog("message file already exists, skipping write (concurrent APPEND)", "path", expectedPath)
 	} else {
 		// Stat error (permission issue, etc.)
-		ierr := s.internalError("failed to check file existence: %v", err)
+		s.WarnLog("failed to check file existence", "error", err)
+		ierr := s.internalError("failed to check file existence: %v", helpers.FileErrorCause(err))
 		recordMetrics(ierr)
 		return nil, ierr
 	}
@@ -379,26 +385,28 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// attachment from an undecidable or synthetic BODYSTRUCTURE.
 	appendFlags = db.WithAttachmentKeyword(appendFlags, fullMessageBytes, false)
 
+	ownMessagesDone := s.beginOwnMessages(mailbox.ID)
 	_, messageUID, err := s.server.rdb.InsertMessageWithRetry(ctx,
 		&db.InsertMessageOptions{
-			AccountID:     destAccountID,
-			MailboxID:     mailbox.ID,
-			S3Domain:      destS3Domain,
-			S3Localpart:   destS3Localpart,
-			MailboxName:   mailbox.Name,
-			ContentHash:   contentHash,
-			MessageID:     messageID,
-			Flags:         appendFlags,
-			InternalDate:  internalDate, // RFC 3501 §6.3.11: APPEND date-time takes precedence
-			Size:          size,
-			Subject:       subject,
-			PlaintextBody: actualPlaintextBody,
-			SentDate:      sentDate,
-			InReplyTo:     inReplyTo,
-			References:    references,
-			BodyStructure: &bodyStructure,
-			Recipients:    recipients,
-			FTSRetention:  s.server.ftsRetention,
+			AccountID:           destAccountID,
+			MailboxID:           mailbox.ID,
+			S3Domain:            destS3Domain,
+			S3Localpart:         destS3Localpart,
+			MailboxName:         mailbox.Name,
+			ContentHash:         contentHash,
+			MessageID:           messageID,
+			Flags:               appendFlags,
+			InternalDate:        internalDate, // RFC 9051 §6.3.12: APPEND date-time, else now
+			Size:                size,
+			Subject:             subject,
+			PlaintextBody:       actualPlaintextBody,
+			SentDate:            sentDate,
+			SentDateUnknownZone: sentDateUnknownZone,
+			InReplyTo:           inReplyTo,
+			References:          references,
+			BodyStructure:       &bodyStructure,
+			Recipients:          recipients,
+			FTSRetention:        s.server.ftsRetention,
 		},
 		db.PendingUpload{
 			InstanceID:  s.server.instanceID,
@@ -407,6 +415,10 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 			AccountID:   destAccountID,
 		})
 	if err != nil {
+		// A duplicate is answered with the UID of a message this APPEND did
+		// not create, which still gets its NOTIFY MessageNew FETCH.
+		ownMessagesDone()
+
 		// Handle duplicate messages (either pre-detected or from unique constraint violation)
 		if errors.Is(err, consts.ErrMessageExists) || errors.Is(err, consts.ErrDBUniqueViolation) {
 			// For duplicates, NEVER delete the file. This prevents a race condition where:
@@ -441,6 +453,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		recordMetrics(ierr)
 		return nil, ierr
 	}
+	ownMessagesDone(imap.UID(messageUID))
 
 	// Before updating the session state, check if the context is still valid
 	// and then update the session state under mutex protection

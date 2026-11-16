@@ -14,7 +14,7 @@ func (db *Database) ListMessages(ctx context.Context, mailboxID int64) ([]Messag
 			m.id, m.account_id, m.uid, m.mailbox_id, m.content_hash, m.s3_domain, m.s3_localpart, m.uploaded,
 			ms.flags, ms.custom_flags,
 			m.internal_date, m.size, m.created_modseq, ms.updated_modseq, m.expunged_modseq, 0 as seqnum,
-			ms.flags_changed_at, m.subject, m.sent_date, m.message_id, m.in_reply_to, m.recipients_json
+			ms.flags_changed_at, m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown IS TRUE, m.message_id, m.in_reply_to, m.recipients_json
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL

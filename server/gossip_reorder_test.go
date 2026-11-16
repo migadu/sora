@@ -259,7 +259,7 @@ func TestAffinityLocalDeleteIsNotResurrectedByAnOlderSet(t *testing.T) {
 func TestAffinityRetransmissionIsAppliedOnce(t *testing.T) {
 	store := &countingAffinityStore{}
 	am := newTestAffinityManager()
-	am.SetPersistStore(store)
+	am.persistStore = store
 
 	encoded, err := encodeAffinityEvent(AffinityEvent{
 		Type:      AffinityEventSet,

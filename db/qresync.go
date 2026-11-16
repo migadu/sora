@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"slices"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
@@ -27,7 +27,7 @@ func (d *Database) GetVanishedUIDs(ctx context.Context, mailboxID int64, sinceMo
 		ORDER BY uid
 	`
 
-	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, sinceModSeq, untilModSeq)
+	rows, err := d.readQuerier(ctx).Query(ctx, query, mailboxID, sinceModSeq, untilModSeq)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query vanished UIDs: %w", err)
 	}
@@ -68,9 +68,17 @@ type QResyncModifiedMessage struct {
 // - Had flags changed after sinceModSeq (updated_modseq > sinceModSeq)
 // - Are NOT expunged (expunged_at IS NULL)
 //
+// In a view (WithSeqView) the changes are those of the mailbox as it stood at the view's
+// modseq, numbered in that view: its messages, the ones it still holds although they have
+// since been expunged included (heldExpungedCond), whose last change is after sinceModSeq
+// and no later than the view. A SELECT sends EXISTS and HIGHESTMODSEQ for the view, so a
+// message created later would be numbered past EXISTS, and a later change cannot be
+// reported in the state it had then. Both are left to the session's next poll, which
+// reports what changed since the view.
+//
 // The query uses idx_messages_created_modseq and idx_messages_updated_modseq indexes.
 func (d *Database) GetMessagesChangedSince(ctx context.Context, mailboxID int64, sinceModSeq uint64) ([]QResyncModifiedMessage, error) {
-	query := `
+	const changed = `
 		SELECT
 			m.id,
 			m.uid,
@@ -81,12 +89,19 @@ func (d *Database) GetMessagesChangedSince(ctx context.Context, mailboxID int64,
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1
-		  AND m.expunged_at IS NULL
-		  AND (m.created_modseq > $2 OR COALESCE(ms.updated_modseq, 0) > $2)
-		ORDER BY m.uid
-	`
+		  AND (m.created_modseq > $2 OR COALESCE(ms.updated_modseq, 0) > $2)`
+	query := changed + ` AND m.expunged_at IS NULL`
+	args := []any{mailboxID, sinceModSeq}
+	if view := seqViewOf(ctx); view > 0 {
+		// The held messages are few (expunged after the view), so they are read by a
+		// branch of their own that leaves the live one on the live-message indexes.
+		args = append(args, int64(view))
+		bound := ` AND GREATEST(m.created_modseq, COALESCE(ms.updated_modseq, 0)) <= $3`
+		query += bound + ` UNION ALL ` + changed + ` AND ` + heldExpungedCond("m", "$3") + bound
+	}
+	query += ` ORDER BY uid`
 
-	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, mailboxID, sinceModSeq)
+	rows, err := d.readQuerier(ctx).Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query changed messages: %w", err)
 	}
@@ -128,6 +143,7 @@ func (d *Database) GetMessagesChangedSince(ctx context.Context, mailboxID int64,
 	}
 
 	// Hydrate dynamic sequence numbers in-memory using optimized gap cumulative SUM trick
+	// (in ctx's view, if it has one).
 	if err := hydrateSequencesCore(ctx, d, mailboxID, messages,
 		func(m *QResyncModifiedMessage) uint32 { return uint32(m.UID) },
 		func(m *QResyncModifiedMessage, seq uint32) { m.SeqNum = seq },
@@ -215,39 +231,43 @@ func (d *Database) ValidateQResyncUIDValidityWithRetry(ctx context.Context, mail
 	return d.ValidateQResyncUIDValidity(ctx, mailboxID, clientUIDValidity)
 }
 
-// GetActiveUIDsInSet returns the active (non-expunged) UIDs in the mailbox that fall within the given UIDSet.
-// This is used for QRESYNC SELECT to efficiently check which of the client's known UIDs are still active.
+// GetActiveUIDsInSet returns the active (non-expunged) UIDs in the mailbox that fall within the given UIDSet,
+// in ascending order. This is used for QRESYNC SELECT to efficiently check which of the client's known UIDs are still active.
+// In a view (WithSeqView) the messages the view still holds although they have since been
+// expunged are active too: the SELECT counts them in EXISTS, and the session's next poll
+// reports their expunge.
+//
+// uidSet is a static set (QRESYNC known-uids cannot hold "*", RFC 7162 §7). Its ranges
+// are sent as two arrays, so the statement is the same however many ranges a client
+// sends, and each range is one index range scan of the mailbox's UIDs.
 func (d *Database) GetActiveUIDsInSet(ctx context.Context, mailboxID int64, uidSet imap.UIDSet) ([]imap.UID, error) {
 	if len(uidSet) == 0 {
 		return nil, nil
 	}
 
-	var conditions []string
-	var args []any
-	args = append(args, mailboxID)
-
-	for _, uidRange := range uidSet {
-		if uidRange.Stop == imap.UID(0) || uidRange.Start == uidRange.Stop {
-			args = append(args, int64(uidRange.Start))
-			conditions = append(conditions, fmt.Sprintf("uid = $%d", len(args)))
-		} else {
-			args = append(args, int64(uidRange.Start), int64(uidRange.Stop))
-			conditions = append(conditions, fmt.Sprintf("(uid >= $%d AND uid <= $%d)", len(args)-1, len(args)))
-		}
+	starts := make([]int64, len(uidSet))
+	stops := make([]int64, len(uidSet))
+	for i, r := range uidSet {
+		starts[i], stops[i] = int64(r.Start), int64(r.Stop)
 	}
+	args := []any{mailboxID, starts, stops}
 
-	whereClause := strings.Join(conditions, " OR ")
+	viewParam := ""
+	if view := seqViewOf(ctx); view > 0 {
+		args = append(args, int64(view))
+		viewParam = fmt.Sprintf("$%d", len(args))
+	}
+	// The ORDER BY inside the lateral subquery makes the (mailbox_id, uid) index, which
+	// returns a range in order, the plan for every range, and keeps the subquery from
+	// being flattened into a join. Without it a mailbox the planner underestimates (one
+	// that has grown since the last ANALYZE) was read whole once per range. There is no
+	// ORDER BY over the result: the database would sort every UID found, on each SELECT.
+	query := `SELECT counted.uid FROM unnest($2::bigint[], $3::bigint[]) AS known(lo, hi)
+		CROSS JOIN LATERAL (SELECT uid FROM ` +
+		seqCountedRows("$1", viewParam, "uid BETWEEN known.lo AND known.hi", "ASC", "") +
+		` c ORDER BY uid) counted`
 
-	query := fmt.Sprintf(`
-		SELECT uid
-		FROM messages
-		WHERE mailbox_id = $1
-		  AND expunged_at IS NULL
-		  AND (%s)
-		ORDER BY uid
-	`, whereClause)
-
-	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, query, args...)
+	rows, err := d.readQuerier(ctx).Query(ctx, query, args...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query active UIDs in set: %w", err)
 	}
@@ -266,7 +286,11 @@ func (d *Database) GetActiveUIDsInSet(ctx context.Context, mailboxID int64, uidS
 		return nil, fmt.Errorf("error iterating active UIDs in set: %w", err)
 	}
 
-	return uids, nil
+	// The ranges come in the set's order, ascending and disjoint as the parser builds
+	// them, so the UIDs already are sorted and this is one linear pass. A hand-built
+	// set may overlap or be out of order.
+	slices.Sort(uids)
+	return slices.Compact(uids), nil
 }
 
 func (d *Database) GetActiveUIDsInSetWithRetry(ctx context.Context, mailboxID int64, uidSet imap.UIDSet) ([]imap.UID, error) {

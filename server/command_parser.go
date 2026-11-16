@@ -32,7 +32,7 @@ func ParseLine(line string, hasTag bool) (tag, command string, args []string, er
 		return tag, "", nil, nil
 	}
 	parts := strings.SplitN(rem, " ", 2)
-	command = strings.ToUpper(parts[0])
+	command = ToUpperASCII(parts[0])
 	if len(parts) < 2 {
 		return tag, command, nil, nil // Tag and command, no args
 	}
@@ -92,6 +92,50 @@ func ParseLine(line string, hasTag bool) (tag, command string, args []string, er
 	}
 
 	return tag, command, args, nil
+}
+
+// ToUpperASCII returns s with its ASCII letters upper-cased and every other byte
+// unchanged. Protocol keywords are case-insensitive over US-ASCII only ("ABNF
+// strings are case insensitive and the character set for these strings is
+// US-ASCII", RFC 5234 section 2.3); strings.ToUpper would also map U+0131
+// (LATIN SMALL LETTER DOTLESS I) to "I" and U+017F (LATIN SMALL LETTER LONG S)
+// to "S", turning a look-alike such as "CAPABıLITY" into a keyword.
+func ToUpperASCII(s string) string {
+	for i := 0; i < len(s); i++ {
+		if 'a' <= s[i] && s[i] <= 'z' {
+			b := []byte(s)
+			for j := i; j < len(b); j++ {
+				if 'a' <= b[j] && b[j] <= 'z' {
+					b[j] -= 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return s
+}
+
+// EqualFoldASCII reports whether s and t are equal when ASCII letters are compared
+// case-insensitively and every other byte exactly. Unlike strings.EqualFold it does
+// not take U+017F (LATIN SMALL LETTER LONG S) for "s" or U+212A (KELVIN SIGN) for
+// "k"; see ToUpperASCII.
+func EqualFoldASCII(s, t string) bool {
+	if len(s) != len(t) {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		a, b := s[i], t[i]
+		if 'a' <= a && a <= 'z' {
+			a -= 'a' - 'A'
+		}
+		if 'a' <= b && b <= 'z' {
+			b -= 'a' - 'A'
+		}
+		if a != b {
+			return false
+		}
+	}
+	return true
 }
 
 // UnquoteString removes surrounding double quotes from a string if present

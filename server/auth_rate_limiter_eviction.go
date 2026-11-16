@@ -5,8 +5,9 @@ import (
 	"time"
 )
 
-// counterSlot is embedded in every failure counter of the auth rate limiter: the key the
-// counter is stored under in its table, and its position in the eviction queue holding it.
+// counterSlot is embedded in every failure counter and IP+username block of the auth
+// rate limiter: the key the entry is stored under in its table, and its position in the
+// eviction queue holding it.
 type counterSlot struct {
 	key   string
 	index int
@@ -14,7 +15,7 @@ type counterSlot struct {
 
 func (s *counterSlot) slot() *counterSlot { return s }
 
-// queuedCounter is a failure counter held in an evictionQueue.
+// queuedCounter is a failure counter or IP+username block held in an evictionQueue.
 type queuedCounter interface {
 	slot() *counterSlot
 	evictionTime() time.Time // the queue's order, earliest first
@@ -23,7 +24,8 @@ type queuedCounter interface {
 // evictionQueue holds the counters of a tracking table in a binary min-heap on their
 // evictionTime, so that the counter a full table gives up is at the root: found in O(1)
 // and removed in O(log n). Searching the table for it cost O(n) under the table's write
-// lock, on every failure that added a key to a full table (#719).
+// lock, on every failure that added a key to a full table (#719). The IP+username blocks
+// are queued the same way by their end (#792).
 //
 // The zero value is an empty queue. Callers hold the table's write lock.
 type evictionQueue[T queuedCounter] []T

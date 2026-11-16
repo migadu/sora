@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
@@ -51,11 +52,41 @@ func classifyStoredBody(content []byte, keyHash string) (storedBodyKind, string)
 	return storedBodyMismatch, blake3
 }
 
+// contextObjectStorage is implemented by *storage.S3Storage so S3 requests stop when the
+// command or S3 object lock context is canceled. Test doubles that only implement
+// objectStorage fall back to checking ctx.Err() before the call.
+type contextObjectStorage interface {
+	GetContext(ctx context.Context, key string) (io.ReadCloser, error)
+	PutContext(ctx context.Context, key string, body io.Reader, size int64) error
+	DeleteContext(ctx context.Context, key string) error
+}
+
+var _ contextObjectStorage = (*storage.S3Storage)(nil)
+
 // readStoredBody downloads (and, with client-side encryption, decrypts) a whole object.
 func readStoredBody(store interface {
 	Get(key string) (io.ReadCloser, error)
 }, key string) ([]byte, error) {
-	reader, err := store.Get(key)
+	return readStoredBodyContext(context.Background(), store, key)
+}
+
+func readStoredBodyContext(ctx context.Context, store interface {
+	Get(key string) (io.ReadCloser, error)
+}, key string) ([]byte, error) {
+	var (
+		reader io.ReadCloser
+		err    error
+	)
+	if cs, ok := store.(interface {
+		GetContext(ctx context.Context, key string) (io.ReadCloser, error)
+	}); ok {
+		reader, err = cs.GetContext(ctx, key)
+	} else {
+		if err := ctx.Err(); err != nil {
+			return nil, fmt.Errorf("download/decrypt failed: %w", err)
+		}
+		reader, err = store.Get(key)
+	}
 	if err != nil {
 		return nil, fmt.Errorf("download/decrypt failed: %w", err)
 	}
@@ -67,9 +98,35 @@ func readStoredBody(store interface {
 	return content, nil
 }
 
+func putStoredBody(ctx context.Context, store objectStorage, key string, body io.Reader, size int64) error {
+	if cs, ok := store.(interface {
+		PutContext(ctx context.Context, key string, body io.Reader, size int64) error
+	}); ok {
+		return cs.PutContext(ctx, key, body, size)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return store.Put(key, body, size)
+}
+
+func deleteStoredBody(ctx context.Context, store objectStorage, key string) error {
+	if cs, ok := store.(interface {
+		DeleteContext(ctx context.Context, key string) error
+	}); ok {
+		return cs.DeleteContext(ctx, key)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return store.Delete(key)
+}
+
 // rekeyOldObjectDelay is how long the old object of a re-keyed body is kept before it is
-// deleted. A transaction that read a message row before the re-key committed can still write
-// a row with the old hash afterwards: COPY inserts its rows with INSERT ... SELECT, which takes
+// deleted. COPY and MOVE copy a source row's hash under the account's rekey lock (see
+// db.RekeyContentHash), so on a server that takes it no copy of the account's rows can write
+// the old hash once the re-key has committed. A server still running an older build, as during
+// a rolling upgrade, can: its COPY inserts its rows with INSERT ... SELECT, which takes
 // content_hash from its snapshot without waiting for row locks. Server write transactions are
 // bounded by the database write_timeout (10 to 15 seconds by default), so after this delay
 // every row that will ever carry the old hash has committed, and the reference check that
@@ -86,12 +143,13 @@ func oldObjectDelayFor(writeTimeout time.Duration) time.Duration {
 }
 
 type rekeyOptions struct {
-	DryRun           bool
-	DeleteOldObjects bool // Opt-in only after all mail nodes and readers have drained.
-	BatchSize        int
-	Jobs             int
-	StartAfter       db.ContentObject // resume after this object; the zero value starts at the beginning
-	Progress         io.Writer        // per-batch progress lines; nil for none
+	DryRun               bool
+	BodyDeletionProtocol string // Operator acknowledgement of the drained global body-lock cutover.
+	DeleteOldObjects     bool   // Opt-in only after all mail nodes and readers have drained.
+	BatchSize            int
+	Jobs                 int
+	StartAfter           db.ContentObject // resume after this object; the zero value starts at the beginning
+	Progress             io.Writer        // per-batch progress lines; nil for none
 }
 
 // rekeyReport is what a run found and did. Lists hold S3 keys, with the error where there
@@ -123,8 +181,15 @@ type rekeyedObject struct {
 	committed time.Time
 }
 
+type rekeyDB interface {
+	PendingUploadExistsWithRetry(ctx context.Context, contentHash string, accountID int64) (bool, error)
+	ExecuteWithS3ObjectLock(ctx context.Context, contentHash string, accountID int64, executionFunc func(ctx context.Context) error) error
+	RekeyContentHashWithRetry(ctx context.Context, accountID int64, obj db.ContentObject, newHash string) (int64, error)
+	IsContentObjectReferencedWithRetry(ctx context.Context, obj db.ContentObject) (bool, error)
+}
+
 type rekeyRun struct {
-	rdb       *resilient.ResilientDatabase
+	rdb       rekeyDB
 	store     objectStorage
 	accountID int64
 	opts      rekeyOptions
@@ -154,6 +219,11 @@ type rekeyRun struct {
 // Every step is idempotent, so a failed or interrupted run is repaired by running again.
 // The report is returned even with an error.
 func rekeyAccount(ctx context.Context, rdb *resilient.ResilientDatabase, store objectStorage, accountID int64, opts rekeyOptions) (*rekeyReport, error) {
+	if opts.DeleteOldObjects && !opts.DryRun {
+		if err := (&config.S3Config{BodyDeletionProtocol: opts.BodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+			return &rekeyReport{Cursor: opts.StartAfter}, err
+		}
+	}
 	if opts.BatchSize <= 0 {
 		opts.BatchSize = 100
 	}
@@ -242,8 +312,11 @@ dispatch:
 }
 
 func (r *rekeyRun) processObject(ctx context.Context, obj db.ContentObject) {
-	content, err := readStoredBody(r.store, obj.Key())
+	content, err := readStoredBodyContext(ctx, r.store, obj.Key())
 	if err != nil {
+		if ctx.Err() != nil {
+			return
+		}
 		r.mu.Lock()
 		r.report.Unreadable = append(r.report.Unreadable, fmt.Sprintf("%s: %v", obj.Key(), err))
 		r.mu.Unlock()
@@ -316,13 +389,16 @@ func (r *rekeyRun) moveBody(ctx context.Context, obj, newObj db.ContentObject, c
 	err = r.rdb.ExecuteWithS3ObjectLock(ctx, newObj.ContentHash, r.accountID, func(ctx context.Context) error {
 		// An object already under the new key is reused only if it holds the body.
 		// The old object stays unless deletion was requested for drained mail nodes.
-		if existing, err := readStoredBody(r.store, newObj.Key()); err != nil || helpers.HashContent(existing) != newObj.ContentHash {
-			if err := r.store.Put(newObj.Key(), bytes.NewReader(content), int64(len(content))); err != nil {
+		existing, err := readStoredBodyContext(ctx, r.store, newObj.Key())
+		if err != nil && ctx.Err() != nil {
+			return err
+		}
+		if err != nil || helpers.HashContent(existing) != newObj.ContentHash {
+			if err := putStoredBody(ctx, r.store, newObj.Key(), bytes.NewReader(content), int64(len(content))); err != nil {
 				return fmt.Errorf("failed to write %s: %w", newObj.Key(), err)
 			}
 			wrote = true
 		}
-		var err error
 		rows, err = r.rdb.RekeyContentHashWithRetry(ctx, r.accountID, obj, newObj.ContentHash)
 		return err
 	})
@@ -357,25 +433,36 @@ func (r *rekeyRun) deleteOldObjects(ctx context.Context, wait bool) {
 	r.oldObjects = waiting
 }
 
-// deleteOldObject deletes old if nothing references it, holding its S3 object lock across
-// the check and the delete as the cleaner does, so a restore or cross-account COPY that
-// claims the body in between is either seen or waits.
+// deleteOldObject deletes old if nothing references it, holding the S3 advisory lock
+// keyed by old.ContentHash across the check and delete, as the cleaner does.
+// Restore, COPY/MOVE and upload gates of every account meet on this lock.
 func (r *rekeyRun) deleteOldObject(ctx context.Context, old db.ContentObject) {
-	var referenced bool
+	if err := (&config.S3Config{BodyDeletionProtocol: r.opts.BodyDeletionProtocol}).RequireBodyDeletionProtocol(); err != nil {
+		r.report.OldLeft = append(r.report.OldLeft, old.Key()+": "+err.Error())
+		return
+	}
+	var referenced, deleted bool
 	err := r.rdb.ExecuteWithS3ObjectLock(ctx, old.ContentHash, r.accountID, func(ctx context.Context) error {
 		var err error
 		if referenced, err = r.rdb.IsContentObjectReferencedWithRetry(ctx, old); err != nil || referenced {
 			return err
 		}
-		return r.store.Delete(old.Key())
+		if err := deleteStoredBody(ctx, r.store, old.Key()); err != nil {
+			return err
+		}
+		deleted = true
+		return nil
 	})
+	if deleted {
+		r.report.OldDeleted++
+	}
 	switch {
-	case err != nil:
-		r.report.OldLeft = append(r.report.OldLeft, fmt.Sprintf("%s: %v", old.Key(), err))
+	case err != nil && deleted:
+		r.report.Failed = append(r.report.Failed, fmt.Sprintf("%s: %v", old.Key(), err))
 	case referenced:
 		r.report.OldKept = append(r.report.OldKept, old.Key())
-	default:
-		r.report.OldDeleted++
+	case err != nil:
+		r.report.OldLeft = append(r.report.OldLeft, fmt.Sprintf("%s: %v", old.Key(), err))
 	}
 }
 
@@ -516,12 +603,13 @@ Examples:
 	}
 	start := time.Now()
 	report, runErr := rekeyAccount(ctx, rdb, s3, accountID, rekeyOptions{
-		DryRun:           *dryRun,
-		DeleteOldObjects: *deleteOld,
-		BatchSize:        *batchSize,
-		Jobs:             *jobs,
-		StartAfter:       cursor,
-		Progress:         os.Stdout,
+		DryRun:               *dryRun,
+		DeleteOldObjects:     *deleteOld,
+		BodyDeletionProtocol: globalConfig.S3.BodyDeletionProtocol,
+		BatchSize:            *batchSize,
+		Jobs:                 *jobs,
+		StartAfter:           cursor,
+		Progress:             os.Stdout,
 	})
 	printRekeyReport(report, *email, *dryRun, time.Since(start))
 	if runErr != nil {

@@ -24,6 +24,12 @@ func (rd *ResilientDatabase) TryAcquireNamedLockWithRetry(ctx context.Context, n
 	return rd.getOperationalDatabaseForOperation(ctx, true).TryAcquireNamedLock(ctx, name, ttl)
 }
 
+// ExtendNamedLockWithRetry moves a held lock's expiry forward, reporting false when the
+// lock is no longer the caller's. Despite the name it does not retry; see above.
+func (rd *ResilientDatabase) ExtendNamedLockWithRetry(ctx context.Context, lock *db.NamedLock, ttl time.Duration) (bool, error) {
+	return rd.getOperationalDatabaseForOperation(ctx, true).ExtendNamedLock(ctx, lock, ttl)
+}
+
 // ReleaseNamedLockWithRetry hands a held lock back before its expiry.
 func (rd *ResilientDatabase) ReleaseNamedLockWithRetry(ctx context.Context, lock *db.NamedLock) error {
 	return rd.getOperationalDatabaseForOperation(ctx, true).ReleaseNamedLock(ctx, lock)

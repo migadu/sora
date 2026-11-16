@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -21,9 +22,19 @@ func insertDeliveredMessage(t *testing.T, db *Database, accountID, mailboxID int
 	require.NoError(t, err)
 	defer tx.Rollback(ctx)
 
+	insertDeliveredMessageTx(t, db, tx, accountID, mailboxID, mailboxName, contentHash, instanceID, uid)
+	require.NoError(t, tx.Commit(ctx))
+}
+
+// insertDeliveredMessageTx is insertDeliveredMessage inside the caller's transaction,
+// which it leaves open.
+func insertDeliveredMessageTx(t *testing.T, db *Database, tx pgx.Tx, accountID, mailboxID int64, mailboxName, contentHash, instanceID string, uid uint32) {
+	t.Helper()
+
+	ctx := context.Background()
 	var bs imap.BodyStructure = &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 1024}
 	now := time.Now()
-	_, _, err = db.InsertMessage(ctx, tx, &InsertMessageOptions{
+	_, _, err := db.InsertMessage(ctx, tx, &InsertMessageOptions{
 		AccountID:     accountID,
 		MailboxID:     mailboxID,
 		MailboxName:   mailboxName,
@@ -43,7 +54,6 @@ func insertDeliveredMessage(t *testing.T, db *Database, accountID, mailboxID int
 		AccountID:   accountID,
 	})
 	require.NoError(t, err)
-	require.NoError(t, tx.Commit(ctx))
 }
 
 // TestInsertMessageReArmsExhaustedPendingUpload proves that a fresh delivery revives an

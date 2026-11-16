@@ -6,9 +6,10 @@ import (
 	"github.com/migadu/go-imap"
 )
 
-// A session retains the last body section it fully extracted so that a client pulling
-// one part in <offset.size> chunks does not reload the message and re-extract the part
-// for every chunk. The retention is bounded three ways:
+// A session retains the last body section it fully extracted, or BINARY section it
+// fully decoded, so that a client pulling one part in <offset.size> chunks does not
+// reload the message and re-extract or re-decode the part for every chunk. The
+// retention is bounded three ways:
 //
 //   - one section per session, dropped as soon as another section is retained, the
 //     mailbox selection is cleared, or the client goes into IDLE;
@@ -17,21 +18,52 @@ import (
 //
 // The retained bytes are charged to the session memory tracker for as long as they are
 // held, and memoryAvailable gives them back rather than let them starve a later fetch.
+// The key held beside them is charged to neither budget, so it is bounded on its own:
+// a section asked for with more than maxCachedHeaderListBytes of header names is
+// answered but not retained.
 const (
 	maxCachedBodySectionBytes      = 8 << 20
 	maxServerBodySectionCacheBytes = 256 << 20
+	maxCachedHeaderListBytes       = 1024
 )
 
 // bodySectionCacheKey identifies a body section independently of its <offset.size>
-// slice, so successive chunk requests for the same section share one entry. It returns
-// an empty key for a message without a content hash, which disables the cache: without
-// the hash there is nothing that ties the retained bytes to the message.
+// slice, so successive chunk requests for the same section share one entry. The
+// HEADER.FIELDS and HEADER.FIELDS.NOT names come off the wire as astrings and may hold a
+// space, '|' or ']', so each name is quoted and each list labelled: no two different
+// lists share a key. It returns an empty key, which disables the cache, for a message
+// without a content hash, as without the hash there is nothing that ties the retained
+// bytes to the message, and for header lists past maxCachedHeaderListBytes: each name
+// may be a literal the command length limit does not count, and quoting writes a
+// control byte as four.
 func bodySectionCacheKey(contentHash string, section *imap.FetchItemBodySection) string {
+	if contentHash == "" ||
+		headerListBytes(section.HeaderFields)+headerListBytes(section.HeaderFieldsNot) > maxCachedHeaderListBytes {
+		return ""
+	}
+	return fmt.Sprintf("%s|%s|%v|fields=%q|not=%q", contentHash, section.Specifier, section.Part,
+		section.HeaderFields, section.HeaderFieldsNot)
+}
+
+// headerListBytes is the length of the names in a header list, counting a separator for
+// each name so that a list of empty names is not free.
+func headerListBytes(names []string) int {
+	n := len(names)
+	for _, name := range names {
+		n += len(name)
+	}
+	return n
+}
+
+// binarySectionCacheKey identifies the decoded BINARY section of a part, which shares
+// the one retained section with BODY: "BINARY" is no BODY section specifier, so the
+// keys of the two never meet. Like bodySectionCacheKey it is empty without a content
+// hash.
+func binarySectionCacheKey(contentHash string, part []int) string {
 	if contentHash == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s|%s|%v|%v|%v", contentHash, section.Specifier, section.Part,
-		section.HeaderFields, section.HeaderFieldsNot)
+	return fmt.Sprintf("%s|BINARY|%v", contentHash, part)
 }
 
 // cachedBodySection returns the retained section for key, or nil.

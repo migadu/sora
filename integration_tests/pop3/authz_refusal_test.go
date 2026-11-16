@@ -76,4 +76,17 @@ func TestPOP3_AuthzIDRefusalNeedsCredentials(t *testing.T) {
 			}
 		})
 	}
+
+	// The same holds for the master username form "user@domain@MASTER_USERNAME": the
+	// master username with a wrong master password got the bad-credential reply, any
+	// other suffix the authorization refusal before its password was checked.
+	t.Run("master_username_not_told_apart", func(t *testing.T) {
+		masterUser := fmt.Sprintf("masteruser-%d", n)
+		addr := startPOP3WithMasterUsername(t, rdb, rateLimit, masterUser, "master_secret_pw")
+		master := pop3AuthPlain(t, addr, victim.Email, account.Email+"@"+masterUser, "wrong")
+		other := pop3AuthPlain(t, addr, victim.Email, account.Email+"@"+fmt.Sprintf("notmaster-%d", n), "wrong")
+		if master != badCredential || other != badCredential {
+			t.Fatalf("wrong password asking to act as another user must get the bad-credential reply %q whatever the master username suffix:\n  master username: %q\n  other suffix:    %q", badCredential, master, other)
+		}
+	})
 }

@@ -193,3 +193,15 @@ func upperASCII(s string) string {
 	}
 	return string(b)
 }
+
+// lowerASCII lower-cases the ASCII letters of s only (strings.ToLower also maps
+// U+0130 to "i" and U+212A KELVIN SIGN to "k").
+func lowerASCII(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}

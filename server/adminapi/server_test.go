@@ -96,30 +96,35 @@ func TestAuthMiddleware(t *testing.T) {
 		authHeader           string
 		expectedStatus       int
 		expectedBodyContains string
+		expectedChallenge    string
 	}{
 		{
 			name:                 "no auth header",
 			authHeader:           "",
 			expectedStatus:       http.StatusUnauthorized,
 			expectedBodyContains: "Authorization header required",
+			expectedChallenge:    `Bearer realm="admin-api"`,
 		},
 		{
 			name:                 "invalid auth format",
 			authHeader:           "InvalidFormat",
 			expectedStatus:       http.StatusUnauthorized,
 			expectedBodyContains: "Authorization header must be 'Bearer",
+			expectedChallenge:    `Bearer realm="admin-api"`,
 		},
 		{
 			name:                 "wrong auth type",
 			authHeader:           "Basic dGVzdA==",
 			expectedStatus:       http.StatusUnauthorized,
 			expectedBodyContains: "Authorization header must be 'Bearer",
+			expectedChallenge:    `Bearer realm="admin-api"`,
 		},
 		{
 			name:                 "invalid API key",
 			authHeader:           "Bearer wrong-key",
-			expectedStatus:       http.StatusForbidden,
+			expectedStatus:       http.StatusUnauthorized,
 			expectedBodyContains: "Invalid API key",
+			expectedChallenge:    `Bearer realm="admin-api", error="invalid_token"`,
 		},
 		{
 			name:                 "valid API key",
@@ -152,6 +157,17 @@ func TestAuthMiddleware(t *testing.T) {
 
 			if !strings.Contains(rr.Body.String(), tt.expectedBodyContains) {
 				t.Errorf("authMiddleware() body = %v, want to contain %v", rr.Body.String(), tt.expectedBodyContains)
+			}
+
+			// RFC 9110 section 15.5.2: "The server generating a 401 response MUST send a
+			// WWW-Authenticate header field (Section 11.6.1) containing at least one
+			// challenge applicable to the target resource." A request without a bearer
+			// token gets no error code; a wrong key is "invalid_token" (RFC 6750
+			// section 3.1).
+			if tt.expectedStatus == http.StatusUnauthorized {
+				if got := rr.Header().Values("WWW-Authenticate"); len(got) != 1 || got[0] != tt.expectedChallenge {
+					t.Errorf("authMiddleware() WWW-Authenticate = %q, want %q", got, tt.expectedChallenge)
+				}
 			}
 		})
 	}
