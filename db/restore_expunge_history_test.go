@@ -2,7 +2,9 @@ package db
 
 import (
 	"context"
+	"fmt"
 	"testing"
+	"time"
 
 	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/require"
@@ -121,4 +123,47 @@ func TestRestoreMessages_KeepsTheExpungeOfTheOldUID(t *testing.T) {
 			inboxID, contentHash).Scan(&live))
 		require.Equal(t, 1, live)
 	})
+}
+
+// A restore creates a new row, as COPY and MOVE do, so [cleanup] max_age_restriction
+// (ExpungeOldMessages, which ages a message by messages.created_at) counts the restored
+// message from the restore. Restored in place, the row kept its original created_at, and
+// a message older than the restriction was expunged again by the next cleanup cycle.
+func TestRestoreMessages_RestoredMessageStartsANewAgeClock(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID, testEmail, inboxID, _ := setupRestoreTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
+	messageID := fmt.Sprintf("<age-clock-%d@example.com>", time.Now().UnixNano())
+	id := insertTestMessage(t, db, accountID, inboxID, "INBOX", "Old", messageID)
+	var uid imap.UID
+	require.NoError(t, db.GetReadPool().QueryRow(ctx,
+		`UPDATE messages SET created_at = now() - interval '20 years' WHERE id = $1 RETURNING uid`, id).Scan(&uid))
+	expungeMessage(t, db, inboxID, uid)
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	n, err := db.RestoreMessages(ctx, tx, RestoreMessagesParams{Email: testEmail, MessageIDs: []int64{id}})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n)
+	require.NoError(t, tx.Commit(ctx))
+
+	// Only rows created more than ten years ago are old enough, which is this test's alone.
+	tx, err = db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	_, err = db.ExpungeOldMessages(ctx, tx, 10*365*24*time.Hour)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+
+	var live int
+	require.NoError(t, db.GetReadPool().QueryRow(ctx,
+		`SELECT COUNT(*) FROM messages WHERE mailbox_id = $1 AND message_id = $2 AND expunged_at IS NULL`,
+		inboxID, messageID).Scan(&live))
+	require.Equal(t, 1, live, "the restored message must not be expunged as older than max_age_restriction")
 }
