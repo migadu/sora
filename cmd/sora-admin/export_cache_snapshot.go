@@ -16,7 +16,10 @@ import (
 const exportSnapshotHelperArg = "--internal-export-cache-snapshot"
 const exportSnapshotHelperEnv = "SORA_INTERNAL_EXPORT_CACHE_SNAPSHOT"
 
-type exportSnapshotRequest struct{ Source, Destination string }
+// exportSnapshotRequest names the private directory the helper copies the cache into.
+// The directory the cache is in reaches the helper as its first extra file
+// (exportSnapshotDirFD), the root the dry run checked, so no path is resolved again.
+type exportSnapshotRequest struct{ Destination string }
 
 // The helper has a separate POSIX lock owner from every SQLite connection in the
 // caller. Closing another descriptor for the same inode cannot release its lock.
@@ -40,8 +43,13 @@ func init() {
 // Source is never opened by SQLite: even a query-only/read-only connection may
 // recover/checkpoint WAL or create/change/remove its sidecars. Only the private
 // DB+WAL copy is opened; SQLite rebuilds SHM there. A live/unsafe source fails.
-func openExportCacheForDryRun(ctx context.Context, dbPath string) (_ *sql.DB, privateDir string, retErr error) {
-	info, err := os.Lstat(dbPath)
+//
+// The cache is the one in root, the directory the dry run checked
+// (openExportPreviewRoot): the helper gets root's descriptor, so the owner of a
+// directory on the way cannot make it copy another directory's cache meanwhile.
+func openExportCacheForDryRun(ctx context.Context, root *os.Root) (_ *sql.DB, privateDir string, retErr error) {
+	dbPath := filepath.Join(root.Name(), maildirCacheName)
+	info, err := root.Lstat(maildirCacheName)
 	if os.IsNotExist(err) {
 		return nil, "", nil
 	}
@@ -51,6 +59,11 @@ func openExportCacheForDryRun(ctx context.Context, dbPath string) (_ *sql.DB, pr
 	if !info.Mode().IsRegular() {
 		return nil, "", fmt.Errorf("dry-run cache must be a regular file: %s", dbPath)
 	}
+	dir, err := root.Open(".")
+	if err != nil {
+		return nil, "", fmt.Errorf("open dry-run cache directory: %w", err)
+	}
+	defer dir.Close()
 	privateDir, err = os.MkdirTemp("", "sora-export-preview-")
 	if err != nil {
 		return nil, "", fmt.Errorf("create private cache snapshot: %w", err)
@@ -64,7 +77,7 @@ func openExportCacheForDryRun(ctx context.Context, dbPath string) (_ *sql.DB, pr
 	if err != nil {
 		return nil, privateDir, err
 	}
-	req, err := json.Marshal(exportSnapshotRequest{Source: dbPath, Destination: privateDir})
+	req, err := json.Marshal(exportSnapshotRequest{Destination: privateDir})
 	if err != nil {
 		return nil, privateDir, err
 	}
@@ -76,6 +89,7 @@ func openExportCacheForDryRun(ctx context.Context, dbPath string) (_ *sql.DB, pr
 	}
 	cmd.Env = append(cmd.Env, exportSnapshotHelperEnv+"=1")
 	cmd.Stdin = strings.NewReader(string(req))
+	cmd.ExtraFiles = []*os.File{dir} // exportSnapshotDirFD
 	if output, err := cmd.CombinedOutput(); err != nil {
 		if ctx.Err() != nil {
 			return nil, privateDir, ctx.Err()

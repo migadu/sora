@@ -15,6 +15,7 @@ import (
 	"syscall"
 
 	"github.com/migadu/sora/pkg/sqlitefile"
+	"golang.org/x/sys/unix"
 	"modernc.org/sqlite"
 )
 
@@ -39,24 +40,26 @@ var hardLinksProtected = func() bool {
 	return err == nil && strings.TrimSpace(string(setting)) == "1"
 }
 
-// openMaildirCache opens sora-maildir.db in dir (the maildir of an import, the
-// destination of an export), creating it if it is missing. dir is the operator's
-// choice, but its owner may be able to write in it, and import and export often run
-// as root. SQLite follows a symbolic link at the database's name, creates or writes
-// the file it names, and keeps the -wal, -shm and -journal files next to that file,
-// so the owner could have the cache created or written anywhere (#1606). The cache
-// and those three files must be regular files where they exist, and anything else is
-// refused, naming it.
+// openMaildirCache opens sora-maildir.db in the directory root (the maildir of an
+// import, the destination of an export), creating it if it is missing. root must have
+// been opened by a name with no symbolic link in it (root.Name()), which names the
+// files in errors. The directory is the operator's choice, but its owner may be able
+// to write in it, and import and export often run as root. SQLite follows a symbolic
+// link at the database's name, creates or writes the file it names, and keeps the
+// -wal, -shm and -journal files next to that file, so the owner could have the cache
+// created or written anywhere (#1606). The cache and those three files must be
+// regular files where they exist, and anything else is refused, naming it.
 //
-// The open is race-free, for an import in place while the owner can still write:
-// the file is created or opened here without following a link and checked to be a
-// regular file; SQLite then opens it without creating it (mode=rw), and every
-// connection is checked before cache settings are applied, to have opened it by
-// the name it was given and not through a link. Opening a connection can already
-// read the database header before that identity check. SQLite resolves
-// links only in the name of the database (and then names the file by the link's
-// target); it opens the database and its -wal, -shm and -journal files with
-// O_NOFOLLOW. dir itself is trusted, as for the rest of the import.
+// The directory is reached through root only, never by its name again: its owner may
+// rename it, or a directory above it they own, right after it was checked, and put a
+// link to another user's maildir in its place (#1729). The four files are checked, and
+// the cache created without following a link, through a descriptor of the directory,
+// and SQLite opens the cache by a name the owner cannot redirect (maildirCachePath).
+// SQLite opens it without creating it (mode=rw), and every connection is checked
+// before cache settings are applied, to have opened it by the name it was given and
+// not through a link. Opening a connection can already read the database header
+// before that identity check. SQLite opens the database and its -wal, -shm and
+// -journal files with O_NOFOLLOW.
 //
 // A hard link at one of the four names is a regular file, and SQLite writes through
 // it: the WAL index into -shm on every run, WAL frames into -wal, the cache into
@@ -64,19 +67,24 @@ var hardLinksProtected = func() bool {
 // opens -wal and -shm by name after any check, so maildirCacheLinkRule allows the
 // cache only in a directory where no other user can put such a link to a file they
 // could not write themselves.
-func openMaildirCache(dir string) (*sql.DB, error) {
-	// SQLite names the database by its absolute path with every link resolved, and
-	// the files beside it are checked in that resolved directory.
-	dir, err := resolveMaildirDir(dir)
+func openMaildirCache(root *os.Root) (*sql.DB, error) {
+	dir := root.Name()
+	dirFile, err := root.Open(".")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to open maildir database directory: %w", err)
 	}
+	opened := false
+	defer func() {
+		if !opened {
+			dirFile.Close()
+		}
+	}()
 	refuseHardLinks, err := maildirCacheLinkRule(dir)
 	if err != nil {
 		return nil, err
 	}
 	for _, name := range []string{maildirCacheName, maildirCacheName + "-wal", maildirCacheName + "-shm", maildirCacheName + "-journal"} {
-		if info, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+		if info, err := root.Lstat(name); err == nil {
 			if err := checkMaildirCacheFile(filepath.Join(dir, name), info, refuseHardLinks); err != nil {
 				return nil, err
 			}
@@ -84,10 +92,15 @@ func openMaildirCache(dir string) (*sql.DB, error) {
 	}
 	path := filepath.Join(dir, maildirCacheName)
 
-	f, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|syscall.O_NOFOLLOW, 0644)
+	var fd int
+	err = ignoringEINTR(func() (err error) {
+		fd, err = unix.Openat(int(dirFile.Fd()), maildirCacheName, unix.O_RDWR|unix.O_CREAT|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0644)
+		return err
+	})
 	if err != nil {
-		return nil, fmt.Errorf("failed to open maildir database: %w", err)
+		return nil, fmt.Errorf("failed to open maildir database: %w", &fs.PathError{Op: "open", Path: path, Err: err})
 	}
+	f := os.NewFile(uintptr(fd), path)
 	info, err := f.Stat()
 	f.Close()
 	if err != nil {
@@ -97,7 +110,16 @@ func openMaildirCache(dir string) (*sql.DB, error) {
 		return nil, err
 	}
 
-	return openMaildirCacheFile(path)
+	sqlitePath, err := maildirCachePath(dirFile, dir)
+	if err != nil {
+		return nil, err
+	}
+	db, err := openMaildirCacheFile(sqlitePath, dirFile)
+	if err != nil {
+		return nil, err
+	}
+	opened = true
+	return db, nil
 }
 
 // maildirCacheLinkRule decides where the cache may be kept against hard links. On a
@@ -121,6 +143,33 @@ func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
 		return false, nil
 	}
 	euid := geteuid()
+	parent, owner, mode, err := renamableParent(dir, euid)
+	if err != nil {
+		return false, fmt.Errorf("failed to check where to keep the maildir database: %w", err)
+	}
+	if parent != "" {
+		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory of their own, with hard links at the database's names, in its place after it is checked; use a directory whose parents only root and uid %d can write", dir, euid, parent, owner, mode, euid)
+	}
+	owner, mode, err = directoryOwnerAndMode(dir)
+	if err != nil {
+		return false, fmt.Errorf("failed to check where to keep the maildir database: %w", err)
+	}
+	if owner != euid || mode&0o022 != 0 {
+		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can create files in it (owner uid %d, mode %04o), and SQLite would write through a hard link one of them puts at the database's names; run as the directory's owner, or use a directory only uid %d can write", dir, euid, owner, mode, euid)
+	}
+	return true, nil
+}
+
+// renamableParent returns the first directory above dir, from the filesystem root
+// down, in which a user other than root and euid could rename an entry, and so change
+// what dir names: one that belongs to another user, or that its group or others may
+// write without the sticky bit, which keeps them from renaming an entry they do not
+// own (as on /tmp). It returns that directory's owner and mode with it, or "" when
+// there is none. Checking from the root down, each accepted directory protects the
+// next name from another user's rename, and directoryOwnerAndMode does not follow a
+// link, so a symbolic link put in place of one after dir was resolved is refused,
+// even to a trusted target.
+func renamableParent(dir string, euid int) (parent string, owner int, mode uint32, err error) {
 	var parents []string
 	for parent := filepath.Dir(dir); ; parent = filepath.Dir(parent) {
 		parents = append(parents, parent)
@@ -130,25 +179,17 @@ func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
 	}
 	// Check from the filesystem root towards dir. Each accepted component then
 	// protects the next name from another user's rename. Lstat below refuses a
-	// symbolic link introduced after resolveMaildirDir, even to a trusted target.
+	// symbolic link introduced since dir was resolved, even to a trusted target.
 	for index := len(parents) - 1; index >= 0; index-- {
-		parent := parents[index]
-		owner, mode, err := directoryOwnerAndMode(parent)
+		owner, mode, err := directoryOwnerAndMode(parents[index])
 		if err != nil {
-			return false, err
+			return "", 0, 0, err
 		}
 		if (owner != 0 && owner != euid) || (mode&0o022 != 0 && mode&syscall.S_ISVTX == 0) {
-			return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory of their own, with hard links at the database's names, in its place after it is checked; use a directory whose parents only root and uid %d can write", dir, euid, parent, owner, mode, euid)
+			return parents[index], owner, mode, nil
 		}
 	}
-	owner, mode, err := directoryOwnerAndMode(dir)
-	if err != nil {
-		return false, err
-	}
-	if owner != euid || mode&0o022 != 0 {
-		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can create files in it (owner uid %d, mode %04o), and SQLite would write through a hard link one of them puts at the database's names; run as the directory's owner, or use a directory only uid %d can write", dir, euid, owner, mode, euid)
-	}
-	return true, nil
+	return "", 0, 0, nil
 }
 
 // directoryOwnerAndMode returns the owner of the directory at path and its permission
@@ -157,14 +198,14 @@ func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
 var directoryOwnerAndMode = func(path string) (owner int, mode uint32, err error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to check maildir database directory: %w", err)
+		return 0, 0, fmt.Errorf("failed to check database directory: %w", err)
 	}
 	if !info.IsDir() {
-		return 0, 0, fmt.Errorf("refusing maildir database directory %s: it is not a directory", path)
+		return 0, 0, fmt.Errorf("refusing database directory %s: it is not a directory", path)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, 0, fmt.Errorf("failed to check maildir database directory %s: no owner", path)
+		return 0, 0, fmt.Errorf("failed to check database directory %s: no owner", path)
 	}
 	return int(st.Uid), uint32(st.Mode) & 0o7777, nil
 }
@@ -189,13 +230,13 @@ func resolveMaildirDir(dir string) (string, error) {
 	if !filepath.IsAbs(dir) {
 		wd, err := os.Getwd()
 		if err != nil {
-			return "", fmt.Errorf("failed to resolve maildir database directory: %w", err)
+			return "", fmt.Errorf("failed to resolve database directory: %w", err)
 		}
 		dir = wd + string(filepath.Separator) + dir
 	}
 	dir, err := filepath.EvalSymlinks(dir)
 	if err != nil {
-		return "", fmt.Errorf("failed to resolve maildir database directory: %w", err)
+		return "", fmt.Errorf("failed to resolve database directory: %w", err)
 	}
 	return dir, nil
 }
@@ -221,9 +262,14 @@ func effectiveMaildirPath(maildirPath string) string {
 }
 
 // openMaildirCacheFile opens the maildir cache at path, an absolute name with no
-// link in it, which must exist.
-func openMaildirCacheFile(path string) (*sql.DB, error) {
-	dsn, err := sqlitefile.DSN(path, "mode=rw")
+// link in it, which must exist, with maildirCacheVFS, which opens path as it is. dir,
+// when not nil, is the directory path reaches the cache through (maildirCachePath),
+// which stays open until the database is closed.
+func openMaildirCacheFile(path string, dir *os.File) (*sql.DB, error) {
+	if err := registerMaildirCacheVFS(); err != nil {
+		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
+	}
+	dsn, err := sqlitefile.DSN(path, "mode=rw&vfs="+maildirCacheVFS)
 	if err != nil {
 		return nil, err
 	}
@@ -231,7 +277,7 @@ func openMaildirCacheFile(path string) (*sql.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
-	db := sql.OpenDB(maildirCacheConnector{Connector: connector, path: path})
+	db := sql.OpenDB(maildirCacheConnector{Connector: connector, path: path, dir: dir})
 	// SQLite works best with a single writer connection.
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
@@ -240,9 +286,11 @@ func openMaildirCacheFile(path string) (*sql.DB, error) {
 
 // maildirCacheConnector opens the connections to the maildir cache at path: it
 // refuses one that SQLite opened through a link, and applies the connection settings.
+// dir is closed with the database.
 type maildirCacheConnector struct {
 	driver.Connector
 	path string
+	dir  *os.File
 }
 
 func (c maildirCacheConnector) Connect(ctx context.Context) (driver.Conn, error) {
@@ -255,6 +303,17 @@ func (c maildirCacheConnector) Connect(ctx context.Context) (driver.Conn, error)
 		return nil, err
 	}
 	return conn, nil
+}
+
+// Close is called by sql.DB.Close after it has closed the idle connection, whose
+// close removes the -wal and -shm by the name dir reaches them through. The import
+// and export close the database only once they are done with it, so no connection is
+// still in use, which with one connection at most would block every later query.
+func (c maildirCacheConnector) Close() error {
+	if c.dir != nil {
+		return c.dir.Close()
+	}
+	return nil
 }
 
 func (c maildirCacheConnector) setUp(ctx context.Context, conn driver.Conn) error {

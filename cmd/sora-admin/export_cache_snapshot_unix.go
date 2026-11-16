@@ -5,8 +5,8 @@ package main
 import (
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
-	"path/filepath"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -19,22 +19,20 @@ import (
 const sqliteLockStart = 0x40000000
 const sqliteLockLength = 512
 
+// exportSnapshotDirFD is, in the helper, the descriptor of the directory that holds
+// the cache: openExportCacheForDryRun passes the root the dry run checked as the
+// helper's first extra file, and every source file is opened and checked through it.
+const exportSnapshotDirFD = 3
+
 func copyExportCacheSnapshot(req exportSnapshotRequest) error {
-	dir, err := resolveMaildirDir(filepath.Dir(req.Source))
-	if err != nil {
-		return err
+	root := exportSnapshotDirFD
+	var st unix.Stat_t
+	if err := unix.Fstat(root, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFDIR {
+		return fmt.Errorf("the cache directory was not passed to the snapshot helper")
 	}
-	root, err := os.OpenRoot(dir)
-	if err != nil {
-		return err
-	}
-	defer root.Close()
-	name := filepath.Base(req.Source)
-	if name != maildirCacheName {
-		return fmt.Errorf("unexpected cache filename")
-	}
+	name := maildirCacheName
 	// O_RDWR is needed for F_WRLCK, but no source descriptor is ever written.
-	f, err := root.OpenFile(name, os.O_RDWR|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0)
+	f, err := openExportSnapshotSource(root, name, unix.O_RDWR)
 	if err != nil {
 		return fmt.Errorf("open cache for exclusive snapshot lock: %w", err)
 	}
@@ -58,7 +56,7 @@ func copyExportCacheSnapshot(req exportSnapshotRequest) error {
 	if err := verifyExportSnapshotSource(root, name, info); err != nil {
 		return err
 	}
-	if _, err := root.Lstat(name + "-journal"); !os.IsNotExist(err) {
+	if _, err := lstatAt(root, name+"-journal"); !os.IsNotExist(err) {
 		return fmt.Errorf("cache has a rollback journal or cannot inspect it; recover/close it before preview: %v", err)
 	}
 	destination, err := os.OpenRoot(req.Destination)
@@ -70,7 +68,7 @@ func copyExportCacheSnapshot(req exportSnapshotRequest) error {
 		return err
 	}
 	var walInfo os.FileInfo
-	wal, err := root.OpenFile(name+"-wal", os.O_RDONLY|unix.O_NONBLOCK|unix.O_NOFOLLOW, 0)
+	wal, err := openExportSnapshotSource(root, name+"-wal", unix.O_RDONLY)
 	if err == nil {
 		defer wal.Close()
 		walInfo, err = wal.Stat()
@@ -90,25 +88,40 @@ func copyExportCacheSnapshot(req exportSnapshotRequest) error {
 		return fmt.Errorf("open cache WAL: %w", err)
 	}
 	if walInfo == nil {
-		if _, err := root.Lstat(name + "-wal"); !os.IsNotExist(err) {
+		if _, err := lstatAt(root, name+"-wal"); !os.IsNotExist(err) {
 			return fmt.Errorf("cache WAL appeared during snapshot")
 		}
 	}
 	if err := verifyExportSnapshotSource(root, name, info); err != nil {
 		return err
 	}
-	if _, err := root.Lstat(name + "-journal"); !os.IsNotExist(err) {
+	if _, err := lstatAt(root, name+"-journal"); !os.IsNotExist(err) {
 		return fmt.Errorf("cache journal appeared during snapshot")
 	}
 	return nil
 }
 
-func verifyExportSnapshotSource(root *os.Root, name string, before os.FileInfo) error {
-	after, err := root.Lstat(name)
-	if err != nil {
+// openExportSnapshotSource opens name in the directory root with flag, never
+// following a link at the name, and with O_NONBLOCK, so that a FIFO there does not
+// wait for a writer.
+func openExportSnapshotSource(root int, name string, flag int) (*os.File, error) {
+	var fd int
+	err := ignoringEINTR(func() (err error) {
+		fd, err = unix.Openat(root, name, flag|unix.O_NONBLOCK|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
 		return err
+	})
+	if err != nil {
+		return nil, &fs.PathError{Op: "openat", Path: name, Err: err}
 	}
-	if !after.Mode().IsRegular() || !os.SameFile(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
+	return os.NewFile(uintptr(fd), name), nil
+}
+
+func verifyExportSnapshotSource(root int, name string, before os.FileInfo) error {
+	after, err := lstatAt(root, name)
+	if err != nil {
+		return &fs.PathError{Op: "lstat", Path: name, Err: err}
+	}
+	if !after.Mode().IsRegular() || !sameFileID(before, after) || before.Size() != after.Size() || !before.ModTime().Equal(after.ModTime()) {
 		return fmt.Errorf("cache component changed during snapshot: %s", name)
 	}
 	return nil
