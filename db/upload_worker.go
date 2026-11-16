@@ -149,7 +149,7 @@ func (db *Database) ResetUploadAttempts(ctx context.Context, tx pgx.Tx, contentH
 // The pending row is locked before dropFinishedPendingUpload decides; see there.
 // CompleteLeasedS3Upload locks it by ending its lease.
 func (db *Database) CompleteS3Upload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, writtenKeys []string) error {
-	if err := LockS3ObjectsSharedInTx(ctx, tx, accountID, []string{contentHash}); err != nil {
+	if err := lockS3ObjectForFinalizeInTx(ctx, tx, accountID, contentHash); err != nil {
 		return err
 	}
 	if err := markS3Uploaded(ctx, tx, contentHash, accountID, writtenKeys); err != nil {
@@ -186,7 +186,7 @@ var ErrUploadLeaseLost = fmt.Errorf("upload lease lost: %w", consts.ErrDBNotFoun
 // statement ends the lease: the row is deleted below once nothing is left to write, and
 // otherwise stays, unleased, for the next lease to write what is left.
 func (db *Database) CompleteLeasedS3Upload(ctx context.Context, tx pgx.Tx, pendingID int64, owner, contentHash string, accountID int64, writtenKeys []string) error {
-	if err := LockS3ObjectsSharedInTx(ctx, tx, accountID, []string{contentHash}); err != nil {
+	if err := lockS3ObjectForFinalizeInTx(ctx, tx, accountID, contentHash); err != nil {
 		return err
 	}
 	if err := markS3Uploaded(ctx, tx, contentHash, accountID, writtenKeys); err != nil {
@@ -205,6 +205,40 @@ func (db *Database) CompleteLeasedS3Upload(ctx context.Context, tx pgx.Tx, pendi
 		return fmt.Errorf("failed to lock pending upload %d: %w", pendingID, err)
 	}
 	return dropFinishedPendingUpload(ctx, tx, contentHash, accountID)
+}
+
+// lockS3ObjectForFinalizeInTx pipelines the shared body lock and the post-lock
+// deletion-intent read in one batch inside tx (1 round trip instead of 3). Unlike
+// LockS3ObjectsSharedInTx, upload finalization runs no storage request afterwards,
+// so no trailing SELECT 1 is needed to clear portal or catalog snapshots across I/O.
+func lockS3ObjectForFinalizeInTx(ctx context.Context, tx pgx.Tx, accountID int64, contentHash string) error {
+	batch := &pgx.Batch{}
+	batch.Queue(`SELECT pg_advisory_xact_lock_shared($1)`, GetS3ObjectLockID(accountID, contentHash))
+	batch.Queue(`SELECT current_setting('transaction_isolation'), EXISTS(SELECT 1 FROM s3_body_delete_intents WHERE content_hash = $1)`, contentHash)
+
+	br := tx.SendBatch(ctx, batch)
+	_, err := br.Exec()
+	var isolation string
+	var quarantined bool
+	if scanErr := br.QueryRow().Scan(&isolation, &quarantined); err == nil {
+		err = scanErr
+	}
+	if closeErr := br.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("check S3 body deletion intents: %w", err)
+	}
+	if isolation != "read committed" {
+		return fmt.Errorf("S3 body admission requires READ COMMITTED: %w", ErrS3BodyQuarantined)
+	}
+	if err := checkS3BodyClaimContinuity(ctx, tx, []string{contentHash}); err != nil {
+		return err
+	}
+	if quarantined {
+		return ErrS3BodyQuarantined
+	}
+	return nil
 }
 
 // markS3Uploaded marks the account's rows of contentHash uploaded whose key now has an
@@ -313,40 +347,65 @@ const (
 // never waits for a body lock and ends before storage I/O, retaining no connection
 // across the transfer.
 func (db *Database) PassS3WriteGate(ctx context.Context, pendingID, accountID int64, contentHash, owner string, ttl time.Duration) (S3WriteGate, error) {
-	// The intent read must take a fresh snapshot AFTER the global try-lock. A
-	// single-statement CTE could resume with a snapshot from before intent commit.
-	tx, err := db.GetWritePool().BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
-	if err != nil {
-		return S3WriteBusy, err
-	}
-	defer func() {
-		rollbackCtx, cancelRollback := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancelRollback()
-		_ = tx.Rollback(rollbackCtx)
-	}()
-	var open bool
-	if err := tx.QueryRow(ctx, "SELECT pg_try_advisory_xact_lock_shared($1)", GetS3ObjectLockID(accountID, contentHash)).Scan(&open); err != nil {
-		return S3WriteBusy, err
-	}
-	if !open {
-		return S3WriteBusy, nil
-	}
+	// Send the shared try-lock and the intent+lease CTE in one pipelined pgx.Batch
+	// (an implicit READ COMMITTED transaction block -> 1 PostgreSQL round trip).
+	// pgx executes statement 1 to completion before binding statement 2, so
+	// statement 2 takes a fresh command snapshot strictly after the lock is granted.
+	// Passing the lock outcome via a transaction-local GUC instead of raising a SQL
+	// error avoids invalidating pgx's statement cache on contended calls.
+	batch := &pgx.Batch{}
+	batch.Queue(`SELECT set_config('sora.s3_write_gate', CASE WHEN pg_try_advisory_xact_lock_shared($1) THEN 'open' ELSE 'busy' END, true) = 'open'`,
+		GetS3ObjectLockID(accountID, contentHash))
+	batch.Queue(`
+		WITH gate AS MATERIALIZED (
+			SELECT COALESCE(current_setting('sora.s3_write_gate', true), '') = 'open' AS locked,
+			       current_setting('transaction_isolation') AS isolation
+		),
+		allowed AS MATERIALIZED (
+			SELECT CASE
+				WHEN (SELECT locked FROM gate) AND (SELECT isolation FROM gate) = 'read committed'
+				THEN NOT EXISTS (SELECT 1 FROM s3_body_delete_intents WHERE content_hash = $4)
+				ELSE FALSE
+			END AS open
+		),
+		lease AS (
+			UPDATE pending_uploads
+			SET lease_until = now() + $2::interval, lease_owner = $3
+			WHERE id = $1
+			  AND (SELECT open FROM allowed)
+			  AND (lease_until IS NULL OR lease_until < now())
+			RETURNING id
+		)
+		SELECT (SELECT isolation FROM gate),
+		       (SELECT open FROM allowed),
+		       EXISTS (SELECT 1 FROM lease),
+		       CASE WHEN (SELECT locked FROM gate)
+		            THEN EXISTS (SELECT 1 FROM pending_uploads WHERE id = $1)
+		            ELSE FALSE
+		       END
+	`, pendingID, ttl, owner, contentHash)
+
+	br := db.GetWritePool().SendBatch(ctx, batch)
+	var locked bool
+	err := br.QueryRow().Scan(&locked)
+	var isolation string
 	var permitted, leased, exists bool
-	if err := tx.QueryRow(ctx, `
-        WITH allowed AS MATERIALIZED(SELECT NOT EXISTS(SELECT 1 FROM s3_body_delete_intents WHERE content_hash=$4) AS open), lease AS (
-          UPDATE pending_uploads SET lease_until=now()+$2::interval,lease_owner=$3
-          WHERE id=$1 AND (SELECT open FROM allowed) AND (lease_until IS NULL OR lease_until<now()) RETURNING id
-        )
-        SELECT (SELECT open FROM allowed),EXISTS(SELECT 1 FROM lease),EXISTS(SELECT 1 FROM pending_uploads WHERE id=$1)
-    `, pendingID, ttl, owner, contentHash).Scan(&permitted, &leased, &exists); err != nil {
+	if scanErr := br.QueryRow().Scan(&isolation, &permitted, &leased, &exists); err == nil {
+		err = scanErr
+	}
+	if closeErr := br.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		return S3WriteBusy, fmt.Errorf("failed to pass write gate for %s of account %d: %w", contentHash, accountID, err)
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return S3WriteBusy, err
+	if isolation != "read committed" {
+		return S3WriteBusy, fmt.Errorf("S3 body admission requires READ COMMITTED: %w", ErrS3BodyQuarantined)
+	}
+	if !locked || !permitted {
+		return S3WriteBusy, nil
 	}
 	switch {
-	case !permitted:
-		return S3WriteBusy, nil
 	case leased:
 		return S3WriteOpen, nil
 	case exists:
