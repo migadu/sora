@@ -65,7 +65,8 @@ running Sora server, and they can run while servers are running.
 - **Run it where the maildir is.** The importer reads the files directly and writes its cache,
   `sora-maildir.db`, **into the maildir directory**. The user running `sora-admin` needs write
   access to that directory, even for a dry run. Except on Linux with `fs.protected_hardlinks = 1`,
-  no other user may be able to write in it ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
+  no other user may be able to write in it, or to rename it through a directory above it
+  ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 - **Check the size limit.** Messages larger than `[admin_cli] import_message_limit` are not
   imported and count as failed. Unset, the limit is the `append_limit` of the first IMAP
   `[[server]]` block in the file (default 25 MB), or 50 MB without one. See
@@ -335,8 +336,12 @@ distributions, a user can hard-link only a file they own or may read and write, 
 gains them nothing, and the cache is kept in the maildir whoever can write in it. Elsewhere
 (macOS, FreeBSD by default, Linux with `fs.protected_hardlinks = 0`) the directory that holds the
 cache must belong to the user running `sora-admin`, and its group and others must not be able to
-write in it; otherwise the import or export refuses to start and names the directory. Run
-`sora-admin` as the maildir's owner, or import a copy that belongs to the user running it. In such
+write in it. Every directory above it must belong to root or to that user, and its group and
+others may write in it only with the sticky bit set, as on `/tmp`: whoever can rename the
+directory could put one of their own, with such links, in its place after the check. Otherwise
+the import or export refuses to start and names the directory. Run `sora-admin` as the maildir's
+owner, or import a copy that belongs to the user running it, in a directory no other user can
+rename (not, for example, in the home directory of the maildir's owner). In such
 a directory a `sora-maildir.db`, `-wal`, `-shm` or `-journal` that is a hard link (its file has
 another name too, for example in a backup made with `cp -al`) is refused as well; replace it with
 a copy, or remove it.

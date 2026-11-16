@@ -154,3 +154,43 @@ func TestMaildirCacheOpensInADirectoryOthersCanWriteWithProtectedHardLinks(t *te
 		})
 	}
 }
+
+// The directory is checked by its name, and SQLite opens the cache's files by that
+// name after the check. A user who can rename it, because they can write in a
+// directory above it, could put a directory of their own with hard links at the
+// database's names in its place in between, so such a directory is refused as well,
+// before anything is created. The sticky bit (as on /tmp) keeps others from renaming
+// an entry they do not own, and such a directory above is allowed.
+func TestMaildirCacheRefusesADirectoryOthersCanReplace(t *testing.T) {
+	withoutHardLinkProtection(t)
+	cases := []struct {
+		name    string
+		mode    os.FileMode
+		refused bool
+	}{
+		{"its group can write above it", 0775, true},
+		{"others can write above it", 0757, true},
+		{"others can write above it with the sticky bit", 0777 | os.ModeSticky, false},
+	}
+
+	for _, r := range maildirCacheRuns {
+		for _, c := range cases {
+			t.Run(r.name+"/"+c.name, func(t *testing.T) {
+				dir := newMaildirWith(t, nil)
+				require.NoError(t, os.Chmod(filepath.Dir(dir), c.mode))
+				realDir, err := filepath.EvalSymlinks(dir)
+				require.NoError(t, err)
+
+				err = r.run(dir)
+
+				if !c.refused {
+					require.NoError(t, err)
+					return
+				}
+				assert.ErrorContains(t, err, "refusing to keep the maildir database in "+realDir)
+				assert.ErrorContains(t, err, "can rename entries of "+filepath.Dir(realDir)+" above it")
+				assert.NotContains(t, dirNames(t, dir), maildirCacheName, "created the cache")
+			})
+		}
+	}
+}

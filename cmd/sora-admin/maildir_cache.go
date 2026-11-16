@@ -109,22 +109,51 @@ func openMaildirCache(dir string) (*sql.DB, error) {
 // is already there (left from before the directory was that user's alone, or linked
 // to a backup) is refused, as refuseHardLinks says. A directory other users can write
 // is refused.
+//
+// dir is checked by its name, and SQLite opens the files by that name later, so the
+// directories above dir are checked too: a user who could rename an entry in one of
+// them could put a directory of their own, holding such links, at dir's name after
+// the checks. Each must belong to root or to this user, and others may write in it
+// only where the sticky bit keeps them from renaming an entry they do not own (as in
+// /tmp): no other user can then change what dir names.
 func maildirCacheLinkRule(dir string) (refuseHardLinks bool, err error) {
 	if hardLinksProtected() {
 		return false, nil
 	}
-	info, err := os.Stat(dir)
+	euid := geteuid()
+	owner, mode, err := directoryOwnerAndMode(dir)
 	if err != nil {
-		return false, fmt.Errorf("failed to check maildir database directory: %w", err)
+		return false, err
+	}
+	if owner != euid || mode&0o022 != 0 {
+		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can create files in it (owner uid %d, mode %04o), and SQLite would write through a hard link one of them puts at the database's names; run as the directory's owner, or use a directory only uid %d can write", dir, euid, owner, mode, euid)
+	}
+	for parent := filepath.Dir(dir); ; parent = filepath.Dir(parent) {
+		owner, mode, err := directoryOwnerAndMode(parent)
+		if err != nil {
+			return false, err
+		}
+		if (owner != 0 && owner != euid) || (mode&0o022 != 0 && mode&syscall.S_ISVTX == 0) {
+			return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory of their own, with hard links at the database's names, in its place after it is checked; use a directory whose parents only root and uid %d can write", dir, euid, parent, owner, mode, euid)
+		}
+		if parent == filepath.Dir(parent) {
+			return true, nil
+		}
+	}
+}
+
+// directoryOwnerAndMode returns the owner of the directory at path and its permission
+// bits, with the set-user-ID, set-group-ID and sticky bits.
+func directoryOwnerAndMode(path string) (owner int, mode uint32, err error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to check maildir database directory: %w", err)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return false, fmt.Errorf("failed to check maildir database directory %s: no owner", dir)
+		return 0, 0, fmt.Errorf("failed to check maildir database directory %s: no owner", path)
 	}
-	if euid := geteuid(); int(st.Uid) != euid || info.Mode().Perm()&0o022 != 0 {
-		return false, fmt.Errorf("refusing to keep the maildir database in %s: users other than uid %d can create files in it (owner uid %d, mode %04o), and SQLite would write through a hard link one of them puts at the database's names; run as the directory's owner, or use a directory only uid %d can write", dir, euid, st.Uid, info.Mode().Perm(), euid)
-	}
-	return true, nil
+	return int(st.Uid), uint32(st.Mode) & 0o7777, nil
 }
 
 // checkMaildirCacheFile refuses the maildir cache, or one of the files SQLite keeps
