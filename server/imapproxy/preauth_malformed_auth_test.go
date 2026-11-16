@@ -47,9 +47,20 @@ func TestPreAuthMalformedLoginAndAuthenticateAnswerBAD(t *testing.T) {
 		{"AUTHENTICATE PLAIN initial response with non-terminal pad", []step{
 			{"a2 AUTHENTICATE PLAIN =AAA", "a2 BAD Invalid base64 encoding"},
 		}},
+		{"AUTHENTICATE PLAIN initial response with a pad inside", []step{
+			// RFC 9051 §6.2.2: "=AAA" and "AAA=BBB" are not allowed.
+			{"a2 AUTHENTICATE PLAIN AAA=BBB", "a2 BAD Invalid base64 encoding"},
+		}},
 		{"AUTHENTICATE PLAIN continuation response outside the alphabet", []step{
 			{"a2 AUTHENTICATE PLAIN", "+ "},
 			{"!!!!", "a2 BAD Invalid base64 encoding"},
+		}},
+		{"AUTHENTICATE PLAIN continuation response of a single pad", []step{
+			// "=" is the zero-length INITIAL response only (RFC 9051 §9:
+			// initial-resp = (base64 / "=")); a continuation reply is base64,
+			// which a lone pad is not. A zero-length reply is an empty line.
+			{"a2 AUTHENTICATE PLAIN", "+ "},
+			{"=", "a2 BAD Invalid base64 encoding"},
 		}},
 		// AUTHENTICATE without a mechanism: arguments invalid.
 		{"AUTHENTICATE without mechanism", []step{
@@ -65,6 +76,10 @@ func TestPreAuthMalformedLoginAndAuthenticateAnswerBAD(t *testing.T) {
 		}},
 		{"AUTHENTICATE PLAIN with a zero-length initial response", []step{
 			{"a6 AUTHENTICATE PLAIN =", "a6 NO Invalid SASL PLAIN response"},
+		}},
+		{"AUTHENTICATE PLAIN with a zero-length continuation response", []step{
+			{"a6 AUTHENTICATE PLAIN", "+ "},
+			{"", "a6 NO Invalid SASL PLAIN response"},
 		}},
 		{"AUTHENTICATE PLAIN with a message of the wrong shape", []step{
 			// base64("\x00foo"): two fields, PLAIN needs three.

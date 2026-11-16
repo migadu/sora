@@ -302,6 +302,22 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	s.DebugLog("processing rcpt to command", "to", to)
 
+	// go-smtp refuses the RCPT parameters it knows but has not enabled (NOTIFY, ORCPT,
+	// RRVS) with 555; EnableRCPTExtensions, set for XRCPTFORWARD, hands every other one
+	// here. Refuse those the backend does not implement the same way, before the
+	// recipient is looked up. RFC 5321 section 4.1.1.11: "If the server SMTP does not
+	// recognize or cannot implement one or more of the parameters associated with a
+	// particular MAIL FROM or RCPT TO command, it will return code 555."
+	if param := unsupportedRcptParameter(opts); param != "" {
+		s.InfoLog("RCPT refused for an unknown parameter", "parameter", param)
+		recordMetrics("failure")
+		return &smtp.SMTPError{
+			Code:         555,
+			EnhancedCode: smtp.EnhancedCode{5, 5, 4},
+			Message:      "Unknown RCPT parameter",
+		}
+	}
+
 	toAddress, err := server.NewAddress(to)
 	if err != nil {
 		s.WarnLog("invalid to address", "error", err)

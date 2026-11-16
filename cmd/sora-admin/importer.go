@@ -495,7 +495,16 @@ func (i *Importer) Run() (err error) {
 	// Import Sieve script if provided
 	if i.options.SievePath != "" {
 		if err := i.importSieveScript(); err != nil {
-			logger.Info("Warning: Failed to import Sieve script", "error", err)
+			// The summary says what became of the script on every path: a refused
+			// link (readSieveFile) or a database error must not pass unnoticed in
+			// a migration of many accounts, which leaves the account without its
+			// filter.
+			if i.options.DryRun {
+				i.sieveOutcome = fmt.Sprintf("would NOT be imported: %v", err)
+			} else {
+				i.sieveOutcome = fmt.Sprintf("NOT imported: %v", err)
+			}
+			logger.Warn("Failed to import Sieve script", "error", err)
 		}
 	}
 

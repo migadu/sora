@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/migadu/sora/consts"
@@ -125,4 +127,56 @@ func TestImportSieveScriptFollowsLinksOnlyWithinItsDirectory(t *testing.T) {
 		}
 		assert.Empty(t, rdb.stored)
 	})
+}
+
+// TestImportSummarySaysWhenTheSieveScriptIsRefused: refusing a --sieve link is now an
+// expected outcome of a Dovecot migration (an absolute ~/.dovecot.sieve, one a user made
+// or Pigeonhole wrote for a script directory elsewhere), and the account loses its
+// filter if nobody notices. The summary's Sieve script line, which says what became of
+// the script on every other path, must say it was not imported and name the file, in a
+// dry run as well, instead of saying nothing.
+func TestImportSummarySaysWhenTheSieveScriptIsRefused(t *testing.T) {
+	for _, dryRun := range []bool{false, true} {
+		t.Run(map[bool]string{false: "import", true: "dry run"}[dryRun], func(t *testing.T) {
+			home := t.TempDir()
+			require.NoError(t, os.MkdirAll(filepath.Join(home, "sieve"), 0755))
+			require.NoError(t, os.WriteFile(filepath.Join(home, "sieve", "managesieve.sieve"), []byte("keep;\n"), 0644))
+			sievePath := filepath.Join(home, ".dovecot.sieve")
+			require.NoError(t, os.Symlink(filepath.Join(home, "sieve", "managesieve.sieve"), sievePath))
+
+			rdb := &sieveRecordingDB{mockResilientDatabase: newMockResilientDatabase()}
+			importer := newTestModeImporter(t, newMaildirWith(t, nil), rdb, ImporterOptions{SievePath: sievePath, DryRun: dryRun})
+			require.NoError(t, importer.Run())
+
+			assert.Empty(t, rdb.stored)
+			want := "NOT imported: "
+			if dryRun {
+				want = "would NOT be imported: "
+			}
+			assert.True(t, strings.HasPrefix(importer.sieveOutcome, want), "the summary does not say the script was not imported: %q", importer.sieveOutcome)
+			assert.Contains(t, importer.sieveOutcome, sievePath, "the summary does not name the file")
+		})
+	}
+}
+
+// sieveFailingDB fails the lookup that precedes storing a Sieve script.
+type sieveFailingDB struct {
+	*mockResilientDatabase
+}
+
+func (m *sieveFailingDB) GetScriptByNameWithRetry(ctx context.Context, name string, accountID int64) (*db.SieveScript, error) {
+	return nil, errors.New("database unavailable")
+}
+
+// TestImportSummarySaysWhenStoringTheSieveScriptFails: a database error while storing
+// the script leaves the account without its filter as well; the summary must say so.
+func TestImportSummarySaysWhenStoringTheSieveScriptFails(t *testing.T) {
+	sievePath := filepath.Join(t.TempDir(), "filter.sieve")
+	require.NoError(t, os.WriteFile(sievePath, []byte("keep;\n"), 0644))
+
+	importer := newTestModeImporter(t, newMaildirWith(t, nil), &sieveFailingDB{mockResilientDatabase: newMockResilientDatabase()}, ImporterOptions{SievePath: sievePath})
+	require.NoError(t, importer.Run())
+
+	assert.True(t, strings.HasPrefix(importer.sieveOutcome, "NOT imported: "), "the summary does not say the script was not imported: %q", importer.sieveOutcome)
+	assert.Contains(t, importer.sieveOutcome, "database unavailable", "the summary does not say why")
 }
