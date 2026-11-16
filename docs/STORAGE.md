@@ -606,8 +606,9 @@ set, for example to `"365d"`, each cleanup cycle expunges every message whose ro
 than that, in every mailbox of every account.
 
 - The age counts from when Sora created the message row (`messages.created_at`). Delivery,
-  APPEND, import, COPY and MOVE all create a new row, so each of them starts a new clock for
-  that copy. The `Date:` header and the IMAP internal date do not matter.
+  APPEND, import, COPY, MOVE and a restore (`sora-admin messages restore`, the Admin API) all
+  create a new row, so each of them starts a new clock for that copy. The `Date:` header and
+  the IMAP internal date do not matter.
 - The cycle expunges in batches of 1000, pauses 2 seconds between batches, and spends at most
   30 seconds. What does not fit waits for the next cycle.
 - Expunged mail then waits the normal `grace_period` before its body is removed. So mail is
