@@ -129,10 +129,17 @@ func ParseDateHeader(value string) (time.Time, error) {
 	return t.UTC(), nil
 }
 
+// parseDateHeaderWithZone captures the transient source-zone classification for
+// attached envelopes before time.Time's location can change during persistence.
+func parseDateHeaderWithZone(value string) (time.Time, bool, error) {
+	date, err := ParseDateHeader(value)
+	return date, err == nil && !date.IsZero() && ZoneUnknown(date), err
+}
+
 // ZoneUnknown classifies a date directly returned by ParseDateHeader: time.UTC
 // marks an unknown zone, RFC 5322 §3.3 "-0000". This transient marker must be
 // recorded before serialization: DB offsets use NULL, and attached envelopes
-// carry DateZoneUnknown explicitly through gob. A decoded time location alone
+// carry DateUnknownZone explicitly through gob. A decoded time location alone
 // cannot retain this distinction when time.Local is time.UTC.
 func ZoneUnknown(t time.Time) bool {
 	return t.Location() == time.UTC

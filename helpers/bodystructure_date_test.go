@@ -105,8 +105,8 @@ func TestSafeBodyStructureAttachedMessageUnknownZone(t *testing.T) {
 			env  *imap.Envelope
 		}{{"extracted", attachedEnvelope(t, bs)}, {"stored", attachedEnvelope(t, *stored)}} {
 			assert.True(t, got.env.Date.Equal(wall), "%q: %s attached envelope date %v, want %v", tc.date, got.name, got.env.Date, wall)
-			assert.Equal(t, tc.unknown, got.env.DateZoneUnknown,
-				"%q: %s attached envelope date %v: zone unknown (in UTC) = %v, want %v", tc.date, got.name, got.env.Date, got.env.DateZoneUnknown, tc.unknown)
+			assert.Equal(t, tc.unknown, got.env.DateUnknownZone,
+				"%q: %s attached envelope date %v: zone unknown (in UTC) = %v, want %v", tc.date, got.name, got.env.Date, got.env.DateUnknownZone, tc.unknown)
 		}
 	}
 }
