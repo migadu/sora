@@ -253,7 +253,13 @@ Dovecot stores custom keywords as letters `a` to `z` in file names. Each folder 
 `dovecot-keywords` file that maps those letters (`0 $Label1`, `1 $Junk`, ... : index 0 is `a`).
 
 - Each folder's own `dovecot-keywords` file maps that folder's letters.
-- A folder without its own file uses the root file's mapping.
+- The root file maps the letters of the root folder (INBOX) only. A folder without its own file
+  names no keywords, as in Dovecot, which clears a folder's list when its file is missing: its
+  letters are dropped, each with an `Unknown keyword ID` warning.
+- A line that is malformed, or whose index is not 0 to 25, is skipped; one warning per file names
+  the file, the number of lines skipped and the first of them, shortened.
+- A file larger than 64 KiB is not read: a warning names it, and the folder's keywords are not
+  imported.
 
 ### Subscriptions (`subscriptions`)
 
@@ -268,6 +274,9 @@ With `--dovecot`, the `subscriptions` file at the maildir root is read:
    name with tab characters; they are joined with `/`, so `Work` + tab + `2024` subscribes
    `Work/2024`. No mailbox is created for it: subscriptions are names, and Dovecot allows
    subscriptions to folders that do not exist.
+
+A `subscriptions` file larger than 4 MiB is not read: a warning names it, and no subscriptions are
+imported.
 
 ### UIDs (`dovecot-uidlist`)
 
@@ -556,7 +565,8 @@ and the file's modification time is set to INTERNALDATE. Flags are written as `D
 
 **Keywords.** Only with `--dovecot`: each folder gets a `dovecot-keywords` file and keywords
 become letters `a` to `z`. Keywords are numbered in sorted order; an existing file's numbering is
-kept. A folder can name at most 26 keywords; further ones are logged and left out. Without
+kept. An existing file that cannot be read, or is larger than 64 KiB, is replaced, with a warning
+that names it. A folder can name at most 26 keywords; further ones are logged and left out. Without
 `--dovecot`, keywords are not exported.
 
 **Subscriptions.** With `--dovecot`, `subscriptions` at the root lists every subscribed name,

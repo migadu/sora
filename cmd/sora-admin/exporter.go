@@ -1151,16 +1151,6 @@ func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
 	return f, nil
 }
 
-// readExportFile reads the regular file name below root (openExportEntry).
-func readExportFile(root *os.Root, name string) ([]byte, error) {
-	f, err := openExportEntry(root, name, false)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return io.ReadAll(f)
-}
-
 // maxMaildirKeywords is how many custom keywords a maildir folder can name: the info
 // part of a filename has the 26 letters a-z for them (Dovecot's own limit).
 const maxMaildirKeywords = 26
@@ -1171,7 +1161,9 @@ const maxMaildirKeywords = 26
 // re-import. Keywords are numbered in sorted order, deterministically, so repeated
 // exports of the same mailbox produce the same file. An existing file's numbering is
 // kept for the keywords it already names, so an incremental export does not renumber
-// files written by an earlier run.
+// files written by an earlier run. An existing file that cannot be read (one that is
+// not a regular file, or is larger than maxDovecotKeywordsSize) is named in a warning
+// and replaced.
 func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Message) error {
 	seen := make(map[string]struct{})
 	for i := range messages {
@@ -1188,15 +1180,15 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 
 	index := make(map[string]int)
 	used := make(map[int]bool)
-	readFile := func(name string) ([]byte, error) { return readExportFile(exporter.root, name) }
-	if existing, err := parseKeywordsFile(keywordsName, readFile); err == nil {
+	unreadable := false
+	open := func(name string) (*os.File, error) { return openExportEntry(exporter.root, name, false) }
+	if existing, err := parseKeywordsFile(keywordsName, open); err == nil {
 		for idx, kw := range existing {
-			if idx >= 0 && idx < maxMaildirKeywords {
-				index[kw] = idx
-				used[idx] = true
-			}
+			index[kw] = idx
+			used[idx] = true
 		}
 	} else if !errors.Is(err, fs.ErrNotExist) {
+		unreadable = true
 		// A file that is there but is not read (a link, a FIFO, a file with more than
 		// one link) is replaced without its numbering, so the letters of files an
 		// earlier run wrote may name other keywords now.
@@ -1230,7 +1222,9 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 	exporter.keywordIndex[mailboxName] = index
 	exporter.mu.Unlock()
 
-	if len(index) == 0 {
+	// A mailbox without keywords needs no file, but one that cannot be read is
+	// replaced all the same (with an empty one), as the warning says.
+	if len(index) == 0 && !unreadable {
 		return nil
 	}
 	if err := exporter.root.MkdirAll(dir, 0755); err != nil {
