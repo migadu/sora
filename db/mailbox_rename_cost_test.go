@@ -33,8 +33,8 @@ func TestRenameMailboxDoesNotTouchMessagesTable(t *testing.T) {
 	src, err := os.ReadFile(filepath.Join(root, "db", "mailbox.go"))
 	require.NoError(t, err)
 
-	body := functionBody(t, string(src), "func (db *Database) RenameMailbox(")
-	require.NotEmpty(t, body, "RenameMailbox not found in db/mailbox.go")
+	body := functionBody(t, string(src), "func (db *Database) renameMailbox(")
+	require.NotEmpty(t, body, "renameMailbox implementation not found in db/mailbox.go")
 
 	offenders := []string{}
 	for i, line := range strings.Split(body, "\n") {

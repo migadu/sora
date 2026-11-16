@@ -49,32 +49,33 @@ func (s *Server) loadSettings() *reloadableSettings {
 
 // Server represents an IMAP proxy server.
 type Server struct {
-	listener           net.Listener
-	listenerMu         sync.RWMutex
-	rdb                *resilient.ResilientDatabase
-	name               string // Server name for logging
-	addr               string
-	hostname           string
-	connManager        *proxy.ConnectionManager
-	connTracker        *server.ConnectionTracker
-	masterUsername     []byte
-	masterPassword     []byte
-	tls                bool
-	tlsCertFile        string
-	tlsKeyFile         string
-	tlsVerify          bool
-	tlsConfig          *tls.Config // Global TLS config from TLS manager (optional)
-	useStartTLS        bool        // The listener is plaintext and sessions upgrade it on STARTTLS
-	startTLSConfig     *tls.Config // What sessions upgrade with on STARTTLS (set by Start); nil when STARTTLS is not offered
-	enableAffinity     bool
-	sessions           server.SessionGroup // Session goroutines, which Stop drains
-	ctx                context.Context
-	cancel             context.CancelFunc
-	authLimiter        server.AuthLimiter
-	trustedProxies     []string // CIDR blocks for trusted proxies that can forward parameters
-	remotelookupConfig *config.RemoteLookupConfig
-	remoteUseIDCommand bool                        // Whether backend supports IMAP ID command for forwarding
-	proxyReader        *server.ProxyProtocolReader // PROXY protocol reader for incoming connections
+	listener                              net.Listener
+	listenerMu                            sync.RWMutex
+	rdb                                   *resilient.ResilientDatabase
+	name                                  string // Server name for logging
+	addr                                  string
+	hostname                              string
+	connManager                           *proxy.ConnectionManager
+	connTracker                           *server.ConnectionTracker
+	masterUsername                        []byte
+	masterPassword                        []byte
+	tls                                   bool
+	tlsCertFile                           string
+	tlsKeyFile                            string
+	tlsVerify                             bool
+	tlsConfig                             *tls.Config // Global TLS config from TLS manager (optional)
+	useStartTLS                           bool        // The listener is plaintext and sessions upgrade it on STARTTLS
+	startTLSConfig                        *tls.Config // What sessions upgrade with on STARTTLS (set by Start); nil when STARTTLS is not offered
+	enableAffinity                        bool
+	sessions                              server.SessionGroup // Session goroutines, which Stop drains
+	ctx                                   context.Context
+	cancel                                context.CancelFunc
+	authLimiter                           server.AuthLimiter
+	trustedProxies                        []string // CIDR blocks for trusted proxies that can forward parameters
+	remotelookupConfig                    *config.RemoteLookupConfig
+	remoteUseIDCommand                    bool                        // Whether backend supports IMAP ID command for forwarding
+	remoteSkipForwardingWithProxyProtocol bool                        // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	proxyReader                           *server.ProxyProtocolReader // PROXY protocol reader for incoming connections
 
 	// Authentication cache
 	lookupCache                *lookupcache.LookupCache
@@ -161,39 +162,40 @@ func (mw *maskingWriter) Write(p []byte) (n int, err error) {
 
 // ServerOptions holds options for creating a new IMAP proxy server.
 type ServerOptions struct {
-	Name                     string // Server name for logging
-	Addr                     string
-	RemoteAddrs              []string
-	Pools                    []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
-	RemotePort               int              // Default port for backends if not in address
-	MasterUsername           string
-	MasterPassword           string
-	MasterSASLUsername       string
-	MasterSASLPassword       string
-	TLS                      bool
-	TLSCertFile              string
-	TLSKeyFile               string
-	TLSVerify                bool
-	TLSUseStartTLS           bool        // Plaintext listener offering STARTTLS (RFC 9051 §6.2.1) instead of implicit TLS; requires TLS
-	TLSConfig                *tls.Config // Global TLS config from TLS manager (optional)
-	RemoteTLS                bool
-	RemoteTLSUseStartTLS     bool // Dial the backend in plaintext and upgrade with STARTTLS after its greeting (requires RemoteTLS)
-	RemoteTLSVerify          bool
-	RemoteTLSCAFile          string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
-	RemoteUseProxyProtocol   bool
-	ConnectTimeout           time.Duration
-	AuthIdleTimeout          time.Duration
-	CommandTimeout           time.Duration // Idle timeout
-	AbsoluteSessionTimeout   time.Duration // Maximum total session duration
-	MinBytesPerMinute        int64         // Minimum throughput
-	EnableAffinity           bool
-	EnableBackendHealthCheck bool           // Enable backend health checking (default: true)
-	RemoteDNSRefresh         *time.Duration // Backend DNS re-resolution interval; nil = default, 0 = pin to the startup resolution
-	AuthRateLimit            server.AuthRateLimiterConfig
-	LookupCache              *config.LookupCacheConfig // Authentication cache configuration
-	RemoteLookup             *config.RemoteLookupConfig
-	TrustedProxies           []string // CIDR blocks for trusted proxies that can forward parameters
-	RemoteUseIDCommand       bool     // Whether backend supports IMAP ID command for forwarding
+	Name                                  string // Server name for logging
+	Addr                                  string
+	RemoteAddrs                           []string
+	Pools                                 []proxy.PoolSpec // Named backend pools ([[pool]] blocks); when set, RemoteAddrs is unused and each pool brings its own backend-leg settings
+	RemotePort                            int              // Default port for backends if not in address
+	MasterUsername                        string
+	MasterPassword                        string
+	MasterSASLUsername                    string
+	MasterSASLPassword                    string
+	TLS                                   bool
+	TLSCertFile                           string
+	TLSKeyFile                            string
+	TLSVerify                             bool
+	TLSUseStartTLS                        bool        // Plaintext listener offering STARTTLS (RFC 9051 §6.2.1) instead of implicit TLS; requires TLS
+	TLSConfig                             *tls.Config // Global TLS config from TLS manager (optional)
+	RemoteTLS                             bool
+	RemoteTLSUseStartTLS                  bool // Dial the backend in plaintext and upgrade with STARTTLS after its greeting (requires RemoteTLS)
+	RemoteTLSVerify                       bool
+	RemoteTLSCAFile                       string // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
+	RemoteUseProxyProtocol                bool
+	ConnectTimeout                        time.Duration
+	AuthIdleTimeout                       time.Duration
+	CommandTimeout                        time.Duration // Idle timeout
+	AbsoluteSessionTimeout                time.Duration // Maximum total session duration
+	MinBytesPerMinute                     int64         // Minimum throughput
+	EnableAffinity                        bool
+	EnableBackendHealthCheck              bool           // Enable backend health checking (default: true)
+	RemoteDNSRefresh                      *time.Duration // Backend DNS re-resolution interval; nil = default, 0 = pin to the startup resolution
+	AuthRateLimit                         server.AuthRateLimiterConfig
+	LookupCache                           *config.LookupCacheConfig // Authentication cache configuration
+	RemoteLookup                          *config.RemoteLookupConfig
+	TrustedProxies                        []string // CIDR blocks for trusted proxies that can forward parameters
+	RemoteUseIDCommand                    bool     // Whether backend supports IMAP ID command for forwarding
+	RemoteSkipForwardingWithProxyProtocol bool     // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
 
 	// Connection limiting
 	MaxConnections      int              // Maximum total connections per instance (0 = unlimited, local only)
@@ -387,39 +389,40 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	}
 
 	s := &Server{
-		rdb:                        rdb,
-		name:                       opts.Name,
-		addr:                       opts.Addr,
-		hostname:                   hostname,
-		connManager:                connManager,
-		masterUsername:             []byte(opts.MasterUsername),
-		masterPassword:             []byte(opts.MasterPassword),
-		tls:                        opts.TLS,
-		tlsCertFile:                opts.TLSCertFile,
-		tlsKeyFile:                 opts.TLSKeyFile,
-		tlsVerify:                  opts.TLSVerify,
-		tlsConfig:                  opts.TLSConfig,
-		useStartTLS:                opts.TLS && opts.TLSUseStartTLS, // config warns when tls_use_starttls lacks tls
-		enableAffinity:             opts.EnableAffinity,
-		ctx:                        ctx,
-		cancel:                     cancel,
-		authLimiter:                authLimiter,
-		trustedProxies:             opts.TrustedProxies,
-		remotelookupConfig:         opts.RemoteLookup,
-		remoteUseIDCommand:         opts.RemoteUseIDCommand,
-		proxyReader:                proxyReader,
-		lookupCache:                lookupCache,
-		positiveRevalidationWindow: positiveRevalidationWindow,
-		limiter:                    limiter,
-		listenBacklog:              listenBacklog,
-		insecureAuth:               opts.InsecureAuth || !opts.TLS, // Auto-enable when TLS not configured
-		additionalCapsSuffix:       additionalCapsSuffix,
-		idName:                     opts.IDName,
-		idVersion:                  opts.IDVersion,
-		idVendor:                   opts.IDVendor,
-		idSupportURL:               opts.IDSupportURL,
-		debugWriter:                debugWriter,
-		activeSessions:             make(map[*Session]struct{}),
+		rdb:                                   rdb,
+		name:                                  opts.Name,
+		addr:                                  opts.Addr,
+		hostname:                              hostname,
+		connManager:                           connManager,
+		masterUsername:                        []byte(opts.MasterUsername),
+		masterPassword:                        []byte(opts.MasterPassword),
+		tls:                                   opts.TLS,
+		tlsCertFile:                           opts.TLSCertFile,
+		tlsKeyFile:                            opts.TLSKeyFile,
+		tlsVerify:                             opts.TLSVerify,
+		tlsConfig:                             opts.TLSConfig,
+		useStartTLS:                           opts.TLS && opts.TLSUseStartTLS, // config warns when tls_use_starttls lacks tls
+		enableAffinity:                        opts.EnableAffinity,
+		ctx:                                   ctx,
+		cancel:                                cancel,
+		authLimiter:                           authLimiter,
+		trustedProxies:                        opts.TrustedProxies,
+		remotelookupConfig:                    opts.RemoteLookup,
+		remoteUseIDCommand:                    opts.RemoteUseIDCommand,
+		remoteSkipForwardingWithProxyProtocol: opts.RemoteSkipForwardingWithProxyProtocol,
+		proxyReader:                           proxyReader,
+		lookupCache:                           lookupCache,
+		positiveRevalidationWindow:            positiveRevalidationWindow,
+		limiter:                               limiter,
+		listenBacklog:                         listenBacklog,
+		insecureAuth:                          opts.InsecureAuth || !opts.TLS, // Auto-enable when TLS not configured
+		additionalCapsSuffix:                  additionalCapsSuffix,
+		idName:                                opts.IDName,
+		idVersion:                             opts.IDVersion,
+		idVendor:                              opts.IDVendor,
+		idSupportURL:                          opts.IDSupportURL,
+		debugWriter:                           debugWriter,
+		activeSessions:                        make(map[*Session]struct{}),
 	}
 	s.settings.Store(&reloadableSettings{
 		maxAuthErrors:          opts.MaxAuthErrors,
@@ -624,6 +627,12 @@ func (s *Server) SetConnectionTracker(tracker *server.ConnectionTracker) {
 	if tracker != nil && s.lookupCache != nil {
 		tracker.SetLookupCache(s.lookupCache)
 	}
+}
+
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
+func (s *Server) GetLookupCache() *lookupcache.LookupCache {
+	return s.lookupCache
 }
 
 // GetConnectionTracker returns the connection tracker for testing

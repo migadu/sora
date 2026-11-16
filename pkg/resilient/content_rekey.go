@@ -46,3 +46,16 @@ func (rd *ResilientDatabase) IsContentObjectReferencedWithRetry(ctx context.Cont
 	}
 	return result.(bool), nil
 }
+
+// UnreferencedContentObjectsWithRetry returns the stored bodies nothing points at any more;
+// see db.UnreferencedContentObjects.
+func (rd *ResilientDatabase) UnreferencedContentObjectsWithRetry(ctx context.Context, objs []db.ContentObject) ([]db.ContentObject, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).UnreferencedContentObjects(ctx, objs)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.ContentObject), nil
+}

@@ -772,3 +772,6 @@ func (s *Server) monitorActiveSessions() {
 func (s *Server) wrapProxyProtocol(l net.Listener) net.Listener {
 	return server.WrapProxyProtocol(l, s.proxyReader, "LMTP-PROXY")
 }
+
+// GetLookupCache exposes the recipient route cache for credential revocation/reset.
+func (s *Server) GetLookupCache() *lookupcache.LookupCache { return s.lookupCache }

@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -125,4 +127,86 @@ func TestMailboxStatsPolling(t *testing.T) {
 			assert.NotEqual(t, mailboxIDs["Archive"], row.MailboxID, "soft-deleted mailbox must not be reported")
 		}
 	})
+}
+
+// TestModSeqWindowSpansOneWrite: InsertMessage, CopyMessages and MoveMessages
+// measure the destination's highest mod-sequence right before and right after
+// their own change to it, inside their transaction, when the context asks for
+// that mailbox, and leave a window for another mailbox alone.
+func TestModSeqWindowSpansOneWrite(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+	db, accountID, inboxID := setupSearchTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+	destID := createTestMailbox(t, db, accountID, "WindowDest")
+
+	var bs imap.BodyStructure = &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 100}
+	base := time.Now().UnixNano()
+	n := 0
+	insert := func(ctx context.Context, tx pgx.Tx, mailboxID int64, mailboxName string) (imap.UID, error) {
+		n++
+		hash := fmt.Sprintf("modseqwindow-%d-%d", base, n)
+		_, uid, err := db.InsertMessage(ctx, tx, &InsertMessageOptions{
+			AccountID: accountID, MailboxID: mailboxID, MailboxName: mailboxName,
+			S3Domain: "example.com", S3Localpart: "modseqwindow", ContentHash: hash,
+			MessageID: hash + "@example.com", InternalDate: time.Now(), Size: 100,
+			Subject: "window", BodyStructure: &bs,
+		}, PendingUpload{InstanceID: "test", ContentHash: hash, Size: 100, AccountID: accountID})
+		return imap.UID(uid), err
+	}
+	// write runs fn in a transaction of its own, in a context asking for
+	// the destination's window, and returns the window.
+	write := func(t *testing.T, fn func(ctx context.Context, tx pgx.Tx) error) ModSeqWindow {
+		t.Helper()
+		w := &ModSeqWindow{MailboxID: destID}
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		require.NoError(t, fn(WithModSeqWindow(ctx, w), tx))
+		require.NoError(t, tx.Commit(ctx))
+		return *w
+	}
+
+	var sources []imap.UID
+	other := write(t, func(ctx context.Context, tx pgx.Tx) error {
+		for range 2 {
+			uid, err := insert(ctx, tx, inboxID, "INBOX")
+			if err != nil {
+				return err
+			}
+			sources = append(sources, uid)
+		}
+		return nil
+	})
+	assert.False(t, other.Measured, "a write into another mailbox measured the window: %+v", other)
+
+	for _, tc := range []struct {
+		name  string
+		write func(ctx context.Context, tx pgx.Tx) error
+	}{
+		{"InsertMessage", func(ctx context.Context, tx pgx.Tx) error {
+			_, err := insert(ctx, tx, destID, "WindowDest")
+			return err
+		}},
+		{"CopyMessages", func(ctx context.Context, tx pgx.Tx) error {
+			_, _, err := db.CopyMessages(ctx, tx, &[]imap.UID{sources[0]}, inboxID, destID, accountID, "example.com", "modseqwindow", "test", nil, nil)
+			return err
+		}},
+		{"MoveMessages", func(ctx context.Context, tx pgx.Tx) error {
+			_, err := db.MoveMessages(ctx, tx, &[]imap.UID{sources[1]}, inboxID, destID, accountID, "example.com", "modseqwindow", "test", nil, nil)
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := getHighestModSeq(t, db, ctx, destID)
+			w := write(t, tc.write)
+			after := getHighestModSeq(t, db, ctx, destID)
+			assert.True(t, w.Measured)
+			assert.Equal(t, before, w.Before, "Before")
+			assert.Equal(t, after, w.After, "After")
+			assert.Greater(t, w.After, w.Before)
+		})
+	}
 }

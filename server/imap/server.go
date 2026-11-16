@@ -1942,7 +1942,8 @@ func (s *IMAPServer) ReloadConfig(cfg config.ServerConfig) error {
 	return nil
 }
 
-// GetLookupCache returns the lookup cache for testing purposes
+// GetLookupCache returns the server's cache of logins (nil when disabled), so that a
+// changed account's cached logins can be dropped (see credchanges.Watcher).
 func (s *IMAPServer) GetLookupCache() *lookupcache.LookupCache {
 	return s.lookupCache
 }
@@ -1965,6 +1966,8 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 		return 0, "main_db", "transient_error", err
 	}
 
+	cacheGeneration := s.lookupCache.Generation()
+
 	// Check cache first if enabled
 	if s.lookupCache != nil {
 		cachedAccountID, found, cacheErr := s.lookupCache.Authenticate(address, password)
@@ -1983,6 +1986,8 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 		logger.Debug("Authentication: cache miss, checking database", "address", address)
 	}
 
+	cacheGeneration = s.lookupCache.Generation()
+
 	// Fetch credentials from database (no caching - we handle that here)
 	accountID, hashedPassword, err := s.rdb.GetCredentialForAuthWithRetry(ctx, address)
 	if err != nil {
@@ -1999,7 +2004,7 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 		// Cache negative result if enabled (user not found)
 		if s.lookupCache != nil {
 			// AuthUserNotFound = 1 (from lookupcache package)
-			s.lookupCache.SetFailure(address, 1)
+			s.lookupCache.SetFailureIfGeneration(cacheGeneration, address, 1)
 		}
 		return 0, "main_db", "user_not_found", err
 	}
@@ -2019,14 +2024,14 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 		// Cache negative result for invalid password if enabled
 		// AuthInvalidPassword = 2 (from lookupcache package)
 		if s.lookupCache != nil {
-			s.lookupCache.SetFailure(address, 2)
+			s.lookupCache.SetFailureIfGeneration(cacheGeneration, address, 2)
 		}
 		return 0, "main_db", "invalid_password", err
 	}
 
 	// Cache successful authentication if enabled
 	if s.lookupCache != nil {
-		s.lookupCache.SetSuccess(address, accountID, hashedPassword, password)
+		s.lookupCache.SetSuccessIfGeneration(cacheGeneration, address, accountID, hashedPassword, password)
 	}
 
 	// Asynchronously rehash if needed
@@ -2046,10 +2051,10 @@ func (s *IMAPServer) Authenticate(ctx context.Context, address, password string)
 				newHashedPassword = string(newHash)
 			}
 
-			// Update password in database
-			if err := s.rdb.UpdatePasswordWithRetry(updateCtx, address, newHashedPassword); err != nil {
+			// Upgrade only the account/address/hash actually authenticated.
+			if changed, err := s.rdb.RehashCredentialWithRetry(updateCtx, address, accountID, hashedPassword, newHashedPassword); err != nil {
 				logger.Error("Rehash: Failed to update password", "address", address, "error", err)
-			} else {
+			} else if changed {
 				logger.Info("Rehash: Successfully rehashed and updated password", "address", address)
 				// Invalidate cache entry since password hash changed
 				if s.lookupCache != nil {
