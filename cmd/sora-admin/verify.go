@@ -497,7 +497,7 @@ func applyFixes(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage
 			}
 			fmt.Printf("  [OK] Deleted %d orphaned objects\n", result.FixedOrphaned)
 			if kept > 0 {
-				fmt.Printf("  [OK] Kept %d objects referenced again since the check\n", kept)
+				fmt.Printf("  [OK] Kept %d objects referenced or deferred by the deletion protocol\n", kept)
 			}
 		}()
 	}
