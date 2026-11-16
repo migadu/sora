@@ -3,7 +3,9 @@
 package imap_test
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -132,6 +134,38 @@ func TestIMAP_ESearchSourcesResolveNamesAsTheDatabaseDoes(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestIMAP_ESearchIgnoresUnstorableMailboxName: a MAILBOXES name PostgreSQL cannot
+// hold (here bytes that are not UTF-8, which UTF8=ACCEPT lets through) names no
+// mailbox and is ignored like any other name of no mailbox: RFC 7377 §5 warns
+// that telling a missing mailbox from an inaccessible one, which §2.2 has
+// ignored, exposes the hierarchy. The read-only ACL fallback queried the
+// database with it, which refused it with SQLSTATE 22021, and the whole ESEARCH
+// answered NO [SERVERBUG].
+func TestIMAP_ESearchIgnoresUnstorableMailboxName(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+	identityAppend(t, dialIdentityTestClient(t, server, account.Email, account.Password), "INBOX")
+
+	c := dialRawIMAP(t, server.Address)
+	c.do(fmt.Sprintf("LOGIN %q %q", account.Email, account.Password))
+	c.do("ENABLE UTF8=ACCEPT")
+	for _, cmd := range []string{
+		"ESEARCH IN (MAILBOXES (INBOX \"a\xffb\")) ALL",
+		"ESEARCH IN (MAILBOXES (\"\xff\" INBOX)) ALL",
+	} {
+		untagged, tagged := c.read(c.send(cmd), cmd)
+		if !strings.Contains(tagged, " OK ") {
+			t.Errorf("%q: %s, want OK", cmd, tagged)
+			continue
+		}
+		if len(untagged) != 1 || !strings.Contains(untagged[0], "MAILBOX INBOX") {
+			t.Errorf("%q answered %q, want one ESEARCH response for INBOX", cmd, untagged)
+		}
 	}
 }
 

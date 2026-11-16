@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/migadu/sora/consts"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -47,4 +48,22 @@ func TestMailboxNameKeys(t *testing.T) {
 	keys, err = database.MailboxNameKeys(canceled, []string{"INBOX"})
 	require.ErrorIs(t, err, context.Canceled)
 	assert.Nil(t, keys)
+}
+
+// TestGetMailboxByNameForRightUnstorableName: a name PostgreSQL cannot hold names no
+// mailbox, as for GetMailboxByName. The read-only ACL fallback queried with it
+// and failed with SQLSTATE 22021, so ESEARCH IN (MAILBOXES ...) with such a name
+// answered NO [SERVERBUG] instead of ignoring it.
+func TestGetMailboxByNameForRightUnstorableName(t *testing.T) {
+	if testing.Short() {
+		t.Skip("requires PostgreSQL")
+	}
+	database, accountID := setupMailboxTestDatabase(t)
+	defer database.Close()
+	ctx := context.Background()
+
+	for _, name := range []string{"\xff", "a\x00b"} {
+		_, err := database.GetMailboxByNameForRight(ctx, accountID, name, ACLRightRead)
+		assert.ErrorIs(t, err, consts.ErrMailboxNotFound, "name %q", name)
+	}
 }
