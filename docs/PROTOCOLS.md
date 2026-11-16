@@ -921,9 +921,10 @@ There is no `AUTH`, `DSN` or `BINARYMIME`.
 ### 8.4 Message size
 
 `max_message_size` (default `50mb`) is advertised in `LHLO` and enforced twice. A `MAIL` command
-whose `SIZE=` parameter is above the limit gets `552 5.3.4` at once. A message that turns out
-larger while it is read gets `552 5.3.4 message size exceeds maximum allowed size of <n> bytes`
-after the data. `max_message_size = "0"` means the default 50 MiB, not unlimited. An empty message
+whose `SIZE=` parameter is above the limit gets `552 5.3.4` at once; one whose value is not 1 to
+20 digits (RFC 1870 §3, `size-value ::= 1*20DIGIT`) gets `501 5.5.4`, even when leading zeros
+leave a small number. A message that turns out larger while it is read gets
+`552 5.3.4 message size exceeds maximum allowed size of <n> bytes` after the data. `max_message_size = "0"` means the default 50 MiB, not unlimited. An empty message
 gets `550 5.6.0 empty message rejected: a message must contain at least headers`.
 
 ### 8.5 Delivery

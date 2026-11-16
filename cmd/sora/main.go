@@ -13,6 +13,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -109,6 +110,7 @@ type serverDependencies struct {
 	connectionTrackers    map[string]*server.ConnectionTracker // protocol -> tracker (for admin API kick)
 	connectionTrackersMux sync.Mutex                           // protects connectionTrackers map
 	authCacheInstance     *authcache.Cache                     // persistent auth cache
+	credChanges           atomic.Pointer[credchanges.Watcher]
 	proxyServers          map[string]adminapi.ProxyServer      // proxy name -> proxy server interface (for backend health)
 	proxyServersMux       sync.Mutex                           // protects proxyServers map
 	maintenance           *proxy.Maintenance                   // backends in maintenance, honored by every proxy (nil without proxies or DB)
@@ -153,12 +155,15 @@ func (deps *serverDependencies) registerServer(name string, server ConfigReloade
 		}
 	}
 	deps.runningServersMux.Lock()
-	defer deps.runningServersMux.Unlock()
 	if deps.runningServers == nil {
 		deps.runningServers = make(map[string]ConfigReloader)
 	}
 	deps.runningServers[name] = server
 	deps.settleLocked(name)
+	deps.runningServersMux.Unlock()
+	if deps.resilientDB != nil {
+		deps.notifyCredentialChanges()
+	}
 }
 
 // expectRegistrations notes, before startServers starts any of them, the servers that
@@ -1305,6 +1310,17 @@ func startServers(ctx context.Context, deps *serverDependencies) chan error {
 			defer deps.startReturned(server.Name)
 			start(ctx, deps, server, errChan)
 		})
+	}
+	if deps.resilientDB != nil {
+		go func() {
+			select {
+			case <-deps.serversRegistered():
+				if ctx.Err() == nil {
+					deps.notifyCredentialChanges()
+				}
+			case <-ctx.Done():
+			}
+		}()
 	}
 
 	return errChan

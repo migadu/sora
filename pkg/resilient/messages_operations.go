@@ -423,3 +423,30 @@ func (rd *ResilientDatabase) restoreMessagesChunked(ctx context.Context, params 
 	}
 	return restored, nil
 }
+
+// FindNullReferencesWithRetry reads one batch of messages for the References repair
+// (see db.FindNullReferences).
+func (rd *ResilientDatabase) FindNullReferencesWithRetry(ctx context.Context, afterID int64, limit int) (db.NullReferencesBatch, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).FindNullReferences(ctx, afterID, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return db.NullReferencesBatch{}, err
+	}
+	return result.(db.NullReferencesBatch), nil
+}
+
+// FillNullReferencesWithRetry writes the values one batch of the References repair found,
+// in a transaction of its own (see db.FillNullReferences). A fill writes only rows that
+// are still NULL, so running it again after an unknown commit outcome is safe.
+func (rd *ResilientDatabase) FillNullReferencesWithRetry(ctx context.Context, fills []db.ReferencesFill) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).FillNullReferences(ctx, tx, fills)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}
