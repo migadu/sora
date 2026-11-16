@@ -34,26 +34,27 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		ctx = context.WithValue(ctx, consts.ConfigContextKey, s.server.config)
 	}
 
-	if strings.EqualFold(existingName, newName) {
-		s.DebugLog("new mailbox name is the same as current one (case-insensitive)", "mailbox", existingName)
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeAlreadyExists,
-			Text: "The new mailbox name is the same as the current one.",
-		}
-	}
-
-	// Reject path-traversal segments ("." / "..") in the destination with a
-	// clean client error (db.RenameMailbox enforces this too, as defence-in-depth
-	// for non-IMAP callers).
-	if helpers.MailboxNameHasTraversal(newName) {
-		s.DebugLog("rejecting rename to name with path traversal segment", "name", newName)
+	// The new name is checked as CREATE checks its name: a trailing delimiter is no
+	// part of it (RFC 9051 §6.3.4), and RENAME creates the superior names it needs
+	// (§6.3.6), so an empty level ("r//s", "/lead") or a "." / ".." level (maildir
+	// export path traversal) is refused before any of them is created.
+	// db.RenameMailbox refuses these names too, for non-IMAP callers.
+	created, err := helpers.MailboxNameToCreate(newName)
+	if err != nil {
+		s.DebugLog("rejecting rename to an invalid mailbox name", "name", newName)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeCannot,
 			Text: "Invalid mailbox name",
 		}
 	}
+	newName = created
+
+	// Which mailbox a name names is the database's call: it matches names by
+	// LOWER(name), which depends on its collation and which no Go case mapping
+	// matches ("ſx" and "sx" are two mailboxes; under a libc collation "İNBOX" is
+	// the INBOX). So names are not compared here: they are looked up, and the
+	// mailboxes found are compared.
 
 	// Middle phase: Database operations outside lock
 	oldMailbox, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, existingName)
@@ -68,18 +69,29 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		}
 		return s.internalError("failed to fetch mailbox '%s': %v", existingName, err)
 	}
+	// RFC 3501 §6.3.5: renaming INBOX is special. The mailbox found is the INBOX when
+	// its stored name is INBOX in any case; strings.EqualFold folds no non-ASCII
+	// letter onto the letters of INBOX.
+	isInbox := strings.EqualFold(oldMailbox.Name, consts.MailboxInbox)
 
 	// Whether a mailbox is shared is settled when it is created in or outside the
 	// shared namespace, so a RENAME never crosses it (issue #160). Checked before any
 	// parent of the new name is created, and against the stored flag as
 	// db.RenameMailbox does: a personal mailbox can sit under the shared prefix, and
-	// may only be renamed out of it.
+	// may only be renamed out of it. The rename carries the mailbox's descendants
+	// along, and each must stay on its side as well (issue #1229). RENAME INBOX moves
+	// the messages of the personal INBOX into a new mailbox and leaves the children
+	// in place, so only the new name counts there.
 	if s.server.config != nil && s.server.config.SharedMailboxes.Enabled {
-		isShared, sharedErr := s.server.rdb.IsMailboxSharedWithRetry(ctx, oldMailbox.ID)
-		if sharedErr != nil {
-			return s.internalError("failed to check whether mailbox '%s' is shared: %v", existingName, sharedErr)
+		crosses := s.server.config.SharedMailboxes.InNamespace(newName)
+		if !isInbox {
+			var sharedErr error
+			crosses, sharedErr = s.server.rdb.RenameCrossesSharedBoundaryWithRetry(ctx, s.server.config.SharedMailboxes, oldMailbox, newName)
+			if sharedErr != nil {
+				return s.internalError("failed to check mailbox '%s' against the shared namespace: %v", existingName, sharedErr)
+			}
 		}
-		if s.server.config.SharedMailboxes.InNamespace(newName) != isShared {
+		if crosses {
 			s.DebugLog("rejecting rename across the shared namespace boundary", "old_name", existingName, "new_name", newName)
 			return sharedBoundaryError()
 		}
@@ -88,12 +100,18 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// A mailbox cannot become its own descendant. Refused before the missing levels
 	// of the new name are created, which would be below this mailbox. (RENAME INBOX
 	// moves messages into a new mailbox instead, which may be below INBOX.)
-	if !strings.EqualFold(existingName, consts.MailboxInbox) && helpers.MailboxNameIsBelow(newName, existingName) {
-		s.DebugLog("rejecting rename of a mailbox below itself", "old_name", existingName, "new_name", newName)
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeCannot,
-			Text: "A mailbox cannot be renamed to a name below itself",
+	if !isInbox {
+		below, belowErr := s.server.rdb.MailboxNameIsBelowWithRetry(ctx, newName, oldMailbox)
+		if belowErr != nil {
+			return s.internalError("failed to check whether '%s' is below '%s': %v", newName, existingName, belowErr)
+		}
+		if below {
+			s.DebugLog("rejecting rename of a mailbox below itself", "old_name", existingName, "new_name", newName)
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeCannot,
+				Text: "A mailbox cannot be renamed to a name below itself",
+			}
 		}
 	}
 
@@ -111,13 +129,18 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		}
 	}
 
-	_, err = s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, newName)
+	// The new name must name no mailbox, this one included.
+	existing, err := s.server.rdb.GetMailboxByNameWithRetry(ctx, AccountID, newName)
 	if err == nil {
-		s.DebugLog("mailbox already exists", "mailbox", newName)
+		text := fmt.Sprintf("mailbox '%s' already exists", newName)
+		if existing.ID == oldMailbox.ID {
+			text = "The new mailbox name is the same as the current one."
+		}
+		s.DebugLog("mailbox already exists", "mailbox", newName, "same_mailbox", existing.ID == oldMailbox.ID)
 		return &imap.Error{
 			Type: imap.StatusResponseTypeNo,
 			Code: imap.ResponseCodeAlreadyExists,
-			Text: fmt.Sprintf("mailbox '%s' already exists", newName),
+			Text: text,
 		}
 	} else {
 		if err != consts.ErrMailboxNotFound {
@@ -127,7 +150,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 
 	// RFC 3501 §6.3.5: Renaming INBOX is special — moves messages to the new
 	// mailbox while leaving INBOX intact (empty, same UID validity).
-	if strings.EqualFold(existingName, consts.MailboxInbox) {
+	if isInbox {
 		// Resolve (auto-creating if needed) the destination's parent hierarchy so
 		// a hierarchical target like "Archive/2026" is linked under "Archive",
 		// consistent with CREATE and the non-INBOX RENAME path. INBOX is the
@@ -181,7 +204,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			if resolveErr != nil {
 				return s.internalError("failed to resolve S3 owner for INBOX rename: %v", resolveErr)
 			}
-			_, err = s.server.rdb.MoveMessagesWithRetry(ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.hostname)
+			_, err = s.server.rdb.MoveMessagesWithRetry(ctx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.instanceID, nil, nil, nil)
 		}
 		if err != nil {
 			return s.internalError("failed to move messages from INBOX to '%s': %v", newName, err)
@@ -240,17 +263,22 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 		// (create) right on the new parent — or, when the new parent must be
 		// auto-created, on the nearest existing ancestor that CREATE would extend.
 		// A pure rename that keeps the same parent needs no "k". (Owners hold "k".)
-		oldParts := strings.Split(existingName, string(consts.MailboxDelimiter))
-		oldParentPath := strings.Join(oldParts[:len(oldParts)-1], string(consts.MailboxDelimiter))
-		if !strings.EqualFold(oldParentPath, newParentPath) {
+		// Whether newParentPath names the current parent is the database's call.
+		parentID, sameParent, parentErr := s.lookUpNewParent(ctx, newParentPath, oldMailbox)
+		if parentErr != nil {
+			return s.internalError("failed to resolve new parent mailbox %q: %v", newParentPath, parentErr)
+		}
+		if !sameParent {
 			if permErr := s.checkCreateRightForHierarchy(ctx, newParentPath, ownerAccountID, AccountID); permErr != nil {
 				return permErr
 			}
 		}
 
-		parentID, perr := s.resolveOrCreateParentPath(ctx, newParentPath, ownerAccountID)
-		if perr != nil {
-			return perr
+		if parentID == nil {
+			var perr error
+			if parentID, perr = s.resolveOrCreateParentPath(ctx, newParentPath, ownerAccountID); perr != nil {
+				return perr
+			}
 		}
 		newParentMailboxID = parentID
 	}
@@ -261,6 +289,13 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxSharedBoundary) {
 			return sharedBoundaryError()
+		}
+		if errors.Is(err, consts.ErrMailboxAlreadyExists) {
+			return &imap.Error{
+				Type: imap.StatusResponseTypeNo,
+				Code: imap.ResponseCodeAlreadyExists,
+				Text: "Mailbox already exists",
+			}
 		}
 		return s.internalError("failed to rename mailbox '%s' to '%s': %v", existingName, newName, err)
 	}
@@ -292,6 +327,29 @@ func (s *IMAPSession) writeRenameOldName(w *imapserver.RenameWriter, oldName, ne
 	}); err != nil {
 		s.WarnLog("failed to write OLDNAME LIST response after RENAME",
 			"old_name", oldName, "new_name", newName, "error", err)
+	}
+}
+
+// lookUpNewParent looks parentPath up in mbox's owner's hierarchy, as the database
+// resolves names, and returns the ID of the mailbox found and whether it is mbox's
+// current parent, the one whose ID ends mbox's path. The caller reuses the ID
+// instead of looking the parent up again. For a top-level mailbox, which has no
+// parent, nothing is looked up; (nil, false) leaves the parent to
+// resolveOrCreateParentPath, as when parentPath names no mailbox.
+func (s *IMAPSession) lookUpNewParent(ctx context.Context, parentPath string, mbox *db.DBMailbox) (*int64, bool, error) {
+	currentParentPath := helpers.GetParentPathFromPath(mbox.Path)
+	if currentParentPath == "" {
+		return nil, false, nil
+	}
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	id, err := s.server.rdb.GetOwnedMailboxIDByNameWithRetry(ctx, mbox.AccountID, parentPath)
+	switch {
+	case err == nil:
+		return &id, strings.HasSuffix(currentParentPath, helpers.FormatMailboxID(id)), nil
+	case errors.Is(err, consts.ErrMailboxNotFound):
+		return nil, false, nil
+	default:
+		return nil, false, err
 	}
 }
 

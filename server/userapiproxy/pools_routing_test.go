@@ -66,16 +66,18 @@ func poolAnswer(pool string) *scriptedLookup {
 	return &scriptedLookup{info: &proxy.UserRoutingInfo{PoolName: pool, AccountID: 42}, result: proxy.AuthSuccess}
 }
 
-// With named pools, a lookup that fails or answers nothing usable is refused: a request
-// carrying a token for account 42 must never reach the default pool's backends, where
-// account 42 is someone else. Nothing is cached, so the next request asks again.
+// With named pools, a lookup that fails, answers nothing usable or refuses the account
+// (401/403) is refused: a request carrying a token for account 42 must never reach the
+// default pool's backends, where account 42 is someone else. Nothing is cached, so the
+// next request asks again.
 func TestRouteUser_NamedPoolsRefuseWhatTheLookupDidNotAnswer(t *testing.T) {
 	for _, c := range []struct {
 		name   string
 		lookup *scriptedLookup
 	}{
 		{"lookup service down", &scriptedLookup{result: proxy.AuthTemporarilyUnavailable, err: errors.New("connection refused")}},
-		{"answer without a route (e.g. 429)", &scriptedLookup{result: proxy.AuthFailed}},
+		{"answer without a route", &scriptedLookup{result: proxy.AuthSuccess}},
+		{"lookup refuses the account (401/403)", &scriptedLookup{result: proxy.AuthFailed}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			s, _ := newPoolsMaintenanceServer(t) // sora0 is the default pool
@@ -253,11 +255,11 @@ func TestUserAPIProxy_TLSVerifyIsPerPool(t *testing.T) {
 	for _, serverVerify := range []bool{false, true} {
 		handler := newPoolsHTTPProxy(t, ServerOptions{Pools: pools, RemoteTLSVerify: serverVerify}, poolAnswer("verifying"))
 		before := hits.Load()
-		if code := login(handler, `{"email":"user@example.com"}`); code != http.StatusBadGateway || hits.Load() != before {
+		if code := login(handler, `{"email":"user@example.com","password":"x"}`); code != http.StatusBadGateway || hits.Load() != before {
 			t.Fatalf("server verify=%v, pool verifies: status %d, backend hit %v; want 502 and no request served by the unverified backend", serverVerify, code, hits.Load() != before)
 		}
 		handler = newPoolsHTTPProxy(t, ServerOptions{Pools: pools, RemoteTLSVerify: serverVerify}, poolAnswer("trusting"))
-		if code := login(handler, `{"email":"user@example.com"}`); code != http.StatusTeapot {
+		if code := login(handler, `{"email":"user@example.com","password":"x"}`); code != http.StatusTeapot {
 			t.Fatalf("server verify=%v, pool trusts: status %d, want the backend's 418", serverVerify, code)
 		}
 	}
@@ -324,10 +326,10 @@ func TestUserAPIProxy_PoolCAFileVerifiesItsBackend(t *testing.T) {
 		// Same CA file, but a backend with another certificate: not trusted.
 		{Name: "stranger", Backends: []string{strings.TrimPrefix(other.URL, "https://")}, Settings: proxy.BackendSettings{TLS: true, TLSVerify: true, TLSCAFile: caFile}},
 	}
-	if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, poolAnswer("private")), `{"email":"user@example.com"}`); code != http.StatusTeapot {
+	if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, poolAnswer("private")), `{"email":"user@example.com","password":"x"}`); code != http.StatusTeapot {
 		t.Fatalf("pool trusting its backend's CA: status %d, want the backend's 418", code)
 	}
-	if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, poolAnswer("stranger")), `{"email":"user@example.com"}`); code != http.StatusBadGateway {
+	if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, poolAnswer("stranger")), `{"email":"user@example.com","password":"x"}`); code != http.StatusBadGateway {
 		t.Fatalf("pool whose CA did not sign its backend: status %d, want 502", code)
 	}
 }
@@ -401,7 +403,7 @@ func TestUserAPIProxy_HostnamePoolBackendIsVerifiedByItsName(t *testing.T) {
 
 	pools := []proxy.PoolSpec{{Name: "named", Backends: []string{backend}, Default: true,
 		Settings: proxy.BackendSettings{TLS: true, TLSVerify: true, TLSCAFile: caFile}}}
-	if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, poolAnswer("named")), `{"email":"user@example.com"}`); code != http.StatusTeapot {
+	if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, poolAnswer("named")), `{"email":"user@example.com","password":"x"}`); code != http.StatusTeapot {
 		t.Fatalf("hostname pool backend with a certificate for its name: status %d, want the backend's 418", code)
 	}
 }
@@ -435,7 +437,7 @@ func TestUserAPIProxy_DNSCollisionNeverReachesAnotherPoolsBackend(t *testing.T) 
 				Settings: proxy.BackendSettings{TLS: true, TLSVerify: verify, TLSCAFile: otherCA}},
 		}
 		for _, lookup := range []*scriptedLookup{poolAnswer("b"), {info: &proxy.UserRoutingInfo{ServerAddress: net.JoinHostPort("localhost", port)}, result: proxy.AuthSuccess}} {
-			if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, lookup), `{"email":"user@example.com"}`); code != http.StatusServiceUnavailable {
+			if code := login(newPoolsHTTPProxy(t, ServerOptions{Pools: pools}, lookup), `{"email":"user@example.com","password":"x"}`); code != http.StatusServiceUnavailable {
 				t.Fatalf("ambiguous pool, verify=%v: status %d, want 503", verify, code)
 			}
 		}

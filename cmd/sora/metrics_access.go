@@ -7,7 +7,11 @@ import (
 	"strings"
 
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/server"
 )
+
+// metricsRealm is the realm of the metrics listener's Bearer challenge.
+const metricsRealm = "metrics"
 
 // metricsAccessGuard wraps the Prometheus handler with the access controls
 // configured on a metrics listener:
@@ -41,14 +45,19 @@ func metricsAccessGuard(allowedHosts []string, apiKey string, next http.Handler)
 		}
 
 		if apiKey != "" {
+			// Both refusals are 401 with the challenge (RFC 9110 section 15.5.2); a
+			// wrong token says why, "invalid_token", for which RFC 6750 section 3.1
+			// says "The resource SHOULD respond with the HTTP 401 (Unauthorized)
+			// status code."
 			token, ok := bearerToken(r.Header.Get("Authorization"))
 			if !ok {
-				w.Header().Set("WWW-Authenticate", `Bearer realm="metrics"`)
+				server.SetBearerChallenge(w.Header(), metricsRealm, "")
 				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
 			if subtle.ConstantTimeCompare([]byte(token), []byte(apiKey)) != 1 {
-				http.Error(w, "forbidden", http.StatusForbidden)
+				server.SetBearerChallenge(w.Header(), metricsRealm, server.BearerInvalidToken)
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
 				return
 			}
 		}

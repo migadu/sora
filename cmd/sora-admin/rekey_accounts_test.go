@@ -44,7 +44,7 @@ func TestRekeyOldObjectDeleteKeepsOutAnotherAccountsUpload(t *testing.T) {
 	f.put(oldKey, body)
 
 	store := &pausingDeleteStore{FileBasedS3Mock: f.store, deleting: make(chan struct{}), release: make(chan struct{})}
-	r := &rekeyRun{rdb: f.rdb, store: store, accountID: accountID, opts: rekeyOptions{DeleteOldObjects: true, BatchSize: 10, Jobs: 1},
+	r := &rekeyRun{rdb: f.rdb, store: store, accountID: accountID, opts: rekeyOptions{DeleteOldObjects: true, BodyDeletionProtocol: "global-hash-v1", BatchSize: 10, Jobs: 1},
 		report: &rekeyReport{}, written: map[db.ContentObject]bool{}}
 	deleted := make(chan struct{})
 	go func() {

@@ -126,6 +126,10 @@ Examples:
 		fs.Usage()
 		os.Exit(1)
 	}
+	if *batchSize < 1 {
+		fmt.Printf("Error: --batch-size must be at least 1\n")
+		os.Exit(1)
+	}
 
 	// Run verification
 	if err := verifyS3Storage(ctx, globalConfig, *email, *showMissing, *fixOrphaned, *fixMissing, *dryRun, *batchSize, *deep); err != nil {
@@ -148,6 +152,11 @@ type verificationResult struct {
 
 func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMissing, fixOrphaned, fixMissing, dryRun bool, batchSize int, deep bool) error {
 	startTime := time.Now()
+	if fixOrphaned && !dryRun {
+		if err := cfg.S3.RequireBodyDeletionProtocol(); err != nil {
+			return err
+		}
+	}
 
 	// Initialize database
 	rdb, err := newAdminDatabase(ctx, &cfg.Database)
@@ -260,6 +269,11 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 }
 
 func checkDBToS3(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, result *verificationResult, batchSize int, deep bool) error {
+	// The loop below steps by batchSize: 0 would never advance, below 0 would slice out of range.
+	if batchSize < 1 {
+		return fmt.Errorf("batch size must be at least 1, got %d", batchSize)
+	}
+
 	// Get all messages for the user
 	messages, err := rdb.GetAllMessagesForUserVerificationWithRetry(ctx, accountID)
 	if err != nil {

@@ -201,7 +201,8 @@ func ValidateNewHashType(hashType string) error {
 // SSHA512, SHA512, BLF-CRYPT or CRYPT (bcrypt) in any of Dovecot's spellings, or a
 // bare bcrypt hash (see parsePasswordHash). A wrong password is reported as
 // ErrInvalidCredentials (errors.Is) for every scheme; a stored hash that cannot be
-// checked as ErrUnverifiableHash.
+// checked as ErrUnverifiableHash. A wrong password costs at least what
+// DummyVerifyPassword costs, whatever the scheme (padFailedVerification).
 func VerifyPassword(hashedPassword, password string) error {
 	start := time.Now()
 	var hashType string
@@ -241,47 +242,83 @@ func VerifyPassword(hashedPassword, password string) error {
 	default: // bcrypt, blf_crypt, crypt
 		err = verifyBcrypt(h.data, password)
 	}
+	if errors.Is(err, ErrInvalidCredentials) {
+		padFailedVerification(h, password)
+	}
 	return err
 }
 
-// dummyHash caches a valid bcrypt hash at dummyHashCost. It is never a real
-// credential — it exists only to burn the same CPU as a genuine password
-// verification on auth paths that would otherwise short-circuit (account not
-// found). Generated lazily so it always tracks the current BcryptCost, no
-// matter when or how the cost was set (SetBcryptCost at startup, or a test
-// assigning BcryptCost directly in its own package init).
+// padFailedVerification brings the work spent on a wrong password checked against h
+// up to one bcrypt comparison at BcryptCost, what DummyVerifyPassword spends on an
+// address with no account, so the response time does not tell the two apart (#847).
+//
+// A bcrypt comparison at cost c is 2^c rounds of key expansion. A SHA-512 digest costs
+// next to nothing, so a failed SSHA512 or SHA512 check gets one comparison at
+// BcryptCost. A bcrypt hash at a lower cost c gets the difference, 2^BcryptCost - 2^c,
+// which is one comparison at each cost from c to BcryptCost-1. A hash at BcryptCost
+// or above is left alone: nothing checks a higher cost faster, and the rehash after a
+// successful login (NeedsRehash) brings a stored one down to BcryptCost.
+func padFailedVerification(h parsedHash, password string) {
+	target := BcryptCost
+	if h.scheme == "ssha512" || h.scheme == "sha512" {
+		_ = bcrypt.CompareHashAndPassword(dummyHashAt(target), []byte(password))
+		return
+	}
+	cost, err := bcrypt.Cost(h.data)
+	if err != nil {
+		return // parsePasswordHash checked the cost
+	}
+	for c := cost; c < target; c++ {
+		_ = bcrypt.CompareHashAndPassword(dummyHashAt(c), []byte(password))
+	}
+}
+
+// dummyHashes caches, by cost, a valid bcrypt hash of a placeholder. None is a real
+// credential: they exist only to burn the CPU of a genuine password verification
+// where there is none to run (an address with no account) or it costs less than one
+// at BcryptCost (padFailedVerification). Generated lazily, so the dummy always tracks
+// the current BcryptCost, no matter when or how the cost was set (SetBcryptCost at
+// startup, or a test assigning BcryptCost directly in its own package init).
 var (
-	dummyHashMu   sync.Mutex
-	dummyHashCost int // 0 = not yet generated
-	dummyHash     []byte
+	dummyHashMu sync.Mutex
+	dummyHashes = map[int][]byte{}
 )
 
-// dummyHashForCurrentCost returns a valid bcrypt hash at the current
-// BcryptCost, regenerating the cached one when the cost changes.
-func dummyHashForCurrentCost() []byte {
+// dummyHashAt returns the dummy bcrypt hash at cost, generating it on first use.
+func dummyHashAt(cost int) []byte {
 	dummyHashMu.Lock()
 	defer dummyHashMu.Unlock()
-	if dummyHashCost != BcryptCost {
-		if h, err := bcrypt.GenerateFromPassword([]byte("sora-timing-equalization-placeholder"), BcryptCost); err == nil {
-			dummyHash = h
-		} else {
+	h, ok := dummyHashes[cost]
+	if !ok {
+		var err error
+		if h, err = bcrypt.GenerateFromPassword([]byte("sora-timing-equalization-placeholder"), cost); err != nil {
 			// Defensive: GenerateFromPassword effectively never fails. Fall back to a known
-			// valid cost-10 hash so DummyVerifyPassword still performs real bcrypt work
+			// valid cost-10 hash so the comparison still performs real bcrypt work
 			// (a malformed hash would return instantly and defeat timing equalization).
-			dummyHash = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
+			h = []byte("$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy")
 		}
-		dummyHashCost = BcryptCost
+		dummyHashes[cost] = h
 	}
-	return dummyHash
+	return h
+}
+
+// dummyHashForCurrentCost returns the dummy bcrypt hash at the current BcryptCost.
+func dummyHashForCurrentCost() []byte {
+	return dummyHashAt(BcryptCost)
 }
 
 // DummyVerifyPassword performs a constant-cost bcrypt comparison that always fails.
 // Call it on the "account not found" branch of an authentication path so the response
-// takes ~the same time as the "wrong password" branch (which runs bcrypt). Without it,
-// a non-existent account returns measurably faster than an existing one, giving an
+// takes ~the same time as the "wrong password" branch (VerifyPassword, which spends at
+// least as much on a wrong password whatever the stored hash). Without it, a
+// non-existent account returns measurably faster than an existing one, giving an
 // attacker a user-enumeration timing oracle. (security-audit M14)
+//
+// Each call is counted in sora_password_dummy_verifications_total once the comparison
+// is done, as VerifyPassword counts its own in sora_password_verification_attempts_total.
 func DummyVerifyPassword(password string) {
 	_ = bcrypt.CompareHashAndPassword(dummyHashForCurrentCost(), []byte(password))
+	metrics.PasswordDummyVerifications.Inc()
 }
 
 // NeedsRehash reports whether a bcrypt hash, in any spelling VerifyPassword accepts
@@ -386,6 +423,34 @@ func (db *Database) GetCredentialEpoch(ctx context.Context, address string) (acc
 	}
 
 	return accountID, epoch, nil
+}
+
+// GetCredentialForToken returns what a User API login needs in one read: the account,
+// the password hash to check, and the credential's epoch (see GetCredentialEpoch) for the
+// token. Read together, the epoch is always that of the hash checked; read apart, a
+// password changed in between would leave a token from the old password carrying the new
+// epoch, which every refresh accepts. Returns consts.ErrUserNotFound when the credential is
+// missing or the account is out of service.
+func (db *Database) GetCredentialForToken(ctx context.Context, address string) (accountID int64, hashedPassword string, epoch time.Time, err error) {
+	normalizedAddress := strings.ToLower(strings.TrimSpace(address))
+	if normalizedAddress == "" {
+		return 0, "", time.Time{}, errors.New("address cannot be empty")
+	}
+
+	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
+		SELECT c.account_id, c.password, c.updated_at
+		FROM credentials c
+		JOIN accounts a ON c.account_id = a.id
+		WHERE LOWER(c.address) = $1 AND a.deleted_at IS NULL
+	`, normalizedAddress).Scan(&accountID, &hashedPassword, &epoch)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, "", time.Time{}, consts.ErrUserNotFound
+		}
+		logger.Error("Database: error fetching credential for token", "address", normalizedAddress, "err", err)
+		return 0, "", time.Time{}, fmt.Errorf("database error fetching credential: %w", err)
+	}
+	return accountID, hashedPassword, epoch, nil
 }
 
 // GetAccountIDByAddress retrieves the main user ID associated with a given identity (address)

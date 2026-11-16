@@ -59,8 +59,9 @@ func TestNoRepliesAreQuotedStrings(t *testing.T) {
 	}{
 		{"wrong master SASL password", plain("user@example.com", "master", "wrong"), `NO "Authentication failed"`},
 		{"unparsable identity", plain("", "not-an-address", "password"), `NO "Authentication failed"`},
-		{"authorization identity without master SASL", plain("other@example.com", "user@example.com", "password"),
-			`NO "Proxy authentication requires master_sasl_username and master_sasl_password to be configured"`},
+		// The authorization refusal itself needs valid credentials, so a database
+		// (integration_tests/managesieve TestManageSieve_AuthzIDRefusalNeedsCredentials).
+		{"authorization identity with bad credentials", plain("other@example.com", "not-an-address", "password"), `NO "Authentication failed"`},
 		{"LOGIN with an unparsable address", `LOGIN "not-an-address" "password"`, `NO "Authentication failed"`},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -76,6 +77,23 @@ func TestNoRepliesAreQuotedStrings(t *testing.T) {
 				t.Errorf("reply = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+// The greeting ends with an OK line whose text is a string too (RFC 5804 section 4:
+// response-capability = *(single-capability) response-oknobye; response-ok = "OK"
+// [SP "(" resp-code ")"] [SP string] CRLF). go-managesieve writes Options.Greeting
+// verbatim after "OK ", so the backend must pre-quote all of it, not one word of it.
+func TestGreetingTextIsQuotedString(t *testing.T) {
+	srv := newServerForConfig(t, config.ServerConfig{Name: "sieve-greeting", Type: "managesieve"}, ManageSieveServerOptions{})
+	_, _, greeting := dialManageSieve(t, srv)
+	okLine := greeting[len(greeting)-1]
+	text, ok := strings.CutPrefix(okLine, "OK ")
+	if !ok {
+		t.Fatalf("greeting OK line = %q, want text after \"OK \"", okLine)
+	}
+	if !isQuotedString(text) {
+		t.Errorf("greeting OK line = %q: text %s is not a quoted string", okLine, text)
 	}
 }
 

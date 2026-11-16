@@ -40,6 +40,12 @@ func TestImporter_DovecotSubscriptionsFile(t *testing.T) {
 			notWant: []string{"Work", "Projects", "Archives", "Sent Items"},
 		},
 		{
+			name:    "dovecot version 2 with CRLF",
+			file:    "V\t2\r\n\r\nINBOX\r\nWork\tProjects\r\nv1.2\r\nSent Items\r\n",
+			want:    []string{"INBOX", "Work/Projects", "v1.2", "Sent"},
+			notWant: []string{"V\t2", "Work\tProjects", "v1/2", "Sent Items"},
+		},
+		{
 			name:    "dovecot unversioned",
 			file:    "INBOX\nVendors\n",
 			want:    []string{"INBOX", "Vendors"},
@@ -155,6 +161,54 @@ func TestExporter_DovecotSubscriptionsFile(t *testing.T) {
 	}
 	const want = "V\t2\n\nINBOX\nVendors\nWork\tProjects\n"
 	if string(got) != want {
+		t.Errorf("subscriptions file = %q, want %q", got, want)
+	}
+}
+
+// TestExporter_SubscriptionsFileLinkIsReplaced (#1597): a subscriptions file in the
+// destination that links out of it is replaced by the exported file; the file the link
+// names is not written.
+func TestExporter_SubscriptionsFileLinkIsReplaced(t *testing.T) {
+	rdb := setupTestDatabase(t)
+	defer rdb.Close()
+	ctx := context.Background()
+
+	const email = "subs-link-export@example.com"
+	createSimpleTestAccount(t, rdb, email, "testpassword123")
+	address, err := server.NewAddress(email)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, address.FullAddress())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := rdb.SubscribeWithRetry(ctx, accountID, "INBOX"); err != nil {
+		t.Fatal(err)
+	}
+
+	secret := []byte("root:secret-hash:19000:0:99999:7:::\n")
+	outside := outsideFile(t, secret)
+	dir := filepath.Join(t.TempDir(), "export")
+	exporter, err := NewExporter(ctx, dir, email, 1, rdb, nil, ExporterOptions{Dovecot: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer exporter.Close()
+	subscriptions := filepath.Join(dir, "subscriptions")
+	linkOut(t, outside, subscriptions, false)
+
+	if err := exporter.exportSubscriptions(accountID); err != nil {
+		t.Fatal(err)
+	}
+
+	assertUnchanged(t, outside, secret)
+	assertRegularFile(t, subscriptions)
+	got, err := os.ReadFile(subscriptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "V\t2\n\nINBOX\n"; string(got) != want {
 		t.Errorf("subscriptions file = %q, want %q", got, want)
 	}
 }

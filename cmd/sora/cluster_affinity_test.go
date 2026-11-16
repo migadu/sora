@@ -106,3 +106,31 @@ url = "http://127.0.0.1:1/lookup/$email"
 		})
 	}
 }
+
+// cluster.New joins the node, and the cluster drops affinity gossip that arrives
+// before the affinity manager has registered its handler, which it does as soon as it
+// is created. Opening the affinity cache (file, schema, integrity check) between the
+// two would widen that window from nothing to the time the open takes, so the cache
+// is opened before the node joins (#1019).
+func TestInitializeServicesOpensAffinityCacheBeforeJoining(t *testing.T) {
+	src, err := os.ReadFile("main.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := strings.Index(string(src), "\nfunc initializeServices(")
+	if start < 0 {
+		t.Fatal("func initializeServices not found in main.go")
+	}
+	body := string(src[start:])
+	if end := strings.Index(body[1:], "\nfunc "); end >= 0 {
+		body = body[:end+1]
+	}
+	open := strings.Index(body, "affinitycache.New(")
+	join := strings.Index(body, "cluster.New(")
+	if open < 0 || join < 0 {
+		t.Fatal("initializeServices does not call affinitycache.New and cluster.New; update this test")
+	}
+	if open > join {
+		t.Error("initializeServices opens the affinity cache after the node joined the cluster, while affinity gossip has no handler")
+	}
+}

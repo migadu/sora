@@ -1,7 +1,9 @@
 package adminapi
 
 import (
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 )
 
@@ -27,26 +29,20 @@ func extractPathParam(path, prefix, suffix string) string {
 }
 
 // routeHandler wraps an http.HandlerFunc with method checking
-func routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "OPTIONS" {
-			// Allow OPTIONS for CORS preflight
-			w.WriteHeader(http.StatusOK)
-			return
-		}
-		if r.Method != method {
-			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		handler(w, r)
-	}
+func (s *Server) routeHandler(method string, handler http.HandlerFunc) http.HandlerFunc {
+	return s.multiMethodHandler(map[string]http.HandlerFunc{method: handler})
 }
 
-// multiMethodHandler allows multiple HTTP methods for a single route
-func multiMethodHandler(handlers map[string]http.HandlerFunc) http.HandlerFunc {
+// multiMethodHandler allows multiple HTTP methods for a single route. It answers
+// OPTIONS itself, and any other method the route does not serve with a 405.
+func (s *Server) multiMethodHandler(handlers map[string]http.HandlerFunc) http.HandlerFunc {
+	// The route's methods, OPTIONS included, for the Allow header.
+	allow := strings.Join(append(slices.Sorted(maps.Keys(handlers)), http.MethodOptions), ", ")
 	return func(w http.ResponseWriter, r *http.Request) {
-		if r.Method == "OPTIONS" {
-			// Allow OPTIONS for CORS preflight
+		if r.Method == http.MethodOptions {
+			// RFC 9110 section 9.3.7: a successful OPTIONS response SHOULD
+			// send Allow.
+			w.Header().Set("Allow", allow)
 			w.WriteHeader(http.StatusOK)
 			return
 		}
@@ -54,6 +50,15 @@ func multiMethodHandler(handlers map[string]http.HandlerFunc) http.HandlerFunc {
 			handler(w, r)
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		// RFC 9110 section 15.5.6: a 405 MUST carry an Allow header listing
+		// the target resource's currently supported methods.
+		w.Header().Set("Allow", allow)
+		s.writeError(w, http.StatusMethodNotAllowed, "Method not allowed")
 	}
+}
+
+// notFound answers a path no endpoint serves with the documented JSON error,
+// in place of ServeMux's text/plain "404 page not found".
+func (s *Server) notFound(w http.ResponseWriter, _ *http.Request) {
+	s.writeError(w, http.StatusNotFound, "Not found")
 }

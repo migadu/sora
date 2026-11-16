@@ -89,29 +89,24 @@
 //		// Script error: implicit keep (RFC 5228 §2.10.6)
 //	}
 //
-//	// Apply result actions: store every copy, then relay every redirect. A store
-//	// that fails is retried by the sender, and a redirect relayed before it would
-//	// go out again on every retry. With no copy to store (a redirect without
-//	// :copy), a single target can be relayed before staging. Multiple targets
-//	// must be staged first: partial handoff followed by a staging failure would
-//	// send the accepted targets another copy on retry. Keep an INBOX fallback
-//	// only if a redirect failed.
-//	dests := result.Destinations(false)
-//	relayAfterStore := len(dests) > 0
-//	if !relayAfterStore && len(result.RedirectTo) > 1 {
-//		if err := stageMessage(); err != nil {
-//			return err // stop before any relay handoff
+//	// Apply result actions. Write every redirect to the relay queue first, but hand
+//	// it to the relay worker only once the delivery can no longer fail: a store that
+//	// fails is retried by the sender, and a redirect handed over before it would go
+//	// out again on every retry. A target the queue cannot take keeps the message in
+//	// INBOX when nothing else stores it (RFC 5228 §4.2).
+//	commit, abort, allHeld := holdRedirects(result.RedirectTo) // RelayQueue.Hold each
+//	defer abort() // drops whatever was not handed over
+//	dests := result.Destinations(!allHeld)
+//	if len(dests) == 0 { // a redirect without :copy: nothing to store
+//		if commit() {
+//			return nil
 //		}
-//	}
-//	if !relayAfterStore && !relay(result.RedirectTo) {
-//		dests = result.Destinations(true)
+//		dests = result.Destinations(true) // keep it after all
 //	}
 //	for _, dest := range dests {
-//		if err := deliverToMailbox(dest.Mailbox); err != nil {
-//			return err // stop before any relay handoff
+//		if err := deliverToMailbox(dest.Mailbox, dest.Flags); err != nil {
+//			return err // nothing handed over yet
 //		}
 //	}
-//	if relayAfterStore {
-//		relay(result.RedirectTo)
-//	}
+//	commit()
 package sieveengine

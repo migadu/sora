@@ -456,7 +456,8 @@ func (rd *ResilientDatabase) hardDeleteAccountChunked(ctx context.Context, accou
 		if done {
 			return nil
 		}
-		// A step that is not done always expunged rows, so this loop cannot spin.
+		// A step that is not done always expunged rows, or found live ones that a
+		// concurrent EXPUNGE or MOVE expunged first, so this loop cannot spin.
 	}
 }
 
@@ -662,7 +663,7 @@ var ErrCommitOutcomeUnknown = errors.New("database commit outcome unknown")
 func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context, tx pgx.Tx) (any, error), nonRetryableErrors ...error) (any, error) {
 	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
-		tx, err := rd.BeginTxWithRetry(ctx, pgx.TxOptions{})
+		tx, origin, err := rd.beginWriteTxWithRetry(ctx, pgx.TxOptions{})
 		if err != nil {
 			if rd.isRetryableError(err) {
 				return err
@@ -720,7 +721,7 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 			// will open a fresh connection that DNS / the load balancer can route to
 			// the new primary.
 			if isReadOnlyTransactionError(cbErr) {
-				rd.resetCurrentWritePool()
+				rd.onReadOnlyWriteTx(origin)
 			}
 
 			for _, nonRetryableErr := range nonRetryableErrors {
@@ -766,6 +767,9 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 
 // executeReadWithRetry provides a generic wrapper for executing a read operation with retries and circuit breaker protection.
 func (rd *ResilientDatabase) executeReadWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context) (any, error), nonRetryableErrors ...error) (any, error) {
+	if db.HasReadSnapshot(ctx) {
+		return op(ctx)
+	}
 	var result any
 	err := retry.WithRetryAdvanced(ctx, func() error {
 		opCtx, cancel := rd.withTimeout(ctx, opType)

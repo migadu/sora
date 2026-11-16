@@ -185,6 +185,39 @@ func TestParseLine(t *testing.T) {
 			wantArgs: []string{`"my vacation script"`},
 			wantErr:  false,
 		},
+		// Command names are ABNF strings, case-insensitive over US-ASCII only
+		// (RFC 5234 §2.3). strings.ToUpper maps U+0131 (dotless i) to "I" and
+		// U+017F (long s) to "S", which turned these into CAPABILITY, SELECT
+		// and MAIL (#1511).
+		{
+			name:    "lower-case ASCII command is upper-cased",
+			line:    "a1 capability",
+			hasTag:  true,
+			wantTag: "a1",
+			wantCmd: "CAPABILITY",
+		},
+		{
+			name:    "dotless i is not an I",
+			line:    "p CAPAB\u0131LITY",
+			hasTag:  true,
+			wantTag: "p",
+			wantCmd: "CAPAB\u0131LITY",
+		},
+		{
+			name:     "long s is not an S",
+			line:     "a \u017felect INBOX",
+			hasTag:   true,
+			wantTag:  "a",
+			wantCmd:  "\u017fELECT",
+			wantArgs: []string{"INBOX"},
+		},
+		{
+			name:     "LMTP command with dotless i",
+			line:     "ma\u0131l FROM:<a@example.com>",
+			hasTag:   false,
+			wantCmd:  "MA\u0131L",
+			wantArgs: []string{"FROM:<a@example.com>"},
+		},
 	}
 
 	for _, tt := range tests {
@@ -483,5 +516,47 @@ func TestParseLiteral(t *testing.T) {
 				t.Errorf("ParseLiteral() nonSync = %v, want %v", nonSync, tt.wantNonSync)
 			}
 		})
+	}
+}
+
+func TestToUpperASCII(t *testing.T) {
+	for _, tc := range []struct{ in, want string }{
+		{"", ""},
+		{"LOGIN", "LOGIN"},
+		{"Login", "LOGIN"},
+		{"x-y_1.z", "X-Y_1.Z"},
+		{"pla\u0131n", "PLA\u0131N"},   // U+0131 stays
+		{"\u017felect", "\u017fELECT"}, // U+017F stays
+		{"\u212aey", "\u212aEY"},       // U+212A stays
+		{"\xff\x80a", "\xff\x80A"},
+	} {
+		if got := ToUpperASCII(tc.in); got != tc.want {
+			t.Errorf("ToUpperASCII(%q) = %q, want %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+func TestEqualFoldASCII(t *testing.T) {
+	for _, tc := range []struct {
+		s, t string
+		want bool
+	}{
+		{"", "", true},
+		{"SIZE", "SIZE", true},
+		{"size", "SIZE", true},
+		{"SmtpUtf8", "SMTPUTF8", true},
+		{"i-default", "I-DEFAULT", true},
+		{"SIZE", "SIZ", false},
+		{"SIZE", "SIZF", false},
+		{"@", "`", false},                      // 0x40 and 0x60 are not a case pair
+		{"\u017fIZE", "SIZE", false},           // U+017F is not "s"
+		{"PLA\u0131N", "PLAIN", false},         // U+0131 is not "i"
+		{"\u212a", "k", false},                 // U+212A is not "k"
+		{"\u0130-default", "i-default", false}, // U+0130 is not "i"
+		{"\xff", "\xff", true},
+	} {
+		if got := EqualFoldASCII(tc.s, tc.t); got != tc.want {
+			t.Errorf("EqualFoldASCII(%q, %q) = %v, want %v", tc.s, tc.t, got, tc.want)
+		}
 	}
 }

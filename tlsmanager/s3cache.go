@@ -44,7 +44,7 @@ type S3Cache struct {
 // Every value it stores is private key material - the certificate PEM bundles end
 // with the certificate key, and "acme_account+key" is the ACME account key - so the
 // write must not leave protection at rest to a bucket default nobody enforces.
-const defaultSSEAlgorithm = types.ServerSideEncryptionAes256
+const defaultSSEAlgorithm = types.ServerSideEncryption(config.CertificateSSEAES256)
 
 // S3CacheOption adjusts how the cache stores certificates.
 type S3CacheOption func(*S3Cache)
@@ -60,40 +60,19 @@ func WithServerSideEncryption(algorithm, kmsKeyID string) S3CacheOption {
 	}
 }
 
-// encryptionOptions turns the configured encryption settings into cache options.
-// A configuration that says nothing about encryption keeps defaultSSEAlgorithm; a
-// stray KMS key id with no algorithm is passed through rather than dropped, so
-// validateEncryption can reject it instead of the deployment believing it applies.
+// encryptionOptions turns the configured encryption settings into cache options. A
+// configuration that says nothing about encryption keeps the default; a stray KMS key id
+// with no algorithm is passed through rather than dropped, so validateEncryption can
+// reject it instead of the deployment believing it applies.
 func encryptionOptions(cfg config.TLSLetsEncryptS3Config) []S3CacheOption {
-	if cfg.ServerSideEncryption == nil && cfg.ServerSideEncryptionKMSKeyID == "" {
-		return nil
-	}
-	algorithm := string(defaultSSEAlgorithm)
-	if cfg.ServerSideEncryption != nil {
-		algorithm = *cfg.ServerSideEncryption
-	}
-	return []S3CacheOption{WithServerSideEncryption(algorithm, cfg.ServerSideEncryptionKMSKeyID)}
+	return []S3CacheOption{WithServerSideEncryption(cfg.CertificateSSE())}
 }
 
 // validateEncryption rejects settings that would not mean what they say, rather than
-// writing private keys under them.
+// writing private keys under them. config.TLSConfig.Validate refuses such a
+// [tls.letsencrypt.s3] with the file, by the same check.
 func (c *S3Cache) validateEncryption() error {
-	switch c.sseAlgorithm {
-	case "":
-		// No header: the store's own default applies.
-	case types.ServerSideEncryptionAes256, types.ServerSideEncryptionAwsKms:
-	default:
-		return fmt.Errorf("unsupported server-side encryption %q: use %q, %q or an empty value",
-			c.sseAlgorithm, types.ServerSideEncryptionAes256, types.ServerSideEncryptionAwsKms)
-	}
-	if c.sseAlgorithm == types.ServerSideEncryptionAwsKms && c.sseKMSKeyID == "" {
-		return fmt.Errorf("server-side encryption %q requires a KMS key id", c.sseAlgorithm)
-	}
-	if c.sseAlgorithm != types.ServerSideEncryptionAwsKms && c.sseKMSKeyID != "" {
-		return fmt.Errorf("a KMS key id is only used by server-side encryption %q, not %q",
-			types.ServerSideEncryptionAwsKms, c.sseAlgorithm)
-	}
-	return nil
+	return config.ValidateCertificateSSE(string(c.sseAlgorithm), c.sseKMSKeyID)
 }
 
 // NewS3Cache creates a new S3-backed autocert cache using AWS SDK.
