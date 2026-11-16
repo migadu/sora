@@ -67,13 +67,14 @@ func TestCopyMoveCarryEveryMessageColumn(t *testing.T) {
 	insert := func(n int) (id int64, uid imap.UID) {
 		t.Helper()
 		hash := fmt.Sprintf("copymovecols-%d-%d", base, n)
+		rawMsgID := fmt.Sprintf("(copy-move) <%s@example.com>", hash)
 		tx, err := db.GetWritePool().Begin(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
 		id, u, err := db.InsertMessage(ctx, tx, &InsertMessageOptions{
 			AccountID: accountID, MailboxID: inboxID, MailboxName: "INBOX",
 			S3Domain: "example.com", S3Localpart: "copymovecols", ContentHash: hash,
-			MessageID: fmt.Sprintf("%s@example.com", hash), InternalDate: time.Now(),
+			MessageID: fmt.Sprintf("%s@example.com", hash), MessageIDRaw: &rawMsgID, InternalDate: time.Now(),
 			Size: 100, Subject: fmt.Sprintf("Re: message %d", n), BodyStructure: &bs, HeaderPresence: &knownHeaders,
 			InReplyTo:  []string{"parent@example.com"},
 			References: []string{"ancestor@example.com", "parent@example.com"},

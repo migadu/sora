@@ -711,6 +711,7 @@ func (si *S3Importer) importStoredBody(ctx context.Context, obj S3ObjectInfo, us
 			BodyStructure:       &bodyStructure,
 			Recipients:          recipients,
 			HeaderPresence:      helpers.ExtractHeaderPresence(messageContent.Header),
+			MessageIDRaw:        helpers.ExtractMessageIDRaw(messageContent.Header, messageID),
 			FTSRetention:        si.options.FTSRetention,
 		},
 		db.PendingUpload{

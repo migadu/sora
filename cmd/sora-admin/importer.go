@@ -124,6 +124,7 @@ type messageMetadata struct {
 	bodyStructure        *imap.BodyStructure
 	recipients           []helpers.Recipient
 	headerPresence       *int16
+	messageIDRaw         *string
 	flags                []imap.Flag
 	preservedUID         *uint32
 	preservedUIDValidity *uint32
@@ -2379,6 +2380,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		bodyStructure:        &bodyStructure,
 		recipients:           recipients,
 		headerPresence:       helpers.ExtractHeaderPresence(messageContent.Header),
+		messageIDRaw:         helpers.ExtractMessageIDRaw(messageContent.Header, messageID),
 		flags:                flags,
 		preservedUID:         preservedUID,
 		preservedUIDValidity: preservedUIDValidity,
@@ -2644,6 +2646,7 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
 			HeaderPresence:       up.metadata.headerPresence,
+			MessageIDRaw:         up.metadata.messageIDRaw,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 			FTSRetention:         i.options.FTSRetention,
@@ -2805,6 +2808,7 @@ func (i *Importer) insertBatchToDBWithTransaction(ctx context.Context, uploaded 
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
 			HeaderPresence:       up.metadata.headerPresence,
+			MessageIDRaw:         up.metadata.messageIDRaw,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 			FTSRetention:         i.options.FTSRetention,
