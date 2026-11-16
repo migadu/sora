@@ -56,16 +56,31 @@ func newCapturingPool(t *testing.T, ctx context.Context, src *pgxpool.Pool, trac
 // planNode is the subset of an EXPLAIN (ANALYZE, FORMAT JSON) node these tests read.
 type planNode struct {
 	NodeType    string     `json:"Node Type"`
+	IndexName   string     `json:"Index Name"`
+	IndexCond   string     `json:"Index Cond"`
 	ActualRows  float64    `json:"Actual Rows"`
 	ActualLoops float64    `json:"Actual Loops"`
 	Plans       []planNode `json:"Plans"`
 }
 
-func (n planNode) walk(visit func(planNode)) {
-	visit(n)
+// walk visits n and every node below it, each with the node it is a child of (nil for n).
+func (n planNode) walk(parent *planNode, visit func(n planNode, parent *planNode)) {
+	visit(n, parent)
 	for _, child := range n.Plans {
-		child.walk(visit)
+		child.walk(&n, visit)
 	}
+}
+
+// andedWholeIndexScan reports whether n is a Bitmap Index Scan that its parent, a
+// BitmapAnd, ANDs in without an index condition. Such a scan reads every entry of its
+// partial index (idx_messages_account_hash_expunged: every expunged message in the
+// table) only to apply the index's predicate to a bitmap its siblings already confine to
+// the statement's own rows, so what it reads is the rest of the table. PostgreSQL costs
+// it as the whole index and adds it only while that is cheaper than the heap pages it
+// saves, which is while the index is small, as in a test database.
+func (n planNode) andedWholeIndexScan(parent *planNode) bool {
+	return parent != nil && parent.NodeType == "BitmapAnd" &&
+		n.NodeType == "Bitmap Index Scan" && n.IndexCond == ""
 }
 
 // explainRowsPerNode runs the statement under EXPLAIN (ANALYZE, FORMAT JSON) and returns
@@ -80,7 +95,9 @@ func explainRowsPerNode(t *testing.T, ctx context.Context, pool *pgxpool.Pool, q
 }
 
 // planRowsPerNode returns the number of rows each node of an EXPLAIN (ANALYZE, FORMAT
-// JSON) plan actually produced (rows x loops).
+// JSON) plan actually produced (rows x loops) for the statement's own rows. A whole-index
+// scan ANDed into a bitmap (andedWholeIndexScan) counts nothing: its rows are those of
+// every other mailbox, as many as the shared test database happens to hold.
 func planRowsPerNode(t *testing.T, raw []byte) map[string]float64 {
 	t.Helper()
 
@@ -92,16 +109,20 @@ func planRowsPerNode(t *testing.T, raw []byte) map[string]float64 {
 
 	rows := make(map[string]float64)
 	i := 0
-	explained[0].Plan.walk(func(n planNode) {
-		loops := n.ActualLoops
-		if loops == 0 {
-			// Never executed: a node the query did not reach costs nothing.
-			rows[fmt.Sprintf("%d:%s", i, n.NodeType)] = 0
-			i++
-			return
-		}
-		rows[fmt.Sprintf("%d:%s", i, n.NodeType)] = n.ActualRows * loops
+	explained[0].Plan.walk(nil, func(n planNode, parent *planNode) {
+		key := fmt.Sprintf("%d:%s", i, n.NodeType)
 		i++
+		switch {
+		case n.ActualLoops == 0:
+			// Never executed: a node the query did not reach costs nothing.
+			rows[key] = 0
+		case n.andedWholeIndexScan(parent):
+			t.Logf("not counted: %.0f rows of %s, a whole-index scan ANDed into a bitmap",
+				n.ActualRows*n.ActualLoops, n.IndexName)
+			rows[key] = 0
+		default:
+			rows[key] = n.ActualRows * n.ActualLoops
+		}
 	})
 	return rows
 }
