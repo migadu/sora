@@ -898,6 +898,45 @@ func (s *Session) ErrorLog(msg string, keyvals ...any) {
 	s.getLogger().ErrorLog(msg, keyvals...)
 }
 
+func formatCanonicalRCPT(recipient string, keptParams []string) string {
+	if len(keptParams) > 0 {
+		return "RCPT TO:<" + recipient + "> " + strings.Join(keptParams, " ")
+	}
+	return "RCPT TO:<" + recipient + ">"
+}
+
+// Parse using the same path-first parameter contract as the RCPT handler.
+func parseRCPTCommand(command string) (address string, keptParams []string, ok bool) {
+	trimmed := strings.TrimSpace(command)
+	if len(trimmed) <= 4 || !server.EqualFoldASCII(trimmed[:4], "RCPT") || (trimmed[4] != ' ' && trimmed[4] != '\t') {
+		return "", nil, false
+	}
+	_, verb, args, err := server.ParseLine("RCPT "+strings.TrimSpace(trimmed[4:]), false)
+	if err != nil || verb != "RCPT" {
+		return "", nil, false
+	}
+	toParam, rest, found := findParameter(args, "TO:")
+	if !found {
+		return "", nil, false
+	}
+	address, ok = extractAddressString(toParam)
+	if !ok || address == "" {
+		return "", nil, false
+	}
+	for _, rawArg := range rest {
+		if strings.HasPrefix(rawArg, `"`) {
+			continue
+		}
+		for _, param := range strings.Fields(rawArg) {
+			key, val, hasEq := strings.Cut(param, "=")
+			if hasEq && val != "" && server.EqualFoldASCII(key, "XRCPTFORWARD") {
+				keptParams = append(keptParams, param)
+			}
+		}
+	}
+	return address, keptParams, true
+}
+
 // mailParameterReply returns the first MAIL parameter the proxy refuses and the reply
 // refusing the command ("" for none). It takes the parameters of the extensions its LHLO
 // reply advertises: SIZE (RFC 1870, checked by mailSizeParameter); SMTPUTF8 (RFC 6531),
@@ -963,6 +1002,10 @@ func unsupportedRcptParameter(params []string) string {
 // null reverse-path of MAIL (RFC 5321 section 4.1.2), never a path that could not
 // be read.
 func (s *Session) extractAddress(param string) (address string, ok bool) {
+	return extractAddressString(param)
+}
+
+func extractAddressString(param string) (address string, ok bool) {
 	// The parameter value might be quoted, so unquote it first. A quoted "<>" is not
 	// the null reverse-path: in a path a quoted string is a local part (section 4.1.2),
 	// and this one has no domain.
@@ -1655,43 +1698,41 @@ func (s *Session) invalidateLookupCache(reason string) {
 
 // forwardRCPT sends the RCPT TO command to backend and handles response interception.
 // Its only parameter can be XRCPTFORWARD: the RCPT handler refuses any other.
-func (s *Session) forwardRCPT(command string) {
-	// IMPORTANT: If remotelookup resolved the recipient to a different email (ActualEmail),
-	// we must rewrite the RCPT TO command to use the resolved email, not the original.
-	// This handles cases where remotelookup returns a token-based or aliased address.
-	// However, we must preserve the detail part (e.g., +test) from the original address.
-	backendCommand := command
-	if s.username != s.toAddress.BaseAddress() {
-		// Username was resolved to a different email - rewrite RCPT TO
-		// Extract any ESMTP parameters from the command (after the address)
-		params := ""
-		if idx := strings.Index(command, ">"); idx != -1 && idx+1 < len(command) {
-			params = strings.TrimSpace(command[idx+1:])
-		}
+func (s *Session) backendRcptTo(command string) (backendCommand string, rewrote bool, resolvedRecipient string) {
+	parsedRecipient, keptParams, ok := parseRCPTCommand(command)
+	recipient := s.to
+	if recipient == "" && ok {
+		recipient = parsedRecipient
+	}
 
-		// Reconstruct resolved email with detail if present
-		var resolvedRecipient string
+	if s.toAddress != nil && s.username != "" && s.username != s.toAddress.BaseAddress() {
 		if s.toAddress.Detail() != "" {
-			// Preserve detail part from original address
-			resolvedAddr, parseErr := server.NewAddress(s.username)
-			if parseErr == nil {
+			if resolvedAddr, parseErr := server.NewAddress(s.username); parseErr == nil {
 				resolvedRecipient = fmt.Sprintf("%s+%s@%s", resolvedAddr.LocalPart(), s.toAddress.Detail(), resolvedAddr.Domain())
 			} else {
-				// Fallback: use resolved username as-is if parsing fails
 				s.WarnLog("Failed to parse resolved username for detail preservation", "username", s.username, "error", parseErr)
 				resolvedRecipient = s.username
 			}
 		} else {
 			resolvedRecipient = s.username
 		}
+		recipient = resolvedRecipient
+		rewrote = true
+	}
 
-		// Reconstruct RCPT TO with resolved email (with detail if present)
-		if params != "" {
-			backendCommand = fmt.Sprintf("RCPT TO:<%s> %s", resolvedRecipient, params)
-		} else {
-			backendCommand = fmt.Sprintf("RCPT TO:<%s>", resolvedRecipient)
-		}
+	if recipient == "" {
+		return command, false, ""
+	}
+	return formatCanonicalRCPT(recipient, keptParams), rewrote, resolvedRecipient
+}
+
+// forwardRCPT preserves canonical path and accepted forwarding tokens after validation.
+func (s *Session) forwardRCPT(command string) {
+	backendCommand, rewrote, resolvedRecipient := s.backendRcptTo(command)
+	if rewrote {
 		s.DebugLog("Rewrote RCPT TO for backend", "original_recipient", s.to, "resolved_recipient", resolvedRecipient, "backend_command", backendCommand)
+	} else if backendCommand != command {
+		s.DebugLog("Canonicalized RCPT TO for backend", "original", command, "cleaned", backendCommand)
 	}
 
 	// Send the RCPT TO command
