@@ -629,14 +629,19 @@ sora-admin --config config.toml export maildir --email user@example.com \
 | `--jobs` | `4` | Messages exported in parallel within a mailbox. |
 | `--delay` | `0` | Pause after each exported message (Go duration). |
 
-**Dry-run cache snapshot.** A missing target or cache stays missing. When a cache
-exists, preview copies its database and WAL into an owner-only temporary directory,
-reads that private copy, and removes it on close. The source database, WAL and SHM
-are never opened by SQLite or changed; source SHM is not copied. Committed rows left
-in WAL after a crash are included. The preview runs a separate helper process that
-holds a nonblocking exclusive POSIX lock while copying, so an active SQLite user
-causes a clear refusal. Stop users of that cache and retry; do not remove its WAL.
-A rollback journal is also refused: recover and close it normally before preview.
+**Dry-run cache snapshot.** A missing target or cache stays missing. The dry run
+reaches the target as the export does ("Links in the target" below): a link the export
+refuses makes the dry run refuse to start too, naming the link, before any cache is
+looked for, and a target the export would create is missing, with every message new.
+When a cache exists, preview copies its database and WAL into an owner-only temporary
+directory, reads that private copy, and removes it on close. The copy is made through
+the directory the dry run checked, not by the target's name again. The source
+database, WAL and SHM are never opened by SQLite or changed; source SHM is not copied.
+Committed rows left in WAL after a crash are included. The preview runs a separate
+helper process that holds a nonblocking exclusive POSIX lock while copying, so an
+active SQLite user causes a clear refusal. Stop users of that cache and retry; do not
+remove its WAL. A rollback journal is also refused: recover and close it normally
+before preview.
 
 This snapshot is supported on local POSIX-locking Linux filesystems
 (ext2/3/4, XFS, Btrfs, tmpfs or overlayfs) and macOS APFS/HFS/UFS/tmpfs. Other
@@ -695,8 +700,9 @@ uidlist in the target is merged: its entries for files still present are kept.
 runs with more privileges, so message and Dovecot contents and Maildir child directories below
 it are accessed through the opened target directory. `--maildir-path` itself, or a directory on
 the way to it, may be a symbolic link under the import's rule
-([section 3](#3-the-maildir-layout-sora-reads)): only when the link belongs to root or to the owner
-of the directory it leads to. A user who can replace `~/Maildir`, or a directory above it, could
+([section 3](#3-the-maildir-layout-sora-reads)): only when the link belongs to root, to the user
+running `sora-admin`, or to the owner of the directory it leads to. A user who can replace
+`~/Maildir`, or a directory above it, could
 otherwise point it at another user's maildir or home and have the account's mail, Dovecot files
 and `sora-maildir.db` written there. Any other link makes the export refuse to start, naming the
 link, before anything is created. The directories missing on the way are created only once every

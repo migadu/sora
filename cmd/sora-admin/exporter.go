@@ -82,24 +82,30 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	if jobs < 1 {
 		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
 	}
-	// Preview never creates or migrates anything in the selected maildir.
+	// Preview never creates or migrates anything in the selected maildir. It reaches
+	// the target as the export does, refusing the links the export refuses, and copies
+	// the cache through the directory it checked (openExportCacheForDryRun). A target
+	// that is missing holds no cache: every message is new.
 	if options.DryRun {
-		if exportRootOpened != nil {
+		root, err := openExportPreviewRoot(maildirPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to open maildir path: %w", err)
+		}
+		if root != nil && exportRootOpened != nil {
 			exportRootOpened()
 		}
 		maildirPath = effectiveMaildirPath(maildirPath)
 		dbPath := filepath.Join(maildirPath, maildirCacheName)
-		cache, privateDir, err := openExportCacheForDryRun(ctx, dbPath)
-		if err != nil {
-			return nil, err
-		}
-		var root *os.Root
-		if cache != nil {
-			root, err = os.OpenRoot(filepath.Clean(maildirPath))
+		var cache *sql.DB
+		var privateDir string
+		if root != nil {
+			cache, privateDir, err = openExportCacheForDryRun(ctx, root)
+			if err != nil || cache == nil {
+				root.Close()
+				root = nil
+			}
 			if err != nil {
-				cache.Close()
-				os.RemoveAll(privateDir)
-				return nil, fmt.Errorf("failed to open maildir path: %w", err)
+				return nil, err
 			}
 		}
 		return &Exporter{ctx: ctx, maildirPath: maildirPath, root: root, email: email,
