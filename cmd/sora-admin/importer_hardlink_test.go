@@ -208,6 +208,12 @@ func worldWritableDirOf(t *testing.T, paths ...string) string {
 // can point it at a directory of the linked file's owner that anyone may write into, as
 // /tmp is root's: its owner vouches for none of the names in it.
 func TestScanMaildirRefusesAHardLinkInAMaildirLinkedToADirectoryAnyoneMayWrite(t *testing.T) {
+	// Exercise the content-reader policy on the protected-hardlink cache branch.
+	// The unprotected branch now refuses this world-writable cache directory before
+	// the scan; TestMaildirCacheRefusesADirectoryOthersCanWrite covers that boundary.
+	previousProtection := hardLinksProtected
+	t.Cleanup(func() { hardLinksProtected = previousProtection })
+	hardLinksProtected = func() bool { return true }
 	const linkName = "1700000002.M2P1.host:2,S"
 	secret := outsideFile(t, cachedSizeMessage("Secret", 100))
 	require.NoError(t, os.Chmod(secret, 0600))
