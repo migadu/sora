@@ -216,7 +216,14 @@ func (rd *ResilientDatabase) AuthenticateWithRetry(ctx context.Context, address,
 			}
 			// Password mismatch — the password may have changed since caching.
 			// Invalidate the stale entry and fall through to the authoritative DB.
-			rd.authCache.Invalidate(ctx, address)
+			// Use a bounded background context: the caller's request context may
+			// have expired or canceled while CPU-bound VerifyPassword ran, and a
+			// context-aborted Invalidate marks authCache unhealthy node-wide.
+			invCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			if invErr := rd.authCache.Invalidate(invCtx, address); invErr != nil {
+				logger.Warn("AuthCache: Failed to invalidate mismatched credentials", "address", address, "error", invErr)
+			}
 			mismatchedHash, mismatchErr = cachedHash, verifyErr
 		}
 		// Cache miss or cache error — proceed to PostgreSQL
