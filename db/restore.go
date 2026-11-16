@@ -54,7 +54,8 @@ type ListDeletedMessagesParams struct {
 const effectiveMailboxName = `COALESCE(mb.name, m.mailbox_path)`
 
 // ListDeletedMessages returns messages that have been deleted (expunged)
-// matching the given criteria
+// matching the given criteria. A message that has since been restored is live again,
+// so the expunged row it was restored from is not listed.
 func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMessagesParams) ([]DeletedMessage, error) {
 	accountID, err := restoreAccountID(ctx, d.GetReadPool(), params.Email)
 	if err != nil {
@@ -78,6 +79,7 @@ func (d *Database) ListDeletedMessages(ctx context.Context, params ListDeletedMe
 		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
 		WHERE m.account_id = $1
 		  AND m.expunged_at IS NOT NULL
+		  AND m.restored_at IS NULL
 	`
 
 	args := []any{accountID}
@@ -184,13 +186,15 @@ func restoreAccountID(ctx context.Context, q rowQuerier, email string) (int64, e
 }
 
 // restoreFilters returns the FROM/WHERE shared by every restore query for params, and
-// its arguments. Columns and aliases follow effectiveMailboxName (m, mb).
+// its arguments. Columns and aliases follow effectiveMailboxName (m, mb). An expunged row
+// whose message has been restored (restored_at, see RestoreMessages) is no candidate.
 func restoreFilters(accountID int64, params RestoreMessagesParams) (string, []any) {
 	query := `
 		FROM messages m
 		LEFT JOIN mailboxes mb ON mb.id = m.mailbox_id
 		WHERE m.account_id = $1
 		  AND m.expunged_at IS NOT NULL
+		  AND m.restored_at IS NULL
 	`
 	args := []any{accountID}
 	argPos := 2
@@ -315,6 +319,13 @@ func (d *Database) GetRestorableMessageIDs(ctx context.Context, params RestoreMe
 // RestoreMessages restores deleted messages back to their original mailboxes
 // It recreates mailboxes if they no longer exist.
 //
+// A message comes back as a new row, with a new UID, as a MOVE brings one: the expunged
+// row stays as it is, the record that its UID was expunged and when, until the cleaner
+// purges it with the other expunged rows. Every reader of that record (a session's
+// poll, QRESYNC and UID FETCH VANISHED, the sequence view of a session not yet told of
+// the expunge) keeps reporting the old UID's expunge to a client that has not seen it.
+// restored_at marks the expunged row, so it is neither listed nor restored again.
+//
 // Every candidate is handled with a fixed number of statements inside the caller's
 // transaction, so the caller must bound the batch (see RestoreMessagesWithRetry, which
 // resolves the ids first and restores them in chunks, each in its own transaction).
@@ -401,7 +412,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		mailboxIDMap[mailboxName] = mailboxID
 	}
 
-	// Restore messages by clearing expunged_at and updating mailbox_id
+	// Restore each message as a new row in its target mailbox
 	var restoredCount int64
 	var skippedCount int64
 	for _, msg := range messagesToRestore {
@@ -414,7 +425,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		// in a previous chunk. The row itself may have vanished since the candidate list was
 		// built (already restored by a concurrent run, or purged by the cleaner); that is a
 		// skip, not an error, so a restore is always safe to re-run.
-		// Hold the object's lock while the row comes back to life: the cleaner takes
+		// Hold the object's lock while the message comes back to life: the cleaner takes
 		// the same lock (session try-lock) around "confirm orphan → delete object",
 		// so a restore can no longer slip between its check and its delete and leave a
 		// live row whose object is gone.
@@ -425,7 +436,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		var restorable bool
 		var existingCount int
 		err := tx.QueryRow(ctx, `
-			SELECT EXISTS (SELECT 1 FROM messages WHERE id = $1 AND expunged_at IS NOT NULL),
+			SELECT EXISTS (SELECT 1 FROM messages WHERE id = $1 AND expunged_at IS NOT NULL AND restored_at IS NULL),
 			       (SELECT COUNT(*) FROM messages
 			         WHERE account_id = $2 AND mailbox_id = $3 AND message_id = $4 AND expunged_at IS NULL)
 		`, msg.id, accountID, targetMailboxID, msg.messageID).Scan(&restorable, &existingCount)
@@ -434,7 +445,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 		}
 
 		if !restorable {
-			logger.Info("Database: skipping message restoration: message no longer expunged or already removed", "id", msg.id, "mailbox", msg.mailboxName)
+			logger.Info("Database: skipping message restoration: message already restored or removed", "id", msg.id, "mailbox", msg.mailboxName)
 			skippedCount++
 			continue
 		}
@@ -458,44 +469,49 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 			return 0, fmt.Errorf("failed to get next UID for mailbox: %w", err)
 		}
 
-		// Restore the message's state and clear the \Deleted flag (FlagDeleted = 8,
-		// bit 3). An upsert, not an UPDATE: the row is missing for any message whose
-		// mailbox was purged by an older build (the FK cascade deleted it), and a bare
-		// UPDATE then matched nothing and reported success — leaving a live message with
-		// no state row, on which every later STORE silently did nothing. With nothing
-		// left to recover, such a message comes back unread and keyword-less.
-		_, err = tx.Exec(ctx, `
-			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
-			VALUES ($1, $2, 0, '[]'::jsonb, now(), nextval('messages_modseq'))
-			ON CONFLICT (message_id) DO UPDATE
-			SET mailbox_id = EXCLUDED.mailbox_id,
-			    flags = message_state.flags & ~8,
-			    flags_changed_at = EXCLUDED.flags_changed_at,
-			    updated_modseq = EXCLUDED.updated_modseq
-		`, msg.id, targetMailboxID)
-		if err != nil {
-			return 0, fmt.Errorf("failed to restore message_state for message %d: %w", msg.id, err)
-		}
-
-		// The message appears in the mailbox again, so it is created anew: a new UID and
-		// a new mod-sequence above HIGHESTMODSEQ (RFC 7162 §3.1: "When a message is
-		// appended to a mailbox (via the IMAP APPEND command, COPY to the mailbox, or
-		// using an external mechanism), the server generates a new modification sequence
-		// that is higher than the highest modification sequence of all messages in the
-		// mailbox and assigns it to the appended message"). The stats trigger raises the
-		// mailbox's highest_modseq to it, so readers synchronized past the expunge can
-		// report the new arrival. Restoring a row still held by an older sequence view
-		// does not preserve its previous UID/expunge history (issue #1712).
+		// The message appears in the mailbox again, so it is created anew: a new row with
+		// a new UID and a new mod-sequence above HIGHESTMODSEQ (RFC 7162 §3.1: "When a
+		// message is appended to a mailbox (via the IMAP APPEND command, COPY to the
+		// mailbox, or using an external mechanism), the server generates a new modification
+		// sequence that is higher than the highest modification sequence of all messages in
+		// the mailbox and assigns it to the appended message"). The stats triggers count it
+		// and raise the mailbox's highest_modseq, as for a COPY. Every column of the message
+		// is carried, as COPY and MOVE carry them (TestCopyMoveCarryEveryMessageColumn), and
+		// delivery_hash too: an MTA redelivery of the message is still a duplicate of it.
+		//
+		// The expunged row is only marked restored_at, in the same statement, and stays the
+		// record of the old UID's expunge. Its state comes along without \Deleted
+		// (FlagDeleted = 8, bit 3). A message whose state row is missing (its mailbox was
+		// purged by an older build, whose FK cascade deleted it) comes back unread and
+		// keyword-less: there is nothing left to recover.
 		result, err := tx.Exec(ctx, `
-			UPDATE messages
-			SET expunged_at = NULL,
-			    expunged_modseq = NULL,
-			    mailbox_id = $2,
-			    uid = $3,
-			    created_modseq = nextval('messages_modseq'),
-			    updated_at = now()
-			WHERE id = $1 AND expunged_at IS NOT NULL
-		`, msg.id, targetMailboxID, nextUID)
+			WITH source AS (
+				UPDATE messages SET restored_at = now()
+				WHERE id = $1 AND expunged_at IS NOT NULL AND restored_at IS NULL
+				RETURNING *
+			),
+			restored AS (
+				INSERT INTO messages (
+					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
+					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
+					body_structure, recipients_json, s3_domain, s3_localpart,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					delivery_hash, mailbox_id, mailbox_path, uid, created_modseq
+				)
+				SELECT
+					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
+					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
+					body_structure, recipients_json, s3_domain, s3_localpart,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses,
+					delivery_hash, $2::bigint, $3::text, $4::bigint, nextval('messages_modseq')
+				FROM source
+				RETURNING id
+			)
+			INSERT INTO message_state (message_id, mailbox_id, flags, custom_flags, flags_changed_at, updated_modseq)
+			SELECT r.id, $2::bigint, COALESCE(ms.flags & ~8, 0), COALESCE(ms.custom_flags, '[]'::jsonb), now(), nextval('messages_modseq')
+			FROM restored r
+			LEFT JOIN message_state ms ON ms.message_id = $1
+		`, msg.id, targetMailboxID, msg.mailboxName, nextUID)
 		if err != nil {
 			return 0, fmt.Errorf("failed to restore message %d: %w", msg.id, err)
 		}
@@ -504,17 +520,7 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 	}
 
 	if skippedCount > 0 {
-		logger.Info("Database: skipped restoring messages that already exist in target mailboxes or are no longer expunged", "count", skippedCount)
-	}
-
-	// Recompute unseen_count for every touched target mailbox. The database trigger on
-	// messages joins on ms.mailbox_id = o.mailbox_id, which cannot match for an orphan
-	// (o.mailbox_id IS NULL) or cross-mailbox restore, treating every restored message
-	// as an unseen arrival and drifting unseen_count up by 1 per \Seen message.
-	for _, targetMailboxID := range mailboxIDMap {
-		if _, err := d.RecomputeMailboxUnseen(ctx, tx, targetMailboxID); err != nil {
-			return 0, fmt.Errorf("failed to recompute unseen count for mailbox %d: %w", targetMailboxID, err)
-		}
+		logger.Info("Database: skipped restoring messages that already exist in target mailboxes or were already restored or removed", "count", skippedCount)
 	}
 
 	return restoredCount, nil

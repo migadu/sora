@@ -574,7 +574,11 @@ func (s *Session) handleConnection() {
 			authnID := parts[1]
 			password := parts[2]
 
-			if err := s.authenticateUser(authnID, password); err != nil {
+			if err := s.authenticateUserWithAuthzID(authzID, authnID, password); err != nil {
+				if errors.Is(err, errAuthorizationFailed) {
+					s.sendResponse(fmt.Sprintf("%s NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.", tag))
+					continue
+				}
 				s.DebugLog("authentication failed", "error", err)
 				// The rate limiter requests a disconnect via a BYE-typed error;
 				// honor it instead of letting the client keep hammering on the
@@ -593,21 +597,6 @@ func (s *Session) handleConnection() {
 				} else {
 					s.sendResponse(fmt.Sprintf("%s NO Authentication failed", tag))
 				}
-				continue
-			}
-
-			// The credentials checked out; now the authorization. RFC 4616 section 2: the
-			// server "will verify that the authentication credentials permit the client to
-			// act as the (presented or derived) authorization identity". They permit acting
-			// only as the account they log in to, which this proxy presents to the backend
-			// as s.username: named by the authentication identity itself or by the address
-			// the login resolved to (the master username form's target). Any other is
-			// refused as the backends refuse it (RFC 5530 section 3 AUTHORIZATIONFAILED),
-			// and only now, so only a client that proved the credentials learns it. Not a
-			// command error, and not a failed login: the credentials were right.
-			if authzID != "" && authzID != authnID && authzID != s.username {
-				s.InfoLog("authorization failed", "authzid", authzID)
-				s.sendResponse(fmt.Sprintf("%s NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.", tag))
 				continue
 			}
 
@@ -1147,8 +1136,38 @@ func (s *Session) ErrorLog(msg string, keysAndValues ...any) {
 	s.getLogger().ErrorLog(msg, keysAndValues...)
 }
 
+var errAuthorizationFailed = errors.New("authorization failed")
+
+// authorizeIdentity verifies that the authenticated credentials for username
+// (which resolve to resolvedEmail for backend impersonation) are permitted to
+// act as authzID (RFC 4616 section 2). Refused only after credentials check out
+// (RFC 5530 section 3 AUTHORIZATIONFAILED) and before session state, rate-limiter
+// success, or login/connection metrics are recorded.
+func (s *Session) authorizeIdentity(authzID, username, resolvedEmail, method string) error {
+	if authzID != "" && authzID != username && authzID != resolvedEmail {
+		s.username = resolvedEmail
+		s.InfoLog("authorization failed", "address", resolvedEmail, "authzid", authzID, "method", method)
+		return errAuthorizationFailed
+	}
+	return nil
+}
+
 // authenticateUser authenticates the user against the database.
 func (s *Session) authenticateUser(username, password string) error {
+	return s.authenticateUserWithAuthzID("", username, password)
+}
+
+func (s *Session) authenticateUserWithAuthzID(authzID, username, password string) (retErr error) {
+	defer func() {
+		if retErr != nil {
+			s.submittedUsername = ""
+			s.username = ""
+			s.accountID = 0
+			s.isRemoteLookupAccount = false
+			s.routingInfo = nil
+		}
+	}()
+
 	// Remember the username exactly as submitted: the lookup cache is keyed on
 	// it (every Set below uses it), so invalidation must use the same value —
 	// not the resolved s.username, which can differ for token/master/+detail logins.
@@ -1278,22 +1297,34 @@ func (s *Session) authenticateUser(username, password string) error {
 				// positive_ttl to allow periodic revalidation via remotelookup/database.
 				// This ensures that when a domain moves backends or password changes,
 				// active users eventually pick up the changes.
-				s.accountID = cached.AccountID
 				s.DebugLog("cache hit - using cached auth", "username", username, "backend", cached.ServerAddress, "age", time.Since(cached.CreatedAt))
 				metrics.LookupCacheResults.WithLabelValues("imap_proxy", "hit").Inc()
 
+				// The resolved address when the entry has one (e.g. "user@example.com" for
+				// "user@TOKEN"); otherwise keep the base address set above, the name the
+				// uncached login routed by. The submitted name would route a +detail or
+				// @SUFFIX login under another key than the uncached one.
+				resolvedEmail := s.username
+				if cached.ActualEmail != "" {
+					resolvedEmail = cached.ActualEmail
+				}
+				if err := s.authorizeIdentity(authzID, username, resolvedEmail, "cache"); err != nil {
+					return err
+				}
+
+				// Check if context is cancelled (server shutting down)
+				if err := s.ctx.Err(); err != nil {
+					s.WarnLog("context cancelled during cache hit", "error", err)
+					return server.ErrServerShuttingDown // Triggers UNAVAILABLE response instead of auth failed
+				}
+
+				s.accountID = cached.AccountID
 				s.isRemoteLookupAccount = cached.FromRemoteLookup
 				// Rebuilt exactly as the uncached login routed (proxy.RouteFromCache): the pin,
 				// its enforcement and every backend-leg setting the lookup answer carried.
 				s.routingInfo = proxy.RouteFromCache(cached)
 				s.routingInfo.ClientConn = s.listenerConn // Always set current client connection for JA4
-				// The resolved address when the entry has one (e.g. "user@example.com" for
-				// "user@TOKEN"); otherwise s.username keeps the base address set above, the
-				// name the uncached login routed by. The submitted name would route a
-				// +detail or @SUFFIX login under another key than the uncached one.
-				if cached.ActualEmail != "" {
-					s.username = cached.ActualEmail
-				}
+				s.username = resolvedEmail
 
 				// Use actual username (resolved email) for rate limiting and metrics
 				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
@@ -1312,12 +1343,6 @@ func (s *Session) authenticateUser(username, password string) error {
 
 				// Single consolidated log for authentication success
 				s.InfoLog("authentication successful", "cached", true, "method", "cache")
-
-				// Check if context is cancelled (server shutting down)
-				if err := s.ctx.Err(); err != nil {
-					s.WarnLog("context cancelled during cache hit", "error", err)
-					return server.ErrServerShuttingDown // Triggers UNAVAILABLE response instead of auth failed
-				}
 
 				// NOTE: the backend connection is established by
 				// postAuthenticationSetup (the single owner of connectToBackend).
@@ -1446,11 +1471,8 @@ func (s *Session) authenticateUser(username, password string) error {
 			switch authResult {
 			case proxy.AuthSuccess:
 				// RemoteLookup returned success - use routing info
-				s.accountID = routingInfo.AccountID
 				s.DebugLog("remotelookup successful", "master_auth_validated", masterAuthValidated)
 				metrics.RemoteLookupResult.WithLabelValues("imap", "success").Inc()
-				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
-				s.routingInfo = routingInfo
 
 				// Determine the resolved email for backend impersonation
 				// Use ActualEmail from remotelookup response if available, otherwise derive from username
@@ -1461,17 +1483,6 @@ func (s *Session) authenticateUser(username, password string) error {
 					resolvedEmail = usernameForRemoteLookup // Base address already
 				} else {
 					resolvedEmail = username // Fallback to original
-				}
-				s.username = resolvedEmail // Use for backend impersonation
-
-				// Use resolvedEmail for rate limiting and metrics (the actual user)
-				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
-				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
-
-				// For metrics, use resolvedEmail for accurate tracking
-				if addr, err := server.NewAddress(resolvedEmail); err == nil {
-					metrics.TrackDomainConnection("imap_proxy", addr.Domain())
-					metrics.TrackUserActivity("imap_proxy", addr.FullAddress(), "connection", 1)
 				}
 
 				// Cache successful remotelookup authentication
@@ -1487,11 +1498,30 @@ func (s *Session) authenticateUser(username, password string) error {
 				proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
 				s.server.lookupCache.Set(s.server.name, username, entry)
 
-				// Single consolidated log for authentication success
 				method := "remotelookup"
 				if masterAuthValidated {
 					method = "master"
 				}
+				if err := s.authorizeIdentity(authzID, username, resolvedEmail, method); err != nil {
+					return err
+				}
+
+				s.accountID = routingInfo.AccountID
+				s.isRemoteLookupAccount = routingInfo.IsRemoteLookupAccount
+				s.routingInfo = routingInfo
+				s.username = resolvedEmail // Use for backend impersonation
+
+				// Use resolvedEmail for rate limiting and metrics (the actual user)
+				s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
+				metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
+
+				// For metrics, use resolvedEmail for accurate tracking
+				if addr, err := server.NewAddress(resolvedEmail); err == nil {
+					metrics.TrackDomainConnection("imap_proxy", addr.Domain())
+					metrics.TrackUserActivity("imap_proxy", addr.FullAddress(), "connection", 1)
+				}
+
+				// Single consolidated log for authentication success
 				s.InfoLog("authentication successful", "cached", false, "method", method)
 
 				return nil // Authentication complete
@@ -1654,36 +1684,6 @@ func (s *Session) authenticateUser(username, password string) error {
 		}
 	}
 
-	s.accountID = accountID
-	s.isRemoteLookupAccount = false
-	// A session that reaches DetermineRoute with no routing info has the routing lookup
-	// run for it, which for a user the lookup 404'd moments ago is a second round trip to
-	// the same answer. A lookup-cache hit for this user rebuilds exactly this from the
-	// entry written below, so give the uncached login the same starting point.
-	s.routingInfo = &proxy.UserRoutingInfo{
-		AccountID:          accountID,
-		RemoteUseIDCommand: s.server.remoteUseIDCommand,
-	}
-	// Set username to base address (without master username suffix or +detail)
-	// This is what gets sent to the backend for impersonation
-	s.username = address.BaseAddress()
-	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
-
-	// Track successful authentication.
-	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
-
-	// Track domain and user connection activity for the login event. The user is the base
-	// address, the name a lookup-cache hit replaying this login counts it under.
-	metrics.TrackDomainConnection("imap_proxy", address.Domain())
-	metrics.TrackUserActivity("imap_proxy", address.BaseAddress(), "connection", 1)
-
-	// Single consolidated log for authentication success
-	method := "main_db"
-	if masterAuthValidated {
-		method = "master"
-	}
-	s.InfoLog("authentication successful", "cached", false, "method", method)
-
 	// Cache successful DB authentication
 	// ServerAddress will be determined later by DetermineRoute in connectToBackend
 	// Always digest the password, even for master auth, to prevent cache bypass
@@ -1700,6 +1700,41 @@ func (s *Session) authenticateUser(username, password string) error {
 		FromRemoteLookup:   false,
 		IsNegative:         false,
 	})
+
+	resolvedEmail := address.BaseAddress()
+	method := "main_db"
+	if masterAuthValidated {
+		method = "master"
+	}
+	if err := s.authorizeIdentity(authzID, username, resolvedEmail, method); err != nil {
+		return err
+	}
+
+	s.accountID = accountID
+	s.isRemoteLookupAccount = false
+	// A session that reaches DetermineRoute with no routing info has the routing lookup
+	// run for it, which for a user the lookup 404'd moments ago is a second round trip to
+	// the same answer. A lookup-cache hit for this user rebuilds exactly this from the
+	// entry written below, so give the uncached login the same starting point.
+	s.routingInfo = &proxy.UserRoutingInfo{
+		AccountID:          accountID,
+		RemoteUseIDCommand: s.server.remoteUseIDCommand,
+	}
+	// Set username to base address (without master username suffix or +detail)
+	// This is what gets sent to the backend for impersonation
+	s.username = resolvedEmail
+	s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, successKey, true)
+
+	// Track successful authentication.
+	metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "success").Inc()
+
+	// Track domain and user connection activity for the login event. The user is the base
+	// address, the name a lookup-cache hit replaying this login counts it under.
+	metrics.TrackDomainConnection("imap_proxy", address.Domain())
+	metrics.TrackUserActivity("imap_proxy", resolvedEmail, "connection", 1)
+
+	// Single consolidated log for authentication success
+	s.InfoLog("authentication successful", "cached", false, "method", method)
 
 	return nil
 }

@@ -147,6 +147,9 @@ func TestExpungeMessagesByIDsSerializesWithFlagChange(t *testing.T) {
 // hold. Expunging it there would run the stats trigger without the mailbox lock, the race
 // the lock exists to close: with a \Seen STORE on the restored message still open, both
 // triggers would charge it to unseen_count. The purge must leave that message alone.
+// A restore now brings the message back as a new row (#1712), which an id-based purge was
+// never given; an older binary that restores in place during a rollout still opens the
+// window.
 func TestExpungeMessagesByIDsLeavesMessageRestoredIntoUnlockedMailbox(t *testing.T) {
 	db := setupTestDatabase(t)
 	defer db.Close()
@@ -251,10 +254,12 @@ func TestExpungeMessagesByIDsLeavesMessageRestoredIntoUnlockedMailbox(t *testing
 	require.Equal(t, int64(1), restored)
 	require.NoError(t, tx3.Commit(ctx))
 
+	// A restore brings the message back as a new row (see RestoreMessages).
+	restoredMsgID := restoredCopyID(t, db, targetMsgID)
 	var restoredUID imap.UID
 	require.NoError(t, db.GetWritePool().QueryRow(ctx,
 		`SELECT uid FROM messages WHERE id = $1 AND mailbox_id = $2 AND expunged_at IS NULL`,
-		targetMsgID, target.ID).Scan(&restoredUID))
+		restoredMsgID, target.ID).Scan(&restoredUID))
 	require.Equal(t, int64(1), readUnseenCount(ctx, t, db, target.ID), "Target after restore")
 
 	tx4, err := db.GetWritePool().Begin(ctx)
@@ -289,6 +294,6 @@ func TestExpungeMessagesByIDsLeavesMessageRestoredIntoUnlockedMailbox(t *testing
 	}
 	var live bool
 	require.NoError(t, db.GetWritePool().QueryRow(ctx,
-		`SELECT expunged_at IS NULL FROM messages WHERE id = $1`, targetMsgID).Scan(&live))
+		`SELECT expunged_at IS NULL FROM messages WHERE id = $1`, restoredMsgID).Scan(&live))
 	require.True(t, live, "the message restored after the purge picked its mailboxes is left alone")
 }

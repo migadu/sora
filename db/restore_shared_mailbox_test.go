@@ -94,7 +94,7 @@ func TestRestoreMessages_RecreatesSharedMailboxAsShared(t *testing.T) {
 		t.Helper()
 		var mailboxID int64
 		require.NoError(t, db.GetWritePool().QueryRow(ctx,
-			`SELECT mailbox_id FROM messages WHERE id = $1 AND expunged_at IS NULL`, msgID).Scan(&mailboxID))
+			`SELECT mailbox_id FROM messages WHERE id = $1 AND expunged_at IS NULL`, restoredCopyID(t, db, msgID)).Scan(&mailboxID))
 		return mailboxID
 	}
 
