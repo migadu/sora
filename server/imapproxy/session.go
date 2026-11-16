@@ -180,7 +180,7 @@ func (s *Session) handleConnection() {
 			return
 		}
 
-		line = strings.TrimRight(line, "\r\n")
+		line = strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
 
 		// Use the shared command parser. IMAP commands have tags.
 		tag, command, args, err := server.ParseLine(line, true)
@@ -234,12 +234,15 @@ func (s *Session) handleConnection() {
 			}
 			authStart := time.Now()
 			// LOGIN has exactly two arguments. A username literal ends this
-			// physical line; its password follows the literal's octets.
+			// physical line; its password follows the literal's octets. A
+			// literal is announced immediately before the CRLF: "{N+}" or "{N}"
+			// followed by white space is neither a literal nor an atom.
 			usernameLiteral := len(args) > 0 && strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}")
 			passwordLiteral := len(args) == 2 && strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}")
 			_, _, hasTrailingLiteral := trailingLiteral(line)
 			if len(args) > 2 || (usernameLiteral && len(args) > 1) ||
-				(hasTrailingLiteral && !usernameLiteral && !passwordLiteral) {
+				(hasTrailingLiteral && !usernameLiteral && !passwordLiteral) ||
+				((usernameLiteral || passwordLiteral) && !strings.HasSuffix(line, "}")) {
 				if s.skipLiterals(line, false) != nil ||
 					s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
 					return
@@ -255,7 +258,7 @@ func (s *Session) handleConnection() {
 				// Check if username is a literal
 				if strings.HasPrefix(args[0], "{") && strings.HasSuffix(args[0], "}") {
 					literalSize, nonSync, err := server.ParseLiteral(args[0])
-					if err != nil || literalSize > maxPreAuthLiteral {
+					if err != nil || preAuthLiteralTooBig(literalSize, nonSync) {
 						if s.skipLiterals(line, false) != nil ||
 							s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in username", tag)) {
 							return
@@ -285,8 +288,8 @@ func (s *Session) handleConnection() {
 						}
 						return
 					}
-					line = strings.TrimRight(line, "\r\n")
-					line = strings.TrimSpace(line)
+					rest := strings.TrimSuffix(strings.TrimSuffix(line, "\n"), "\r")
+					line = strings.TrimSpace(rest)
 
 					if line == "" {
 						if s.handleAuthError(fmt.Sprintf("%s BAD LOGIN requires username and password", tag)) {
@@ -298,10 +301,11 @@ func (s *Session) handleConnection() {
 					// The remainder must contain just the password. Parse it as
 					// an argument so quoted spaces and escapes stay one value.
 					_, _, passwordArgs, parseErr := server.ParseLine("x LOGIN "+line, true)
-					_, _, hasTrailingLiteral := trailingLiteral(line)
+					_, _, hasTrailingLiteral := trailingLiteral(rest)
 					passwordLiteral := strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}")
-					if parseErr != nil || len(passwordArgs) != 1 || (hasTrailingLiteral && !passwordLiteral) {
-						if s.skipLiterals(line, false) != nil ||
+					if parseErr != nil || len(passwordArgs) != 1 || (hasTrailingLiteral && !passwordLiteral) ||
+						(passwordLiteral && !strings.HasSuffix(rest, "}")) {
+						if s.skipLiterals(rest, false) != nil ||
 							s.handleAuthError(fmt.Sprintf("%s BAD Invalid LOGIN arguments", tag)) {
 							return
 						}
@@ -311,7 +315,7 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal
 					if strings.HasPrefix(line, "{") && strings.HasSuffix(line, "}") {
 						literalSize, nonSync, err := server.ParseLiteral(line)
-						if err != nil || literalSize > maxPreAuthLiteral {
+						if err != nil || preAuthLiteralTooBig(literalSize, nonSync) {
 							if s.skipLiterals(line, false) != nil ||
 								s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
@@ -355,7 +359,7 @@ func (s *Session) handleConnection() {
 					// Check if password is a literal (username was not)
 					if strings.HasPrefix(args[1], "{") && strings.HasSuffix(args[1], "}") {
 						literalSize, nonSync, err := server.ParseLiteral(args[1])
-						if err != nil || literalSize > maxPreAuthLiteral {
+						if err != nil || preAuthLiteralTooBig(literalSize, nonSync) {
 							if s.skipLiterals(line, false) != nil ||
 								s.handleAuthError(fmt.Sprintf("%s BAD Invalid literal in password", tag)) {
 								return
@@ -657,15 +661,31 @@ func (s *Session) finishLoginLiteral() (extra bool, err error) {
 	if err != nil {
 		return false, err
 	}
-	rest = strings.TrimRight(rest, "\r\n")
+	rest = strings.TrimSuffix(strings.TrimSuffix(rest, "\n"), "\r")
 	if strings.TrimSpace(rest) == "" {
 		return false, nil
 	}
 	return true, s.skipLiterals(rest, false)
 }
 
-// maxPreAuthLiteral bounds each literal the pre-auth loop reads.
+// maxNonSyncLiteral is the most octets a non-synchronizing literal may carry.
+// Before authentication the proxy advertises LITERAL- and IMAP4rev2, and under
+// both a larger one is invalid: "non-synchronizing literals used in any command
+// MUST NOT be larger than 4096 bytes" (RFC 7888 §5; RFC 9051 §4.3).
+const maxNonSyncLiteral = 4096
+
+// maxPreAuthLiteral bounds each synchronizing literal the pre-auth loop reads.
 const maxPreAuthLiteral = 8192
+
+// preAuthLiteralTooBig reports whether the pre-auth loop refuses a literal of
+// size octets: over maxNonSyncLiteral for a non-synchronizing one, over
+// maxPreAuthLiteral for a synchronizing one.
+func preAuthLiteralTooBig(size int, nonSync bool) bool {
+	if nonSync {
+		return size > maxNonSyncLiteral
+	}
+	return size > maxPreAuthLiteral
+}
 
 var (
 	// errSyncLiteralTooBig: skipLiterals sent no continuation request for a
@@ -673,7 +693,7 @@ var (
 	// more of the command, and the caller rejects it.
 	errSyncLiteralTooBig = errors.New("synchronizing literal too big")
 	// errNonSyncLiteralTooBig: skipLiterals ended the session with BYE over a
-	// non-synchronizing literal over maxPreAuthLiteral.
+	// non-synchronizing literal over maxNonSyncLiteral.
 	errNonSyncLiteralTooBig = errors.New("non-synchronizing literal too big")
 )
 
@@ -691,9 +711,9 @@ var (
 // and the response that rejects the command tells it to send no more of it
 // (RFC 9051 §2.2.1).
 //
-// A literal over maxPreAuthLiteral is not read. For a non-synchronizing one the
-// octets are already in flight and nothing after them can be found, so the
-// session ends with BYE [TOOBIG] (RFC 7888 §4 and §5) and
+// A literal preAuthLiteralTooBig refuses is not read. A non-synchronizing one
+// over the LITERAL- bound is invalid and its octets are already in flight, so
+// the session ends with BYE [TOOBIG] (RFC 7888 §4 and §5) and
 // errNonSyncLiteralTooBig. With sync set, a synchronizing one gets no
 // continuation request and errSyncLiteralTooBig. A read error is returned as is.
 func (s *Session) skipLiterals(line string, sync bool) error {
@@ -702,11 +722,11 @@ func (s *Session) skipLiterals(line string, sync bool) error {
 		if !ok || (!nonSync && !sync) {
 			return nil
 		}
-		if size > maxPreAuthLiteral {
+		if preAuthLiteralTooBig(size, nonSync) {
 			if !nonSync {
 				return errSyncLiteralTooBig
 			}
-			s.DebugLog("non-synchronizing literal over the pre-auth bound", "size", size)
+			s.DebugLog("non-synchronizing literal over the LITERAL- bound", "size", size)
 			s.sendResponse("* BYE [TOOBIG] Non-synchronizing literal too big")
 			return errNonSyncLiteralTooBig
 		}
@@ -720,16 +740,16 @@ func (s *Session) skipLiterals(line string, sync bool) error {
 		if err != nil {
 			return err
 		}
-		line = strings.TrimRight(next, "\r\n")
+		line = strings.TrimSuffix(strings.TrimSuffix(next, "\n"), "\r")
 	}
 }
 
 // trailingLiteral reports the literal announced at the end of a command line
-// without its CRLF: "{N}", or "{N+}" for a non-synchronizing one. Trailing
-// white space is ignored, as ParseLine ignores it, so that a literal LOGIN
-// rejects is found here too.
+// without its CRLF: "{N}", or "{N+}" for a non-synchronizing one. Only an
+// announcement "immediately preceding the CRLF" is one (RFC 7888 §3; RFC 9051
+// §9: literal = "{" number64 ["+"] "}" CRLF *CHAR8): followed by white space it
+// announces nothing, and the line is the whole command.
 func trailingLiteral(line string) (size int, nonSync, ok bool) {
-	line = strings.TrimSpace(line)
 	if !strings.HasSuffix(line, "}") {
 		return 0, false, false
 	}
@@ -854,10 +874,10 @@ func (s *Session) handleAuthError(response string) bool {
 //     baseline behavior; the pre-auth parser accepts them (LOGIN, ID).
 //   - SASL-IR (RFC 4959): AUTHENTICATE PLAIN <initial-response> is accepted;
 //     advertising it saves compliant clients a round trip.
-//   - LITERAL- (RFC 7888): non-synchronizing literals up to 4096 bytes. The
-//     pre-auth path bounds literals at 8 KiB, so LITERAL+ (any size) would be
-//     a promise it cannot keep — a client streaming a large {N+} literal would
-//     get BAD after the bytes are already in flight and desynchronize.
+//   - LITERAL- (RFC 7888): non-synchronizing literals up to 4096 bytes, which
+//     the pre-auth loop enforces (maxNonSyncLiteral; a larger one ends the
+//     session with BYE [TOOBIG]). It reads synchronizing literals up to 8 KiB,
+//     so LITERAL+ (any size) would be a promise it cannot keep.
 //     Credentials and ID values fit comfortably; larger literals fall back to
 //     synchronizing form, which is handled with a continuation.
 //   - AUTH=PLAIN: the only SASL mechanism the proxy accepts. Do NOT list
