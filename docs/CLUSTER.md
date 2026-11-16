@@ -553,7 +553,7 @@ them.
 |---|---|---|---|
 | `enabled` | bool | `true` | Run the cluster-wide affinity store on this node. The proxies opt in with `enable_affinity`. |
 | `ttl` | duration | `"24h"` | How long an affinity entry lives after it is set. An invalid value logs a warning and uses `24h`. |
-| `cleanup_interval` | duration | `"1h"` | How often expired entries are removed (and the affinity metrics refreshed). An invalid value logs a warning and uses `1h`. |
+| `cleanup_interval` | duration | `"1h"` | How often expired entries are removed (and the affinity metrics refreshed). An invalid value logs a warning and uses `1h`, `0` uses `1h` too, and a negative value stops startup. |
 | `cache_path` | string | `""` | Path of a SQLite file that keeps affinity entries across restarts. Empty keeps them in memory only. The directory must exist and be writable; if the file cannot be opened Sora logs `Failed to initialize affinity cache - continuing without persistence` and runs without it. A corrupt file is deleted and recreated. |
 
 Durations accept Go units (`"30m"`, `"24h"`) and days (`"7d"`); see

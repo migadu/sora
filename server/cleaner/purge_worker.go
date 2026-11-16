@@ -25,6 +25,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
@@ -36,7 +37,7 @@ const (
 	// end before the next, so a cycle can run long; the poll is skipped while one runs.
 	purgeWorkerBatch = 10
 	// purgeWorkerMinInterval floors the poll interval.
-	purgeWorkerMinInterval = 5 * time.Second
+	purgeWorkerMinInterval = config.MinPurgePollInterval
 	// purgeBackoffBase and purgeBackoffMax bound the per-account backoff after a failed
 	// attempt: base, doubled per attempt, capped at max.
 	purgeBackoffBase = time.Minute

@@ -219,6 +219,9 @@ to standard error, one for each problem the file has.
 | `[relay.queue] circuit_breaker_timeout`, `cleanup_interval` or `failed_retention` is not a duration, with `[relay]` configured | `[relay.queue]: invalid <key> "<value>": ...` |
 | An IMAP, POP3 or LMTP server is configured and `[cleanup]` has a negative `grace_period`, `max_age_restriction`, `fts_retention` or `health_status_retention`, or an `instance_liveness_threshold` of zero or less | `[cleanup]: <key> must not be negative, got "<value>"` or `[cleanup]: instance_liveness_threshold must be positive, got "<value>"` |
 | An IMAP, POP3 or LMTP server is configured and `[uploader]` has a `batch_size`, `concurrency` or `max_attempts` of zero or less, a `cleanup_grace_period` of zero or less or that is not a duration, a `retry_interval` of zero or less, or a `max_staging_size` that is not a size | `[uploader] <key> must be positive, got <n>`, `[uploader] cleanup_grace_period must be positive, got "<value>"`, `[uploader] cleanup_grace_period: <parse error>`, `[uploader] retry_interval must be positive, got "<value>"` or `[uploader] max_staging_size: <parse error>` |
+| An IMAP, POP3 or LMTP server is configured and `[local_cache]` has a `purge_interval` or `metrics_interval` of zero or less | `[local_cache]: <key> must be positive, got "<value>"` |
+| `[auth_cache] enabled = true` and `cleanup_interval` is zero or less | `[auth_cache]: cleanup_interval must be positive, got "<value>"` |
+| `[cluster]` and `[cluster.affinity]` are enabled and `[cluster.affinity] cleanup_interval` is negative | `[cluster.affinity]: cleanup_interval must not be negative, got "<value>"` |
 | `[shared_mailboxes] enabled = true` and `namespace_prefix` is not a mailbox name followed by `/` (for example `""`, `"Shared"` or `"Shared//"`), or is `INBOX/` in any letter case | `[shared_mailboxes]: namespace_prefix "<value>" must be a mailbox name followed by the hierarchy delimiter "/", such as "Shared/"` or `[shared_mailboxes]: namespace_prefix "<value>" conflicts with the reserved personal INBOX` |
 | `[timeout_scheduler] shard_count` is below -1 | `[timeout_scheduler]: shard_count must be >= -1, got <n>` |
 
@@ -258,14 +261,28 @@ These conditions only log, and startup continues:
   `[uploader]`, `[auth_cache]` or `[database]`, where the part of the node that reads it runs. The
   `[database]` timeouts are logged at each query. A `[spam_training]` value that does not parse
   leaves spam training out, and a `max_message_size` above 2147483647 bytes is lowered to that.
+- A server, the cluster, the TLS manager or the cleaner works differently from what a setting
+  says: an `imap`, `pop3` or `managesieve` server has `master_sasl_password` without
+  `master_sasl_allowed_networks`; an `imap` server's `append_limit` is above 2147483647 bytes
+  (lowered to that) or above its `session_memory_limit` (which then is its `APPENDLIMIT`), its
+  `command_timeout` is 35 minutes or more (the IMAP library closes idle sessions at 35 minutes), or
+  `disabled_caps` or a `client_filters` entry names a capability it cannot withdraw; an
+  `http_user_api` server's `token_duration` is above 7 days (lowered to that); an `http_admin_api`
+  or `http_user_api` server's `allowed_hosts` has an entry that is not an IP address or CIDR; a
+  server with `tls = true` sets `tls_cert_file` or `tls_key_file` while `[tls]` is enabled (the
+  `[tls]` certificate is used); `[tls.letsencrypt]` has `enable_fallback = false`; `[cluster]`
+  `addr` has a port and `port` is also set, `addr` is a loopback address, or `peers` names this node
+  or leaves no other node to join; `[cleanup]` `wake_interval` is below 1 minute or
+  `purge_poll_interval` below 5 seconds (raised to that).
 
 Later steps can still fail, for example a TLS certificate that cannot be read, or a database that
 cannot be reached. Those are covered in the topic documents.
 
 `sora-admin config validate` runs every validation check in the table without starting
-anything, and reports the collected configuration warnings above as `[WARN]` lines without
-changing its success exit status. Plaintext-authentication, metrics, host-name and additional
-package-specific warnings are currently reported only at startup. See [ADMIN_CLI.md](ADMIN_CLI.md).
+anything, and reports the warnings above that follow from the file alone as `[WARN]` lines without
+changing its success exit status. The ones that depend on the host are reported only at startup:
+plaintext authentication and metrics on a publicly reachable address, the host name, and a `peers`
+entry that names this node by host name. See [ADMIN_CLI.md](ADMIN_CLI.md).
 
 ---
 
@@ -512,9 +529,9 @@ See [STORAGE.md](STORAGE.md).
 | `path` | string | `"/var/cache/sora/cache"` | Cache directory. |
 | `capacity` | size | `"1gb"` | Total cache size. |
 | `max_object_size` | size | `"5mb"` | Largest body cached. |
-| `purge_interval` | duration | `"12h"` | How often the cache is trimmed. |
+| `purge_interval` | duration | `"12h"` | How often the cache is trimmed. Must be positive. |
 | `orphan_cleanup_age` | duration | `"30d"` | Age before an orphaned entry is removed. |
-| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are stored in the database. |
+| `metrics_interval` | duration | `"5m"` | How often hit and miss counts are stored in the database. Must be positive. |
 | `metrics_retention` | duration | `"30d"` | How long those stored counts are kept. |
 | `enable_warmup` | bool | `true` | Preload recent messages when a user logs in over IMAP. |
 | `warmup_message_count` | integer | `50` | Messages preloaded per mailbox. |
@@ -692,7 +709,7 @@ See [CLUSTER.md](CLUSTER.md).
 |---|---|---|---|
 | `enabled` | bool | `true` | Share affinities across the cluster. |
 | `ttl` | duration | `"24h"` | How long an affinity lasts. |
-| `cleanup_interval` | duration | `"1h"` | How often expired affinities are removed. |
+| `cleanup_interval` | duration | `"1h"` | How often expired affinities are removed. `0` means `1h`; a negative value stops startup. |
 | `cache_path` | string | none | SQLite file that keeps affinities across restarts. Unset keeps them in memory only. |
 
 `[cluster.rate_limit_sync]`, for the `imap_proxy`, `pop3_proxy` and `managesieve_proxy` listeners with
@@ -715,7 +732,7 @@ A SQLite cache of credentials, used by proxies that check passwords in the datab
 | `path` | string | `"/var/cache/sora/auth_cache.db"` | Database file. Its directory is created. |
 | `max_age` | duration | `"24h"` | Age after which an entry is fetched again. |
 | `purge_unused` | duration | `"168h"` | Entries unused this long are removed. |
-| `cleanup_interval` | duration | `"1h"` | How often old entries are removed. |
+| `cleanup_interval` | duration | `"1h"` | How often old entries are removed. Must be positive. |
 
 If the cache cannot be opened, Sora logs an error and runs without it.
 

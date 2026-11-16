@@ -280,7 +280,8 @@ Description:
         [[pool]], [relay], trusted_networks, [shared_mailboxes] and
         [timeout_scheduler]
       [relay.queue] when [relay] is configured
-      [uploader] and [cleanup] when a mail backend (imap, lmtp, pop3) runs
+      [uploader], [cleanup] and [local_cache] when a mail backend (imap, lmtp,
+        pop3) runs
       [database], [database.write] and [database.read] when a server queries
         the database (imap, lmtp, pop3, managesieve, the HTTP APIs, and a
         proxy that looks users up there)
@@ -288,7 +289,8 @@ Description:
         together, encryption_key with encrypt = true) when the node connects
         to S3 (a mail backend, or the User API when [s3] has an endpoint,
         bucket or keys)
-      [cluster] and [tls] when enabled
+      [cluster], [tls] and [auth_cache] when enabled, and [cluster.affinity]
+        when it and [cluster] are enabled
   - Warning, as start-up does, about settings that do not do on this node
     what they say:
       [sieve] enabled_extensions and managesieve_proxy supported_extensions
@@ -311,6 +313,17 @@ Description:
       a [spam_training] value start-up cannot parse, which leaves spam
         training out, and a max_message_size above the largest message Sora
         can store
+      master SASL without master_sasl_allowed_networks; an imap append_limit
+        above the largest message Sora can store or above session_memory_limit,
+        an imap command_timeout of 35m or more, and imap capabilities
+        disabled_caps or client_filters cannot withdraw
+      a User API token_duration above 7 days, Admin and User API
+        allowed_hosts entries that are not an IP address or CIDR,
+        tls_cert_file or tls_key_file beside an enabled [tls], and
+        [tls.letsencrypt] enable_fallback = false
+      a [cluster] addr with a port beside the port key or on loopback, and
+        peers that leave no other node to join
+      [cleanup] wake_interval and purge_poll_interval below their minimum
 
 
   It connects to nothing and does not look at the node's disk, so it does
