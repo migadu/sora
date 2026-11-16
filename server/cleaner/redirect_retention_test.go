@@ -19,7 +19,7 @@ func TestCleanupWorker_KeepsRedirectLogForTheRateWindow(t *testing.T) {
 	mockDB := new(mockDatabase)
 	ctx := context.Background()
 	window := 24 * time.Hour
-	worker := &CleanupWorker{
+	worker := &CleanupWorker{bodyDeletionProtocol: "global-hash-v1",
 		rdb:                   mockDB,
 		s3:                    &mockS3{healthy: true},
 		cache:                 new(mockCache),
