@@ -256,15 +256,6 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		maxMessageAge = options.Config.Cleanup.GetMaxAgeRestrictionWithDefault()
 	}
 
-	// Cleartext auth is auto-enabled when TLS is not configured (the common
-	// backend-behind-a-TLS-terminating-proxy deployment). That coupling is a
-	// silent security downgrade if the listener is actually public, so make the
-	// implicit decision visible at startup. (review: insecureAuth auto-enable)
-	insecureAuth := options.InsecureAuth || !options.TLS
-	if !options.InsecureAuth && !options.TLS {
-		logger.Warn("POP3: TLS not configured; cleartext authentication auto-enabled. Acceptable only behind a TLS-terminating proxy or on trusted networks.", "name", name)
-	}
-
 	server := &POP3Server{
 		maintenanceGate: options.MaintenanceGate,
 		hostname:        hostname,
@@ -285,7 +276,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		trustedNetworks: options.TrustedNetworks,
 		authIdleTimeout: options.AuthIdleTimeout,
 		commandTimeouts: defaultCommandTimeouts(),
-		insecureAuth:    insecureAuth, // Auto-enabled when TLS not configured (warned above)
+		insecureAuth:    options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured; cmd/sora warns on a public address
 		maxMessageAge:   maxMessageAge,
 		activeSessions:  make(map[*POP3Session]struct{}),
 	}

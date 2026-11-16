@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"sort"
@@ -1100,6 +1101,13 @@ func replaceFile(root *os.Root, tmpDir, name string, content []byte) error {
 // can take its place afterwards, and O_NONBLOCK is cleared before returning so the
 // regular file is read in blocking mode (as os.Open reads it). The root follows no link
 // out of the export directory.
+//
+// The owner can also make the name a hard link, which the root cannot tell from the
+// file's first name, to a file elsewhere on the same file system, one they cannot read
+// where the system lets them link it (BSD and macOS do, as Linux does with
+// fs.protected_hardlinks = 0). The files the export reads back are created by renaming
+// a new file over the name, by the export (replaceFile) as by Dovecot, so they have one
+// link: a regular file with more is refused.
 func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
 	if dir {
 		f, err := root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
@@ -1125,6 +1133,10 @@ func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
 		f.Close()
 		return nil, fmt.Errorf("refusing %s in the export directory: it is not a regular file", name)
 	}
+	if links := info.Sys().(*syscall.Stat_t).Nlink; links > 1 {
+		f.Close()
+		return nil, fmt.Errorf("refusing %s in the export directory: it is a hard link (%d links)", name, links)
+	}
 	conn, err := f.SyscallConn()
 	if err == nil {
 		var setErr error
@@ -1139,16 +1151,6 @@ func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
 	return f, nil
 }
 
-// readExportFile reads the regular file name below root (openExportEntry).
-func readExportFile(root *os.Root, name string) ([]byte, error) {
-	f, err := openExportEntry(root, name, false)
-	if err != nil {
-		return nil, err
-	}
-	defer f.Close()
-	return io.ReadAll(f)
-}
-
 // maxMaildirKeywords is how many custom keywords a maildir folder can name: the info
 // part of a filename has the 26 letters a-z for them (Dovecot's own limit).
 const maxMaildirKeywords = 26
@@ -1159,7 +1161,9 @@ const maxMaildirKeywords = 26
 // re-import. Keywords are numbered in sorted order, deterministically, so repeated
 // exports of the same mailbox produce the same file. An existing file's numbering is
 // kept for the keywords it already names, so an incremental export does not renumber
-// files written by an earlier run.
+// files written by an earlier run. An existing file that cannot be read (one that is
+// not a regular file, or is larger than maxDovecotKeywordsSize) is named in a warning
+// and replaced.
 func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Message) error {
 	seen := make(map[string]struct{})
 	for i := range messages {
@@ -1176,14 +1180,20 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 
 	index := make(map[string]int)
 	used := make(map[int]bool)
-	readFile := func(name string) ([]byte, error) { return readExportFile(exporter.root, name) }
-	if existing, err := parseKeywordsFile(keywordsName, readFile); err == nil {
+	unreadable := false
+	open := func(name string) (*os.File, error) { return openExportEntry(exporter.root, name, false) }
+	if existing, err := parseKeywordsFile(keywordsName, open); err == nil {
 		for idx, kw := range existing {
-			if idx >= 0 && idx < maxMaildirKeywords {
-				index[kw] = idx
-				used[idx] = true
-			}
+			index[kw] = idx
+			used[idx] = true
 		}
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		unreadable = true
+		// A file that is there but is not read (a link, a FIFO, a file with more than
+		// one link) is replaced without its numbering, so the letters of files an
+		// earlier run wrote may name other keywords now.
+		logger.Warn("Existing dovecot-keywords not read; it is replaced and its keyword numbering is not kept",
+			"mailbox", mailboxName, "path", filepath.Join(exporter.root.Name(), keywordsName), "error", err)
 	}
 
 	names := make([]string, 0, len(seen))
@@ -1212,7 +1222,9 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 	exporter.keywordIndex[mailboxName] = index
 	exporter.mu.Unlock()
 
-	if len(index) == 0 {
+	// A mailbox without keywords needs no file, but one that cannot be read is
+	// replaced all the same (with an empty one), as the warning says.
+	if len(index) == 0 && !unreadable {
 		return nil
 	}
 	if err := exporter.root.MkdirAll(dir, 0755); err != nil {
@@ -1240,7 +1252,13 @@ func (exporter *Exporter) prepareKeywords(mailboxName string, messages []db.Mess
 // (openExportEntry).
 func mergeUIDMappings(root *os.Root, dir string, current []UIDFileMapping) []UIDFileMapping {
 	existing, err := parseDovecotUIDListFile(openExportEntry(root, filepath.Join(dir, "dovecot-uidlist"), false))
-	if err != nil || existing == nil || len(existing.UIDMappings) == 0 {
+	if err != nil {
+		// Dovecot then gives new UIDs to the files of earlier runs that the file listed.
+		logger.Warn("Existing dovecot-uidlist not read; it is replaced without the entries of earlier runs",
+			"path", filepath.Join(root.Name(), dir, "dovecot-uidlist"), "error", err)
+		return current
+	}
+	if existing == nil || len(existing.UIDMappings) == 0 {
 		return current
 	}
 	usedUID := make(map[uint32]bool, len(current))
