@@ -89,6 +89,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		logger.Info("Database: moving messages within the same mailbox, will assign new UIDs", "mailbox_id", srcMailboxID)
 	}
 
+	if err := lockS3SourceClaims(ctx, tx, srcMailboxID, ids); err != nil {
+		return nil, err
+	}
+
 	// Serialize unseen_count maintenance for both mailboxes by locking their
 	// mailbox rows in ascending id order (see lockMailboxStats). This both
 	// prevents the flag/expunge-vs-move trigger race from drifting the cache and
@@ -96,6 +100,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// mailboxes cannot deadlock (A->B and B->A lock the same rows in the same order).
 	if err := lockMailboxStatsPair(ctx, tx, srcMailboxID, destMailboxID); err != nil {
 		return nil, fmt.Errorf("failed to lock mailbox stats for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
+	}
+	window := modSeqWindowFor(ctx, destMailboxID)
+	if err := window.begin(ctx, tx); err != nil {
+		return nil, err
 	}
 
 	// From here to the commit a rekey must not rename a source. The row locks below would
@@ -345,6 +353,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 	}
 
+	if err := window.end(ctx, tx); err != nil {
+		return nil, err
+	}
 	return messageUIDMap, nil
 }
 

@@ -370,7 +370,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 
 // CreateMailbox creates a mailbox with no RFC 6154 special-use attribute.
 func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64) error {
-	return db.createMailbox(ctx, tx, AccountID, name, parentID, "")
+	return db.createMailbox(ctx, tx, AccountID, name, parentID, "", nil)
 }
 
 // CreateMailboxWithSpecialUse creates a mailbox and assigns an RFC 6154 special-use
@@ -380,10 +380,10 @@ func (db *Database) CreateMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 // consts.ErrMailboxSpecialUseInUse (mapped to NO [USEATTR] by the caller); a duplicate
 // name surfaces as consts.ErrDBUniqueViolation.
 func (db *Database) CreateMailboxWithSpecialUse(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64, specialUse string) error {
-	return db.createMailbox(ctx, tx, AccountID, name, parentID, specialUse)
+	return db.createMailbox(ctx, tx, AccountID, name, parentID, specialUse, nil)
 }
 
-func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64, specialUse string) error {
+func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int64, name string, parentID *int64, specialUse string, capture *mailboxCreationCapture) error {
 	// Mailbox names are case-insensitive (Option A): the UNIQUE(account_id,
 	// LOWER(name)) index rejects any case-variant of an existing name. Folding
 	// INBOX additionally guarantees the reserved inbox is stored as the canonical
@@ -460,12 +460,21 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 	// (CreateMailboxForUser, GetOrCreateMailboxByNameWithRetry) read the existing
 	// mailbox back in it (issue #1396).
 	var mailboxID int64
-	err = tx.QueryRow(ctx, `
+	query := `
 		INSERT INTO mailboxes (account_id, name, uid_validity, subscribed, path, is_shared, owner_domain, special_use)
 		VALUES ($1, $2, $3, $4, '', $5, $6, $7)
 		ON CONFLICT (account_id, LOWER(name)) WHERE deleted_at IS NULL DO NOTHING
-		RETURNING id
-	`, AccountID, name, int64(uidValidity), false, isShared, ownerDomain, specialUseParam).Scan(&mailboxID)
+		RETURNING id`
+	args := []any{AccountID, name, int64(uidValidity), false, isShared, ownerDomain, specialUseParam}
+	scan := []any{&mailboxID}
+	if capture != nil {
+		// The statement's snapshot records initial subscription state. A later
+		// query could already contain another session's post-insert SUBSCRIBE.
+		query += `, LOWER(name), EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id=$8 AND LOWER(s.mailbox_name)=LOWER(mailboxes.name))`
+		args = append(args, capture.viewer)
+		scan = append(scan, &capture.state.NameKey, &capture.state.Subscribed)
+	}
+	err = tx.QueryRow(ctx, query, args...).Scan(scan...)
 
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Distinct from a duplicate special-use attribute below, so the caller can
@@ -515,6 +524,18 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		if err := grantNewSharedMailboxACL(ctx, tx, AccountID, name, mailboxID, sharedParentID, *ownerDomain); err != nil {
 			return err
 		}
+	}
+
+	if capture != nil {
+		capture.state.ID = mailboxID
+		capture.state.Name = name
+		capture.state.UIDValidity = uidValidity
+		capture.state.OwnerID = AccountID
+		visible, err := lockNotifyMailboxForMutation(ctx, tx, capture.viewer, name)
+		if err != nil {
+			return err
+		}
+		capture.state.Visible = visible != nil && visible.ID == mailboxID
 	}
 
 	return nil
@@ -1345,6 +1366,10 @@ func isInboxMailboxName(stored string) bool {
 }
 
 func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64) error {
+	return db.renameMailbox(ctx, tx, mailboxID, AccountID, newName, newParentID, nil)
+}
+
+func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64, changes *[]MailboxNameMutation) error {
 	// The same names createMailbox refuses: control characters, empty levels and
 	// "." / ".." levels (maildir-export path traversal).
 	if !helpers.MailboxNameValid(newName) {
@@ -1579,6 +1604,27 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		}
 	}
 
+	var beforeNames map[int64]MailboxNameMutation
+	if changes != nil {
+		beforeNames = make(map[int64]MailboxNameMutation)
+		rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE account_id=$1 AND deleted_at IS NULL AND (id=$2 OR path LIKE $3 || '%')`, ownerAccountID, mailboxID, oldPath)
+		if err != nil {
+			return fmt.Errorf("read locked mailbox names before rename: %w", err)
+		}
+		for rows.Next() {
+			var n MailboxNameMutation
+			if err := rows.Scan(&n.ID, &n.BeforeName, &n.BeforeKey); err != nil {
+				rows.Close()
+				return err
+			}
+			beforeNames[n.ID] = n
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+	}
+
 	// Update the target mailbox itself.
 	_, err = tx.Exec(ctx, `
 		UPDATE mailboxes
@@ -1667,6 +1713,32 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// subscription for a shared-mailbox rename is a separate concern.
 	if err := db.RenameSubscriptions(ctx, tx, AccountID, oldName, newName, string(consts.MailboxDelimiter)); err != nil {
 		return fmt.Errorf("failed to move subscriptions during rename of mailbox %d: %w", mailboxID, err)
+	}
+
+	if changes != nil {
+		ids := make([]int64, 0, len(beforeNames))
+		for id := range beforeNames {
+			ids = append(ids, id)
+		}
+		rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE id=ANY($1) AND deleted_at IS NULL ORDER BY id`, ids)
+		if err != nil {
+			return fmt.Errorf("read transaction's renamed mailbox names: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			var name, key string
+			if err := rows.Scan(&id, &name, &key); err != nil {
+				rows.Close()
+				return err
+			}
+			n := beforeNames[id]
+			n.AfterName, n.AfterKey = name, key
+			*changes = append(*changes, n)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
 	}
 
 	return nil

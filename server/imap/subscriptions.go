@@ -31,12 +31,9 @@ func (s *IMAPSession) updateSubscriptionStatus(ctx context.Context, mailboxName 
 	// Subscribe of any name — including one with no mailbox — is always persisted.
 	// Unsubscribe leaves a default mailbox's subscription in place: db.Unsubscribe
 	// keeps it, as only the database can tell which names are a default mailbox's.
-	var err error
-	if subscribe {
-		err = s.server.rdb.SubscribeWithRetry(ctx, AccountID, mailboxName)
-	} else {
-		err = s.server.rdb.UnsubscribeWithRetry(ctx, AccountID, mailboxName)
-	}
+	own := s.beginOwnTreeChange()
+	defer own.end()
+	change, err := s.server.rdb.UpdateSubscriptionReturningStateWithRetry(ctx, AccountID, mailboxName, subscribe)
 	if err != nil {
 		return s.internalError("failed to update subscription status for mailbox '%s': %v", mailboxName, err)
 	}
@@ -47,6 +44,7 @@ func (s *IMAPSession) updateSubscriptionStatus(ctx context.Context, mailboxName 
 	}
 	s.DebugLog("mailbox subscription changed", "mailbox", mailboxName, "action", action)
 	s.useMasterDB.Store(true) // Pin session to master DB for read-your-writes consistency
+	own.subscribed(change)
 
 	return nil
 }
