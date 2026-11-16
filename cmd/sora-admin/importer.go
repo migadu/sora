@@ -36,6 +36,7 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
+	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
 
@@ -1387,9 +1388,15 @@ var errNotRegularFile = errors.New("not a regular file")
 // not have been able to read (checkNamedByOwner).
 var errAnotherUsersFile = errors.New("may be another user's file")
 
-// fileUID returns the user that owns the file info describes. It is a variable so that
-// a test can make a file appear to belong to another user, which only root can arrange.
-var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t).Uid }
+// fileUID returns the user that owns the file info describes: one from the os package
+// or one openImportRoot's walk made (statInfo). It is a variable so that a test can
+// make a file appear to belong to another user, which only root can arrange.
+var fileUID = func(info fs.FileInfo) uint32 {
+	if st, ok := info.Sys().(*unix.Stat_t); ok {
+		return st.Uid
+	}
+	return info.Sys().(*syscall.Stat_t).Uid
+}
 
 // openRegularFile opens name below root if it is regular and passes the Unix
 // owner-directory check below. It fails with errNotRegularFile or
@@ -1609,8 +1616,11 @@ const maxImportRootLinks = 255
 //
 // path is walked a component at a time by descriptor from the file system root (a
 // relative one from the working directory), as the system resolves it: a ".." after a
-// link goes up from the link's target. The root returned is the directory the walk
-// checked, so an entry replaced meanwhile cannot change what is read through it.
+// link goes up from the link's target. The directories on the way are opened for
+// search only (openSearchDir), so, as for an open by path, the user running the import
+// needs only search permission on them. The root is then opened by the name the walk
+// reached it by, which has no link in it, and returned only if it is the directory the
+// walk checked, so an entry replaced meanwhile cannot change what is read through it.
 func openImportRoot(path string) (*os.Root, error) {
 	sep := string(filepath.Separator)
 	given := path
@@ -1629,13 +1639,6 @@ func openImportRoot(path string) (*os.Root, error) {
 		link    string
 		linkUID uint32
 	}
-	// cause is the error of a call through a root, to name the file by its path.
-	cause := func(err error) error {
-		if c := errors.Unwrap(err); c != nil {
-			return c
-		}
-		return err
-	}
 	split := func(p string) []step {
 		var steps []step
 		for _, name := range strings.Split(p, sep) {
@@ -1646,24 +1649,24 @@ func openImportRoot(path string) (*os.Root, error) {
 		return steps
 	}
 
-	// dirs are the directories walked to, dirs[0] the file system root; resolved
-	// names the last of them, with no link in it.
-	var dirs []*os.Root
+	// dirs are the descriptors of the directories walked to, dirs[0] the file system
+	// root; resolved names the last of them, with no link in it.
+	var dirs []int
 	var resolved string
 	closeDirs := func() {
 		for _, dir := range dirs {
-			dir.Close()
+			unix.Close(dir)
 		}
 		dirs = nil
 	}
 	defer closeDirs()
 	restart := func() error {
 		closeDirs()
-		top, err := os.OpenRoot(sep)
+		top, err := openSearchDir(unix.AT_FDCWD, sep)
 		if err != nil {
-			return err
+			return &fs.PathError{Op: "open", Path: sep, Err: err}
 		}
-		dirs, resolved = []*os.Root{top}, sep
+		dirs, resolved = []int{top}, sep
 		return nil
 	}
 	if err := restart(); err != nil {
@@ -1678,9 +1681,9 @@ func openImportRoot(path string) (*os.Root, error) {
 		cur := dirs[len(dirs)-1]
 		switch {
 		case st.link != "":
-			info, err := cur.Stat(".")
+			info, err := fstatDir(cur, resolved)
 			if err != nil {
-				return nil, err
+				return nil, &fs.PathError{Op: "stat", Path: resolved, Err: err}
 			}
 			if uid := fileUID(info); uid != st.linkUID {
 				return nil, fmt.Errorf("refusing %s: %s is a symbolic link of uid %d to %s, a directory of uid %d, and a link is followed only if it belongs to root or to the owner of the directory it leads to; name that directory instead", given, st.link, st.linkUID, resolved, uid)
@@ -1688,7 +1691,7 @@ func openImportRoot(path string) (*os.Root, error) {
 			continue
 		case st.name == "..":
 			if len(dirs) > 1 {
-				cur.Close()
+				unix.Close(cur)
 				dirs = dirs[:len(dirs)-1]
 				resolved = filepath.Dir(resolved)
 			}
@@ -1696,28 +1699,28 @@ func openImportRoot(path string) (*os.Root, error) {
 		}
 
 		name := filepath.Join(resolved, st.name)
-		info, err := cur.Lstat(st.name)
+		info, err := lstatAt(cur, st.name)
 		if err != nil {
-			return nil, &fs.PathError{Op: "open", Path: name, Err: cause(err)}
+			return nil, &fs.PathError{Op: "open", Path: name, Err: err}
 		}
 		if info.Mode()&fs.ModeSymlink != 0 {
 			if links++; links > maxImportRootLinks {
 				return nil, &fs.PathError{Op: "open", Path: given, Err: syscall.ELOOP}
 			}
-			target, err := cur.Readlink(st.name)
+			target, err := readlinkAt(cur, st.name)
 			if err != nil {
-				return nil, &fs.PathError{Op: "readlink", Path: name, Err: cause(err)}
+				return nil, &fs.PathError{Op: "readlink", Path: name, Err: err}
 			}
 			// The owner checked must be that of the link the target was read from.
-			again, err := cur.Lstat(st.name)
-			if err != nil || !os.SameFile(info, again) {
+			again, err := lstatAt(cur, st.name)
+			if err != nil || !sameStat(info, again) {
 				return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, name)
 			}
 			// The owner says who made the link, not who gave it this name: where users
 			// may hard-link a file they do not own (hardLinksProtected), alice can name
 			// root's /var/mail/bob, or bob's own link to his maildir, ~/Maildir.
-			if sys, ok := again.Sys().(*syscall.Stat_t); ok && sys.Nlink > 1 && !hardLinksProtected() {
-				return nil, fmt.Errorf("refusing %s: %s is a symbolic link with %d names, and on this system any user may have given it this one with a hard link; name the directory it leads to instead", given, name, sys.Nlink)
+			if nlink := uint64(again.st.Nlink); nlink > 1 && !hardLinksProtected() {
+				return nil, fmt.Errorf("refusing %s: %s is a symbolic link with %d names, and on this system any user may have given it this one with a hard link; name the directory it leads to instead", given, name, nlink)
 			}
 			next := split(target)
 			if uid := fileUID(again); uid != 0 {
@@ -1734,18 +1737,31 @@ func openImportRoot(path string) (*os.Root, error) {
 		if !info.IsDir() {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.ENOTDIR}
 		}
-		dir, err := cur.OpenRoot(st.name)
+		dir, err := openSearchDir(cur, st.name)
 		if err != nil {
-			return nil, &fs.PathError{Op: "open", Path: name, Err: cause(err)}
+			return nil, &fs.PathError{Op: "open", Path: name, Err: err}
 		}
 		dirs = append(dirs, dir)
-		if dirInfo, err := dir.Stat("."); err != nil || !os.SameFile(info, dirInfo) {
+		if dirInfo, err := fstatDir(dir, name); err != nil || !sameStat(info, dirInfo) {
 			return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, name)
 		}
 		resolved = name
 	}
-	root := dirs[len(dirs)-1]
-	dirs = dirs[:len(dirs)-1]
+
+	// Only the root itself must be readable: it is opened by its name, and the name
+	// must still lead to the directory the walk checked, which dirs still holds open.
+	checked, err := fstatDir(dirs[len(dirs)-1], resolved)
+	if err != nil {
+		return nil, &fs.PathError{Op: "stat", Path: resolved, Err: err}
+	}
+	root, err := os.OpenRoot(resolved)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := root.Stat("."); err != nil || !sameFileID(checked, info) {
+		root.Close()
+		return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, resolved)
+	}
 	return root, nil
 }
 

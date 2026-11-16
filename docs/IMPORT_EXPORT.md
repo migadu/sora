@@ -134,7 +134,9 @@ refuse to start, naming the link, its owner and the directory it leads to, befor
 who made it, not who gave it its name, so where users may hard-link a file they do not own (macOS
 and the BSDs, and Linux with `fs.protected_hardlinks = 0`) a link with more than one name is
 refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise pass as root's link. These are
-Unix UID checks. Below the root, a folder that is a link is not walked and is named in a warning.
+Unix UID checks. Checking them needs no more permission than opening the path does: the
+directories above the maildir need only be searchable (`x`), not readable, by the user running
+the import. Below the root, a folder that is a link is not walked and is named in a warning.
 A message file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
 file that is a link is read only when the link is relative and its target is below the root. Any
 other link (one pointing outside the root, or any absolute link, even to a file inside the root)
