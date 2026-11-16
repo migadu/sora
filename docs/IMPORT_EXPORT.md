@@ -655,7 +655,14 @@ uidlist in the target is merged: its entries for files still present are kept.
 
 **Links in the target.** The target may be a maildir its owner could write to, while the export
 runs with more privileges, so message and Dovecot contents and Maildir child directories below
-it are accessed through the opened target directory. `--maildir-path` itself may be a link.
+it are accessed through the opened target directory. `--maildir-path` itself, or a directory on
+the way to it, may be a symbolic link under the import's rule
+([section 3](#3-the-maildir-layout-sora-reads)): only when the link belongs to root or to the owner
+of the directory it leads to. A user who can replace `~/Maildir`, or a directory above it, could
+otherwise point it at another user's maildir or home and have the account's mail, Dovecot files
+and `sora-maildir.db` written there. Any other link makes the export refuse to start, naming the
+link, before anything is created. The directories missing on the way are created only after the
+links leading to them are checked, and never through a link to a directory that does not exist.
 Each exported content file (a message,
 `dovecot-keywords`, `subscriptions`, `dovecot-uidlist`) is written as a new file and renamed over
 its name, so a symbolic or hard link at that name is replaced, and the file it points to is left

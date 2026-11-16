@@ -1612,6 +1612,24 @@ const maxImportRootLinks = 255
 // link goes up from the link's target. The root returned is the directory the walk
 // checked, so an entry replaced meanwhile cannot change what is read through it.
 func openImportRoot(path string) (*os.Root, error) {
+	return openLinkCheckedRoot(path, false)
+}
+
+// openExportRoot opens the directory at path, --maildir-path of an export, as the root
+// the export writes every message and metadata file through, under openImportRoot's
+// rule for the links on the way: an export into a user's maildir in place also often
+// runs as root, and would write the account's mail into the directory the user's link
+// chooses. A directory missing on the way is created, as os.MkdirAll creates it, in
+// the directory the walk has reached: only a name of path itself is created, never one
+// that a link's target names (os.MkdirAll does not create through a link that leads
+// nowhere either), and a link is checked before the names after it. So nothing is
+// created in a directory that a refused link leads to.
+func openExportRoot(path string) (*os.Root, error) {
+	return openLinkCheckedRoot(path, true)
+}
+
+// openLinkCheckedRoot is openImportRoot and, with create, openExportRoot.
+func openLinkCheckedRoot(path string, create bool) (*os.Root, error) {
 	sep := string(filepath.Separator)
 	given := path
 	if !filepath.IsAbs(path) {
@@ -1622,10 +1640,12 @@ func openImportRoot(path string) (*os.Root, error) {
 		path = wd + sep + path
 	}
 
-	// A step is a name to walk to or, after the target of a link that is not root's,
-	// the check that the directory the target reached belongs to the link's owner.
+	// A step is a name to walk to, created if missing when create says so, or, after
+	// the target of a link that is not root's, the check that the directory the target
+	// reached belongs to the link's owner.
 	type step struct {
 		name    string
+		create  bool
 		link    string
 		linkUID uint32
 	}
@@ -1671,6 +1691,9 @@ func openImportRoot(path string) (*os.Root, error) {
 	}
 
 	steps := split(path)
+	for i := range steps {
+		steps[i].create = create
+	}
 	links := 0
 	for len(steps) > 0 {
 		st := steps[0]
@@ -1697,6 +1720,12 @@ func openImportRoot(path string) (*os.Root, error) {
 
 		name := filepath.Join(resolved, st.name)
 		info, err := cur.Lstat(st.name)
+		if st.create && errors.Is(err, fs.ErrNotExist) {
+			if err := cur.Mkdir(st.name, 0755); err != nil && !errors.Is(err, fs.ErrExist) {
+				return nil, &fs.PathError{Op: "mkdir", Path: name, Err: cause(err)}
+			}
+			info, err = cur.Lstat(st.name)
+		}
 		if err != nil {
 			return nil, &fs.PathError{Op: "open", Path: name, Err: cause(err)}
 		}
