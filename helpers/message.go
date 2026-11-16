@@ -59,13 +59,15 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 			continue
 		}
 
+		// go-message keeps the media type when only the parameters are
+		// malformed. Such a text part is still text (RFC 2045 §5.2 even
+		// recommends assuming text/plain for an invalid field), so it is
+		// indexed, as MessagePreview shows it, read like one without a charset.
 		mediaType, _, err := header.ContentType()
-		if err != nil {
-			// Malformed Content-Type header (e.g., invalid media parameters).
-			// Skip this part and continue - plaintext extraction is best-effort for FTS.
-			skippedParts = append(skippedParts, fmt.Sprintf("invalid Content-Type: %v", err))
-			continue
-		} else if mediaType != "text/plain" && mediaType != "text/html" {
+		if mediaType != "text/plain" && mediaType != "text/html" {
+			if err != nil {
+				skippedParts = append(skippedParts, fmt.Sprintf("invalid Content-Type: %v", err))
+			}
 			continue
 		}
 
