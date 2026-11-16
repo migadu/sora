@@ -16,21 +16,23 @@ components:
       bearerFormat: API Key
       description: >-
         api_key or read_only_api_key, as 'Bearer <API_KEY>' in the Authorization header. The
-        read-only key grants GET operations only. A missing or non-Bearer header is answered
-        401, a wrong key 403.
+        read-only key grants GET operations only. A missing or non-Bearer header, or a key
+        that is neither, is answered 401; the read-only key on a write 403.
 
   # Refusals of the access checks every request passes before its route: the client
   # address against allowed_hosts, then the API key. Every operation can answer them.
   responses:
     Unauthorized:
       description: >-
-        The Authorization header is missing or is not a Bearer header. The response carries
-        the challenge `WWW-Authenticate: Bearer realm="admin-api"`.
+        The Authorization header is missing or is not a Bearer header, or the key is neither
+        api_key nor read_only_api_key. The response carries the challenge
+        `WWW-Authenticate: Bearer realm="admin-api"`; for a wrong key it adds the reason
+        (RFC 6750 section 3.1): `Bearer realm="admin-api", error="invalid_token"`.
       headers:
         WWW-Authenticate:
           schema:
             type: string
-          example: 'Bearer realm="admin-api"'
+          example: 'Bearer realm="admin-api", error="invalid_token"'
       content:
         application/json:
           schema:
@@ -44,28 +46,26 @@ components:
               summary: Not a Bearer header
               value:
                 error: "Authorization header must be 'Bearer <token>'"
+            invalid_key:
+              summary: Wrong key
+              value:
+                error: "Invalid API key"
     Forbidden:
       description: >-
-        The key is neither api_key nor read_only_api_key, the read-only key was sent with a
-        method other than GET, or allowed_hosts is set and does not match the client address.
-        A refused key carries a Bearer challenge with the reason (RFC 6750 section 3.1):
-        `WWW-Authenticate: Bearer realm="admin-api", error="invalid_token"` for a wrong key,
-        `error="insufficient_scope"` for the read-only key on a write. A client address
-        refused by allowed_hosts gets no challenge.
+        The read-only key was sent with a method other than GET, or allowed_hosts is set and
+        does not match the client address. The read-only key on a write carries the challenge
+        `WWW-Authenticate: Bearer realm="admin-api", error="insufficient_scope"` (RFC 6750
+        section 3.1). A client address refused by allowed_hosts gets no challenge.
       headers:
         WWW-Authenticate:
           schema:
             type: string
-          example: 'Bearer realm="admin-api", error="invalid_token"'
+          example: 'Bearer realm="admin-api", error="insufficient_scope"'
       content:
         application/json:
           schema:
             $ref: '#/components/schemas/Error'
           examples:
-            invalid_key:
-              summary: Wrong key
-              value:
-                error: "Invalid API key"
             read_only:
               summary: Read-only key on a write
               value:

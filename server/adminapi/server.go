@@ -692,17 +692,19 @@ func (s *Server) authMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		// A refused key is answered 403 and, like the 401s above, carries the
-		// challenge, here with the reason: RFC 6750 section 3 requires the header for a
-		// request that "does not contain an access token that enables access to the
-		// protected resource", and section 3.1 names the reasons.
+		// A refused key carries the challenge with the reason: RFC 6750 section 3
+		// requires the header for a request that "does not contain an access token that
+		// enables access to the protected resource", and section 3.1 names the reasons
+		// and their statuses. A key that is neither key is "invalid_token": "The
+		// resource SHOULD respond with the HTTP 401 (Unauthorized) status code."
 		if settings.readOnlyAPIKey == "" || subtle.ConstantTimeCompare(token, []byte(settings.readOnlyAPIKey)) != 1 {
 			server.SetBearerChallenge(w.Header(), bearerRealm, server.BearerInvalidToken)
-			s.writeError(w, http.StatusForbidden, "Invalid API key")
+			s.writeError(w, http.StatusUnauthorized, "Invalid API key")
 			return
 		}
 		// The read-only key: every GET route only reads, and every write is a
-		// POST, PUT or DELETE.
+		// POST, PUT or DELETE. A write with it is "insufficient_scope": "The resource
+		// server SHOULD respond with the HTTP 403 (Forbidden) status code".
 		if r.Method != http.MethodGet {
 			server.SetBearerChallenge(w.Header(), bearerRealm, server.BearerInsufficientScope)
 			s.writeError(w, http.StatusForbidden, "API key is read-only")

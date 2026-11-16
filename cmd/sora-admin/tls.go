@@ -1483,7 +1483,11 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	// Determine which domains to cache
 	var domainsToCache []string
 	if specificDomain != "" {
-		domainsToCache = []string{specificDomain}
+		name, err := autocertName(specificDomain)
+		if err != nil {
+			return err
+		}
+		domainsToCache = []string{name}
 	} else {
 		domainsToCache = cfg.TLS.LetsEncrypt.Domains
 	}
@@ -1508,9 +1512,6 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 
 		domain, err := autocertName(configured)
 		if err != nil {
-			if specificDomain != "" {
-				return err
-			}
 			// autocert.HostWhitelist drops such a configured domain silently and the
 			// server serves the others, so skip it rather than stop syncing them.
 			logger.Warn("Skipping configured domain autocert cannot serve", "domain", configured, "error", err)
@@ -1611,6 +1612,13 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	if len(failures) > 0 {
 		fmt.Printf("  Failed:    %d (not cached)\n", len(failures))
 		return fmt.Errorf("%d certificate(s) could not be cached: %w", len(failures), errors.Join(failures...))
+	}
+
+	// A configured domain with neither certificate in S3 has not been issued yet, which
+	// is normal in a run over all of them. A domain named with --domain that has none
+	// fails the command, as tls delete --domain does.
+	if specificDomain != "" && cached+skipped+expired == 0 {
+		return fmt.Errorf("no certificate found for %s in S3", domainsToCache[0])
 	}
 
 	return nil
