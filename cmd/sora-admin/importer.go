@@ -1405,6 +1405,10 @@ func (i *Importer) readMaildirFile(path string) ([]byte, error) {
 // a device.
 var errNotRegularFile = errors.New("not a regular file")
 
+// fileUID returns the user that owns the file info describes. It is a variable so that
+// a test can make a file appear to belong to another user, which only root can arrange.
+var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t).Uid }
+
 // openRegularFile opens name below root for reading if it is a regular file, and
 // fails with errNotRegularFile otherwise. The files the import reads may have been
 // written by their owner, who can make one a FIFO (mkfifo; rsync -a copies them), and
