@@ -1524,11 +1524,13 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	// Before updating, check if any child would conflict with existing mailboxes
 	if hasChildren {
 		// Check if any child's new name would conflict with an existing mailbox
+		// outside the subtree being renamed, using the database's LOWER() identity.
 		var conflictCount int
 		err = tx.QueryRow(ctx, `
 			SELECT COUNT(*)
 			FROM mailboxes existing
 			WHERE existing.account_id = $1
+			  AND existing.path NOT LIKE $2 || '%'
 			  AND existing.deleted_at IS NULL
 			  AND EXISTS (
 				SELECT 1 FROM mailboxes child
@@ -1536,7 +1538,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 				  AND child.path LIKE $2 || '%'
 				  AND child.path != $2
 				  AND child.deleted_at IS NULL
-				  AND existing.name = array_to_string(ARRAY[$3::text] || (string_to_array(child.name, $5))[$4::int + 1:], $5)
+				  AND LOWER(existing.name) = LOWER(array_to_string(ARRAY[$3::text] || (string_to_array(child.name, $5))[$4::int + 1:], $5))
 			  )
 		`, ownerAccountID, oldPath, newName, oldLevels, delimiter).Scan(&conflictCount)
 		if err != nil {
@@ -1545,7 +1547,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		}
 		if conflictCount > 0 {
 			logger.Error("Database: rename would create conflicting child names", "mailbox_id", mailboxID, "old_name", oldName, "new_name", newName, "conflicts", conflictCount)
-			return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts)", conflictCount)
+			return fmt.Errorf("rename would create conflicting mailbox names (%d conflicts): %w", conflictCount, consts.ErrMailboxAlreadyExists)
 		}
 	}
 
