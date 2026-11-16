@@ -15,12 +15,46 @@ import (
 	"github.com/migadu/sora/logger"
 )
 
+// MaxCrossAccountBodies is the most distinct bodies one COPY or MOVE may re-key into the
+// account that owns its destination mailbox. Such a command holds two shared advisory locks
+// per body until it commits, the destination object's S3 lock (LockS3ObjectsSharedInTx) and
+// the FTS orphan-sweep lock (restageFTS), and PostgreSQL keeps each one in its shared lock
+// table: max_locks_per_transaction × (max_connections + max_prepared_transactions) entries
+// for the whole server. Once they are used up, every session fails with "out of shared
+// memory" (SQLSTATE 53200). The command cannot be split into smaller transactions instead:
+// RFC 9051 §6.4.7, "partial copy MUST NOT be done". The value is the lock budget of the
+// cleaner's FTS orphan sweep batch (BATCH_PURGE_SIZE).
+const MaxCrossAccountBodies = 1000
+
+// ErrCrossAccountBodyLimit refuses a COPY or MOVE that would re-key more than
+// MaxCrossAccountBodies distinct bodies into another account; nothing is locked or written.
+var ErrCrossAccountBodyLimit = fmt.Errorf("a copy or move into another account's mailbox is limited to %d distinct messages", MaxCrossAccountBodies)
+
+// CheckCrossAccountBodies returns ErrCrossAccountBodyLimit when sourceHashes, the hashes by
+// source UID of the rows a COPY or MOVE re-keys to the destination owner (see CopyMessages
+// and MoveMessages), name more than MaxCrossAccountBodies distinct bodies. Copies of one body
+// count once, as they take its locks once.
+func CheckCrossAccountBodies(sourceHashes map[imap.UID]string) error {
+	if len(sourceHashes) <= MaxCrossAccountBodies {
+		return nil
+	}
+	bodies := make(map[string]struct{}, MaxCrossAccountBodies+1)
+	for _, hash := range sourceHashes {
+		bodies[hash] = struct{}{}
+		if len(bodies) > MaxCrossAccountBodies {
+			return ErrCrossAccountBodyLimit
+		}
+	}
+	return nil
+}
+
 // LockS3ObjectsSharedInTx takes the S3 object locks (GetS3ObjectLockID) of accountID's
 // contentHashes in shared mode on tx, in id order, waiting for an exclusive holder (for at
 // most the transaction's lock_timeout). They last until tx ends. Shared holders do not
 // exclude one another; they keep out every exclusive locker of the same objects: the
 // cleaner's and the purge's deletes (which only try the lock and skip a busy object), a
-// restore, sora-admin rekey, and the uploader's write gate.
+// restore, sora-admin rekey, and the uploader's write gate. Each lock is a lock-table entry
+// until tx ends, so the caller bounds contentHashes (CheckCrossAccountBodies).
 //
 // The statement carries the ids as literals, so it goes over the simple protocol and
 // leaves no portal or snapshot behind: a transaction that holds the locks across S3 round
@@ -318,10 +352,8 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	if err := db.restagePendingUploads(ctx, tx, destMailboxID, keptUIDs, rekeyedUIDs, instanceID); err != nil {
 		return nil, err
 	}
-	if len(rekeyedUIDs) > 0 {
-		if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
-			return nil, err
-		}
+	if err := db.restageFTS(ctx, tx, destMailboxID, rekeyedUIDs); err != nil {
+		return nil, err
 	}
 
 	// Mark the original messages as expunged in the source mailbox

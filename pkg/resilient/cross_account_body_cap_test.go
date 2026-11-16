@@ -4,6 +4,7 @@ package resilient
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -14,7 +15,7 @@ import (
 
 // crossAccountBodyCap is the most distinct bodies one COPY or MOVE may re-key into another
 // account's mailbox.
-const crossAccountBodyCap = 1000
+const crossAccountBodyCap = db.MaxCrossAccountBodies
 
 // heldAdvisoryLocks returns how many advisory locks are held by the backend that holds
 // accountID's S3 object lock on hash in shared mode, as a cross-account COPY or MOVE does
@@ -72,7 +73,7 @@ func TestCrossAccountCopyMoveOverTheBodyCapTakeNoLocks(t *testing.T) {
 				_, err = rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID,
 					"example.net", "owner", "test-instance", f.sourceHashes(), f.hashes, ensure)
 			}
-			if err == nil || checks != 0 {
+			if !errors.Is(err, db.ErrCrossAccountBodyLimit) || checks != 0 {
 				t.Errorf("%s of %d distinct bodies into another account: err = %v, made %d S3 checks while its session held %d advisory locks; want it refused before taking any",
 					command, bodies, err, checks, held)
 			}

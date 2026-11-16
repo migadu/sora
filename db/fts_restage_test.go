@@ -461,7 +461,7 @@ func TestCrossAccountMoveCopyAtTheBodyCapHoldTwoLocksPerBody(t *testing.T) {
 	require.NoError(t, err)
 	sharedB := createRestageMailbox(t, ctx, db, ownerB, "Shared")
 
-	const bodies = 1000 // MaxCrossAccountBodies
+	const bodies = MaxCrossAccountBodies
 	base := time.Now().UnixNano()
 	uids := make([]imap.UID, 0, bodies)
 	hashes := make([]string, 0, bodies)

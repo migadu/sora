@@ -184,7 +184,14 @@ var destObjectKeepalive = 30 * time.Second
 // move with a *DestObjectError, which the write circuit breaker does not count and the
 // retry does not repeat (the S3 calls retry on their own). A statement keeps the
 // transaction alive at least every destObjectKeepalive.
+//
+// The transaction holds two lock-table entries per distinct re-keyed body until it
+// commits, so a move of more than db.MaxCrossAccountBodies of them fails with
+// db.ErrCrossAccountBodyLimit before it begins.
 func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(ctx context.Context, contentHash string) error) (map[imap.UID]imap.UID, error) {
+	if err := db.CheckCrossAccountBodies(sourceHashes); err != nil {
+		return nil, err
+	}
 	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
 		if len(destObjects) > 0 {
 			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {

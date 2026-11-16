@@ -551,8 +551,13 @@ func (rd *ResilientDatabase) ResolveAccountS3Owner(ctx context.Context, accountI
 // not commit, so nil is returned.
 // Destination object preparation follows MOVE's one-transaction contract: acquire
 // shared locks before S3 work, keep that transaction alive during the checks, and
-// give the row writes their own timeout afterwards. No lock handover is needed.
+// give the row writes their own timeout afterwards. No lock handover is needed. As
+// for MOVE, a copy of more than db.MaxCrossAccountBodies distinct re-keyed bodies fails
+// with db.ErrCrossAccountBodyLimit before its transaction begins.
 func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(context.Context, string) error) (map[imap.UID]imap.UID, []int64, error) {
+	if err := db.CheckCrossAccountBodies(sourceHashes); err != nil {
+		return nil, nil, err
+	}
 	var capturedUIDMap map[imap.UID]imap.UID
 	var capturedIDs []int64
 	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {

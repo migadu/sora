@@ -303,10 +303,8 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	if err := db.restagePendingUploads(ctx, tx, destMailboxID, keptUIDs, rekeyedUIDs, instanceID); err != nil {
 		return nil, nil, err
 	}
-	if len(rekeyedUIDs) > 0 {
-		if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
-			return nil, nil, err
-		}
+	if err := db.restageFTS(ctx, tx, destMailboxID, rekeyedUIDs); err != nil {
+		return nil, nil, err
 	}
 
 	return messageUIDMap, newMessageIDs, nil
@@ -356,21 +354,25 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 	return nil
 }
 
-// restageFTS ensures every just-inserted message in (mailboxID, newUIDs) has a per-account
-// FTS row under its own account, so it is searchable by body for its new owner.
+// restageFTS ensures every just-inserted message in (mailboxID, rekeyedUIDs) has a
+// per-account FTS row under its own account, so it is searchable by body for its new owner.
 //
 // This is the search-side analogue of restagePendingUploads. messages_fts_v2 is keyed by
 // (content_hash, account_id), so a cross-account COPY or MOVE lands a message under an
 // account that has no row for that body: without this it would be silently unsearchable in
 // the destination, exactly as it would be unreadable without the pending_upload re-stage.
 //
-// Callers skip it when every source row already belongs to the destination account. That
-// account's row for the body is then anchored by the source row itself, which stays in
-// messages (MOVE only expunges it, and the orphan sweep counts expunged rows), so the sweep
-// cannot delete the row and there is nothing to insert. A rekey, which renames the source
-// row's hash, waits for the copy (lockRekeySources) and so sees the copied rows too. The
-// skip matters: the shared lock below is one entry per distinct body in PostgreSQL's
-// server-wide lock table, held until commit, and a bulk same-account MOVE is the common case.
+// Callers pass only the copies re-keyed from another account. A copy of a row that already
+// belonged to the destination account (every row of a same-account COPY or MOVE, and a
+// message that account added to another owner's shared mailbox while messages.account_id
+// was still the adder's) needs nothing: that account's row for the body is anchored by the
+// source row itself, which stays in messages (MOVE only expunges it, and the orphan sweep
+// counts expunged rows), so the sweep cannot delete the row and there is nothing to insert.
+// A rekey, which renames the source row's hash, waits for the copy (lockRekeySources) and so
+// sees the copied rows too. Leaving those copies out matters: the shared lock below is one
+// entry per distinct body in PostgreSQL's server-wide lock table, held until commit, a bulk
+// same-account MOVE is the common case, and the re-keyed bodies are what one command is
+// limited to (MaxCrossAccountBodies).
 //
 // Do not replace the lock with a "row already exists" pre-check. A row that exists can be an
 // orphan the sweep is about to delete, and the sweep cannot see the uncommitted message that
@@ -381,8 +383,8 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 // a sibling rather than tokenising anything again. The EXISTS guard keeps us from creating
 // rows for a body that was never indexed at all -- empty, past fts_retention, or pruned --
 // which would otherwise be queued forever and then poisoned.
-func (db *Database) restageFTS(ctx context.Context, tx pgx.Tx, mailboxID int64, newUIDs []int64) error {
-	if len(newUIDs) == 0 {
+func (db *Database) restageFTS(ctx context.Context, tx pgx.Tx, mailboxID int64, rekeyedUIDs []int64) error {
+	if len(rekeyedUIDs) == 0 {
 		return nil
 	}
 	// Acquire shared advisory locks on all distinct content_hashes for these messages
@@ -396,7 +398,7 @@ func (db *Database) restageFTS(ctx context.Context, tx pgx.Tx, mailboxID int64, 
 			FROM messages m
 			WHERE m.mailbox_id = $2 AND m.uid = ANY($3) AND m.expunged_at IS NULL
 		) m`,
-		consts.SoraFTSOrphanSweepLockClassID, mailboxID, newUIDs); err != nil {
+		consts.SoraFTSOrphanSweepLockClassID, mailboxID, rekeyedUIDs); err != nil {
 		return fmt.Errorf("failed to acquire shared advisory lock for fts restage: %w", err)
 	}
 
@@ -407,7 +409,7 @@ func (db *Database) restageFTS(ctx context.Context, tx pgx.Tx, mailboxID int64, 
 		WHERE m.mailbox_id = $1 AND m.uid = ANY($2) AND m.expunged_at IS NULL
 		  AND EXISTS (SELECT 1 FROM messages_fts_v2 s WHERE s.content_hash = m.content_hash)
 		ON CONFLICT (content_hash, account_id) DO NOTHING`,
-		mailboxID, newUIDs)
+		mailboxID, rekeyedUIDs)
 	if err != nil {
 		return fmt.Errorf("failed to re-stage fts rows: %w", err)
 	}

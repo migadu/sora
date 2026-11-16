@@ -328,6 +328,16 @@ A message in a shared folder belongs to the folder's owner. Its body is stored i
 owner's account, whoever appended, copied, moved or filed it there. It counts in the owner's
 message counts, as shown by `sora-admin` and the Admin API. Sora has no storage quota to enforce.
 
+A `COPY` or `MOVE` between folders of different owners (into a shared folder, out of one into
+the user's own folders, or between the shared folders of two owners) hands each message to the
+destination's owner, and may carry at most 1,000 distinct messages; copies of one message count
+once. A larger one is refused with
+`NO [LIMIT] COPY between mailboxes of different users is limited to 1000 messages at a time`
+(or `MOVE ...`) and copies or moves nothing; select fewer messages and repeat. The limit keeps one
+command from filling PostgreSQL's lock table (see
+[DATABASE.md](DATABASE.md#server-settings)). A `COPY` or `MOVE` between folders of the same owner
+has no such limit.
+
 When the owner's account is deleted and purged, the shared folders it owns are deleted with it,
 messages included. Give shared folders an owner account that outlives any one person. Account
 deletion is described in [STORAGE.md](STORAGE.md).

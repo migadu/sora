@@ -10,13 +10,14 @@ import (
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapclient"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
 	"github.com/stretchr/testify/require"
 )
 
 // crossAccountBodyCap is the most distinct messages one COPY or MOVE may carry into a
 // mailbox of another account.
-const crossAccountBodyCap = 1000
+const crossAccountBodyCap = db.MaxCrossAccountBodies
 
 // A COPY or MOVE into another account's mailbox holds two lock-table entries per distinct
 // message until it commits, so one over the cap is refused with NO [LIMIT] (RFC 5530) and

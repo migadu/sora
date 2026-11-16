@@ -127,6 +127,13 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		sourceUIDs = append(sourceUIDs, msg.UID)
 	}
 
+	// The hash each cross-account body is made available for below. MoveMessages moves a
+	// source only if it still has it, since a rekey can rename it before the rows are locked.
+	sourceHashes := crossAccountSourceHashes(messages, destMailbox.AccountID)
+	if err := db.CheckCrossAccountBodies(sourceHashes); err != nil {
+		return s.crossAccountBodyLimitError("MOVE")
+	}
+
 	// Identify cross-account operations and relocate S3 objects if necessary.
 	destS3Domain := s.Session.User.Domain()
 	destS3Localpart := s.Session.User.LocalPart()
@@ -152,14 +159,10 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 	}
 	destObjects := make(map[string]destObject)
 	var destHashes []string
-	// The hash each cross-account body is made available for below. MoveMessages moves a
-	// source only if it still has it, since a rekey can rename it before the rows are locked.
-	sourceHashes := make(map[imap.UID]string)
 	for _, msg := range messages {
 		if msg.AccountID == destMailbox.AccountID {
 			continue // Same owner: body already lives under the correct S3 path.
 		}
-		sourceHashes[msg.UID] = msg.ContentHash
 		if !msg.IsUploaded {
 			if s.server.uploader == nil {
 				continue

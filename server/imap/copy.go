@@ -98,6 +98,13 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		sourceUIDs = append(sourceUIDs, msg.UID)
 	}
 
+	// The hash each cross-account body is made available for below. CopyMessages copies a
+	// source only if it still has it, since a rekey can rename it before the INSERT.
+	sourceHashes := crossAccountSourceHashes(messages, destMailbox.AccountID)
+	if err := db.CheckCrossAccountBodies(sourceHashes); err != nil {
+		return nil, s.crossAccountBodyLimitError("COPY")
+	}
+
 	// Identify cross-account operations and relocate S3 objects if necessary.
 	destS3Domain := s.Session.User.Domain()
 	destS3Localpart := s.Session.User.LocalPart()
@@ -118,9 +125,6 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	}
 	destObjects := make(map[string]crossAccountObject)
 	var destHashes []string
-	// The hash each cross-account body is made available for below. CopyMessages copies a
-	// source only if it still has it, since a rekey can rename it before the INSERT.
-	sourceHashes := make(map[imap.UID]string)
 
 	for _, msg := range messages {
 		if msg.AccountID == destMailbox.AccountID {
@@ -128,7 +132,6 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		}
 		// Cross-account copy: the new row will be owned by the destination mailbox
 		// owner, so the body must be reachable under the owner's S3 path.
-		sourceHashes[msg.UID] = msg.ContentHash
 		if !msg.IsUploaded {
 			if s.server.uploader == nil {
 				continue
@@ -276,6 +279,32 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	s.messagesCopied.Add(uint32(len(uidMap)))
 
 	return copyData, nil
+}
+
+// crossAccountSourceHashes maps the UID of every message a COPY or MOVE re-keys to
+// destAccountID, the owner of its destination mailbox, to the message's content hash.
+func crossAccountSourceHashes(messages []db.Message, destAccountID int64) map[imap.UID]string {
+	hashes := make(map[imap.UID]string)
+	for _, msg := range messages {
+		if msg.AccountID != destAccountID {
+			hashes[msg.UID] = msg.ContentHash
+		}
+	}
+	return hashes
+}
+
+// crossAccountBodyLimitError answers a COPY or MOVE that would re-key more distinct
+// messages into another account than db.MaxCrossAccountBodies: its transaction would hold
+// two lock-table entries per message until it commits. Nothing was copied or moved, and a
+// smaller set succeeds. RFC 5530 §3, LIMIT: "The operation ran up against an implementation
+// limit of some kind".
+func (s *IMAPSession) crossAccountBodyLimitError(command string) *imap.Error {
+	s.InfoLog("refused a cross-account command over the message limit", "command", command, "max", db.MaxCrossAccountBodies)
+	return &imap.Error{
+		Type: imap.StatusResponseTypeNo,
+		Code: imap.ResponseCodeLimit,
+		Text: fmt.Sprintf("%s between mailboxes of different users is limited to %d messages at a time", command, db.MaxCrossAccountBodies),
+	}
 }
 
 // stageCrossAccountBody links the staging file of a body that is not uploaded yet from

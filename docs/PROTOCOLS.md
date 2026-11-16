@@ -415,6 +415,13 @@ start a cache warm-up that copies the newest INBOX messages from S3 to the local
 - The body is written to the local spool and uploaded to S3 in the background; see
   [STORAGE.md](STORAGE.md).
 
+**COPY and MOVE**
+
+- A `COPY` or `MOVE` between mailboxes of different owners (shared mailboxes) may carry at most
+  1,000 distinct messages. A larger one is refused with
+  `NO [LIMIT] COPY between mailboxes of different users is limited to 1000 messages at a time`
+  and copies or moves nothing; see [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md#storage-and-statistics).
+
 **Keywords**
 
 - A message may carry at most 50 keywords (custom flags). An APPEND or STORE that would exceed this
