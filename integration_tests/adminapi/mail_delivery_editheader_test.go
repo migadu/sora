@@ -58,6 +58,7 @@ func TestAdminAPI_DeliverMail_AppliesSieveHeaderEdits(t *testing.T) {
 	// Unique script text so a parallel test's compiled entry cannot serve this one.
 	script := fmt.Sprintf("require [\"editheader\", \"fileinto\"];\r\n# %s\r\n"+
 		"addheader \"X-Spam-Flag\" \"YES\";\r\nfileinto \"Junk\";\r\n", marker)
+	script += "addheader \"Cc\" \"\";\r\n"
 	sc, err := server.rdb.CreateScriptWithRetry(ctx, accountID, "active", script)
 	if err != nil {
 		t.Fatalf("create sieve script: %v", err)
@@ -80,14 +81,20 @@ func TestAdminAPI_DeliverMail_AppliesSieveHeaderEdits(t *testing.T) {
 
 	var contentHash, mailboxName string
 	var rowAccountID int64
+	var presence int16
 	err = server.rdb.QueryRowWithRetry(ctx, `
-		SELECT m.content_hash, mb.name, m.account_id
+		SELECT m.content_hash, mb.name, m.account_id,m.header_presence
 		FROM messages m JOIN mailboxes mb ON m.mailbox_id = mb.id
 		WHERE m.account_id = $1 AND m.expunged_at IS NULL
 		ORDER BY m.uid DESC LIMIT 1
-	`, accountID).Scan(&contentHash, &mailboxName, &rowAccountID)
+	`, accountID).Scan(&contentHash, &mailboxName, &rowAccountID, &presence)
 	if err != nil {
 		t.Fatalf("delivered message row: %v", err)
+	}
+
+	bit, _ := helpers.HeaderPresenceBit("cc")
+	if presence&bit == 0 {
+		t.Fatal("post-Sieve empty Cc not recorded")
 	}
 
 	// Anchor: the script ran and compiled with the configured set (fileinto took effect).

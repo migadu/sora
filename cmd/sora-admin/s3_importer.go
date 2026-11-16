@@ -683,6 +683,7 @@ func (si *S3Importer) importStoredBody(ctx context.Context, obj S3ObjectInfo, us
 			References:          references,
 			BodyStructure:       &bodyStructure,
 			Recipients:          recipients,
+			HeaderPresence:      helpers.ExtractHeaderPresence(messageContent.Header),
 			FTSRetention:        si.options.FTSRetention,
 		},
 		db.PendingUpload{

@@ -42,16 +42,17 @@ type ExporterOptions struct {
 
 // Exporter handles the maildir export process.
 type Exporter struct {
-	ctx         context.Context // Context for cancellation support
-	maildirPath string
-	root        *os.Root // confines message/Dovecot contents and Maildir child directories; excludes the SQLite cache
-	email       string
-	jobs        int
-	db          *sql.DB
-	dbPath      string // Path to the SQLite database file
-	rdb         *resilient.ResilientDatabase
-	s3          objectStorage
-	options     ExporterOptions
+	ctx             context.Context // Context for cancellation support
+	maildirPath     string
+	root            *os.Root // confines message/Dovecot contents and Maildir child directories; excludes the SQLite cache
+	email           string
+	jobs            int
+	db              *sql.DB
+	dbPath          string // Path to the SQLite database file
+	privateCacheDir string // Dry-run snapshot, removed after closing its SQLite connection
+	rdb             *resilient.ResilientDatabase
+	s3              objectStorage
+	options         ExporterOptions
 
 	totalMessages    int64
 	exportedMessages int64
@@ -76,6 +77,29 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	if jobs < 1 {
 		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
 	}
+	// Preview never creates or migrates anything in the selected maildir.
+	if options.DryRun {
+		maildirPath = effectiveMaildirPath(maildirPath)
+		dbPath := filepath.Join(maildirPath, maildirCacheName)
+		cache, privateDir, err := openExportCacheForDryRun(ctx, dbPath)
+		if err != nil {
+			return nil, err
+		}
+		var root *os.Root
+		if cache != nil {
+			root, err = os.OpenRoot(filepath.Clean(maildirPath))
+			if err != nil {
+				cache.Close()
+				os.RemoveAll(privateDir)
+				return nil, fmt.Errorf("failed to open maildir path: %w", err)
+			}
+		}
+		return &Exporter{ctx: ctx, maildirPath: maildirPath, root: root, email: email,
+			jobs: jobs, db: cache, dbPath: dbPath, privateCacheDir: privateDir, rdb: rdb, s3: s3,
+			options: options, startTime: time.Now(), uidMappings: make(map[string][]UIDFileMapping),
+			keywordIndex: make(map[string]map[string]int)}, nil
+	}
+
 	// Ensure maildir path exists
 	if err := os.MkdirAll(maildirPath, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create maildir path: %w", err)
@@ -183,14 +207,22 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 
 // Close cleans up resources used by the exporter.
 func (exporter *Exporter) Close() error {
+	var closeErr error
 	if exporter.db != nil {
-		exporter.db.Close()
-		logger.Info("Maildir database saved", "path", exporter.dbPath)
+		closeErr = errors.Join(closeErr, exporter.db.Close())
+		if !exporter.options.DryRun {
+			logger.Info("Maildir database saved", "path", exporter.dbPath)
+		}
 	}
 	if exporter.root != nil {
-		exporter.root.Close()
+		closeErr = errors.Join(closeErr, exporter.root.Close())
+		exporter.root = nil
 	}
-	return nil
+	if exporter.privateCacheDir != "" {
+		closeErr = errors.Join(closeErr, os.RemoveAll(exporter.privateCacheDir))
+		exporter.privateCacheDir = ""
+	}
+	return closeErr
 }
 
 // Run starts the export process.
@@ -856,6 +888,10 @@ func (exporter *Exporter) buildMaildirFlags(msg *db.Message, mailboxName string)
 // folders' directories differently (#1166), and a message left only in such a
 // directory is not in the folder the importer reads the mailbox from.
 func (exporter *Exporter) isMessageExported(contentHash, mailbox string) (bool, string, error) {
+	if exporter.db == nil {
+		return false, "", nil
+	}
+
 	var filename string
 	err := exporter.db.QueryRow(
 		"SELECT filename FROM messages WHERE hash = ? AND mailbox = ?",
