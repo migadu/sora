@@ -915,8 +915,10 @@ There is no `AUTH`, `DSN` or `BINARYMIME`.
   §4.1.1.11), the DSN parameters `NOTIFY`, `ORCPT`, `RET` and `ENVID` among them, and `AUTH`, as
   `LHLO` does not announce `AUTH`. `XRCPTFORWARD` is the only `RCPT` parameter taken. A malformed
   parameter gets `501 5.5.4`: `SMTPUTF8` with a value (RFC 6531 §3.4), any parameter written
-  with `=` and no value (RFC 5321 §4.1.2), or any parameter given twice in one command (RFC 6152
-  §3, RFC 1870 §6).
+  with `=` and no value (RFC 5321 §4.1.2), or any parameter given twice (RFC 6152 §3,
+  RFC 1870 §6). Empty values and repeated keywords are refused before extension checks.
+  Otherwise, parameters are checked in the order sent and the first refused decides the
+  reply, so `SIZE=abc FOO=1` gets `501` and `FOO=1 SIZE=abc` gets `555`.
 - `VRFY` answers `252 2.5.0 Cannot VRFY user, but will accept message`.
 
 ### 8.4 Message size
