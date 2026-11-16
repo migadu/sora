@@ -264,10 +264,11 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 		add(byKey[nextKeys(1)[0]])
 	}
 	if source.Personal {
-		// The user's own namespace: owned mailboxes only (exclude shared, whose
-		// AccountID is the sharing owner's).
+		// RFC 5465 §6.2: all selectable mailboxes in the personal namespace(s), as
+		// NOTIFY's PERSONAL watches them. A shared mailbox the user owns is not one.
+		sharedRoot := s.sharedNamespaceRoot()
 		for _, m := range allMailboxes {
-			if m.AccountID == accountID {
+			if !inSharedNamespace(m.Name, sharedRoot) {
 				add(m)
 			}
 		}

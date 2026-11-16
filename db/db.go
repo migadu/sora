@@ -212,41 +212,38 @@ func (db *Database) GetReadPoolWithContext(ctx context.Context) *pgxpool.Pool {
 	return db.ReadPool
 }
 
-// getLatestMigrationVersion retrieves the latest available migration version from the embedded file system.
-func getLatestMigrationVersion() (uint, error) {
+// MigrationVersions returns the versions of the embedded migrations in ascending order.
+func MigrationVersions() ([]uint, error) {
 	migrations, err := fs.Sub(MigrationsFS, "migrations")
 	if err != nil {
-		return 0, fmt.Errorf("failed to get migrations subdirectory: %w", err)
+		return nil, fmt.Errorf("failed to get migrations subdirectory: %w", err)
 	}
 
 	sourceDriver, err := iofs.New(migrations, ".")
 	if err != nil {
-		return 0, fmt.Errorf("failed to create migration source driver: %w", err)
+		return nil, fmt.Errorf("failed to create migration source driver: %w", err)
 	}
 
-	firstVersion, err := sourceDriver.First()
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return 0, nil // 0 signifies no migrations found
-		}
-		return 0, fmt.Errorf("failed to get first migration version: %w", err)
+	var versions []uint
+	version, err := sourceDriver.First()
+	for err == nil {
+		versions = append(versions, version)
+		version, err = sourceDriver.Next(version)
 	}
-
-	latestVersion := firstVersion
-	currentSourceVersion := firstVersion
-	for {
-		next, err := sourceDriver.Next(currentSourceVersion)
-		if err != nil {
-			if errors.Is(err, fs.ErrNotExist) {
-				break
-			}
-			return 0, fmt.Errorf("failed to iterate migration versions: %w", err)
-		}
-		latestVersion = next
-		currentSourceVersion = next
+	if !errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("failed to iterate migration versions: %w", err)
 	}
+	return versions, nil
+}
 
-	return latestVersion, nil
+// getLatestMigrationVersion retrieves the latest available migration version from the
+// embedded file system, or 0 when there are no migrations.
+func getLatestMigrationVersion() (uint, error) {
+	versions, err := MigrationVersions()
+	if err != nil || len(versions) == 0 {
+		return 0, err
+	}
+	return versions[len(versions)-1], nil
 }
 
 func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration) error {
