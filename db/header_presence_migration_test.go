@@ -229,7 +229,7 @@ func TestHeaderPresenceMigrationRollbackPreparation(t *testing.T) {
 		require.True(t, hasColumn)
 	})
 
-	t.Run("prepared large database drops column and catalog-only rerun never locks messages", func(t *testing.T) {
+	t.Run("large rollback requires complete preparation before catalog-only execution", func(t *testing.T) {
 		conn, schema := openAt70(t, true)
 		_, err := conn.Exec(ctx, `CREATE INDEX CONCURRENTLY idx_messages_mailbox_headers_v2 ON messages (mailbox_id)
 			INCLUDE (id, uid, content_hash, created_modseq, expunged_modseq, internal_date, sent_date, size,
@@ -239,6 +239,17 @@ func TestHeaderPresenceMigrationRollbackPreparation(t *testing.T) {
 		_, err = conn.Exec(ctx, `DROP INDEX CONCURRENTLY idx_messages_mailbox_headers_v3`)
 		require.NoError(t, err)
 
+		// Index preparation alone must not bypass the large-table DDL guard.
+		// The remaining column drop needs an operator-controlled lock timeout.
+		_, err = conn.Exec(ctx, string(down))
+		require.ErrorContains(t, err, "more than 25000")
+		require.ErrorContains(t, err, "DROP COLUMN header_presence")
+		var retained bool
+		require.NoError(t, conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_attribute
+            WHERE attrelid = 'messages'::regclass AND attname = 'header_presence' AND NOT attisdropped)`).Scan(&retained))
+		require.True(t, retained)
+		_, err = conn.Exec(ctx, `SET lock_timeout = '200ms'; ALTER TABLE messages DROP COLUMN header_presence; RESET lock_timeout`)
+		require.NoError(t, err)
 		_, err = conn.Exec(ctx, string(down))
 		require.NoError(t, err)
 
