@@ -313,6 +313,17 @@ Description:
       a [spam_training] value start-up cannot parse, which leaves spam
         training out, and a max_message_size above the largest message Sora
         can store
+      master SASL without master_sasl_allowed_networks; an imap append_limit
+        above the largest message Sora can store or above session_memory_limit,
+        an imap command_timeout of 35m or more, and imap capabilities
+        disabled_caps or client_filters cannot withdraw
+      a User API token_duration above 7 days, Admin and User API
+        allowed_hosts entries that are not an IP address or CIDR,
+        tls_cert_file or tls_key_file beside an enabled [tls], and
+        [tls.letsencrypt] enable_fallback = false
+      a [cluster] addr with a port beside the port key or on loopback, and
+        peers that leave no other node to join
+      [cleanup] wake_interval and purge_poll_interval below their minimum
 
 
   It connects to nothing and does not look at the node's disk, so it does

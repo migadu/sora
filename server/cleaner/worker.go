@@ -21,6 +21,7 @@ import (
 	"time"
 
 	"github.com/migadu/sora/cache"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
@@ -188,7 +189,7 @@ func (w *CleanupWorker) run(ctx context.Context) {
 	logger.Info("Cleanup: Worker processing", "config", strings.Join(logParts, ", "))
 
 	interval := w.interval
-	const minAllowedInterval = time.Minute
+	const minAllowedInterval = config.MinCleanupWakeInterval
 	if interval < minAllowedInterval {
 		logger.Warn("Cleanup: Configured interval less than minimum - using minimum", "interval", interval, "minimum", minAllowedInterval)
 		interval = minAllowedInterval
