@@ -37,8 +37,9 @@ const maildirCacheSettings = `PRAGMA busy_timeout = 5000; PRAGMA journal_mode = 
 // The open is race-free, for an import in place while the owner can still write:
 // the file is created or opened here without following a link and checked to be a
 // regular file; SQLite then opens it without creating it (mode=rw), and every
-// connection is checked, before anything is read from or written to the file, to
-// have opened it by the name it was given and not through a link. SQLite resolves
+// connection is checked, before anything is written to the file, to have opened it
+// by the name it was given and not through a link. (Opening a connection reads the
+// file's 100-byte header, and nothing else, before that check.) SQLite resolves
 // links only in the name of the database (and then names the file by the link's
 // target); it opens the database and its -wal, -shm and -journal files with
 // O_NOFOLLOW. dir itself is trusted, as for the rest of the import.
