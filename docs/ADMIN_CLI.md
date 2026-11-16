@@ -641,10 +641,10 @@ sora-admin --config config.toml messages repair-references --apply
   has a value for cannot be filled: it is counted and stays as it is.
 - The summary line gives the rows checked, how many have no stored References, how many can be
   filled and how many cannot. With `--apply` it also gives how many were filled.
-- Each batch is read in one statement through the read pool (a replica, when `[database.read]`
-  has one), then with `--apply` filled in one short transaction on the primary. It holds no
-  session state, so it runs through PgBouncer in transaction mode, and it can run while the
-  servers are serving mail.
+- The admin CLI skips configured read replicas: each batch is read from the primary in one
+  statement, then with `--apply` filled in one short primary transaction. `[database.read]`
+  does not redirect this command. It holds no session state, so it runs through PgBouncer in
+  transaction mode, and it can run while the servers are serving mail.
 - At most every 10 seconds, and when it fails, it prints the id to pass to `--start-after`. It
   is safe to run again: a filled row is not counted again. A message restored later with
   `messages restore` gets the value its expunged row had, so run the command again after
