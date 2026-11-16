@@ -38,6 +38,8 @@ func handleMailboxCommand(ctx context.Context) {
 		handleMailboxUnsubscribe(ctx)
 	case "fix-utf7":
 		handleMailboxFixUTF7(ctx)
+	case "repair-unseen":
+		handleMailboxRepairUnseen(ctx)
 	case "help", "--help", "-h":
 		printMailboxUsage()
 	default:
@@ -604,6 +606,10 @@ Examples:
   # Preview changes for all accounts
   sora-admin mailbox fix-utf7 --config config.toml --dry-run
 
+  # Report mailboxes whose cached unseen count is too high (dry run), then repair them
+  sora-admin mailbox repair-unseen --config config.toml
+  sora-admin mailbox repair-unseen --config config.toml --apply
+
   # Fix all accounts
   sora-admin mailbox fix-utf7 --config config.toml
 
@@ -1070,6 +1076,7 @@ Subcommands:
   subscribe     Subscribe to a mailbox
   unsubscribe   Unsubscribe from a mailbox
   fix-utf7      Fix mailbox names with un-decoded Modified UTF-7 encoding
+  repair-unseen Find and repair cached unseen counts that are too high
 
 Examples:
   # Create a new mailbox

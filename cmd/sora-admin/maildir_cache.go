@@ -44,20 +44,11 @@ const maildirCacheSettings = `PRAGMA busy_timeout = 5000; PRAGMA journal_mode = 
 // target); it opens the database and its -wal, -shm and -journal files with
 // O_NOFOLLOW. dir itself is trusted, as for the rest of the import.
 func openMaildirCache(dir string) (*sql.DB, error) {
-	// SQLite names the database by its absolute path with every link resolved. A
-	// relative dir is not cleaned (as filepath.Abs would): a ".." after a link is
-	// resolved from the link's target, as the OS does. The files are checked in the
-	// resolved directory, the one the cache is opened in.
-	if !filepath.IsAbs(dir) {
-		wd, err := os.Getwd()
-		if err != nil {
-			return nil, fmt.Errorf("failed to resolve maildir database directory: %w", err)
-		}
-		dir = wd + string(filepath.Separator) + dir
-	}
-	dir, err := filepath.EvalSymlinks(dir)
+	// SQLite names the database by its absolute path with every link resolved, and
+	// the files beside it are checked in that resolved directory.
+	dir, err := resolveMaildirDir(dir)
 	if err != nil {
-		return nil, fmt.Errorf("failed to resolve maildir database directory: %w", err)
+		return nil, err
 	}
 	for _, name := range []string{maildirCacheName, maildirCacheName + "-wal", maildirCacheName + "-shm", maildirCacheName + "-journal"} {
 		if info, err := os.Lstat(filepath.Join(dir, name)); err == nil && !info.Mode().IsRegular() {
@@ -80,6 +71,44 @@ func openMaildirCache(dir string) (*sql.DB, error) {
 	}
 
 	return openMaildirCacheFile(path)
+}
+
+// resolveMaildirDir returns the absolute path of dir with every symbolic link
+// resolved. A relative dir is not cleaned (as filepath.Abs would): a ".." after a
+// link is resolved from the link's target, as the OS does.
+func resolveMaildirDir(dir string) (string, error) {
+	if !filepath.IsAbs(dir) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return "", fmt.Errorf("failed to resolve maildir database directory: %w", err)
+		}
+		dir = wd + string(filepath.Separator) + dir
+	}
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return "", fmt.Errorf("failed to resolve maildir database directory: %w", err)
+	}
+	return dir, nil
+}
+
+// effectiveMaildirPath keeps maildirPath when filepath.Clean(maildirPath) names the
+// same directory (including when maildirPath is itself a symbolic link to a
+// maildir), and otherwise returns the OS-resolved directory so os.OpenRoot,
+// filepath.Clean, and filepath.Join do not collapse a ".." across a symbolic link
+// onto a different or missing directory.
+func effectiveMaildirPath(maildirPath string) string {
+	info, err := os.Stat(maildirPath)
+	if err != nil {
+		return maildirPath
+	}
+	if cleanInfo, err := os.Stat(filepath.Clean(maildirPath)); err == nil && os.SameFile(info, cleanInfo) {
+		return maildirPath
+	}
+	resolved, err := resolveMaildirDir(maildirPath)
+	if err != nil {
+		return maildirPath
+	}
+	return resolved
 }
 
 // openMaildirCacheFile opens the maildir cache at path, an absolute name with no
