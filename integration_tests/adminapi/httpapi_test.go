@@ -1545,6 +1545,19 @@ func TestMessageRestoration(t *testing.T) {
 		t.Fatalf("Failed to insert message 3: %v", err)
 	}
 
+	// Every write path takes a message's UID from mailboxes.highest_uid, which therefore
+	// stays at or above every UID the mailbox holds. A restore takes the next one for the
+	// message it brings back, next to the expunged row that keeps the old UID.
+	syncHighestUID := func(t *testing.T) {
+		t.Helper()
+		if _, err := server.rdb.GetDatabase().GetWritePool().Exec(ctx, `
+			UPDATE mailboxes mb SET highest_uid = (SELECT COALESCE(MAX(uid), 0) FROM messages WHERE mailbox_id = mb.id)
+			WHERE mb.account_id = $1`, accountID); err != nil {
+			t.Fatalf("Failed to set highest_uid: %v", err)
+		}
+	}
+	syncHighestUID(t)
+
 	// 5. List all deleted messages
 	t.Run("ListAllDeletedMessages", func(t *testing.T) {
 		resp, body := server.makeRequest(t, "GET", "/admin/accounts/"+testEmail+"/messages/deleted", nil)
@@ -1667,6 +1680,7 @@ func TestMessageRestoration(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Failed to insert message 4: %v", err)
 		}
+		syncHighestUID(t)
 
 		// Now we have msg3 and msg4 deleted in Archive
 		restoreReq := map[string]any{

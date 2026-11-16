@@ -23,12 +23,11 @@ type seqViewKey struct{}
 //
 // For append, soft-expunge and restore changes, the view of a modseq is the same in
 // every snapshot: an expunge only moves a message from the live rows to the held ones,
-// and a restore gives the message a new UID and a new created_modseq, so to every view
-// before it the restored message is created after the view, like an append. Each
-// numbering statement is therefore exact while those rows and their recorded
-// UID/creation/expunge history remain available. The exception is a restore of a
-// message that a view still holds (expunged after the view): restore rewrites that
-// expunged row in place, so the view loses the message it held (#1712).
+// and a restore leaves the expunged row as it is and adds the message as a new row with
+// a new UID and a new created_modseq, so to every view before it the restored message
+// is created after the view, like an append. Each numbering statement is therefore
+// exact while those rows and their recorded UID/creation/expunge history remain
+// available.
 //
 // Without a view (or with modSeq 0, before anything exists) sequence numbers count the
 // live messages, as for any caller that is not an IMAP session.
