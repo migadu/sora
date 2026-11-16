@@ -1719,6 +1719,11 @@ func openImportRoot(path string) (*os.Root, error) {
 			// The owner says who made the link, not who gave it this name: where users
 			// may hard-link a file they do not own (hardLinksProtected), alice can name
 			// root's /var/mail/bob, or bob's own link to his maildir, ~/Maildir.
+			// Only the names the link has now are seen: one alice made earlier has
+			// a single name again once /var/mail/bob is removed, or bob replaces his
+			// link, and is then followed as its owner's. Telling it apart would need
+			// a rule on who may write the directory holding the link; the operator can
+			// name the directory itself instead (docs/IMPORT_EXPORT.md, section 3).
 			if nlink := uint64(again.st.Nlink); nlink > 1 && !hardLinksProtected() {
 				return nil, fmt.Errorf("refusing %s: %s is a symbolic link with %d names, and on this system any user may have given it this one with a hard link; name the directory it leads to instead", given, name, nlink)
 			}

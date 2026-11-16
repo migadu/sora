@@ -133,7 +133,12 @@ refuse to start, naming the link, its owner and the directory it leads to, befor
 `sora-maildir.db` cache is created; name that directory itself to import it. A link's owner says
 who made it, not who gave it its name, so where users may hard-link a file they do not own (macOS
 and the BSDs, and Linux with `fs.protected_hardlinks = 0`) a link with more than one name is
-refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise pass as root's link. These are
+refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise pass as root's link. The import
+sees only the names a link has when it runs: on such a system, a hard link a user made earlier
+to root's link (or to another user's link to their own maildir) has one name again once that
+original name is removed (root deletes `/var/mail/bob`, or bob replaces his link), and it is then
+followed as the link of its owner. Where users may make such links, name the maildir's own
+directory, with no link on the way, as `--maildir-path` (or `--sieve`). These are
 Unix UID checks. Checking them needs no more permission than opening the path does: the
 directories above the maildir need only be searchable (`x`), not readable, by the user running
 the import. Below the root, a folder that is a link is not walked and is named in a warning.
