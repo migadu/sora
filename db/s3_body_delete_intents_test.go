@@ -132,3 +132,20 @@ func TestS3BodyIntentMigrationRefusesUnknownOutcomeDowngrade(t *testing.T) {
 	require.NoError(t, d.GetWritePool().QueryRow(ctx, `SELECT count(*) FROM s3_body_delete_intents WHERE content_hash=$1`, hash).Scan(&count))
 	require.Equal(t, 1, count)
 }
+
+func TestS3BodyIntentBlocksRestore(t *testing.T) {
+	d, email, account, mailbox := setupCleanerTestDatabase(t)
+	defer d.Close()
+	ctx := context.Background()
+	hash := fmt.Sprintf("intent-restore-%d", time.Now().UnixNano())
+	insertKeyedMessage(t, d, account, mailbox, 1, hash, "restore", true, time.Now().Add(-48*time.Hour))
+	var message int64
+	require.NoError(t, d.GetWritePool().QueryRow(ctx, `SELECT id FROM messages WHERE account_id=$1 AND content_hash=$2`, account, hash).Scan(&message))
+	_, err := d.GetWritePool().Exec(ctx, `INSERT INTO s3_body_delete_intents(content_hash,operation_id,object_keys,retire_snapshot) VALUES($1,$2,ARRAY[$3],'[]')`, hash, uuid.NewString(), "example.com/restore/"+hash)
+	require.NoError(t, err)
+	tx, err := d.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	_, err = d.RestoreMessages(ctx, tx, RestoreMessagesParams{Email: email, MessageIDs: []int64{message}})
+	require.ErrorIs(t, err, ErrS3BodyQuarantined)
+}
