@@ -86,6 +86,13 @@ func (m *mockResilientDatabase) GetOrCreateMailboxByNameWithRetry(ctx context.Co
 
 // --- Unused methods for this test, but required by the interface ---
 
+func (m *mockResilientDatabase) GetDatabaseIdentityWithRetry(ctx context.Context) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	return "4a6ea2d2-8d86-4fba-a4e9-c00f11122101", nil
+}
+
 func (m *mockResilientDatabase) GetAccountIDByAddressWithRetry(ctx context.Context, address string) (int64, error) {
 	return 1, nil
 }

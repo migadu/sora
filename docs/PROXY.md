@@ -674,15 +674,28 @@ For each protocol, the backend server block must accept what the proxy sends:
 `XCLIENT` client addresses, and refuses to start with `proxy_protocol = true`. List only the proxy
 addresses: every host in the list may claim any client address. See [SECURITY.md](SECURITY.md).
 
-You need only one way to pass the client address. PROXY protocol works for all protocols and keeps
-the backend from seeing the proxy's address at all. `ID` and `XCLIENT` work without changing the
-backend's listener. On IMAP and POP3, a backend that receives a PROXY header judges `ID` and
-`XCLIENT` by the client the header names, not by the proxy, so next to a header it ignores the `ID`
-forwarding fields and refuses the POP3 `XCLIENT` (unless that client is itself in
-`trusted_networks`); the login continues. The header already carries the client's address and
-port, its JA4 fingerprint and the proxy session ID (8.4). LMTP `XCLIENT` is judged by the proxy
-and still carries the client's `HELO` next to a PROXY header
+PROXY protocol conveys the client endpoint before the application greeting. ID and XCLIENT
+can also carry forwarding context that the header does not represent. A backend's trust policy
+determines which fields it accepts alongside PROXY: Sora IMAP checks the effective client
+address for ID forwarding, while Sora POP3 accepts XCLIENT from a trusted transport peer and
+keeps TTL and extra variables even when it retains the PROXY client address. Other backends
+may differ. Configure the appropriate trusted proxy networks and check the backend's policy
+before suppressing either command. LMTP XCLIENT retains its HELO forwarding alongside PROXY
 ([SECURITY.md](SECURITY.md#31-trusted_networks)).
+
+### Explicit suppression alongside PROXY
+
+Configured IMAP ID and POP3 XCLIENT forwarding is preserved by default, including
+when the backend leg sends a PROXY header. To omit those commands on such a leg,
+set `remote_skip_forwarding_with_proxy_protocol = true` on the server, named pool,
+or remote-lookup backend settings. Pool/lookup settings apply to the route they own.
+The setting applies only to IMAP and POP3; LMTP keeps its XCLIENT/HELO forwarding.
+
+PROXY carries endpoint identity and some trace fields, but does not replace all
+ID/XCLIENT TTL, proxy-server, user and source variables or original connected-endpoint
+context. Enable suppression only when the backend does not need those fields. A
+connection that cannot send a PROXY header still sends its configured forwarding
+command. Changing backend-leg settings needs a restart, like other forwarding settings.
 
 ### 8.2 Which settings apply
 
@@ -876,9 +889,12 @@ delete it on a failed backend connection, so an outage does not send one lookup 
 Failures are cached only when definite: a wrong password, or a user who does not exist. Database and
 API outages are not cached.
 
-Administrative password, credential and account changes request cache invalidation. Immediate
-revocation on every node is not guaranteed: a node that misses the change can retain cached
-credentials until they are refreshed or expire. A password changed in the remote lookup API's own system reaches
+Nodes with database access synchronize PostgreSQL credential changes from the primary, normally
+on the next five-second poll, in addition to administrative invalidation gossip. Failed feed or
+cache synchronization suspends hits and fills until recovery; cache misses authenticate on the
+primary. In-flight fills are fenced against invalidation. See
+[AUTHENTICATION.md](AUTHENTICATION.md#12-cached-logins-and-password-changes) for startup, upgrade,
+retention-gap and restore requirements. A password changed in the remote lookup API's own system reaches
 the proxy as entries expire: the old password still works for up to `positive_ttl` for a user who
 used it recently, and the new one may be refused for up to `positive_revalidation_window`.
 
@@ -931,9 +947,14 @@ by the remote lookup, and master logins, never use it. It needs the node to have
 Errors reading the file are logged and the login goes to the database. The cache never fails a
 login by itself.
 
-Administrative password, credential and account changes also request invalidation of this cache.
-Propagation can miss a node, so old cached credentials can remain usable until refresh or expiry;
-the change does not guarantee immediate revocation at every proxy.
+The primary credential-change feed invalidates this cache without depending on gossip reaching
+every node. The cache stays suspended until initial namespace/provenance checks and feed
+synchronization succeed; subsequent synchronization failures disable it again. Credential reads
+and fills use primary data, and a generation fence rejects fills that crossed an invalidation.
+An untracked or different-database cache is cleared before reuse; normal restarts with matching
+provenance can retain warm rows. See
+[AUTHENTICATION.md](AUTHENTICATION.md#12-cached-logins-and-password-changes) for limitations and
+operational requirements.
 
 ### 11.3 On disk
 
@@ -968,7 +989,7 @@ Sora logs `AuthCache: Failed to initialize - continuing without auth cache` and 
 |---|---|---|
 | `enabled` | `false` | Turn the cache on. |
 | `path` | `/var/cache/sora/auth_cache.db` | The SQLite file. |
-| `max_age` | `24h` | Entries older than this are not used, and are deleted at cleanup. |
+| `max_age` | `24h` | Entries older than this are not used, and are deleted at cleanup. Capped at seven days, the credential-feed retention. |
 | `purge_unused` | `168h` | Entries not used for this long are deleted at cleanup. |
 | `cleanup_interval` | `1h` | How often cleanup runs. Must be positive. |
 

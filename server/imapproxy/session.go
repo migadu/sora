@@ -29,6 +29,7 @@ import (
 
 // Session represents an IMAP proxy session.
 type Session struct {
+	authSessionGeneration uint64 // captured before each credential verdict
 	server                *Server
 	settings              *reloadableSettings // the server's settings when the session started (see reloadableSettings)
 	startTLSInProgress    bool                // Protected by mu; asynchronous notices are omitted during negotiation
@@ -1158,6 +1159,9 @@ func (s *Session) authenticateUser(username, password string) error {
 }
 
 func (s *Session) authenticateUserWithAuthzID(authzID, username, password string) (retErr error) {
+	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
+	cacheGeneration := s.server.lookupCache.Generation()
+
 	defer func() {
 		if retErr != nil {
 			s.submittedUsername = ""
@@ -1496,7 +1500,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 					IsNegative:     false,
 				}
 				proxy.CacheRoute(entry, routingInfo) // the route, its settings, FromRemoteLookup
-				s.server.lookupCache.Set(s.server.name, username, entry)
+				s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, entry)
 
 				method := "remotelookup"
 				if masterAuthValidated {
@@ -1539,7 +1543,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 				// Cache negative result (failed authentication) WITH password hash
 				// This allows us to detect repeated wrong passwords vs different wrong passwords
 				// Always digest the password, even for master auth, to prevent cache bypass
-				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+				s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 					PasswordDigest: lookupcache.NewPasswordDigest(password),
 					Result:         lookupcache.AuthFailed,
 					IsNegative:     true,
@@ -1572,7 +1576,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 					if !masterAuthValidated {
 						db.DummyVerifyPassword(password)
 					}
-					s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+					s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 						PasswordDigest: lookupcache.NewPasswordDigest(password),
 						Result:         lookupcache.AuthUserNotFound,
 						IsNegative:     true,
@@ -1666,7 +1670,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 				s.DebugLog("caching definitive auth failure", "username", username)
 				// Cache WITH password hash to detect repeated wrong passwords
 				// Always digest the password, even for master auth, to prevent cache bypass
-				s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+				s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 					PasswordDigest: lookupcache.NewPasswordDigest(password),
 					Result:         lookupcache.AuthFailed,
 					IsNegative:     true,
@@ -1687,7 +1691,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 	// Cache successful DB authentication
 	// ServerAddress will be determined later by DetermineRoute in connectToBackend
 	// Always digest the password, even for master auth, to prevent cache bypass
-	s.server.lookupCache.Set(s.server.name, username, &lookupcache.CacheEntry{
+	s.server.lookupCache.SetIfGeneration(cacheGeneration, s.server.name, username, &lookupcache.CacheEntry{
 		AccountID:      accountID,
 		PasswordDigest: lookupcache.NewPasswordDigest(password),
 		ServerAddress:  "", // Will be populated by affinity/routing in next connection
@@ -1879,9 +1883,16 @@ func (s *Session) connectToBackend() error {
 	// This MUST be done before authenticating to the backend, as the ID command
 	// is only valid in the "Not Authenticated" state.
 	useIDCommand := s.server.remoteUseIDCommand
+	skipForwarding := s.server.remoteSkipForwardingWithProxyProtocol
 	// The route's setting applies to the backend the lookup named or its pool picked (as for the dial)
 	if s.routingInfo.UsesRouteSettings(s.serverAddr) {
 		useIDCommand = s.routingInfo.RemoteUseIDCommand
+		skipForwarding = s.routingInfo.RemoteSkipForwardingWithProxyProtocol
+	}
+	// Explicit opt-in: PROXY does not carry all ID/XCLIENT metadata.
+	// Preserve configured forwarding unless this route accepts that omission.
+	if skipForwarding && useIDCommand && s.server.connManager.SendsProxyHeader(s.routingInfo, s.serverAddr, clientHost, clientPort, serverHost, serverPort) {
+		useIDCommand = false
 	}
 	if useIDCommand {
 		if err := s.sendForwardingParametersToBackend(); errors.Is(err, errIDRefused) {
@@ -2394,7 +2405,7 @@ func (s *Session) updateActivityPeriodically(ctx context.Context) {
 
 	// Register for kick notifications
 	s.DebugLog("registering session for kick notifications")
-	kickChan := s.server.connTracker.RegisterSession(s.accountID)
+	kickChan := s.server.connTracker.RegisterSessionIfGeneration(s.accountID, s.authSessionGeneration)
 	defer s.server.connTracker.UnregisterSession(s.accountID, kickChan)
 
 	for {
