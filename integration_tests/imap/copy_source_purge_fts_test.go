@@ -73,7 +73,7 @@ func TestCrossAccountCopyStaysSearchableAfterSourcePurge(t *testing.T) {
 			require.Equal(t, sourceID, purgedID)
 			s3, err := storage.New(fake.Endpoint(), "test-access-key", "test-secret-key", "test-bucket", false, false, 10*time.Second)
 			require.NoError(t, err)
-			_, err = cleaner.PurgeAccount(ctx, rdb, resilient.NewResilientS3Storage(s3), sourceID)
+			_, err = cleaner.PurgeAccount(ctx, rdb, resilient.NewResilientS3Storage(s3), sourceID, "global-hash-v1")
 			require.NoError(t, err)
 			var sourceAccounts, sourceRows int
 			require.NoError(t, rdb.QueryRowWithRetry(ctx, `

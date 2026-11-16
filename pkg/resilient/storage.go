@@ -417,8 +417,17 @@ func (rs *ResilientS3Storage) deleteBulkBatch(ctx context.Context, keys []string
 
 	remaining := keys
 	var failures map[string]error
+	uncertain := map[string]error{}
+	attempted := false
 	op := func() (any, error) {
+		attempted = true
 		errs := rs.storage.DeleteBulkContext(ctx, remaining)
+		for key, err := range errs {
+			if !storage.DeleteDefinitelyRefused(err) {
+				uncertain[key] = err
+				errs[key] = &storage.DeleteOutcomeUnknown{Err: err}
+			}
+		}
 		failures = errs
 		if len(errs) == 0 {
 			return nil, nil
@@ -440,13 +449,29 @@ func (rs *ResilientS3Storage) deleteBulkBatch(ctx context.Context, keys []string
 		remaining = next
 		return nil, firstErr
 	}
-	_, err := rs.executeS3OperationWithRetry(ctx, rs.deleteBreaker, config, rs.isRetryableError, op, fmt.Sprintf("%d keys", len(keys)), "DELETE_BULK")
+	_, err := rs.executeS3OperationWithRetry(ctx, rs.deleteBreaker, config, func(err error) bool {
+		var unknown *storage.DeleteOutcomeUnknown
+		if errors.As(err, &unknown) {
+			return false
+		}
+		return rs.isRetryableError(err)
+	}, op, fmt.Sprintf("%d keys", len(keys)), "DELETE_BULK")
 	if err != nil && len(failures) == 0 {
 		// The breaker rejected the call outright, so nothing was attempted.
 		failures = make(map[string]error, len(remaining))
 		for _, key := range remaining {
-			failures[key] = err
+			if !attempted {
+				failures[key] = &storage.DeleteNotAttempted{Err: err}
+			} else {
+				failures[key] = err
+			}
 		}
+	}
+	for key, cause := range uncertain {
+		if failures == nil {
+			failures = map[string]error{}
+		}
+		failures[key] = &storage.DeleteOutcomeUnknown{Err: cause}
 	}
 	return failures
 }

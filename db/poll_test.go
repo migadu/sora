@@ -128,6 +128,7 @@ func TestPollMailbox(t *testing.T) {
 		require.Len(t, poll.Updates, 1)
 		update := poll.Updates[0]
 		assert.False(t, update.IsExpunge)
+		assert.True(t, update.IsNew)
 		assert.Equal(t, imap.UID(20), update.UID)
 		assert.Equal(t, uint32(1), update.SeqNum)
 		assert.Equal(t, uint32(1), poll.NumMessages)
@@ -161,6 +162,7 @@ func TestPollMailbox(t *testing.T) {
 		require.Len(t, poll.Updates, 1)
 		update := poll.Updates[0]
 		assert.False(t, update.IsExpunge)
+		assert.False(t, update.IsNew)
 		assert.Equal(t, imap.UID(30), update.UID)
 		assert.Equal(t, uint32(1), update.SeqNum)
 		assert.True(t, ContainsFlag(update.BitwiseFlags, FlagSeen))
@@ -240,12 +242,14 @@ func TestPollMailbox(t *testing.T) {
 		// Expunge of UID 110 (original seq 2)
 		expungeUpdate := poll.Updates[0]
 		assert.True(t, expungeUpdate.IsExpunge)
+		assert.False(t, expungeUpdate.IsNew)
 		assert.Equal(t, imap.UID(110), expungeUpdate.UID)
 		assert.Equal(t, uint32(2), expungeUpdate.SeqNum)
 
 		// Flag update of UID 120 (original seq 3, new seq 2)
 		flagUpdate := poll.Updates[1]
 		assert.False(t, flagUpdate.IsExpunge)
+		assert.False(t, flagUpdate.IsNew)
 		assert.Equal(t, imap.UID(120), flagUpdate.UID)
 		assert.Equal(t, uint32(2), flagUpdate.SeqNum)
 		assert.True(t, ContainsFlag(flagUpdate.BitwiseFlags, FlagFlagged))
@@ -253,6 +257,7 @@ func TestPollMailbox(t *testing.T) {
 		// New message UID 130 (new seq 3)
 		newMsgUpdate := poll.Updates[2]
 		assert.False(t, newMsgUpdate.IsExpunge)
+		assert.True(t, newMsgUpdate.IsNew)
 		assert.Equal(t, imap.UID(130), newMsgUpdate.UID)
 		assert.Equal(t, uint32(3), newMsgUpdate.SeqNum)
 

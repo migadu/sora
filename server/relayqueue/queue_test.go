@@ -828,6 +828,8 @@ func TestRecoverOrphanedMessages(t *testing.T) {
 			pending, processing, failed)
 	}
 
+	// Drop the simulated dead owner's kernel leases before startup recovery.
+	releaseClaimsForCrashTest(queue)
 	// Recover orphaned messages (simulates restart after crash)
 	recovered, err := queue.RecoverOrphanedMessages()
 	if err != nil {
@@ -1011,5 +1013,26 @@ func TestCleanupDisabledWithZeroRetention(t *testing.T) {
 	}
 	if failed != 3 {
 		t.Errorf("Expected 3 failed messages (cleanup disabled), got %d", failed)
+	}
+}
+
+func releaseClaimsForCrashTest(q *DiskQueue) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	for id, lease := range q.claims {
+		lease.close()
+		delete(q.claims, id)
+	}
+}
+
+func acquireProtocolEventually(t *testing.T, q *DiskQueue) (*QueuedMessage, []byte, error) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		msg, body, err := q.AcquireNext()
+		if err != nil || msg != nil || time.Now().After(deadline) {
+			return msg, body, err
+		}
+		time.Sleep(10 * time.Millisecond)
 	}
 }

@@ -47,6 +47,8 @@ deleteheader "Cc";
 addheader "Cc" "new-cc@example.com";
 deleteheader "Reply-To";
 addheader "Reply-To" "new-reply@example.com";
+addheader "Bcc" "";
+deleteheader "Sender";
 fileinto :create :copy "Archive";
 `
 		_, err = sieveengine.NewSieveExecutorWithExtensions(script, extensions)
@@ -61,6 +63,7 @@ fileinto :create :copy "Archive";
 			"To: " + account.Email,
 			"Cc: old-cc@example.com",
 			"Reply-To: old-reply@example.com",
+			"Sender: old-sender@example.com",
 			"Subject: " + marker,
 			"Message-ID: <" + marker + "@example.com>",
 			"",
@@ -73,14 +76,19 @@ fileinto :create :copy "Archive";
 
 		for _, mailbox := range []string{"INBOX", "Archive"} {
 			var recipientsBytes []byte
+			var presence int16
 			var fromEmailSort, fromNameSort, ccEmailSort string
 			err := rdb.QueryRowWithRetry(ctx, `
-				SELECT m.recipients_json, COALESCE(m.from_email_sort, ''), COALESCE(m.from_name_sort, ''), COALESCE(m.cc_email_sort, '')
+				SELECT m.recipients_json, COALESCE(m.from_email_sort, ''), COALESCE(m.from_name_sort, ''), COALESCE(m.cc_email_sort, ''), m.header_presence
 				FROM messages m
 				JOIN mailboxes mb ON mb.id = m.mailbox_id
 				WHERE m.account_id = $1 AND mb.name = $2 AND m.subject = $3 AND m.expunged_at IS NULL
-			`, accountID, mailbox, marker).Scan(&recipientsBytes, &fromEmailSort, &fromNameSort, &ccEmailSort)
+			`, accountID, mailbox, marker).Scan(&recipientsBytes, &fromEmailSort, &fromNameSort, &ccEmailSort, &presence)
 			require.NoError(t, err, "mailbox %s", mailbox)
+			bit, _ := helpers.HeaderPresenceBit("bcc")
+			require.NotZero(t, presence&bit, "post-edit empty Bcc in %s", mailbox)
+			bit, _ = helpers.HeaderPresenceBit("sender")
+			require.Zero(t, presence&bit, "deleted Sender in %s", mailbox)
 
 			var recipients []helpers.Recipient
 			require.NoError(t, json.Unmarshal(recipientsBytes, &recipients), "mailbox %s", mailbox)

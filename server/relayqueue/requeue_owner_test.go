@@ -38,6 +38,11 @@ func TestRequeueGivesTheCopiesToTheQueueOwner(t *testing.T) {
 	t.Cleanup(func() { geteuid, chownFile = realGeteuid, realChown })
 	geteuid = func() int { return int(st.Uid) + 1 }
 	chownFile = func(f *os.File, uid, gid int) error {
+		// Journals are also handed to the failed-directory owner. This assertion
+		// specifically checks the two pending copies and their publication order.
+		if filepath.Dir(f.Name()) != queue.pendingDir {
+			return nil
+		}
 		var published []string
 		for _, name := range []string{id + ".msg", id + ".json"} {
 			if fileExists(filepath.Join(queue.pendingDir, name)) {
