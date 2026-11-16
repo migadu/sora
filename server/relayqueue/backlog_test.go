@@ -137,7 +137,9 @@ func TestRestartedQueueFindsMailOnlyOnDisk(t *testing.T) {
 	if err != nil || acquired == nil {
 		t.Fatalf("AcquireNext failed: %v", err)
 	}
-	// The process dies here, with the message sitting in processing/.
+	// Release the simulated dead process's kernel lease; the subprocess tests
+	// separately prove that real process death releases ownership.
+	releaseClaimsForCrashTest(crashed)
 
 	restarted, err := NewDiskQueue(dir, 10, nil)
 	if err != nil {

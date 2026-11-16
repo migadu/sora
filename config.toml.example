@@ -140,6 +140,9 @@ query_timeout = "30s"           # Per-endpoint timeout for individual database q
 # and durability. Message metadata remains in PostgreSQL for fast access.
 
 [s3]
+# Keep paused until every old body deleter and claimer has drained; see OPERATIONS.md.
+# This acknowledgment is manual, not automatic fleet-version detection.
+body_deletion_protocol = "paused" # after the completed cutover: "global-hash-v1"
 endpoint = "s3.amazonaws.com"           # S3-compatible storage endpoint (e.g., "s3.amazonaws.com", "https://s3.amazonaws.com", "minio.example.com:9000").
                                         # Can include protocol (https:// or http://) or omit it - protocol is automatically added based on disable_tls setting if not present
 disable_tls = false                     # Disable TLS for S3 endpoint (when true, uses http:// instead of https://). Useful for local MinIO setups.
@@ -1702,6 +1705,7 @@ remote_tls_verify = true              # Verify backend server TLS certificates
 # remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_id_command = false         # Send IMAP ID command to backends
+remote_skip_forwarding_with_proxy_protocol = false # IMAP/POP3 only: opt in to omitting ID/XCLIENT when PROXY is actually sent; loses extra metadata
 remote_health_checks = true           # Enable backend health tracking (default: true)
                                       # When false, all backends are always considered healthy.
                                       # Disable only for debugging or when backends have external health monitoring.
