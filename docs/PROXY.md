@@ -68,8 +68,8 @@ reuses the connection it holds) and forwards the command. Like the backend, it d
 backend, a `MAIL` or `RCPT` parameter the proxy does not implement gets `555 5.5.4` (RFC 5321
 §4.1.1.11), `NOTIFY`, `ORCPT`, `RET`, `ENVID` and `AUTH` among them. It takes `SIZE`, `SMTPUTF8` and
 `BODY=7BIT` or `BODY=8BITMIME` on `MAIL`, and `XRCPTFORWARD` on `RCPT`, which it forwards. As on
-the backend, a malformed parameter gets `501 5.5.4`: `SMTPUTF8` with a value, or any parameter
-written with `=` and no value (RFC 5321 §4.1.2). A `MAIL`
+the backend, a malformed parameter gets `501 5.5.4`: `SMTPUTF8` with a value, any parameter
+written with `=` and no value (RFC 5321 §4.1.2), or any parameter given twice. A `MAIL`
 refused for a parameter starts no transaction; a refused `RCPT` leaves the transaction open for the
 next recipient. As on the backend, `MAIL` before `LHLO` gets `503 5.5.1`. A later `LHLO`, or a completed `STARTTLS`, starts the session over:
 the transaction in progress ends, and a held backend connection is closed, so the next recipient
