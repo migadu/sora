@@ -90,10 +90,10 @@ type notifyWatch struct {
 	selected *imap.NotifyItem
 	delayed  bool
 
-	// nameKeys maps each name the MAILBOXES and SUBTREE specifiers give, and
-	// "INBOX" for INBOXES, to its key, LOWER(name) as the database computed it
-	// when NOTIFY SET ran. Mailboxes are matched to the specifiers by key
-	// (notifySnapshotEntry.key), as the database matches names.
+	// nameKeys maps each name the MAILBOXES and SUBTREE specifiers give to its
+	// key, LOWER(name) as the database computed it when NOTIFY SET ran.
+	// Mailboxes are matched to the specifiers by key (notifySnapshotEntry.key),
+	// as the database matches names.
 	nameKeys map[string]string
 
 	// statusMarks holds a per-mailbox high-water modseq for the STATUS fan-in:
@@ -255,9 +255,9 @@ func (watch *notifyWatch) wantsNonSelectedItems() bool {
 // mailbox by all non-selected specifiers. RFC 5465 §6: multiple event groups
 // can apply to the same mailbox and their events accumulate; only
 // SELECTED/SELECTED-DELAYED match the currently selected mailbox, so callers
-// must exclude it for message events. The mailbox is matched to the INBOXES,
-// MAILBOXES and SUBTREE specifiers by its key, LOWER(name) as the database
-// computes it (see nameKeys).
+// must exclude it for message events. The mailbox is matched to the MAILBOXES
+// and SUBTREE specifiers by its key, LOWER(name) as the database computes it
+// (see nameKeys).
 func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sharedRoot string) map[imap.NotifyEvent]bool {
 	nonSelectable := isSharedNamespaceRoot(name, sharedRoot)
 	var events map[imap.NotifyEvent]bool
@@ -284,18 +284,15 @@ func (watch *notifyWatch) eventsForMailbox(name, key string, subscribed bool, sh
 		switch item.MailboxSpec {
 		case imap.NotifyMailboxSpecSelected, imap.NotifyMailboxSpecSelectedDelayed:
 			continue
-		case imap.NotifyMailboxSpecPersonal:
+		case imap.NotifyMailboxSpecPersonal, imap.NotifyMailboxSpecInboxes:
 			// RFC 5465 §6.2: all selectable mailboxes in the personal
-			// namespace(s), as ESEARCH IN (PERSONAL) searches them.
+			// namespace(s), as ESEARCH IN (PERSONAL) searches them. INBOXES
+			// (§6.3) is the subset an MDA may deliver to, but "If the IMAP
+			// server cannot easily compute this set, it MUST treat "inboxes"
+			// as equivalent to "personal"." Sora does not compute it: Sieve
+			// fileinto (with :create) and the Admin API's target mailbox can
+			// name any personal mailbox.
 			if !inSharedNamespace(name, sharedRoot) {
-				add(item)
-			}
-		case imap.NotifyMailboxSpecInboxes:
-			// RFC 5465 §6.3: mailboxes an MDA may deliver to. Sieve fileinto
-			// can target any personal mailbox, but computing that set is not
-			// tractable per-connection; like Dovecot, sora maps INBOXES to
-			// INBOX.
-			if root, ok := watch.nameKeys[consts.MailboxInbox]; ok && root != "" && key == root {
 				add(item)
 			}
 		case imap.NotifyMailboxSpecSubscribed:
@@ -332,9 +329,8 @@ func (s *IMAPSession) resolveNotifyNames(ctx context.Context, watch *notifyWatch
 		item := &watch.options.Items[i]
 		switch item.MailboxSpec {
 		case imap.NotifyMailboxSpecSelected, imap.NotifyMailboxSpecSelectedDelayed,
-			imap.NotifyMailboxSpecPersonal, imap.NotifyMailboxSpecSubscribed:
-		case imap.NotifyMailboxSpecInboxes:
-			names = append(names, consts.MailboxInbox)
+			imap.NotifyMailboxSpecPersonal, imap.NotifyMailboxSpecInboxes,
+			imap.NotifyMailboxSpecSubscribed:
 		default:
 			names = append(names, item.Mailboxes...)
 		}
