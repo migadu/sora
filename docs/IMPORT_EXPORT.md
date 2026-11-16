@@ -130,6 +130,15 @@ other link (one pointing outside the root, or any absolute link, even to a file 
 is not read: such a message file is reported as failed by its path, and such a `cur/` or `new/` is
 skipped with a warning naming it.
 
+A hard link is another name for the same file, which the root cannot tell apart, so a message or
+metadata file is read only if it belongs to the owner of the maildir directory (`--maildir-path`,
+after any link) or anyone may read it. Any other file is not read and is reported as failed by its
+path, as the owner could otherwise link in a file of another user's from the same file system.
+Hard links between the owner's own files, as Dovecot's `maildir_copy_with_hardlinks` and `cp -al`
+backups make, are read as before. A maildir whose files belong to another user than its directory
+(for example, extracted as root into a directory root created) has its files refused; give the
+directory to the files' owner first.
+
 This policy covers source message and Dovecot metadata contents and `cur/`/`new/` listings. It
 does not change how the SQLite cache or an explicitly supplied `--paths-file` file are opened;
 `--sieve` has its own rule ([section 7](#7-importing-a-sieve-script)). Folder discovery and file
@@ -298,7 +307,8 @@ relative and its target is within that directory, as Pigeonhole's own
 `.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
 link) is refused: nothing is stored, and the summary and the log name the file. Where Pigeonhole's script
 directory is not below the link's directory, its link is absolute; name the script it points to
-instead.
+instead. As a hard link cannot be told apart from the file, the file is read only if it belongs to
+the owner of that directory or anyone may read it; otherwise it is refused in the same way.
 
 | Situation | Result |
 |---|---|

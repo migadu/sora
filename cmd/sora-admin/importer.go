@@ -1405,18 +1405,31 @@ func (i *Importer) readMaildirFile(path string) ([]byte, error) {
 // a device.
 var errNotRegularFile = errors.New("not a regular file")
 
+// errAnotherUsersFile refuses a file the import would read that the owner of the
+// directory it is read through could not have read (openRegularFile).
+var errAnotherUsersFile = errors.New("belongs to another user than the directory it is read through")
+
 // fileUID returns the user that owns the file info describes. It is a variable so that
 // a test can make a file appear to belong to another user, which only root can arrange.
 var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t).Uid }
 
-// openRegularFile opens name below root for reading if it is a regular file, and
-// fails with errNotRegularFile otherwise. The files the import reads may have been
-// written by their owner, who can make one a FIFO (mkfifo; rsync -a copies them), and
-// opening a FIFO for reading waits until something opens it for writing: the run
-// would never finish, and cancelling it would not end the wait. The file is opened
-// with O_NONBLOCK to avoid that FIFO writer wait, and the open file is checked, so
-// a file replaced since a stat or directory listing cannot get past the check. A regular
-// file is then read in blocking mode, as os.Open reads it.
+// openRegularFile opens name below root for reading if it is a regular file the owner
+// of root could have read, and fails with errNotRegularFile or errAnotherUsersFile
+// otherwise. The files the import reads may have been written by their owner, who can
+// make one a FIFO (mkfifo; rsync -a copies them), and opening a FIFO for reading waits
+// until something opens it for writing: the run would never finish, and cancelling it
+// would not end the wait. The file is opened with O_NONBLOCK to avoid that FIFO writer
+// wait, and the open file is checked, so a file replaced since a stat or directory
+// listing cannot get past the check. A regular file is then read in blocking mode, as
+// os.Open reads it.
+//
+// The owner can also make a name a hard link, which root cannot tell from the file's
+// first name, to a file elsewhere on the same file system, one they cannot read where
+// the system lets them link it (BSD and macOS do, as Linux does with
+// fs.protected_hardlinks = 0). The import runs with privileges the owner lacks, so a
+// file is read only if it is the owner's or anyone may read it. A link count is no
+// test: Dovecot copies a message between folders as a hard link
+// (maildir_copy_with_hardlinks), and cp -al backups link every file.
 func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -1425,6 +1438,13 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	info, err := file.Stat()
 	if err == nil && !info.Mode().IsRegular() {
 		err = &fs.PathError{Op: "open", Path: name, Err: errNotRegularFile}
+	}
+	if err == nil && info.Mode().Perm()&0o004 == 0 {
+		var dir fs.FileInfo
+		if dir, err = root.Stat("."); err == nil && fileUID(info) != fileUID(dir) {
+			err = &fs.PathError{Op: "open", Path: name, Err: fmt.Errorf("%w (uid %d, not %d) and others may not read it",
+				errAnotherUsersFile, fileUID(info), fileUID(dir))}
+		}
 	}
 	if err == nil {
 		var conn syscall.RawConn
