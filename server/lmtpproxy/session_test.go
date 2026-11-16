@@ -221,7 +221,7 @@ func TestStripUnsupportedRCPTParameters(t *testing.T) {
 		{
 			name:     "RCPT with space after TO:",
 			input:    "RCPT TO: <user@example.com> NOTIFY=NEVER",
-			expected: "RCPT TO: <user@example.com>",
+			expected: "RCPT TO:<user@example.com>",
 		},
 		{
 			name:     "Non-RCPT command (should not be modified)",
@@ -236,7 +236,7 @@ func TestStripUnsupportedRCPTParameters(t *testing.T) {
 		{
 			name:     "Case insensitive RCPT command",
 			input:    "rcpt to:<user@example.com> NOTIFY=NEVER",
-			expected: "rcpt to:<user@example.com>",
+			expected: "RCPT TO:<user@example.com>",
 		},
 		{
 			name:     "RCPT with RET parameter",
@@ -277,6 +277,81 @@ func TestStripUnsupportedRCPTParameters(t *testing.T) {
 			name:     "RCPT with mix of allowed and disallowed",
 			input:    "RCPT TO:<user@example.com> UNKNOWN1=a XRCPTFORWARD=fwd@example.com UNKNOWN2=b NOTIFY=NEVER",
 			expected: "RCPT TO:<user@example.com> XRCPTFORWARD=fwd@example.com",
+		},
+		{
+			name:     "RCPT with extra spaces before TO: and unknown parameter",
+			input:    "RCPT  TO:<user@example.com> FOO=1",
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with extra spaces before TO: and NOTIFY",
+			input:    "RCPT  TO:<user@example.com> NOTIFY=SUCCESS",
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with leading space and unknown parameter",
+			input:    " RCPT TO:<user@example.com> FOO=1",
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with tab before TO: and NOTIFY",
+			input:    "RCPT\tTO:<user@example.com> NOTIFY=NEVER",
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with space and tab before TO:",
+			input:    "RCPT \tTO:<user@example.com> FOO=1 XRCPTFORWARD=fwd@example.com",
+			expected: "RCPT TO:<user@example.com> XRCPTFORWARD=fwd@example.com",
+		},
+		{
+			name:     "RCPT with tab after TO:",
+			input:    "RCPT TO:\t<user@example.com> FOO=1",
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with quoted bracketed path",
+			input:    `RCPT TO:"<user@example.com>"`,
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with quoted bracketed path and parameters",
+			input:    `RCPT TO:"<user@example.com>" FOO=1 XRCPTFORWARD=fwd@example.com`,
+			expected: "RCPT TO:<user@example.com> XRCPTFORWARD=fwd@example.com",
+		},
+		{
+			name:     "RCPT with space after TO: and quoted bracketed path",
+			input:    `RCPT TO: "<user@example.com>" NOTIFY=NEVER`,
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with bare unbracketed address",
+			input:    "RCPT TO:user@example.com",
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with bare unbracketed address and parameters",
+			input:    "RCPT TO:user@example.com NOTIFY=NEVER FOO=1 XRCPTFORWARD=fwd@example.com",
+			expected: "RCPT TO:<user@example.com> XRCPTFORWARD=fwd@example.com",
+		},
+		{
+			name:     "RCPT with quoted bare address and parameter",
+			input:    `RCPT TO:"user@example.com" FOO=1`,
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with empty XRCPTFORWARD value stripped",
+			input:    "RCPT TO:<user@example.com> XRCPTFORWARD=",
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with valueless XRCPTFORWARD stripped",
+			input:    "RCPT TO:<user@example.com> XRCPTFORWARD",
+			expected: "RCPT TO:<user@example.com>",
+		},
+		{
+			name:     "RCPT with Unicode look-alike XRCPTFORWARD stripped",
+			input:    "RCPT TO:<user@example.com> XRCPTſORWARD=fwd@example.com",
+			expected: "RCPT TO:<user@example.com>",
 		},
 	}
 
