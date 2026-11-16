@@ -324,60 +324,47 @@ func handleRelayDelete(_ context.Context) {
 
 		fmt.Printf("Deleted %d messages from %s queue\n", deleted, *queueType)
 	} else {
-		// Delete specific message
-		metadataPath := filepath.Join(queueDir, *messageID+".json")
-		messagePath := filepath.Join(queueDir, *messageID+".msg")
-
-		// Check if message exists
-		if _, err := os.Stat(metadataPath); os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Message ID %s not found in %s queue\n", *messageID, *queueType)
+		queue, err := openExistingRelayQueue(cfg.Relay.GetQueuePath(), cfg.Relay.Queue.MaxAttempts)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error accessing relay queue: %v\n", err)
 			os.Exit(1)
 		}
-
-		// Delete both files
-		if err := os.Remove(metadataPath); err != nil {
-			fmt.Fprintf(os.Stderr, "Error deleting metadata: %v\n", err)
+		if err := queue.Delete(*messageID, *queueType); err != nil {
+			fmt.Fprintf(os.Stderr, "Error deleting message %s from %s queue: %v\n", *messageID, *queueType, err)
 			os.Exit(1)
-		}
-
-		if err := os.Remove(messagePath); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Error deleting message body: %v\n", err)
 		}
 
 		fmt.Printf("Deleted message %s from %s queue\n", *messageID, *queueType)
 	}
 }
 
-// deleteAllMessagesInQueueDir deletes every committed message (identified by its .json
-// metadata file) from queueDir, removing <id>.json before <id>.msg so a concurrent
-// worker never observes metadata without its body, while leaving uncommitted .held
-// redirects, scratch files, and unpaired .msg files untouched.
+// deleteAllMessagesInQueueDir deletes committed messages through the same lease
+// and durable terminal journal as the worker. Busy messages and uncommitted holds
+// are left alone; only completed discards contribute to the returned count.
 func deleteAllMessagesInQueueDir(queueDir string) (int, error) {
+	queueType := filepath.Base(filepath.Clean(queueDir))
+	if queueType != "pending" && queueType != "processing" && queueType != "failed" {
+		return 0, fmt.Errorf("unknown relay queue %q", queueType)
+	}
+	queue, err := openExistingRelayQueue(filepath.Dir(filepath.Clean(queueDir)), 10)
+	if err != nil {
+		return 0, err
+	}
 	entries, err := os.ReadDir(queueDir)
 	if err != nil {
 		return 0, err
 	}
-
 	deleted := 0
 	for _, entry := range entries {
 		if entry.IsDir() || filepath.Ext(entry.Name()) != ".json" {
 			continue
 		}
-		name := entry.Name()
-		id := strings.TrimSuffix(name, ".json")
-		metadataPath := filepath.Join(queueDir, name)
-		messagePath := filepath.Join(queueDir, id+".msg")
-
-		if err := os.Remove(metadataPath); err != nil {
-			// A worker may have claimed the metadata since ReadDir. Its body can
-			// still be here until the second rename; leave that body to the worker.
+		id := strings.TrimSuffix(entry.Name(), ".json")
+		if err := queue.Delete(id, queueType); err != nil {
 			if !os.IsNotExist(err) {
-				fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", name, err)
+				fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", entry.Name(), err)
 			}
 			continue
-		}
-		if err := os.Remove(messagePath); err != nil && !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Warning: Could not delete %s: %v\n", id+".msg", err)
 		}
 		deleted++
 	}

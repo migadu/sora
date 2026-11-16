@@ -29,15 +29,20 @@ var defaultMailboxNamesLower = func() []string {
 // Subscribe records a name-based subscription for the account. Idempotent and
 // case-insensitive (matching mailbox-name case-insensitivity, migration 000041).
 func (db *Database) Subscribe(ctx context.Context, tx pgx.Tx, accountID int64, mailboxName string) error {
-	_, err := tx.Exec(ctx, `
+	_, err := db.subscribe(ctx, tx, accountID, mailboxName)
+	return err
+}
+
+func (db *Database) subscribe(ctx context.Context, tx pgx.Tx, accountID int64, mailboxName string) (bool, error) {
+	tag, err := tx.Exec(ctx, `
 		INSERT INTO subscriptions (account_id, mailbox_name)
 		VALUES ($1, $2)
 		ON CONFLICT (account_id, LOWER(mailbox_name)) DO NOTHING
 	`, accountID, mailboxName)
 	if err != nil {
-		return fmt.Errorf("failed to subscribe %q: %w", mailboxName, err)
+		return false, fmt.Errorf("failed to subscribe %q: %w", mailboxName, err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 // Unsubscribe removes a name-based subscription. Idempotent and case-insensitive.
@@ -49,7 +54,12 @@ func (db *Database) Subscribe(ctx context.Context, tx pgx.Tx, accountID int64, m
 // Unicode-named physical mailbox is not a default just because its lower()
 // happens to match one: the stored physical name must be an ASCII default.
 func (db *Database) Unsubscribe(ctx context.Context, tx pgx.Tx, accountID int64, mailboxName string) error {
-	_, err := tx.Exec(ctx, `
+	_, err := db.unsubscribe(ctx, tx, accountID, mailboxName)
+	return err
+}
+
+func (db *Database) unsubscribe(ctx context.Context, tx pgx.Tx, accountID int64, mailboxName string) (bool, error) {
+	tag, err := tx.Exec(ctx, `
 		DELETE FROM subscriptions s
 		WHERE s.account_id = $1 AND LOWER(s.mailbox_name) = LOWER($2)
 		  AND LOWER(s.mailbox_name COLLATE "C") <> ALL ($3)
@@ -61,9 +71,9 @@ func (db *Database) Unsubscribe(ctx context.Context, tx pgx.Tx, accountID int64,
 		  )
 	`, accountID, mailboxName, defaultMailboxNamesLower)
 	if err != nil {
-		return fmt.Errorf("failed to unsubscribe %q: %w", mailboxName, err)
+		return false, fmt.Errorf("failed to unsubscribe %q: %w", mailboxName, err)
 	}
-	return nil
+	return tag.RowsAffected() > 0, nil
 }
 
 // GetSubscribedMailboxNames returns every subscribed name for the account,

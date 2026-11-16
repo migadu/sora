@@ -37,15 +37,16 @@ type CacheEntry struct {
 	ActualEmail    string // Resolved email address (different from cache key if token-based auth)
 
 	// Routing data (for proxy)
-	ServerAddress          string
-	PoolName               string // Named backend pool the lookup answered with (empty = default pool)
-	RemoteTLS              bool
-	RemoteTLSUseStartTLS   bool
-	RemoteTLSVerify        bool
-	RemoteUseProxyProtocol bool
-	RemoteUseIDCommand     bool
-	RemoteUseXCLIENT       bool
-	RemoteUseUTF8          bool // POP3: mirror a client's pre-auth UTF8 to the backend
+	ServerAddress                         string
+	PoolName                              string // Named backend pool the lookup answered with (empty = default pool)
+	RemoteTLS                             bool
+	RemoteTLSUseStartTLS                  bool
+	RemoteTLSVerify                       bool
+	RemoteUseProxyProtocol                bool
+	RemoteUseIDCommand                    bool
+	RemoteSkipForwardingWithProxyProtocol bool // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	RemoteUseXCLIENT                      bool
+	RemoteUseUTF8                         bool // POP3: mirror a client's pre-auth UTF8 to the backend
 
 	// Metadata
 	Result           AuthResult

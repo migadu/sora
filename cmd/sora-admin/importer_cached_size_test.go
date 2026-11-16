@@ -211,7 +211,7 @@ func TestUploadReadsNoMoreOfAChangedFileThanTheLimit(t *testing.T) {
 			runtime.GC()
 			var before, after runtime.MemStats
 			runtime.ReadMemStats(&before)
-			uploaded := importer.uploadBatchToS3([]msgInfo{msg})
+			uploaded := importer.readBatch([]msgInfo{msg})
 			runtime.ReadMemStats(&after)
 
 			assert.Empty(t, uploaded, "uploaded a message above the limit")
