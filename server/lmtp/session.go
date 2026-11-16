@@ -38,7 +38,9 @@ var defaultSieveScript = delivery.DefaultSieveScript
 // handing it to the relay worker, and reports whether every target was held. commit
 // hands over every redirect still held, charges each one handed over against the rate
 // limit, and reports whether all of them went; abort drops the ones still held.
-func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Result, messageContent *message.Entity, fullMessageBytes []byte) (commit func() bool, abort func(), allHeld bool) {
+// arrivedHops is the redirect hop count of the message before the script's header
+// edits; every outgoing copy is stamped one above it.
+func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Result, arrivedHops int, fullMessageBytes []byte) (commit func() bool, abort func(), allHeld bool) {
 	type heldRedirect struct {
 		to     string
 		commit func() error
@@ -55,8 +57,7 @@ func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Resu
 
 		if s.backend.relayQueue != nil {
 			// Stamp the outgoing copy with an incremented hop count (loop backstop).
-			hops := helpers.RedirectHopCount(helpers.HeaderGetter(messageContent.Header.Map()))
-			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(hops+1))
+			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(arrivedHops+1))
 			// User.Address is the script owner's primary address, even for aliases.
 			// Replace earlier or sender-supplied attribution on the outgoing copy only.
 			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
@@ -872,7 +873,13 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// is retried by the sender, so a redirect handed over before the failure would be
 	// relayed again by every retry. Whatever is not handed over when this delivery
 	// returns is dropped; the retry holds it again.
-	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, messageContent, fullMessageBytes)
+	//
+	// The hop count is the one the message arrived with, as the script saw it and
+	// RedirectAllowed checked it: an editheader script may delete X-Sora-Loop (RFC 5293
+	// §6 leaves which fields it may delete to local policy), and a count read after its
+	// edits would restart on every pass and never reach max_redirect_hops.
+	arrivedHops := helpers.RedirectHopCount(helpers.HeaderGetter(sieveCtx.Header))
+	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, arrivedHops, fullMessageBytes)
 	defer abortRedirects()
 	redirectFailed := !allHeld
 	destinations := result.Destinations(redirectFailed)
