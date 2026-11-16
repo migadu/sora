@@ -34,6 +34,7 @@ require (
 	golang.org/x/sys v0.47.0
 	golang.org/x/text v0.41.0
 	lukechampine.com/blake3 v1.4.1
+	modernc.org/libc v1.75.3
 	modernc.org/sqlite v1.56.0
 )
 
@@ -91,7 +92,6 @@ require (
 	golang.org/x/tools v0.48.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
-	modernc.org/libc v1.75.3 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.12.0 // indirect
 	rsc.io/binaryregexp v0.2.0 // indirect

@@ -124,9 +124,28 @@ is a message. Files in `new/` usually carry no flags, so they arrive unread.
 
 The maildir may have been written by its owner, while the import runs with more privileges, so
 source messages and Dovecot metadata are read through the opened maildir root. Symbolic links
-below it cannot redirect those reads outside the root. `--maildir-path` itself
-may be a link. Below it, a folder that is a link is not walked and is named in a warning. A message
-file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
+below it cannot redirect those reads outside the root. `--maildir-path` itself, or a directory
+on the way to it, may be a symbolic link only when the link belongs to root, to the user running
+`sora-admin`, or to the owner of the directory it leads to, as
+`/var/mail/alice -> /srv/mail/alice` made by root, `/srv/import/alice -> /var/vmail/alice` made by
+an operator who is not root, or a user's own `~/Maildir -> ~/mail/Maildir` does. A link of root or
+of the user running `sora-admin` leads only where that user could name directly. A user who can
+replace `~/Maildir` could otherwise point it at another user's maildir and have that read into the
+account. Any other link makes the import refuse to start, naming the link, its owner and the
+directory it leads to, before the `sora-maildir.db` cache is created; name that directory itself
+to import it. A link's owner says who made it, not who gave it its name, so where users may
+hard-link a file they do not own (macOS and the BSDs, and Linux with `fs.protected_hardlinks = 0`)
+a link with more than one name is refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise
+pass as root's link. The import sees only the names a link has when it runs: on such a system, a
+hard link a user made earlier to root's link (or to a link of the user running `sora-admin`, or to
+another user's link to their own maildir) has one name again once that original name is removed
+(root deletes `/var/mail/bob`, or bob replaces his link), and it is then followed as the link of
+its owner. Where users may make such links, name the maildir's own directory, with no link on the
+way, as `--maildir-path` (or `--sieve`). These are
+Unix UID checks. Checking them needs no more permission than opening the path does: the
+directories above the maildir need only be searchable (`x`), not readable, by the user running
+the import. Below the root, a folder that is a link is not walked and is named in a warning.
+A message file, a `cur/` or `new/` directory, or a `subscriptions`, `dovecot-keywords` or `dovecot-uidlist`
 file that is a link is read only when the link is relative and its target is below the root. Any
 other link (one pointing outside the root, or any absolute link, even to a file inside the root)
 is not read: such a message file is reported as failed by its path, and such a `cur/` or `new/` is
@@ -323,7 +342,10 @@ Very large UIDVALIDITY values in the uidlist are truncated to 32 bits.
 `--sieve PATH` stores the file as a Sieve script of the account before the messages are
 imported. If the file does not exist, it is ignored with a log line.
 
-The file is read through its directory. The usual file from Dovecot, the user's
+The file is read through its directory, opened under the same rule for links on the way to it
+as `--maildir-path` ([section 3](#3-the-maildir-layout-sora-reads)): with `~/sieve` a link the user
+made to another user's directory, the script is not imported and the summary names the link. The
+usual file from Dovecot, the user's
 `~/.dovecot.sieve`, is a symbolic link the user owns, so a link is followed only when it is
 relative and its target is within that directory, as Pigeonhole's own
 `.dovecot.sieve -> sieve/<name>.sieve`. Any other link (one out of the directory, or any absolute
@@ -365,6 +387,15 @@ them is a symbolic link, even to a file inside the maildir, or another kind of f
 refuses to start and names it. The cache is opened without following a link, so a link put in its
 place while the run starts is refused as well. The export applies the same rule to the
 `sora-maildir.db` in its target directory.
+
+Once the import has checked the directory `--maildir-path` leads to (section 3), it does not look
+the path up again: the cache is checked and created, and the folders are listed, through the
+directory it opened, so the maildir's owner cannot make them land in another directory by renaming
+`~/Maildir` and putting a link in its place during the run. On Linux SQLite opens the cache, and its
+`-wal` and `-shm`, as `/proc/self/fd/N/sora-maildir.db`, through that directory's descriptor, which
+needs `/proc`. Elsewhere it opens them by the directory's name, which the rule below lets only root
+and the user running `sora-admin` change, and only while that name still leads to the directory
+that was checked.
 
 SQLite also writes through a hard link at those names, and a hard link cannot be refused
 without a race in a directory another user can write: SQLite opens the `-wal` and `-shm` files by
