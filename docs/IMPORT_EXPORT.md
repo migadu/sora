@@ -239,7 +239,9 @@ Dovecot stores custom keywords as letters `a` to `z` in file names. Each folder 
 `dovecot-keywords` file that maps those letters (`0 $Label1`, `1 $Junk`, ... : index 0 is `a`).
 
 - Each folder's own `dovecot-keywords` file maps that folder's letters.
-- A folder without its own file uses the root file's mapping.
+- The root file maps the letters of the root folder (INBOX) only. A folder without its own file
+  names no keywords, as in Dovecot, which clears a folder's list when its file is missing: its
+  letters are dropped, each with an `Unknown keyword ID` warning.
 - A line that is malformed, or whose index is not 0 to 25, is skipped; one warning per file names
   the file, the number of lines skipped and the first of them, shortened.
 - A file larger than 64 KiB is not read: a warning names it, and the folder's keywords are not
