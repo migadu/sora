@@ -180,9 +180,11 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// actually stored.
 	var mailboxName string
 	var relayAfterStore func() bool
-	var copyMailboxes []string   // further Sieve destinations, saved once the body is staged
+	var copies []SieveCopy       // further Sieve destinations, saved once the body is staged
 	var createMailboxes []string // Sieve fileinto :create targets, created if missing
-	var sieveFlags []imap.Flag   // flags set by the Sieve script (imap4flags, RFC 5232)
+	var resolveDestinations func(context.Context) ([]SieveCopy, error)
+	var resolvedTarget *db.DBMailbox
+	var sieveFlags []imap.Flag // flags the Sieve script set on the mailboxName copy (imap4flags, RFC 5232)
 
 	// The delivery reads from the writer, as LMTP does once RCPT has looked the
 	// recipient up: LookupRecipient creates an account's default mailboxes on first
@@ -228,7 +230,8 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		}
 
 		mailboxName = outcome.MailboxName
-		copyMailboxes = outcome.CopyMailboxes
+		copies = outcome.Copies
+		resolveDestinations = outcome.resolveDestinations
 		createMailboxes = outcome.CreateMailboxes
 		sieveFlags = outcome.Flags
 		// Adopt any header edits the script made (RFC 5293) before anything is derived
@@ -260,7 +263,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		d.Logger.Log("Invalid body structure detected, using fallback: %v", bsErr)
 	}
 	bodyStructure := &bodyStructureVal
-	deliveryFlags := db.WithAttachmentKeyword(sieveFlags, messageBytes, true)
+	// Classified once: every copy gets the keyword next to its own Sieve flags.
+	attachmentKeyword, attachmentKnown := helpers.AttachmentKeyword(messageBytes)
+	deliveryFlags := db.WithClassifiedAttachmentKeyword(sieveFlags, attachmentKeyword, attachmentKnown, true)
 
 	// Extract recipients
 	recipients := helpers.ExtractRecipients(messageEntity.Header)
@@ -297,6 +302,25 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		return result, fmt.Errorf("failed to check file existence: %w", err)
 	}
 
+	if resolveDestinations != nil {
+		destinations, err := resolveDestinations(ctx)
+		if err != nil {
+			err = fmt.Errorf("failed to resolve Sieve destinations: %w", err)
+			result.ErrorMessage = err.Error()
+			return result, err
+		}
+		if len(destinations) == 0 {
+			err = errors.New("Sieve storage plan has no destination")
+			result.ErrorMessage = err.Error()
+			return result, err
+		}
+		resolvedTarget = destinations[0].target
+		mailboxName = resolvedTarget.Name
+		deliveryFlags = db.WithClassifiedAttachmentKeyword(destinations[0].Flags, attachmentKeyword, attachmentKnown, true)
+		copies = destinations[1:]
+		createMailboxes = nil // the resolver completed every requested :create above
+	}
+
 	for _, createMailbox := range createMailboxes {
 		if err := d.createMissingMailbox(ctx, recipient, createMailbox); err != nil {
 			result.ErrorMessage = fmt.Sprintf("Failed to create Sieve fileinto :create target %s: %v", createMailbox, err)
@@ -307,12 +331,13 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// The further copies Sieve asked for: save them now that the body is on disk, so
 	// their pending_uploads rows can never name a file that is not staged yet - the
 	// uploader treats a missing local file as permanently lost content.
-	for _, copyMailbox := range copyMailboxes {
-		err := d.SaveMessageToMailbox(ctx, recipient, copyMailbox, messageBytes, messageEntity, plaintextBody, deliveryFlags, contentHash, bodyStructure)
+	for _, c := range copies {
+		flags := db.WithClassifiedAttachmentKeyword(c.Flags, attachmentKeyword, attachmentKnown, true)
+		err := d.saveMessageToResolvedMailbox(ctx, recipient, c.Mailbox, messageBytes, messageEntity, plaintextBody, flags, contentHash, bodyStructure, c.target)
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
-			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve copy to %s: %v", copyMailbox, err)
+			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve copy to %s: %v", c.Mailbox, err)
 			return result, err
 		}
 	}
@@ -321,7 +346,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// account), enforce the 'i' right, attribute the message to the mailbox owner, and
 	// stage the already-saved body under the owner's path. The body was stored locally
 	// under recipient.AccountID above.
-	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash, messageBytes)
+	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash, messageBytes, resolvedTarget)
 	if err != nil {
 		result.ErrorMessage = fmt.Sprintf("Failed to resolve destination mailbox: %v", err)
 		return result, err
@@ -567,28 +592,12 @@ func (d *DeliveryContext) createMissingMailbox(ctx context.Context, recipient Re
 // Uploader.StoreLocally) before this is called. DeliverMessage's inline save and
 // SaveMessageToMailbox both use this so the two paths cannot drift (e.g. one of them
 // skipping the 'i' right check).
-func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient RecipientInfo, mailboxName, contentHash string, messageBytes []byte) (mailbox *db.DBMailbox, destAccountID int64, destS3Domain, destS3Localpart string, err error) {
-	mailbox, err = FileintoTarget(ctx, d.RDB, d.SharedMailboxes, recipient.AccountID, mailboxName)
-	if err != nil {
-		if errors.Is(err, consts.ErrMailboxNotFound) {
-			// Fallback to INBOX
-			mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, consts.MailboxInbox)
-		}
+func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient RecipientInfo, mailboxName, contentHash string, messageBytes []byte, target *db.DBMailbox) (mailbox *db.DBMailbox, destAccountID int64, destS3Domain, destS3Localpart string, err error) {
+	mailbox = target
+	if mailbox == nil {
+		mailbox, err = resolveFileintoMailbox(ctx, d.RDB, d.SharedMailboxes, recipient.AccountID, mailboxName, false, d.Logger.Log)
 		if err != nil {
 			return nil, 0, "", "", err
-		}
-	}
-
-	// Enforce the insert ('i') right for shared mailboxes owned by another account: a
-	// SIEVE fileinto / delivery must not write into a mailbox the recipient can only
-	// look up (RFC 4314). On denial (or check error) deliver to the recipient's INBOX.
-	if mailbox.AccountID != recipient.AccountID {
-		canInsert, permErr := d.RDB.CheckMailboxPermissionWithRetry(ctx, mailbox.ID, recipient.AccountID, db.ACLRightInsert)
-		if permErr != nil || !canInsert {
-			d.Logger.Log("delivery denied: no insert right on shared mailbox %q, delivering to INBOX (err=%v)", mailbox.Name, permErr)
-			if mailbox, err = d.RDB.GetMailboxByNameWithRetry(ctx, recipient.AccountID, consts.MailboxInbox); err != nil {
-				return nil, 0, "", "", err
-			}
 		}
 	}
 
@@ -622,7 +631,11 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 // and passes the final flags, Sieve-set ones plus the attachment keyword, so a
 // fileinto :copy stores the same metadata in both mailboxes.
 func (d *DeliveryContext) SaveMessageToMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag, contentHash string, bodyStructure *imap.BodyStructure) error {
-	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash, messageBytes)
+	return d.saveMessageToResolvedMailbox(ctx, recipient, mailboxName, messageBytes, messageEntity, plaintextBody, flags, contentHash, bodyStructure, nil)
+}
+
+func (d *DeliveryContext) saveMessageToResolvedMailbox(ctx context.Context, recipient RecipientInfo, mailboxName string, messageBytes []byte, messageEntity *message.Entity, plaintextBody *string, flags []imap.Flag, contentHash string, bodyStructure *imap.BodyStructure, target *db.DBMailbox) error {
+	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash, messageBytes, target)
 	if err != nil {
 		return err
 	}

@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strconv"
 	"strings"
@@ -14,6 +15,7 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
+	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
@@ -70,6 +72,18 @@ func ResolveDefaultJunk(ctx context.Context, rdb *resilient.ResilientDatabase, a
 	}
 	result.Mailboxes = slices.Clone(result.Mailboxes)
 	result.Mailboxes[i] = name
+	if name != consts.MailboxJunk {
+		if result.MailboxFlags != nil {
+			result.MailboxFlags = maps.Clone(result.MailboxFlags)
+			result.MailboxFlags[name] = result.MailboxFlags[consts.MailboxJunk]
+			delete(result.MailboxFlags, consts.MailboxJunk)
+		}
+		if result.MailboxStoreOrder != nil {
+			result.MailboxStoreOrder = maps.Clone(result.MailboxStoreOrder)
+			result.MailboxStoreOrder[name] = result.MailboxStoreOrder[consts.MailboxJunk]
+			delete(result.MailboxStoreOrder, consts.MailboxJunk)
+		}
+	}
 	return result, nil
 }
 
@@ -78,18 +92,22 @@ type SieveOutcome struct {
 	// MailboxName is where the delivered copy goes. Discarded means nothing is stored.
 	MailboxName string
 	Discarded   bool
-	// Flags set by the script via imap4flags (RFC 5232), applied to every stored copy.
+	// Flags are those the script set on the MailboxName copy (imap4flags, RFC 5232):
+	// each copy has the flags of the keep or fileinto that stores it.
 	Flags []imap.Flag
 	// MessageBytes/MessageEntity carry the message after any header edits (RFC 5293
 	// editheader); they are always set. The caller MUST hash and store THESE bytes:
 	// content_hash is the S3 object key, so it has to describe the body actually written.
 	MessageBytes  []byte
 	MessageEntity *message.Entity
-	// CopyMailboxes are the other mailboxes that get a copy: further fileinto targets,
-	// and INBOX when the message is also kept. The caller saves them AFTER staging the
+	// Copies are the other mailboxes that get a copy: further fileinto targets, and
+	// INBOX when the message is also kept. The caller saves them AFTER staging the
 	// body locally: SaveMessageToMailbox writes a pending_uploads row, and the uploader
 	// treats a pending upload whose local file is missing as permanent content loss.
-	CopyMailboxes []string
+	Copies []SieveCopy
+	// Resolving can create mailboxes, so the caller invokes this only after the
+	// storable-size check and body staging, with redirect abort already deferred.
+	resolveDestinations func(context.Context) ([]SieveCopy, error)
 	// CreateMailboxes are the fileinto :create targets (RFC 5490 §3.2): the caller
 	// creates each missing mailbox before saving the copies.
 	CreateMailboxes []string
@@ -103,6 +121,14 @@ type SieveOutcome struct {
 	Redirect      func() bool
 	AbortRedirect func()
 	RedirectOnly  bool
+}
+
+// SieveCopy is a further mailbox a delivery stores the message in, with the flags
+// the script set on that copy (imap4flags, RFC 5232).
+type SieveCopy struct {
+	Mailbox string
+	Flags   []imap.Flag
+	target  *db.DBMailbox
 }
 
 // SieveExecutor interface defines the contract for Sieve script execution.
@@ -264,18 +290,6 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		}
 	}
 
-	// Flags set by the Sieve script via imap4flags (RFC 5232). Applied to every
-	// locally stored copy of the message. Keywords that are not valid IMAP atoms
-	// are dropped -- stored, they would wedge SELECT of the mailbox -- and named
-	// in the log, as the LMTP path does, since the user's script line silently
-	// did nothing.
-	rawFlags := helpers.StringsToFlags(result.Flags)
-	outcome.Flags = helpers.SanitizeFlags(rawFlags)
-	if rejected := helpers.DroppedFlags(rawFlags, outcome.Flags); len(rejected) > 0 {
-		s.DeliveryCtx.Logger.Log("Sieve set invalid IMAP keywords, dropped: %s (not a valid IMAP flag-keyword, RFC 9051 §9)",
-			strings.Join(rejected, ","))
-	}
-
 	// The vacation reply goes out whatever happens to the message (RFC 5230 §4.7), and
 	// after the header edits, which it has to see (RFC 5293 §7).
 	if result.Vacation != nil && s.VacationHandler != nil && recipient.FromAddress != nil {
@@ -303,6 +317,8 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		if outcome.Redirect != nil {
 			outcome.RedirectOnly = true
 			outcome.MailboxName = consts.MailboxInbox
+			// Kept in INBOX only if the handoff fails, then with the keep's flags.
+			outcome.Flags = s.sieveFlags(result.FlagsForKeep())
 			return outcome, nil
 		}
 		outcome.MailboxName = ""
@@ -310,16 +326,39 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		return outcome, nil
 	}
 	outcome.MailboxName = destinations[0].Mailbox
+	outcome.Flags = helpers.SanitizeFlags(helpers.StringsToFlags(destinations[0].Flags))
 	for _, dest := range destinations {
 		if dest.Create {
 			outcome.CreateMailboxes = append(outcome.CreateMailboxes, dest.Mailbox)
 		}
 	}
 	for _, dest := range destinations[1:] {
-		outcome.CopyMailboxes = append(outcome.CopyMailboxes, dest.Mailbox)
+		outcome.Copies = append(outcome.Copies, SieveCopy{Mailbox: dest.Mailbox, Flags: helpers.SanitizeFlags(helpers.StringsToFlags(dest.Flags))})
+	}
+	outcome.resolveDestinations = func(ctx context.Context) ([]SieveCopy, error) {
+		destinations, err := ResolveSieveDestinations(ctx, s.DeliveryCtx.RDB, s.DeliveryCtx.SharedMailboxes, recipient.AccountID, result, !allHeld, s.DeliveryCtx.Logger.Log)
+		if err != nil {
+			return nil, err
+		}
+		copies := make([]SieveCopy, len(destinations))
+		for i, dest := range destinations {
+			copies[i] = SieveCopy{Mailbox: dest.Target.Name, Flags: s.sieveFlags(dest.Flags), target: dest.Target}
+		}
+		return copies, nil
 	}
 
 	return outcome, nil
+}
+
+// sieveFlags converts one stored copy's Sieve flags to valid IMAP flags.
+func (s *StandardSieveExecutor) sieveFlags(names []string) []imap.Flag {
+	raw := helpers.StringsToFlags(names)
+	flags := helpers.SanitizeFlags(raw)
+	if rejected := helpers.DroppedFlags(raw, flags); len(rejected) > 0 {
+		s.DeliveryCtx.Logger.Log("Sieve set invalid IMAP keywords, dropped: %s (not a valid IMAP flag-keyword, RFC 9051 §9)",
+			strings.Join(rejected, ","))
+	}
+	return flags
 }
 
 // holdRedirects writes the message to the relay queue for every redirect without
@@ -414,14 +453,22 @@ func MergeSieveResults(defaultResult, userResult sieveengine.Result) (merged sie
 // keepDefaultAction merges the result of a user script that ended in a keep into
 // the default script's, whose action then stands, be it a filing or a keep of its
 // own: the user script only left where the message goes to the default. Everything
-// else it did still happens, after the default script's work as the two ran: its
-// flags join the default's, its header edits follow the default's, and its vacation
-// reply goes out (RFC 5230 §4.7), seeing those edits as RFC 5293 §7 requires. A user
-// reply takes precedence; otherwise the default script's independent vacation reply
-// still stands.
+// else it did still happens, after the default script's work as the two ran: the
+// flags of its keep join those of every copy the default stores, its header edits
+// follow the default's, and its vacation reply goes out (RFC 5230 §4.7), seeing
+// those edits as RFC 5293 §7 requires. A user reply takes precedence; otherwise the
+// default script's independent vacation reply still stands.
 func keepDefaultAction(defaultResult, userResult sieveengine.Result) sieveengine.Result {
 	merged := defaultResult
-	merged.Flags = mergeFlags(defaultResult.Flags, userResult.Flags)
+	userFlags := userResult.FlagsForKeep()
+	merged.KeepFlags = mergeFlags(defaultResult.FlagsForKeep(), userFlags)
+	merged.Flags = merged.KeepFlags
+	if len(defaultResult.Mailboxes) > 0 {
+		merged.MailboxFlags = make(map[string][]string, len(defaultResult.Mailboxes))
+		for _, mailbox := range defaultResult.Mailboxes {
+			merged.MailboxFlags[mailbox] = mergeFlags(defaultResult.FlagsForMailbox(mailbox), userFlags)
+		}
+	}
 	merged.HeaderEdits = slices.Concat(defaultResult.HeaderEdits, userResult.HeaderEdits)
 	if userResult.Vacation != nil {
 		merged.Vacation = userResult.Vacation

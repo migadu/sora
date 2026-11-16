@@ -132,10 +132,28 @@ type Result struct {
 	Mailboxes       []string          // every fileinto target, in script order, without repeats
 	CreateMailboxes []string          // RFC 5490 :create - the Mailboxes to create if missing
 	RedirectTo      []string          // every address to relay to, without repeats
-	Flags           []string          // flags to add to the message
 	Copy            bool              // with fileinto or redirect: the message is also kept (explicit keep, or every one used RFC 3894 :copy)
 	HeaderEdits     []HeaderEdit      // RFC5293 - editheader extension (addheader/deleteheader)
 	Additional      map[string]string // future-proofing
+
+	// imap4flags (RFC 5232) flags belong to one stored copy, not to the message.
+	// MailboxFlags holds those of each Mailboxes copy, by target: its fileinto's
+	// :flags, or else the script's flags as they were when it ran (§3, §5).
+	// KeepFlags are those of the copy kept in INBOX: an explicit keep's, chosen
+	// the same way, or else the implicit keep's, the script's flags at its end.
+	// Destinations gives every copy its own.
+	MailboxFlags map[string][]string
+	KeepFlags    []string
+
+	// Store order resolves actions naming the same physical mailbox, including
+	// case variants and fileinto INBOX alongside keep. The last flags win (RFC 5232 §3).
+	// An implicit keep has order zero and does not override an explicit action.
+	MailboxStoreOrder map[string]uint64
+	KeepStoreOrder    uint64
+
+	// Flags contains the kept copy's flags, for callers that predate per-copy flags.
+	// Deprecated: use KeepFlags or Destination.Flags instead.
+	Flags []string
 
 	// RecordRedirect charges one redirect against the account's redirect rate limit.
 	// Evaluation charges nothing, since only delivery knows whether a redirect went
@@ -395,10 +413,21 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 
 	// Process the results
 	result := Result{
-		Action:     ActionKeep,
-		Additional: make(map[string]string),
-		Flags:      make([]string, 0),
+		Action:            ActionKeep,
+		Additional:        make(map[string]string),
+		MailboxFlags:      data.MailboxFlags,
+		KeepFlags:         data.Flags,
+		MailboxStoreOrder: data.MailboxStoreOrder,
+		KeepStoreOrder:    data.KeepStoreOrder,
 	}
+	// An explicit keep stands in for the implicit one (RFC 5228 §2.10.2: "if a
+	// fileinto, a keep, a redirect, or a discard is performed, an implicit keep
+	// is not"), so the kept copy has its flags rather than the internal
+	// variable's final value.
+	if data.Keep {
+		result.KeepFlags = data.KeepFlags
+	}
+	result.Flags = result.KeepFlags
 
 	// Every fileinto and every redirect the script ran is carried out, next to one
 	// another and to a keep: RFC 5228 §2.10.4 lets a site limit the actions, but a
@@ -460,11 +489,6 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 			ClaimResponse: execPolicy.vacationClaimer(sender, vacation.ResponseIdentity, duration),
 		}
 		break
-	}
-
-	// Handle flags
-	if len(data.Flags) > 0 {
-		result.Flags = data.Flags
 	}
 
 	// Handle header edits (RFC 5293 - editheader extension)
@@ -936,31 +960,84 @@ func (r Result) RejectLogFields() (action, reason string) {
 	return action, reason
 }
 
+// FlagsForKeep returns the kept copy's flags. A legacy Result constructed with
+// only Flags retains those flags; per-copy fields take precedence, even if empty.
+func (r Result) FlagsForKeep() []string {
+	if r.hasCopyFlags() {
+		return r.KeepFlags
+	}
+	return r.Flags
+}
+
+// FlagsForMailbox returns the flags of one fileinto target, before :create name
+// normalization. It also accepts legacy Results that supplied only Flags.
+func (r Result) FlagsForMailbox(mailbox string) []string {
+	if r.hasCopyFlags() {
+		return r.MailboxFlags[mailbox]
+	}
+	return r.Flags
+}
+
+func (r Result) hasCopyFlags() bool {
+	return r.KeepFlags != nil || r.MailboxFlags != nil || r.KeepStoreOrder != 0 || r.MailboxStoreOrder != nil
+}
+
 // Destination is a mailbox delivery stores the message in.
 type Destination struct {
 	Mailbox string
-	Create  bool // RFC 5490 §3.2 fileinto :create: create the mailbox if it is missing
+	Create  bool     // RFC 5490 §3.2 fileinto :create: create the mailbox if it is missing
+	Flags   []string // the flags the script set on this copy (RFC 5232 §5)
 }
 
 // Destinations lists the mailboxes the message is stored in: every fileinto target,
 // then INBOX when the message is kept (RFC 5228 §2.10.2, §4.3), each mailbox once
-// (§2.10.3; mailbox names are case-insensitive here). redirectFailed reports a
-// redirect that could not be handed to the relay: a message then stored nowhere
-// else is kept in INBOX rather than lost (§4.2: "Any ignored redirect MUST NOT
-// cancel the implicit keep"). An empty list means nothing is stored.
+// (§2.10.3; mailbox names are case-insensitive here), each with the flags of the
+// fileinto or keep that stores it. redirectFailed reports a redirect that could not
+// be handed to the relay: a message then stored nowhere else is kept in INBOX rather
+// than lost (§4.2: "Any ignored redirect MUST NOT cancel the implicit keep"). An
+// empty list means nothing is stored.
 func (r Result) Destinations(redirectFailed bool) []Destination {
+	dests, _ := r.DestinationsByKey(redirectFailed, nil)
+	return dests
+}
+
+// DestinationsByKey groups copies by their resolved storage identity. resolve is
+// called before duplicate elimination, so database aliases and fallback targets
+// retain the last explicit action's flags. A nil resolver keeps the legacy name
+// comparison used by Destinations; storage callers supply a physical identity.
+func (r Result) DestinationsByKey(redirectFailed bool, resolve func(string, bool) (string, error)) ([]Destination, error) {
 	dests := make([]Destination, 0, len(r.Mailboxes)+1)
-	add := func(mailbox string, create bool) {
-		for i := range dests {
-			if strings.EqualFold(dests[i].Mailbox, mailbox) {
-				// One copy, but a :create on either spelling still creates it.
-				dests[i].Create = dests[i].Create || create
-				return
+	orders := make([]uint64, 0, len(r.Mailboxes)+1)
+	keys := make([]string, 0, len(r.Mailboxes)+1)
+	add := func(mailbox string, create bool, flags []string, order uint64) error {
+		key := ""
+		if resolve != nil {
+			var err error
+			key, err = resolve(mailbox, create)
+			if err != nil {
+				return err
 			}
 		}
-		dests = append(dests, Destination{Mailbox: mailbox, Create: create})
+		for i := range dests {
+			if resolve != nil && keys[i] == key || resolve == nil && strings.EqualFold(dests[i].Mailbox, mailbox) {
+				// Keep one copy in the first destination's position. A :create on
+				// any spelling creates it, and the last action supplies its flags.
+				dests[i].Create = dests[i].Create || create
+				if order > orders[i] {
+					dests[i].Flags = flags
+					orders[i] = order
+				}
+				return nil
+			}
+		}
+		dests = append(dests, Destination{Mailbox: mailbox, Create: create, Flags: flags})
+		orders = append(orders, order)
+		keys = append(keys, key)
+		return nil
 	}
 	for _, mailbox := range r.Mailboxes {
+		flags := r.FlagsForMailbox(mailbox)
+		order := r.MailboxStoreOrder[mailbox]
 		create := slices.Contains(r.CreateMailboxes, mailbox)
 		if create {
 			// The copy goes into the mailbox :create makes: "Foo" for "Foo/" (RFC 3501
@@ -970,12 +1047,16 @@ func (r Result) Destinations(redirectFailed bool) []Destination {
 				mailbox = name
 			}
 		}
-		add(mailbox, create)
+		if err := add(mailbox, create, flags, order); err != nil {
+			return nil, err
+		}
 	}
 	if r.Action == ActionKeep || r.Copy || (redirectFailed && len(dests) == 0) {
-		add(consts.MailboxInbox, false)
+		if err := add(consts.MailboxInbox, false, r.FlagsForKeep(), r.KeepStoreOrder); err != nil {
+			return nil, err
+		}
 	}
-	return dests
+	return dests, nil
 }
 
 // scriptRunner is what runScript needs of a compiled script; *sieve.Script
