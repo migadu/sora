@@ -118,7 +118,7 @@ func repairExcessUnseen(ctx context.Context, rdb *resilient.ResilientDatabase, a
 		fmt.Printf("Checked up to mailbox_id %d (resume with --start-after %d)\n", after, after)
 	}
 
-	fmt.Printf("Checked %d mailbox(es) with unseen messages: %d mailbox(es) with unseen_count too high, by %d in total (at most %d in one mailbox).\n",
+	fmt.Printf("Checked %d mailbox(es) with positive cached unseen counts: %d mailbox(es) with unseen_count too high, by %d in total (at most %d in one mailbox).\n",
 		checked, found, total, largest)
 	switch {
 	case apply:
