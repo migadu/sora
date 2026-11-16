@@ -779,18 +779,19 @@ transaction` for a long time are usually the lock holders of [section 8](#8-pgbo
 | Clients get `NO [UNAVAILABLE]` under load | Timeouts, lock timeouts, an open circuit breaker or an exhausted pool. | Check the circuit breaker log lines, `sora_db_pool_in_use_conns` and slow queries in PostgreSQL. |
 
 
-### Message state for newly created rows
+### Message state for newly created and historical rows
 
 COPY and MOVE create a `message_state` row for each destination message even when
 an older source message has none. Missing source state is represented by empty
 flags and keywords, matching the source's existing displayed state. Delivery,
 APPEND, imports and restore also create state for their newly inserted rows.
 
-This is a forward-only repair after all writers have been upgraded. Existing
-messages without state are left unchanged; their historical SEARCH UNSEEN,
-STATUS counts and flag-update inconsistencies are not repaired. There is no
-historical backfill, backfill migration or startup scan for this change. Older
-writers and transactions started before upgrade can still create missing rows.
+Online flag updates (IMAP `STORE`, single-message flag helpers, and User API
+`PATCH`/`DELETE`) seed a missing `message_state` row on demand before applying
+their flag mutation. To repair historical rows in bulk so `SEARCH UNSEEN`,
+`STATUS UNSEEN`, `SELECT`'s first-unseen lookup and `GET /user/mailboxes` unseen
+counts include them without a startup migration scan, run
+`sora-admin --config config.toml messages repair-state --apply`.
 
 ### Import body admission connections
 

@@ -58,7 +58,7 @@ func (db *Database) resolveMessageIDsBatch(ctx context.Context, tx pgx.Tx, mailb
 	}
 
 	rows, err := tx.Query(ctx, `
-		SELECT m.id, m.uid, GREATEST(m.created_modseq, COALESCE(ms.updated_modseq, 0))
+		SELECT m.id, m.uid, GREATEST(m.created_modseq, COALESCE(ms.updated_modseq, 0)), (ms.message_id IS NULL)
 		FROM messages m
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.mailbox_id = $1 AND m.uid = ANY($2) AND m.expunged_at IS NULL
@@ -71,16 +71,29 @@ func (db *Database) resolveMessageIDsBatch(ctx context.Context, tx pgx.Tx, mailb
 	idToUID := make(map[int64]imap.UID)
 	modSeqs := make(map[int64]int64)
 	var messageIDs []int64
+	var statelessIDs []int64
 	for rows.Next() {
 		var id, uid, modSeq int64
-		if err := rows.Scan(&id, &uid, &modSeq); err != nil {
+		var missingState bool
+		if err := rows.Scan(&id, &uid, &modSeq, &missingState); err != nil {
 			return nil, nil, nil, err
 		}
 		idToUID[id] = imap.UID(uid)
 		modSeqs[id] = modSeq
 		messageIDs = append(messageIDs, id)
+		if missingState {
+			statelessIDs = append(statelessIDs, id)
+		}
 	}
-	return idToUID, messageIDs, modSeqs, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, nil, nil, err
+	}
+	if len(statelessIDs) > 0 {
+		if err := db.ensureMessageStateForLockedMailbox(ctx, tx, mailboxID, statelessIDs); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return idToUID, messageIDs, modSeqs, nil
 }
 
 func (db *Database) getAllFlagsForMessages(ctx context.Context, tx pgx.Tx, messageIDs []int64) (map[int64][]imap.Flag, error) {
