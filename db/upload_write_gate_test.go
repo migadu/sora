@@ -104,7 +104,25 @@ func TestPassS3WriteGate(t *testing.T) {
 	assert.WithinDuration(t, time.Now().Add(gateTestLease), *lease, 10*time.Second)
 	require.NoError(t, database.ReleasePendingUploadLease(ctx, pendingID, gateTestOwner))
 
-	// A deleter (or a restore, or a cross-account COPY) holds the object lock.
+	// An immutable-body claimant may need this upload to finish while it waits for
+	// a mailbox lock. Sharing the body lock avoids an application-level wait cycle;
+	// the pending-row lease still excludes a second uploader of this row.
+	claimant, err := database.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer claimant.Rollback(ctx)
+	_, err = claimant.Exec(ctx, "SELECT pg_advisory_xact_lock_shared($1)", lockID)
+	require.NoError(t, err)
+	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, gateTestOwner, gateTestLease)
+	require.NoError(t, err)
+	require.Equal(t, S3WriteOpen, gate, "an immutable-body claimant must not prevent its uploader from finishing")
+	gate, err = database.PassS3WriteGate(ctx, pendingID, accountID, hash, "another-owner", gateTestLease)
+	require.NoError(t, err)
+	require.Equal(t, S3WriteBusy, gate, "shared admission must not weaken the exclusive pending-row lease")
+	require.Equal(t, gateTestOwner, leaseOwner(t, database, pendingID))
+	require.NoError(t, database.ReleasePendingUploadLease(ctx, pendingID, gateTestOwner))
+	require.NoError(t, claimant.Rollback(ctx))
+
+	// A destructive holder excludes every claimant until it finishes.
 	holder, err := database.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	_, err = holder.Exec(ctx, "SELECT pg_advisory_xact_lock($1)", lockID)

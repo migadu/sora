@@ -2,6 +2,7 @@ package relayqueue
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -22,10 +23,18 @@ const (
 	// ".json", which commit renames it to.
 	heldExt = ".held"
 
+	// requeueStaged* and requeueRetiring* hold the pending metadata and retiring
+	// failed pair while Requeue hands a message back to pending/ without exposing
+	// failed/<id>.{msg,json} to a post-publish unlink race (#840).
+	requeueStagedPrefix   = ".requeue-"
+	requeueStagedSuffix   = ".staged"
+	requeueRetiringPrefix = ".requeuing-"
+	requeueRetiringJSON   = ".json.old"
+	requeueRetiringMsg    = ".msg.old"
+
 	// orphanGracePeriod is how long a half-written message pair or a leftover temp
-	// file must sit untouched before CleanupOrphans reclaims it. Every write path
-	// holds q.mu, so anything older than this is crash debris rather than a write
-	// still in flight.
+	// file must sit untouched before CleanupOrphans reclaims it. Message leases
+	// additionally exclude live holders, regardless of their age.
 	orphanGracePeriod = 1 * time.Hour
 )
 
@@ -64,6 +73,7 @@ type DiskQueue struct {
 	retryBackoff  []time.Duration
 	mu            sync.Mutex
 	pending       *pendingIndex
+	claims        map[string]*queueLease
 
 	// metaRead, when set, is called before each metadata file is read from disk. It is
 	// a test seam: how much of the pending backlog an operation touches, and which
@@ -101,6 +111,7 @@ func NewDiskQueue(basePath string, maxAttempts int, retryBackoff []time.Duration
 		maxAttempts:   maxAttempts,
 		retryBackoff:  retryBackoff,
 		pending:       newPendingIndex(),
+		claims:        make(map[string]*queueLease),
 	}
 
 	// Create directories
@@ -124,47 +135,49 @@ func (q *DiskQueue) MaxAttempts() int {
 func (q *DiskQueue) RecoverOrphanedMessages() (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-
+	recovered, err := q.recoverInterruptedRequeues()
+	if err != nil {
+		return recovered, err
+	}
 	entries, err := os.ReadDir(q.processingDir)
 	if err != nil {
-		return 0, fmt.Errorf("failed to read processing directory: %w", err)
+		return recovered, err
 	}
-
-	recovered := 0
+	seen := make(map[string]bool)
 	for _, entry := range entries {
-		if entry.IsDir() {
+		ext := filepath.Ext(entry.Name())
+		if entry.IsDir() || (ext != ".json" && ext != ".msg") {
 			continue
 		}
-
-		filename := entry.Name()
-		ext := filepath.Ext(filename)
-
-		// Only handle .msg and .json files
-		if ext != ".msg" && ext != ".json" {
+		id := strings.TrimSuffix(entry.Name(), ext)
+		if seen[id] {
 			continue
 		}
-
-		processingPath := filepath.Join(q.processingDir, filename)
-		pendingPath := filepath.Join(q.pendingDir, filename)
-
-		// Move back to pending
-		if err := os.Rename(processingPath, pendingPath); err != nil {
-			logger.Error("RelayQueue: Failed to recover orphaned file", "file", filename, "error", err)
+		seen[id] = true
+		lease, err := q.tryLease(id)
+		if err != nil {
+			return recovered, err
+		}
+		if lease == nil {
 			continue
 		}
-
-		// Only count .msg files to avoid double-counting (each message has .msg + .json)
-		if ext == ".msg" {
+		moved, err := func() (bool, error) {
+			defer lease.close()
+			complete, err := q.recoverState(id)
+			if err != nil || complete {
+				return false, err
+			}
+			return q.recoverProcessing(id)
+		}()
+		if err != nil {
+			return recovered, err
+		}
+		if moved {
 			recovered++
 		}
 	}
 
-	if recovered > 0 {
-		// The recovered messages landed in pending/ behind the index's back.
-		q.pending.invalidate()
-		logger.Info("RelayQueue: Recovered orphaned messages from processing directory", "count", recovered)
-	}
-
+	q.pending.invalidate()
 	return recovered, nil
 }
 
@@ -252,42 +265,14 @@ func (q *DiskQueue) CleanupOldFailedMessages(retentionPeriod time.Duration) (int
 			continue
 		}
 
-		// Read metadata to check when message was moved to failed
-		metadataPath := filepath.Join(q.failedDir, filename)
-		var metadata QueuedMessage
-		if err := q.readMetadata(metadataPath, &metadata); err != nil {
-			logger.Error("RelayQueue: Failed to read metadata during cleanup", "file", filename, "error", err)
-			continue
+		didRemove, err := q.cleanupFailedEntry(filename, now, retentionPeriod)
+		if err != nil {
+			return cleaned, err
+		}
+		if didRemove {
+			cleaned++
 		}
 
-		// Calculate age based on last attempt time (when it was moved to failed)
-		age := now.Sub(metadata.LastAttempt)
-		if age < retentionPeriod {
-			continue // Not old enough to delete
-		}
-
-		// Delete both .json and .msg files
-		messageID := metadata.ID
-		messagePath := filepath.Join(q.failedDir, messageID+".msg")
-
-		// Delete message file first
-		if err := os.Remove(messagePath); err != nil && !os.IsNotExist(err) {
-			logger.Error("RelayQueue: Failed to delete old failed message", "id", messageID, "error", err)
-			continue
-		}
-
-		// Delete metadata file
-		if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
-			logger.Error("RelayQueue: Failed to delete old failed metadata", "id", messageID, "error", err)
-			continue
-		}
-
-		cleaned++
-		// The queue file was the last copy of a message the server already answered
-		// 250 for, so record what is being destroyed, not just that something was.
-		logger.Warn("RelayQueue: Deleted permanently failed message after retention - no copy remains",
-			"id", messageID, "from", metadata.From, "to", metadata.To, "type", metadata.Type,
-			"attempts", metadata.Attempts, "age", age.Round(time.Second), "last_error", lastError(metadata))
 	}
 
 	if cleaned > 0 {
@@ -310,23 +295,40 @@ func (q *DiskQueue) CleanupOrphans() (int, error) {
 	cutoff := time.Now().Add(-orphanGracePeriod)
 	removed := 0
 
-	// Leftover temp files, in every directory writeDataAtomic can target.
+	if _, err := q.recoverInterruptedRequeues(); err != nil {
+		return removed, err
+	}
+
+	// Leftover temp files, in every directory writeDataAtomic can target, and stale
+	// .requeue-*.staged files whose requeue failed before retiring failed/<id>.json.
 	for _, dir := range []string{q.pendingDir, q.processingDir, q.failedDir} {
 		entries, err := os.ReadDir(dir)
 		if err != nil {
 			return removed, fmt.Errorf("failed to read directory %s: %w", dir, err)
 		}
 		for _, entry := range entries {
-			if entry.IsDir() || !strings.HasPrefix(entry.Name(), tempFilePrefix) || !modifiedBefore(entry, cutoff) {
+			name := entry.Name()
+			isScratch := strings.HasPrefix(name, tempFilePrefix) ||
+				(dir == q.pendingDir && strings.HasPrefix(name, requeueStagedPrefix) && strings.HasSuffix(name, requeueStagedSuffix))
+			if entry.IsDir() || !isScratch || !modifiedBefore(entry, cutoff) {
 				continue
 			}
 			path := filepath.Join(dir, entry.Name())
-			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-				logger.Error("RelayQueue: Failed to remove stale temp file", "file", path, "error", err)
-				continue
+			var didRemove bool
+			if strings.HasPrefix(name, requeueStagedPrefix) {
+				id := strings.TrimSuffix(strings.TrimPrefix(name, requeueStagedPrefix), requeueStagedSuffix)
+				didRemove, err = q.removeOrphan(path, id, cutoff)
+			} else {
+				err = removeIfPresent(path)
+				didRemove = err == nil
 			}
-			removed++
-			logger.Info("RelayQueue: Removed stale temp file", "file", path)
+			if err != nil {
+				return removed, err
+			}
+			if didRemove {
+				removed++
+			}
+
 		}
 	}
 
@@ -386,12 +388,15 @@ func (q *DiskQueue) CleanupOrphans() (int, error) {
 		}
 
 		path := filepath.Join(q.pendingDir, filename)
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
-			logger.Error("RelayQueue: Failed to remove orphaned queue file", "file", path, "error", err)
-			continue
+		didRemove, err := q.removeOrphan(path, id, cutoff)
+		if err != nil {
+			return removed, err
 		}
-		removed++
-		logger.Warn("RelayQueue: Removed orphaned queue file", "file", path, "id", id)
+		if didRemove {
+			removed++
+			logger.Warn("RelayQueue: Removed orphaned queue file", "file", path, "id", id)
+		}
+
 	}
 
 	if removed > 0 {
@@ -427,6 +432,19 @@ func (q *DiskQueue) Hold(from, to, messageType string, messageBytes []byte) (com
 
 	// Generate unique ID
 	id := uuid.New().String()
+	lease, err := q.tryLease(id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if lease == nil {
+		return nil, nil, fmt.Errorf("new relay message id is busy")
+	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			lease.close()
+		}
+	}()
 
 	// Create metadata
 	metadata := QueuedMessage{
@@ -472,6 +490,7 @@ func (q *DiskQueue) Hold(from, to, messageType string, messageBytes []byte) (com
 			return fmt.Errorf("relay message %s was already committed or aborted", id)
 		}
 		settled = true
+		defer lease.close()
 		observe := func(result string) {
 			metrics.RelayQueueOperations.WithLabelValues("enqueue", result).Inc()
 			metrics.RelayQueueOperationDuration.WithLabelValues("enqueue").Observe((holdTime + time.Since(start)).Seconds())
@@ -510,6 +529,7 @@ func (q *DiskQueue) Hold(from, to, messageType string, messageBytes []byte) (com
 			return
 		}
 		settled = true
+		defer lease.close()
 		for _, path := range []string{heldPath, messagePath} {
 			if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 				// CleanupOrphans removes it once its grace period is over.
@@ -517,73 +537,111 @@ func (q *DiskQueue) Hold(from, to, messageType string, messageBytes []byte) (com
 			}
 		}
 	}
+	handedOff = true
 	return commit, abort, nil
 }
 
-// Requeue moves a message from failed/ back to pending/ with its attempts and error
-// history reset, ready for immediate delivery. Like Enqueue it writes the body before
-// the metadata, each atomically, so a worker that sees the metadata - including a
-// server's worker picking it up on its next resync - always finds the whole body. The
-// failed copy is removed only after that: a crash in between leaves the message in both
-// queues, never in neither.
-//
-// It runs in sora-admin, often as root, while the server reads pending/ as its own
-// user: a 0600 file root wrote there is one the server cannot open, so the message
-// would sit in pending/, logged as unreadable on every resync. The copies are given to
-// the owner of the pending directory before they get their names, as the server's own
-// moves (renames) keep theirs.
+// Requeue moves failed mail back to pending using a durable publication journal.
+// A message lease excludes live admin/worker/recovery operations in other upgraded
+// processes. Publication and rollback failures remain recoverable, without guessing
+// delivery state from a filename's age or from an empty queue.
+// Newly written files retain the corresponding queue directory's owner.
 func (q *DiskQueue) Requeue(messageID string) error {
 	q.mu.Lock()
 	defer q.mu.Unlock()
-
+	lease, err := q.tryLease(messageID)
+	if err != nil {
+		return err
+	}
+	if lease == nil {
+		return fmt.Errorf("relay message %s is busy", messageID)
+	}
+	defer lease.close()
+	if _, err := q.recoverState(messageID); err != nil {
+		return err
+	}
+	for _, dir := range []string{q.pendingDir, q.processingDir} {
+		if present, err := existsChecked(filepath.Join(dir, messageID+".json")); err != nil {
+			return err
+		} else if present {
+			return fmt.Errorf("relay message %s is already queued", messageID)
+		}
+	}
 	failedMetadataPath := filepath.Join(q.failedDir, messageID+".json")
 	failedMessagePath := filepath.Join(q.failedDir, messageID+".msg")
-
 	var metadata QueuedMessage
 	if err := q.readMetadata(failedMetadataPath, &metadata); err != nil {
 		return fmt.Errorf("could not read metadata: %w", err)
+	}
+	if metadata.ID != messageID {
+		return fmt.Errorf("failed message identity does not match %s", messageID)
 	}
 	messageBytes, err := os.ReadFile(failedMessagePath)
 	if err != nil {
 		return fmt.Errorf("could not read message body: %w", err)
 	}
-
 	metadata.Attempts = 0
 	metadata.LastAttempt = time.Time{}
 	metadata.NextRetry = time.Now()
 	metadata.Errors = []string{}
 	metadataBytes, err := json.MarshalIndent(metadata, "", "  ")
 	if err != nil {
-		return fmt.Errorf("could not marshal metadata: %w", err)
+		return err
 	}
-
 	owner, err := foreignOwner(q.pendingDir)
 	if err != nil {
-		return fmt.Errorf("could not look up the owner of the pending queue: %w", err)
+		return err
 	}
-
-	metadataPath := filepath.Join(q.pendingDir, messageID+".json")
-	messagePath := filepath.Join(q.pendingDir, messageID+".msg")
-	if err := q.writeDataAtomic(messagePath, messageBytes, owner); err != nil {
-		return fmt.Errorf("could not write message body to pending: %w", err)
+	oldMeta, oldBody, stage := q.retiredPaths(messageID)
+	body := filepath.Join(q.pendingDir, messageID+".msg")
+	if err := q.writeDataAtomic(body, messageBytes, owner); err != nil {
+		return err
 	}
-	if err := q.writeDataAtomic(metadataPath, metadataBytes, owner); err != nil {
-		// The rename may have happened before the error (a failed directory fsync), so
-		// withdraw the metadata before the body it points at.
-		os.Remove(metadataPath)
-		os.Remove(messagePath)
-		return fmt.Errorf("could not write metadata to pending: %w", err)
+	if err := q.writeDataAtomic(stage, metadataBytes, owner); err != nil {
+		return errors.Join(err, removeIfPresent(stage), removeIfPresent(body))
+	}
+	state := requeueState{Phase: "preparing", Metadata: metadata}
+	if err := q.writeState(state); err != nil {
+		return err
+	}
+	// The journal is durable before either original is retired. A crash before
+	// the publication decision restores them, with checked, retryable renames.
+	rollback := func(cause error) error {
+		state.Phase = "rollback"
+		if err := q.writeState(state); err != nil {
+			return errors.Join(cause, err)
+		}
+		return errors.Join(cause, q.restoreRetired(messageID))
+	}
+	if err := os.Rename(failedMetadataPath, oldMeta); err != nil {
+		return rollback(err)
+	}
+	if err := os.Rename(failedMessagePath, oldBody); err != nil {
+		return rollback(err)
+	}
+	if err := syncDir(q.failedDir); err != nil {
+		return rollback(err)
+	}
+	state.Phase = "publishing"
+	if err := q.writeState(state); err != nil {
+		return err
+	}
+	// After this durable decision recovery finishes publication; it never guesses
+	// that an absent queue entry means the message was not already delivered.
+	if err := os.Rename(stage, filepath.Join(q.pendingDir, messageID+".json")); err != nil {
+		return err
+	}
+	if err := syncDir(q.pendingDir); err != nil {
+		return err
+	}
+	state.Phase = "published"
+	if err := q.writeState(state); err != nil {
+		return err
+	}
+	if err := q.cleanupRetired(messageID); err != nil {
+		return err
 	}
 	q.pending.add(messageID, metadata.NextRetry)
-
-	// Body first, as CleanupOldFailedMessages does: metadata left behind is reclaimed
-	// by retention, a body without it would never be.
-	if err := os.Remove(failedMessagePath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("requeued, but could not remove the failed copy: %w", err)
-	}
-	if err := os.Remove(failedMetadataPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("requeued, but could not remove the failed copy: %w", err)
-	}
 	return nil
 }
 
@@ -659,6 +717,28 @@ func (q *DiskQueue) claimPending(messageID string) (*QueuedMessage, []byte, bool
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	lease, err := q.tryLease(messageID)
+	if err != nil {
+		logger.Error("RelayQueue: Failed to acquire message lease", "id", messageID, "error", err)
+		return nil, nil, false
+	}
+	if lease == nil {
+		q.pending.add(messageID, time.Now().Add(time.Second))
+		return nil, nil, false
+	}
+	retained := false
+	defer func() {
+		if !retained {
+			lease.close()
+		}
+	}()
+	if complete, err := q.recoverState(messageID); err != nil || complete {
+		if err != nil {
+			logger.Error("RelayQueue: Failed to recover message transaction", "id", messageID, "error", err)
+		}
+		return nil, nil, false
+	}
+
 	metadataPath := filepath.Join(q.pendingDir, messageID+".json")
 	messagePath := filepath.Join(q.pendingDir, messageID+".msg")
 
@@ -705,6 +785,8 @@ func (q *DiskQueue) claimPending(messageID string) (*QueuedMessage, []byte, bool
 		return nil, nil, false
 	}
 
+	q.claims[messageID] = lease
+	retained = true
 	return &metadata, messageBytes, true
 }
 
@@ -713,20 +795,28 @@ func (q *DiskQueue) MarkSuccess(messageID string) error {
 	start := time.Now()
 	q.mu.Lock()
 	defer q.mu.Unlock()
-
-	metadataPath := filepath.Join(q.processingDir, messageID+".json")
-	messagePath := filepath.Join(q.processingDir, messageID+".msg")
-
-	// Remove both files
-	if err := os.Remove(metadataPath); err != nil && !os.IsNotExist(err) {
-		metrics.RelayQueueOperations.WithLabelValues("mark_success", "error").Inc()
-		metrics.RelayQueueOperationDuration.WithLabelValues("mark_success").Observe(time.Since(start).Seconds())
-		return fmt.Errorf("failed to remove metadata: %w", err)
+	lease := q.claims[messageID]
+	if lease != nil {
+		delete(q.claims, messageID)
+	} else {
+		var err error
+		lease, err = q.tryLease(messageID)
+		if err != nil {
+			return err
+		}
+		if lease == nil {
+			return fmt.Errorf("relay message %s is busy", messageID)
+		}
 	}
-	if err := os.Remove(messagePath); err != nil && !os.IsNotExist(err) {
-		metrics.RelayQueueOperations.WithLabelValues("mark_success", "error").Inc()
-		metrics.RelayQueueOperationDuration.WithLabelValues("mark_success").Observe(time.Since(start).Seconds())
-		return fmt.Errorf("failed to remove message: %w", err)
+	defer lease.close()
+
+	// A terminal decision is durable before either delivery file is removed.
+	// If cleanup fails, recovery finishes deletion instead of resending the message.
+	if err := q.writeState(requeueState{Phase: "complete", Metadata: QueuedMessage{ID: messageID}}); err != nil {
+		return err
+	}
+	if err := q.finishComplete(messageID, false); err != nil {
+		return err
 	}
 
 	metrics.RelayQueueOperations.WithLabelValues("mark_success", "success").Inc()
@@ -741,6 +831,20 @@ func (q *DiskQueue) MarkPermanentFailure(messageID string, errorMsg string) erro
 	start := time.Now()
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	lease := q.claims[messageID]
+	if lease != nil {
+		delete(q.claims, messageID)
+	} else {
+		var err error
+		lease, err = q.tryLease(messageID)
+		if err != nil {
+			return err
+		}
+		if lease == nil {
+			return fmt.Errorf("relay message %s is busy", messageID)
+		}
+	}
+	defer lease.close()
 
 	metadataPath := filepath.Join(q.processingDir, messageID+".json")
 	messagePath := filepath.Join(q.processingDir, messageID+".msg")
@@ -776,8 +880,16 @@ func (q *DiskQueue) MarkPermanentFailure(messageID string, errorMsg string) erro
 		return fmt.Errorf("failed to move message to failed: %w", err)
 	}
 
-	// Remove from processing
-	os.Remove(metadataPath)
+	// Remove from processing after the destination pair has been published.
+	if err := removeIfPresent(metadataPath); err != nil {
+		return err
+	}
+	if err := q.finishQueueTransition(); err != nil {
+		return err
+	}
+	if err := q.clearState(messageID); err != nil {
+		return err
+	}
 	metrics.RelayQueueOperations.WithLabelValues("mark_permanent_failure", "success").Inc()
 	metrics.RelayQueueOperationDuration.WithLabelValues("mark_permanent_failure").Observe(time.Since(start).Seconds())
 	return nil
@@ -789,6 +901,20 @@ func (q *DiskQueue) MarkFailure(messageID string, errorMsg string) error {
 	start := time.Now()
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	lease := q.claims[messageID]
+	if lease != nil {
+		delete(q.claims, messageID)
+	} else {
+		var err error
+		lease, err = q.tryLease(messageID)
+		if err != nil {
+			return err
+		}
+		if lease == nil {
+			return fmt.Errorf("relay message %s is busy", messageID)
+		}
+	}
+	defer lease.close()
 
 	metadataPath := filepath.Join(q.processingDir, messageID+".json")
 	messagePath := filepath.Join(q.processingDir, messageID+".msg")
@@ -826,8 +952,15 @@ func (q *DiskQueue) MarkFailure(messageID string, errorMsg string) error {
 			return fmt.Errorf("failed to move message to failed: %w", err)
 		}
 
-		// Remove from processing
-		os.Remove(metadataPath)
+		if err := removeIfPresent(metadataPath); err != nil {
+			return err
+		}
+		if err := q.finishQueueTransition(); err != nil {
+			return err
+		}
+		if err := q.clearState(messageID); err != nil {
+			return err
+		}
 		metrics.RelayQueueOperations.WithLabelValues("mark_failure", "success").Inc()
 		metrics.RelayQueueOperationDuration.WithLabelValues("mark_failure").Observe(time.Since(start).Seconds())
 		return nil
@@ -862,8 +995,16 @@ func (q *DiskQueue) MarkFailure(messageID string, errorMsg string) error {
 		return fmt.Errorf("failed to move message to pending: %w", err)
 	}
 
-	// Remove from processing
-	os.Remove(metadataPath)
+	// Remove from processing after the destination pair has been published.
+	if err := removeIfPresent(metadataPath); err != nil {
+		return err
+	}
+	if err := q.finishQueueTransition(); err != nil {
+		return err
+	}
+	if err := q.clearState(messageID); err != nil {
+		return err
+	}
 	q.pending.add(messageID, metadata.NextRetry)
 	metrics.RelayQueueOperations.WithLabelValues("mark_failure", "success").Inc()
 	metrics.RelayQueueOperationDuration.WithLabelValues("mark_failure").Observe(time.Since(start).Seconds())
@@ -877,6 +1018,20 @@ func (q *DiskQueue) Release(messageID string) error {
 	start := time.Now()
 	q.mu.Lock()
 	defer q.mu.Unlock()
+	lease := q.claims[messageID]
+	if lease != nil {
+		delete(q.claims, messageID)
+	} else {
+		var err error
+		lease, err = q.tryLease(messageID)
+		if err != nil {
+			return err
+		}
+		if lease == nil {
+			return fmt.Errorf("relay message %s is busy", messageID)
+		}
+	}
+	defer lease.close()
 
 	metadataPath := filepath.Join(q.processingDir, messageID+".json")
 	messagePath := filepath.Join(q.processingDir, messageID+".msg")
@@ -911,8 +1066,16 @@ func (q *DiskQueue) Release(messageID string) error {
 		return fmt.Errorf("failed to move message to pending: %w", err)
 	}
 
-	// Remove from processing
-	os.Remove(metadataPath)
+	// Remove from processing after the destination pair has been published.
+	if err := removeIfPresent(metadataPath); err != nil {
+		return err
+	}
+	if err := q.finishQueueTransition(); err != nil {
+		return err
+	}
+	if err := q.clearState(messageID); err != nil {
+		return err
+	}
 	q.pending.add(messageID, metadata.NextRetry)
 	metrics.RelayQueueOperations.WithLabelValues("release", "success").Inc()
 	metrics.RelayQueueOperationDuration.WithLabelValues("release").Observe(time.Since(start).Seconds())
@@ -1014,7 +1177,8 @@ func (q *DiskQueue) writeDataAtomic(path string, data []byte, owner *fileOwner) 
 }
 
 // syncDir fsyncs a directory to ensure renamed and newly created entries are durable.
-func syncDir(dir string) error {
+// Variable so tests can pause between a rename into pending/ and the caller's next step.
+var syncDir = func(dir string) error {
 	d, err := os.Open(dir)
 	if err != nil {
 		return err

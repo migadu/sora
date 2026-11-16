@@ -530,6 +530,7 @@ See [STORAGE.md](STORAGE.md).
 | `timeout` | duration | `"30s"` | Timeout of one S3 operation. |
 | `encrypt` | bool | `false` | Encrypt bodies on the client before upload. |
 | `encryption_key` | string | none | Key for `encrypt`. |
+| `body_deletion_protocol` | string | `"paused"` | Message-body deletion and reference retirement stay paused until the [fleet cutover](OPERATIONS.md#upgrading-the-s3-message-body-lock-protocol) is complete; only then acknowledge `"global-hash-v1"`. Delivery, reads and uploads remain available. |
 
 ### 8.5 Local cache (`[local_cache]`)
 
@@ -1135,3 +1136,9 @@ At startup Sora checks the pools as a whole (`Config.ValidatePools` in
 - a proxy server also has `remote_addrs`;
 - a pool backend has no port and a proxy server has no `remote_port`;
 - there is no default pool and a proxy has no remote lookup, or has `lookup_local_users = true`.
+
+
+For IMAP/POP3 proxy backend legs, `remote_skip_forwarding_with_proxy_protocol`
+defaults to `false`. Set it explicitly on the server, pool or remote-lookup settings
+to omit configured ID/XCLIENT when a PROXY header is actually sent. See
+[PROXY.md](PROXY.md#explicit-suppression-alongside-proxy) for the metadata omitted.
