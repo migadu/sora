@@ -562,7 +562,10 @@ is relative and its target is below the target directory; any other link makes t
 before it writes a message, naming the path. An existing `dovecot-keywords` or `dovecot-uidlist`
 that is such a link is not read, and is replaced as if it were not there. Neither is one with more
 than one link: a hard link cannot be told apart from the file it names, while the export and
-Dovecot create these files by renaming a new file over the name, so theirs have one. The SQLite
+Dovecot create these files by renaming a new file over the name, so theirs have one. A file that
+is there but not read is logged as a warning: the folder's keyword numbering, or the UIDs of the
+files an earlier run wrote, are then not kept. A copy of the target made with `cp -al`, or a tool
+that replaces identical files with hard links, gives these files a second link. The SQLite
 cache and its sidecars still use ordinary paths; their policy is unchanged
 ([section 8](#8-the-sqlite-cache-sora-maildirdb)).
 
