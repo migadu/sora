@@ -1090,9 +1090,9 @@ func replaceFile(root *os.Root, tmpDir, name string, content []byte) error {
 // owner could write to (replaceFile), so whatever it reads back there (a file an
 // earlier run left, or a directory it created) may have been replaced by anything, a
 // FIFO included, and opening a FIFO for reading blocks until something opens it for
-// writing: the export would never finish. The open is O_NONBLOCK, which returns at
-// once whatever is at name and changes nothing for reading a regular file or a
-// directory, and the file opened is refused unless it is of the kind asked for. The
+// writing: the export would never finish. O_NONBLOCK prevents opening a FIFO from
+// waiting for a writer and does not change regular file or directory reads. The
+// file opened is refused unless it is of the kind asked for. The
 // check is on the open file, so nothing can take its place afterwards. The root
 // follows no link out of the export directory.
 func openExportEntry(root *os.Root, name string, dir bool) (*os.File, error) {
