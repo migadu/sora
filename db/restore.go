@@ -477,12 +477,22 @@ func (d *Database) RestoreMessages(ctx context.Context, tx pgx.Tx, params Restor
 			return 0, fmt.Errorf("failed to restore message_state for message %d: %w", msg.id, err)
 		}
 
+		// The message appears in the mailbox again, so it is created anew: a new UID and
+		// a new mod-sequence above HIGHESTMODSEQ (RFC 7162 §3.1: "When a message is
+		// appended to a mailbox (via the IMAP APPEND command, COPY to the mailbox, or
+		// using an external mechanism), the server generates a new modification sequence
+		// that is higher than the highest modification sequence of all messages in the
+		// mailbox and assigns it to the appended message"). The stats trigger raises the
+		// mailbox's highest_modseq to it, so readers synchronized past the expunge can
+		// report the new arrival. Restoring a row still held by an older sequence view
+		// does not preserve its previous UID/expunge history (issue #1712).
 		result, err := tx.Exec(ctx, `
 			UPDATE messages
 			SET expunged_at = NULL,
 			    expunged_modseq = NULL,
 			    mailbox_id = $2,
 			    uid = $3,
+			    created_modseq = nextval('messages_modseq'),
 			    updated_at = now()
 			WHERE id = $1 AND expunged_at IS NOT NULL
 		`, msg.id, targetMailboxID, nextUID)

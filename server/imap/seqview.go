@@ -79,10 +79,10 @@ func (v seqView) encode(seq uint32) uint32 {
 // names. A client number past its last message names nothing, as does one whose
 // message has been expunged although the client has not been told yet. The result
 // holds no "*": its ranges end at the last message the client knows, wherever the
-// database's view ends. The two can differ (a restored message keeps the
-// created_modseq it had, mailbox_stats.message_count can trail the live count), and
-// a message the client was not told about must not be stored to, copied or moved by
-// sequence number.
+// database's view ends. The two can differ (a message delivered or restored since the
+// poll is live but not yet reported, mailbox_stats.message_count can trail the live
+// count), and a message the client was not told about must not be stored to, copied or
+// moved by sequence number.
 func (v seqView) decode(set imap.SeqSet) imap.SeqSet {
 	clientCount := v.clientCount()
 	out := imap.SeqSet{}
