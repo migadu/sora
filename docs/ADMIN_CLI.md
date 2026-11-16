@@ -614,6 +614,45 @@ sora-admin --config config.toml messages restore --email user@example.com --ids 
   messages stay restored; run the same command again for the rest. Messages already back are
   skipped, not duplicated.
 
+### messages repair-references
+
+Fills in the stored References of messages that have none. `SEARCH HEADER References` and
+THREAD read the References chain from a column of the message row
+([SEARCH.md](SEARCH.md)). Messages stored before the column was added (migration 000036), and
+messages copied or moved by older builds, have no value in it (NULL). Search does not find them
+by References, and THREAD links them by In-Reply-To only. A message without a References header
+is stored with an empty value, not NULL.
+
+```sh
+sora-admin --config config.toml messages repair-references
+sora-admin --config config.toml messages repair-references --apply
+```
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--apply` | `false` | Fill the rows that can be filled. Without it, only count them and change nothing. |
+| `--batch-size` | `1000` | Message rows read per batch. |
+| `--start-after` | `0` | Resume after this message id. |
+
+- Rows are read in id order, all accounts. A live message with no stored References is filled
+  with the value stored for another message row with the same body (content hash): the same
+  bytes have the same References header. Expunged messages are not filled.
+- The command uses only PostgreSQL and reads nothing from S3. A message whose body no other row
+  has a value for cannot be filled: it is counted and stays as it is.
+- The summary line gives the rows checked, how many have no stored References, how many can be
+  filled and how many cannot. With `--apply` it also gives how many were filled.
+- Each batch is read in one statement through the read pool (a replica, when `[database.read]`
+  has one), then with `--apply` filled in one short transaction on the primary. It holds no
+  session state, so it runs through PgBouncer in transaction mode, and it can run while the
+  servers are serving mail.
+- At most every 10 seconds, and when it fails, it prints the id to pass to `--start-after`. It
+  is safe to run again: a filled row is not counted again. A message restored later with
+  `messages restore` gets the value its expunged row had, so run the command again after
+  restoring old mail.
+- The run reads every row of the `messages` table once and does one index lookup for each row
+  without References. The dry run reads exactly what `--apply` reads, so the time it takes is
+  a measurement of the read part of `--apply`.
+
 ---
 
 ## 8. acl
