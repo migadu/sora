@@ -1462,10 +1462,12 @@ var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t
 // The owner can also make a name a hard link, which root cannot tell from the file's
 // first name, to a file elsewhere on the same file system, one they cannot read where
 // the system lets them link it (BSD and macOS do, as Linux does with
-// fs.protected_hardlinks = 0). The import runs with privileges the owner lacks, so a
-// file others may not read must pass checkNamedByOwner. A
-// link count is no test: Dovecot copies a message between folders as a hard link
-// (maildir_copy_with_hardlinks), and cp -al backups link every file.
+// fs.protected_hardlinks = 0). The import runs with privileges the owner lacks, so any
+// file without read bits set in all three Unix DAC classes (0o444) must pass
+// checkNamedByOwner; Unix evaluates owner, group, and other classes in
+// first-match order, so 0o004 alone (e.g. 0604 or 0044) still denies group members or
+// the owner. A link count is no test: Dovecot copies a message between folders as a
+// hard link (maildir_copy_with_hardlinks), and cp -al backups link every file.
 func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	file, err := root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
@@ -1475,7 +1477,7 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 	if err == nil && !info.Mode().IsRegular() {
 		err = &fs.PathError{Op: "open", Path: name, Err: errNotRegularFile}
 	}
-	if err == nil && info.Mode().Perm()&0o004 == 0 {
+	if err == nil && info.Mode().Perm()&0o444 != 0o444 {
 		err = checkNamedByOwner(root, name, info)
 	}
 	if err == nil {
@@ -1495,43 +1497,157 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 }
 
 // checkNamedByOwner refuses info, the file openRegularFile opened as name below root,
-// with errAnotherUsersFile unless the directory that holds name belongs to the file's
-// owner and its mode bits grant neither group nor other write access. Group members
-// with write access can also add a name, including a hard link. This checks Unix UID
-// and mode bits, not access granted through filesystem ACLs.
+// with errAnotherUsersFile unless the directory that actually holds the resolved file
+// belongs to the file's owner, grants neither group nor other write access (0o022 == 0),
+// and (for non-root owners) info grants owner read access (0o400). Group members with
+// write access can also add a name, including a hard link. This checks Unix UID and
+// mode bits, not access granted through filesystem ACLs.
+//
 // The root's own owner says nothing: --maildir-path, or the --sieve file's directory,
 // may be a link the user made to a directory of root's that anyone may write into
 // (/tmp), and a maildir extracted as root into a directory root made keeps its owner's
-// files below it. The directory is opened, and name looked up in it, by descriptor,
-// with the file found there required to be the file opened, so a directory renamed or
-// replaced meanwhile cannot vouch for it. A name that is a link vouches only for a file
-// below its own directory, as Pigeonhole's ~/.dovecot.sieve -> sieve/<name>.sieve: the
-// link's owner may not have been able to read one elsewhere in the root.
+// files below it. Components are walked from root by descriptor (Lstat, Readlink,
+// OpenRoot), requiring the final entry to be the file opened so a directory or entry
+// replaced meanwhile cannot vouch for it. Any symbolic link along the path must stay
+// strictly below the directory holding that link (no absolute or .. segments), live in
+// a directory without group or other write access, and belong (together with its
+// directory) to root or to the file's owner — allowing Pigeonhole's
+// ~/.dovecot.sieve -> sieve/<name>.sieve under either a user-owned or root-owned home
+// directory while checking the target sieve/ directory itself.
 func checkNamedByOwner(root *os.Root, name string, info fs.FileInfo) error {
-	dir, err := root.OpenRoot(filepath.Dir(name))
-	if err != nil {
+	refuse := func(reason string) error {
+		return &fs.PathError{
+			Op:   "open",
+			Path: name,
+			Err:  fmt.Errorf("%w: %s, and not everyone may read it", errAnotherUsersFile, reason),
+		}
+	}
+	unwrap := func(err error) error {
+		if cause := errors.Unwrap(err); cause != nil {
+			return cause
+		}
 		return err
 	}
-	defer dir.Close()
-	dirInfo, err := dir.Stat(".")
-	if err != nil {
-		return err
+
+	clean := filepath.Clean(name)
+	if !filepath.IsLocal(clean) || clean == "." {
+		return refuse("it is not found below the directory that holds its name")
 	}
-	named, err := dir.Stat(filepath.Base(name))
-	var reason string
-	switch {
-	case err != nil:
-		reason = fmt.Sprintf("it is not found below the directory that holds its name (%v)", errors.Unwrap(err))
-	case !os.SameFile(named, info):
-		reason = "it was replaced while it was opened"
-	case dirInfo.Mode().Perm()&0o022 != 0:
-		reason = "group or others may write into the directory that holds it"
-	case fileUID(info) != fileUID(dirInfo):
-		reason = fmt.Sprintf("it belongs to uid %d, the directory that holds it to uid %d", fileUID(info), fileUID(dirInfo))
-	default:
-		return nil
+	sep := string(filepath.Separator)
+	parts := strings.Split(clean, sep)
+
+	curDir := root
+	ownCur := false
+	defer func() {
+		if ownCur {
+			curDir.Close()
+		}
+	}()
+
+	const maxSymlinks = 8
+	uid := fileUID(info)
+	symlinks := 0
+	followedLink := false
+
+	for len(parts) > 0 {
+		curDirInfo, err := curDir.Stat(".")
+		if err != nil {
+			return err
+		}
+		seg, rest := parts[0], parts[1:]
+		linfo, err := curDir.Lstat(seg)
+		if err != nil {
+			return refuse(fmt.Sprintf("it is not found below the directory that holds its name (%v)", unwrap(err)))
+		}
+
+		if linfo.Mode()&fs.ModeSymlink != 0 {
+			symlinks++
+			if symlinks > maxSymlinks {
+				return refuse("too many symbolic links hold its name")
+			}
+			if curDirInfo.Mode().Perm()&0o022 != 0 {
+				return refuse("group or others may write into the directory that holds it")
+			}
+			target, err := curDir.Readlink(seg)
+			if err != nil {
+				return refuse(fmt.Sprintf("it is not found below the directory that holds its name (%v)", unwrap(err)))
+			}
+			if target == "" || strings.HasPrefix(target, sep) {
+				return refuse("it is not found below the directory that holds its name")
+			}
+			rawTarget := strings.Split(target, sep)
+			targetParts := make([]string, 0, len(rawTarget))
+			for _, p := range rawTarget {
+				switch p {
+				case "", ".":
+					continue
+				case "..":
+					return refuse("it is not found below the directory that holds its name")
+				default:
+					targetParts = append(targetParts, p)
+				}
+			}
+			if len(targetParts) == 0 {
+				return refuse("it is not found below the directory that holds its name")
+			}
+			if dirUID := fileUID(curDirInfo); dirUID != 0 && dirUID != uid {
+				return refuse(fmt.Sprintf("it belongs to uid %d, the directory that holds its link to uid %d", uid, dirUID))
+			}
+			if linkUID := fileUID(linfo); linkUID != 0 && linkUID != uid {
+				return refuse(fmt.Sprintf("it belongs to uid %d, the link that names it to uid %d", uid, linkUID))
+			}
+			parts = append(targetParts, rest...)
+			followedLink = true
+			continue
+		}
+
+		if len(rest) == 0 {
+			switch {
+			case !os.SameFile(linfo, info):
+				return refuse("it was replaced while it was opened")
+			case curDirInfo.Mode().Perm()&0o022 != 0:
+				return refuse("group or others may write into the directory that holds it")
+			case uid != fileUID(curDirInfo):
+				return refuse(fmt.Sprintf("it belongs to uid %d, the directory that holds it to uid %d", uid, fileUID(curDirInfo)))
+			case uid != 0 && info.Mode().Perm()&0o400 == 0:
+				return refuse("its owner may not read it")
+			default:
+				return nil
+			}
+		}
+
+		if !linfo.IsDir() {
+			return refuse("it was replaced while it was opened")
+		}
+		if followedLink {
+			if curDirInfo.Mode().Perm()&0o022 != 0 {
+				return refuse("group or others may write into the directory that holds it")
+			}
+			if dirUID := fileUID(curDirInfo); dirUID != 0 && dirUID != uid {
+				return refuse(fmt.Sprintf("it belongs to uid %d, a directory on its link path to uid %d", uid, dirUID))
+			}
+		}
+		nextDir, err := curDir.OpenRoot(seg)
+		if err != nil {
+			return refuse(fmt.Sprintf("it is not found below the directory that holds its name (%v)", unwrap(err)))
+		}
+		nextInfo, err := nextDir.Stat(".")
+		if err != nil {
+			nextDir.Close()
+			return err
+		}
+		if !os.SameFile(linfo, nextInfo) {
+			nextDir.Close()
+			return refuse("it was replaced while it was opened")
+		}
+		if ownCur {
+			curDir.Close()
+		}
+		curDir = nextDir
+		ownCur = true
+		parts = rest
 	}
-	return &fs.PathError{Op: "open", Path: name, Err: fmt.Errorf("%w: %s, and others may not read it", errAnotherUsersFile, reason)}
+	return refuse("it was replaced while it was opened")
 }
 
 // readMaildirDir is os.ReadDir through the maildir root (openMaildirFile). Only a
