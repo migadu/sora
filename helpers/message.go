@@ -116,7 +116,7 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 // decodeToBinary decodes the MIME-encoded content (e.g., Base64, Quoted-Printable) into raw binary.
 func DecodeToBinary(part *message.Entity) (io.Reader, error) {
 	// Get the Content-Transfer-Encoding from the headers
-	encodingType := strings.ToLower(part.Header.Get("Content-Transfer-Encoding"))
+	encodingType := transferEncodingMechanism(part.Header.Get("Content-Transfer-Encoding"))
 
 	// Based on the encoding type, decode the content
 	switch encodingType {
@@ -126,7 +126,7 @@ func DecodeToBinary(part *message.Entity) (io.Reader, error) {
 	case "quoted-printable":
 		// Decode quoted-printable content
 		return quotedprintable.NewReader(part.Body), nil
-	case "7bit", "8bit", "binary":
+	case "", "7bit", "8bit", "binary":
 		// For these encodings, no decoding is necessary; return the body directly
 		return part.Body, nil
 	default:
@@ -183,9 +183,17 @@ func ValidateBodyStructure(bs *imap.BodyStructure) error {
 	return nil
 }
 
-// ExtractBodyStructure is imapserver.ExtractBodyStructure, indirected so tests
-// can exercise SafeBodyStructure's recovery path.
-var ExtractBodyStructure = imapserver.ExtractBodyStructure
+// extractOptions reads the Date: of an attached message/rfc822 or message/global part,
+// whose envelope the body structure stores, with ParseDateHeaderWithZone like the message's own.
+// go-imap's default is net/mail, which reads an obsolete zone such as PDT in time.Local.
+var extractOptions = &imapserver.ExtractOptions{ParseDateWithZone: ParseDateHeaderWithZone}
+
+// ExtractBodyStructure is imapserver.ExtractBodyStructure with the envelope dates of
+// attached messages read by ParseDateHeader, indirected so tests can exercise
+// SafeBodyStructure's recovery path.
+var ExtractBodyStructure = func(r io.Reader) imap.BodyStructure {
+	return imapserver.ExtractBodyStructureWithOptions(r, extractOptions)
+}
 
 // SafeBodyStructure returns the BODYSTRUCTURE to store for a raw message. Every
 // ingestion path (LMTP, APPEND, Admin API delivery) stores one and FETCH later

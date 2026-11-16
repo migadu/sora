@@ -396,10 +396,7 @@ func StartSessionDrainer(ctx context.Context, m *Maintenance, rate float64, sess
 	if inMaintenance == nil {
 		inMaintenance = m.Contains
 	}
-	if !(rate > 0) || math.IsInf(rate, 0) {
-		rate = DefaultMaintenanceKickRate
-	}
-	interval := time.Duration(float64(time.Second) / rate)
+	interval := drainInterval(rate)
 
 	trigger := make(chan struct{}, 1)
 	m.OnUpdate(func() {
@@ -440,6 +437,22 @@ func StartSessionDrainer(ctx context.Context, m *Maintenance, rate float64, sess
 			}
 		}
 	}()
+}
+
+// drainInterval is the pause between two closes at rate sessions per second; a rate that
+// is not a positive finite number gets the default. A tiny positive rate puts the pause
+// beyond the time.Duration range, and Go leaves converting such a float to an integer
+// implementation-dependent (math.MinInt64 on amd64, which would leave the drain unpaced),
+// so the pause saturates at the longest Duration instead.
+func drainInterval(rate float64) time.Duration {
+	if !(rate > 0) || math.IsInf(rate, 0) {
+		rate = DefaultMaintenanceKickRate
+	}
+	ns := float64(time.Second) / rate
+	if ns >= float64(math.MaxInt64) { // rounds to 2^63, the first value out of range
+		return math.MaxInt64
+	}
+	return time.Duration(ns)
 }
 
 // DefaultMaintenanceKickRate is how many sessions per second a proxy server closes on a

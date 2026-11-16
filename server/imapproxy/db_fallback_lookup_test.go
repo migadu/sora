@@ -125,3 +125,10 @@ func TestDBFallbackLoginQueriesRemoteLookupOnce(t *testing.T) {
 		t.Errorf("the login made %d remote lookups, want 1: the 404 from the first was not remembered, so routing repeated it", got)
 	}
 }
+
+// This immutable replay fixture never mutates cache state; guarded fills retain
+// the existing no-op Put behavior while satisfying the mandatory fence contract.
+func (c *stubAuthCache) Generation() uint64 { return 0 }
+func (c *stubAuthCache) PutIfGeneration(ctx context.Context, address string, accountID int64, hash string, _ uint64) error {
+	return c.Put(ctx, address, accountID, hash)
+}

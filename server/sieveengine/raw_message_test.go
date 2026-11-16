@@ -82,7 +82,7 @@ func rawContext(t *testing.T, raw string) Context {
 	return Context{
 		EnvelopeFrom: "sender@example.com",
 		EnvelopeTo:   "recipient@example.com",
-		Header:       entity.Header.Map(),
+		Header:       HeaderMap(entity.Header),
 		Message:      []byte(raw),
 	}
 }

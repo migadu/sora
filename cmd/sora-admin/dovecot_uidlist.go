@@ -22,9 +22,12 @@ type DovecotUIDList struct {
 
 // ParseDovecotUIDList parses a dovecot-uidlist file from the given maildir path
 func ParseDovecotUIDList(maildirPath string) (*DovecotUIDList, error) {
-	uidlistPath := filepath.Join(maildirPath, "dovecot-uidlist")
+	return parseDovecotUIDListFile(os.Open(filepath.Join(maildirPath, "dovecot-uidlist")))
+}
 
-	file, err := os.Open(uidlistPath)
+// parseDovecotUIDListFile parses the dovecot-uidlist file that opening it returned,
+// and closes it.
+func parseDovecotUIDListFile(file *os.File, err error) (*DovecotUIDList, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			// No uidlist file, return nil (not an error for maildir without one)
@@ -236,19 +239,9 @@ func (u *DovecotUIDList) GetUIDForFile(filename string) (uint32, bool) {
 	return uid, ok
 }
 
-// WriteDovecotUIDList writes a DovecotUIDList to the specified maildir path
-func WriteDovecotUIDList(maildirPath string, uidList *DovecotUIDList) error {
-	if uidList == nil {
-		return fmt.Errorf("uidList cannot be nil")
-	}
-
-	uidlistPath := filepath.Join(maildirPath, "dovecot-uidlist")
-
-	file, err := os.Create(uidlistPath)
-	if err != nil {
-		return fmt.Errorf("failed to create dovecot-uidlist: %w", err)
-	}
-	defer file.Close()
+// formatDovecotUIDList returns uidList as the content of a dovecot-uidlist file.
+func formatDovecotUIDList(uidList *DovecotUIDList) []byte {
+	var b strings.Builder
 
 	// Write header line - format: "3 V{uidvalidity} N{nextuid} G{globaluid}"
 	headerLine := fmt.Sprintf("3 V%d N%d", uidList.UIDValidity, uidList.NextUID)
@@ -257,9 +250,7 @@ func WriteDovecotUIDList(maildirPath string, uidList *DovecotUIDList) error {
 	}
 	headerLine += "\n"
 
-	if _, err := file.WriteString(headerLine); err != nil {
-		return fmt.Errorf("failed to write header: %w", err)
-	}
+	b.WriteString(headerLine)
 
 	// Write UID mappings, sorted by UID for consistency
 	type uidMapping struct {
@@ -280,12 +271,10 @@ func WriteDovecotUIDList(maildirPath string, uidList *DovecotUIDList) error {
 	// Write each mapping - format: "UID :filename"
 	for _, mapping := range mappings {
 		line := fmt.Sprintf("%d :%s\n", mapping.uid, mapping.filename)
-		if _, err := file.WriteString(line); err != nil {
-			return fmt.Errorf("failed to write UID mapping: %w", err)
-		}
+		b.WriteString(line)
 	}
 
-	return nil
+	return []byte(b.String())
 }
 
 // CreateDovecotUIDListFromMessages creates a DovecotUIDList from message data

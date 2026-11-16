@@ -1,8 +1,12 @@
 package helpers
 
 import (
+	"io"
 	"strings"
 	"testing"
+
+	"github.com/emersion/go-message"
+	"github.com/migadu/go-imap"
 )
 
 // RFC 2045 §5.1 inherits RFC 822 comments and quoted-pairs. Comments have no
@@ -93,4 +97,213 @@ func TestAttachmentKeyword_EvidenceBeforeAmbiguousParameter(t *testing.T) {
 			t.Fatalf("valid filename before ambiguous parameter yielded %q, %v; want attachment", keyword, known)
 		}
 	}
+}
+
+// RFC 2045 §1: MIME header fields "can include RFC 822 comments, which have no
+// semantic content and should be ignored during MIME processing", so a
+// Content-Transfer-Encoding with comments is the mechanism it names, for the
+// stored BODYSTRUCTURE, the full-text search text and the PREVIEW alike.
+var cteCommentMessages = []struct {
+	name, raw, wantEncoding, wantText string
+}{
+	{
+		name: "single part",
+		raw: "From: a@example.com\r\nTo: b@example.com\r\nSubject: comment\r\nMIME-Version: 1.0\r\n" +
+			"Content-Type: text/plain\r\n" +
+			"Content-Transfer-Encoding: base64 (encoded)\r\n" +
+			"\r\n" +
+			"aGVsbG8gd29ybGQK\r\n",
+		wantEncoding: "base64",
+		wantText:     "hello world\n",
+	},
+	{
+		name: "multipart child",
+		raw: "From: a@example.com\r\nTo: b@example.com\r\nSubject: comment\r\nMIME-Version: 1.0\r\n" +
+			"Content-Type: multipart/alternative; boundary=b\r\n" +
+			"\r\n" +
+			"--b\r\n" +
+			"Content-Type: text/plain; charset=utf-8\r\n" +
+			"Content-Transfer-Encoding: (a (nested) comment) Quoted-Printable (with a \\) quoted-pair)\r\n" +
+			"\r\n" +
+			"hello wor=\r\nld=21\r\n" +
+			"--b--\r\n",
+		wantEncoding: "quoted-printable",
+		wantText:     "hello world!",
+	},
+}
+
+func TestCTEComments_BodyStructure(t *testing.T) {
+	for _, tc := range cteCommentMessages {
+		t.Run(tc.name, func(t *testing.T) {
+			bs, err := SafeBodyStructure([]byte(tc.raw))
+			if err != nil {
+				t.Fatalf("SafeBodyStructure: %v", err)
+			}
+			if mp, ok := bs.(*imap.BodyStructureMultiPart); ok {
+				bs = mp.Children[0]
+			}
+			leaf, ok := bs.(*imap.BodyStructureSinglePart)
+			if !ok {
+				t.Fatalf("leaf is %T, want *imap.BodyStructureSinglePart", bs)
+			}
+			if !strings.EqualFold(leaf.Encoding, tc.wantEncoding) {
+				t.Errorf("body-fld-enc = %q, want %q", leaf.Encoding, tc.wantEncoding)
+			}
+		})
+	}
+}
+
+func TestCTEComments_ExtractPlaintextBody(t *testing.T) {
+	for _, tc := range cteCommentMessages {
+		t.Run(tc.name, func(t *testing.T) {
+			// server.ParseMessage tolerates an unknown encoding the same way.
+			entity, err := message.Read(strings.NewReader(tc.raw))
+			if err != nil && !message.IsUnknownEncoding(err) {
+				t.Fatalf("message.Read: %v", err)
+			}
+			text, err := ExtractPlaintextBody(entity)
+			if err != nil {
+				t.Errorf("ExtractPlaintextBody error: %v", err)
+			}
+			if text == nil || strings.TrimRight(*text, "\r\n") != strings.TrimRight(tc.wantText, "\r\n") {
+				t.Errorf("ExtractPlaintextBody = %q, want %q", deref(text), tc.wantText)
+			}
+		})
+	}
+}
+
+func TestCTEComments_MessagePreview(t *testing.T) {
+	for _, tc := range cteCommentMessages {
+		t.Run(tc.name, func(t *testing.T) {
+			want := strings.TrimSpace(tc.wantText)
+			if got := MessagePreview(strings.NewReader(tc.raw)); got != want {
+				t.Errorf("MessagePreview = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestCTEComments_DecodeToBinary(t *testing.T) {
+	var h message.Header
+	h.Set("Content-Transfer-Encoding", "(encoded) BASE64 (as stored)")
+	r, err := DecodeToBinary(&message.Entity{Header: h, Body: strings.NewReader("aGVsbG8gd29ybGQK")})
+	if err != nil {
+		t.Fatalf("DecodeToBinary: %v", err)
+	}
+	if b, err := io.ReadAll(r); err != nil || string(b) != "hello world\n" {
+		t.Errorf("DecodeToBinary = %q, %v; want %q", b, err, "hello world\n")
+	}
+
+	// A comment is not part of the mechanism and separates tokens.
+	for _, enc := range []string{"x-uuencode (comment)", "base(comment)64"} {
+		h.Set("Content-Transfer-Encoding", enc)
+		if _, err := DecodeToBinary(&message.Entity{Header: h, Body: strings.NewReader("")}); err == nil {
+			t.Errorf("DecodeToBinary(%q): expected an unsupported-encoding error", enc)
+		}
+	}
+}
+
+func TestCTEComments_DefaultEncodingAndMalformedValues(t *testing.T) {
+	for _, encoding := range []string{"", "(only a comment)", "(outer (nested) comment)"} {
+		t.Run("identity "+encoding, func(t *testing.T) {
+			const body = "plain body\r\n"
+			var h message.Header
+			h.Set("Content-Transfer-Encoding", encoding)
+			r, err := DecodeToBinary(&message.Entity{Header: h, Body: strings.NewReader(body)})
+			if err != nil {
+				t.Fatalf("missing mechanism defaults to 7bit: %v", err)
+			}
+			if got, err := io.ReadAll(r); err != nil || string(got) != body {
+				t.Fatalf("identity body = %q, %v", got, err)
+			}
+		})
+	}
+
+	// A comment separates tokens; it cannot make two tokens into one known
+	// encoding. Malformed values likewise must not expose undecoded bytes in
+	// PREVIEW, even if the MIME reader tolerates an unfinished comment.
+	for _, encoding := range []string{"base(comment)64", "base64 (unfinished", "base64 (escaped\\)", "base64 extra", "base64;", "x-unknown (comment)"} {
+		t.Run("unsupported "+encoding, func(t *testing.T) {
+			const body = "aGVsbG8gd29ybGQK\r\n"
+			var h message.Header
+			h.Set("Content-Transfer-Encoding", encoding)
+			if _, err := DecodeToBinary(&message.Entity{Header: h, Body: strings.NewReader(body)}); err == nil {
+				t.Fatal("unsupported or malformed encoding was accepted")
+			}
+			raw := "Content-Type: text/plain\r\nContent-Transfer-Encoding: " + encoding + "\r\n\r\n" + body
+			if got := MessagePreview(strings.NewReader(raw)); got != "" {
+				t.Fatalf("unsupported or malformed preview = %q", got)
+			}
+		})
+	}
+}
+
+func TestCTEComments_PreviewMatchesReaderForWhitespace(t *testing.T) {
+	for _, tc := range []struct {
+		name, field string
+		decoded     bool
+	}{
+		{"retained bare CR", "base64 \r \r\n", false},
+		{"ordinary whitespace", "base64 \t\r\n", true},
+		{"folded whitespace", "base64\r\n \t\r\n", true},
+		{"folded comment", "(encoded)\r\n BASE64 (comment)\r\n", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const body = "aGVsbG8gd29ybGQK\r\n"
+			raw := "Content-Type: text/plain\r\nContent-Transfer-Encoding: " + tc.field + "\r\n" + body
+			entity, err := message.Read(strings.NewReader(raw))
+			if tc.decoded && err != nil {
+				t.Fatalf("valid CTE not decoded: %v", err)
+			}
+			if !tc.decoded && !message.IsUnknownEncoding(err) {
+				t.Fatalf("malformed CTE was not reported as unknown: %v", err)
+			}
+			got, err := io.ReadAll(entity.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			wantBody, wantPreview := body, ""
+			if tc.decoded {
+				wantBody, wantPreview = "hello world\n", "hello world"
+			}
+			if string(got) != wantBody {
+				t.Fatalf("reader body = %q, want %q", got, wantBody)
+			}
+			if preview := MessagePreview(strings.NewReader(raw)); preview != wantPreview {
+				t.Fatalf("preview = %q, want %q", preview, wantPreview)
+			}
+		})
+	}
+}
+
+// FuzzTransferEncodingMechanismAgreesWithGoMessage pins the property PREVIEW
+// relies on against go-message itself: every value transferEncodingMechanism
+// reduces to a mechanism go-message knows is one go-message decodes.
+func FuzzTransferEncodingMechanismAgreesWithGoMessage(f *testing.F) {
+	for _, seed := range []string{
+		"base64", "BASE64 (encoded)", "(a (nested) comment) Quoted-Printable (with a \\) quoted-pair)",
+		"(only a comment)", "base64 (unclosed", "base(comment)64", "\rbase64", "base64\r ",
+		" base64", "base64\r\n (folded)", "7bit\t", "x-uuencode (comment)",
+	} {
+		f.Add(seed)
+	}
+	f.Fuzz(func(t *testing.T, cte string) {
+		switch transferEncodingMechanism(cte) {
+		case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
+		default:
+			return
+		}
+		var h message.Header
+		h.Set("Content-Transfer-Encoding", cte)
+		if _, err := message.New(h, strings.NewReader("")); message.IsUnknownEncoding(err) {
+			t.Errorf("transferEncodingMechanism(%q) = %q, but go-message: %v", cte, transferEncodingMechanism(cte), err)
+		}
+	})
+}
+
+func deref(s *string) string {
+	if s == nil {
+		return "<nil>"
+	}
+	return *s
 }

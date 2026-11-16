@@ -97,11 +97,13 @@ type UserConnectionInfo struct {
 
 // ConnectionTracker manages connection tracking using gossip protocol
 type ConnectionTracker struct {
-	name           string
+	name           string // the protocol: keys the gossip; the metrics use metricsProtocol
 	serverName     string
 	hostname       string
 	instanceID     string
 	clusterManager *cluster.Manager
+
+	metricsProtocol string // the protocol label of the tracker's metrics
 
 	// Connection tracking
 	connections map[int64]*UserConnectionInfo // accountID -> info
@@ -112,11 +114,15 @@ type ConnectionTracker struct {
 	node *nodeSessions
 
 	// Kick notifications
-	kickSessions   map[int64][]chan struct{} // accountID -> channels to notify
-	kickSessionsMu sync.RWMutex
+	kickSessions      map[int64][]chan struct{} // accountID -> channels to notify
+	kickSessionsMu    sync.RWMutex
+	sessionGeneration uint64 // guarded by kickSessionsMu; fences late authenticated registrations
 
-	// Cache invalidation (optional): the lookup cache of the server this tracker serves
+	// Cache invalidation (optional): the lookup cache of the server this tracker serves,
+	// and the node's persistent auth cache, which a proxy falls back on when the lookup
+	// cache misses
 	lookupCache LookupCacheInvalidator // Interface for invalidating auth/routing cache on kick or forgotten logins
+	authCache   AuthCacheInvalidator
 
 	// Configuration
 	maxConnectionsPerUser      int  // Cluster-wide limit per user (0 = unlimited)
@@ -164,11 +170,33 @@ type LookupCacheInvalidator interface {
 	InvalidateAccount(accountID int64)
 }
 
+// AuthCacheInvalidator drops an account from the node's persistent auth cache
+// (authcache.Cache), which the proxies answer a login from when their lookup cache
+// misses.
+type AuthCacheInvalidator interface {
+	InvalidateAccount(ctx context.Context, accountID int64) error
+}
+
+// authCacheInvalidateTimeout bounds dropping an account from the persistent auth cache,
+// which can run on the gossip receive path.
+const authCacheInvalidateTimeout = 2 * time.Second
+
 // NewConnectionTracker creates a new connection tracker.
 // If clusterMgr is provided, uses gossip protocol for cluster-wide tracking (for proxies).
 // If clusterMgr is nil, operates in local-only mode (for backend servers).
 // If snapshotOnly is true, only broadcasts periodic state snapshots (no individual register/unregister events).
 func NewConnectionTracker(name, serverName, hostname string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int, snapshotOnly bool) *ConnectionTracker {
+	return newConnectionTracker(name, metricsProtocol(name), serverName, hostname, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, snapshotOnly)
+}
+
+// NewProxyConnectionTracker is NewConnectionTracker for a proxy listener. The tracker
+// has the protocol's name like a backend's, which its gossip and the Admin API rely
+// on; its metrics are labelled with the proxy's server type ("imap_proxy", ...).
+func NewProxyConnectionTracker(name, serverName, hostname string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int, snapshotOnly bool) *ConnectionTracker {
+	return newConnectionTracker(name, metricsProtocol(name)+"_proxy", serverName, hostname, instanceID, clusterMgr, maxConnectionsPerUser, maxConnectionsPerUserPerIP, maxEventQueueSize, snapshotOnly)
+}
+
+func newConnectionTracker(name, metricsLabel, serverName, hostname string, instanceID string, clusterMgr *cluster.Manager, maxConnectionsPerUser int, maxConnectionsPerUserPerIP int, maxEventQueueSize int, snapshotOnly bool) *ConnectionTracker {
 	// Use default if not specified
 	if maxEventQueueSize <= 0 {
 		maxEventQueueSize = defaultMaxEventQueueSize
@@ -176,6 +204,7 @@ func NewConnectionTracker(name, serverName, hostname string, instanceID string, 
 
 	ct := &ConnectionTracker{
 		name:                       name,
+		metricsProtocol:            metricsLabel,
 		serverName:                 serverName,
 		hostname:                   hostname,
 		instanceID:                 instanceID,
@@ -233,6 +262,13 @@ func NewConnectionTracker(name, serverName, hostname string, instanceID string, 
 // This should be called after creating the tracker to enable cache invalidation.
 func (ct *ConnectionTracker) SetLookupCache(cache LookupCacheInvalidator) {
 	ct.lookupCache = cache
+}
+
+// SetAuthCache sets the node's persistent auth cache, so that a kick or forgotten logins
+// drop the account from it as well: otherwise the next login misses the lookup cache and
+// is answered from the auth cache, with the old password.
+func (ct *ConnectionTracker) SetAuthCache(cache AuthCacheInvalidator) {
+	ct.authCache = cache
 }
 
 // trackerType returns the name of the tracker for logging purposes.
@@ -388,8 +424,10 @@ func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientA
 	// Decrement connection count for this instance
 	clientIP := clientIPOf(clientAddr)
 
+	released := false
 	if perIPMap := info.PerIPCountByInstance[ct.instanceID]; perIPMap != nil {
 		if count := perIPMap[clientIP]; count > 0 {
+			released = true
 			if ct.node != nil {
 				ct.node.mu.Lock()
 				ct.node.add(accountID, clientIP, -1)
@@ -427,8 +465,11 @@ func (ct *ConnectionTracker) unregisterLocked(accountID int64, protocol, clientA
 		delete(ct.connections, accountID)
 	}
 
-	// Broadcast to cluster (only in cluster mode and if not snapshot-only mode)
-	if ct.clusterManager == nil || ct.snapshotOnly {
+	// Broadcast to cluster (only in cluster mode and if not snapshot-only mode),
+	// and only an unregister that released a connection this instance counted:
+	// peers count this instance's connections from its events, and one with no
+	// register behind it is held by every peer as a reordered decrement.
+	if ct.clusterManager == nil || ct.snapshotOnly || !released {
 		return nil
 	}
 
@@ -748,8 +789,17 @@ func (ct *ConnectionTracker) broadcastAccountEvent(eventType ConnectionEventType
 
 // forgetLogins drops the cached routing and auth entries that let the account
 // sign in: the one for the address given (a proxy keys it by the username the
-// client submitted) and every other one the account has.
+// client submitted) and every other one the account has. The persistent auth cache
+// goes first: a login between the two would otherwise miss the lookup cache, be
+// answered from the auth cache and fill the lookup cache again.
 func (ct *ConnectionTracker) forgetLogins(accountID int64, username string) {
+	if ct.authCache != nil && accountID != 0 {
+		ctx, cancel := context.WithTimeout(context.Background(), authCacheInvalidateTimeout)
+		if err := ct.authCache.InvalidateAccount(ctx, accountID); err != nil {
+			logger.Warn("Connection tracker: Failed to drop account from auth cache", "name", ct.name, "account_id", accountID, "error", err)
+		}
+		cancel()
+	}
 	if ct.lookupCache == nil {
 		return
 	}
@@ -767,9 +817,30 @@ func (ct *ConnectionTracker) forgetLogins(accountID int64, username string) {
 // from the kick it issued and from a peer's copy of the same event.
 func (ct *ConnectionTracker) applyKick(accountID int64, username string) int {
 	ct.forgetLogins(accountID, username)
+	return ct.closeSessions(accountID)
+}
 
+// EndLocalSessions closes this node's sessions of an account and reports how many there
+// were. It tells no peer and drops no cached login: it is for the credential-change poll
+// (credchanges.Watcher), which every node runs for itself and which drops every cache of
+// the node on its own. Safe on a nil tracker (a server without one has nothing to close).
+func (ct *ConnectionTracker) EndLocalSessions(accountID int64) int {
+	if ct == nil {
+		return 0
+	}
+	n := ct.closeSessions(accountID)
+	if n > 0 {
+		logger.Info("Connection tracker: Ended sessions of an account taken out of service", "tracker", ct.trackerType(), "name", ct.name,
+			"count", n, "account_id", accountID)
+	}
+	return n
+}
+
+// closeSessions closes the kick channel of every session this node holds for the account.
+func (ct *ConnectionTracker) closeSessions(accountID int64) int {
 	ct.kickSessionsMu.Lock()
 	defer ct.kickSessionsMu.Unlock()
+	ct.sessionGeneration++
 
 	sessions := ct.kickSessions[accountID]
 	for _, ch := range sessions {
@@ -1176,12 +1247,12 @@ func (ct *ConnectionTracker) cleanup() {
 			"users", cleanedUsers, "instance_ids", cleanedInstances, "ips", cleanedIPs)
 	}
 
-	metrics.ConnectionTrackerUsers.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalUsers))
-	metrics.ConnectionTrackerInstanceIDs.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalInstanceIDs))
-	metrics.ConnectionTrackerIPs.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(totalIPs))
+	metrics.ConnectionTrackerUsers.WithLabelValues(ct.metricsProtocol, ct.serverName, ct.hostname).Set(float64(totalUsers))
+	metrics.ConnectionTrackerInstanceIDs.WithLabelValues(ct.metricsProtocol, ct.serverName, ct.hostname).Set(float64(totalInstanceIDs))
+	metrics.ConnectionTrackerIPs.WithLabelValues(ct.metricsProtocol, ct.serverName, ct.hostname).Set(float64(totalIPs))
 
 	queueSize := ct.queue.numQueued() + ct.criticalQueue.numQueued() + ct.heartbeatQueue.numQueued()
-	metrics.ConnectionTrackerBroadcastQueue.WithLabelValues(ct.name, ct.serverName, ct.hostname).Set(float64(queueSize))
+	metrics.ConnectionTrackerBroadcastQueue.WithLabelValues(ct.metricsProtocol, ct.serverName, ct.hostname).Set(float64(queueSize))
 
 	// Log memory usage stats every 10 cleanup cycles (~10 minutes with 1m cleanup interval)
 	ct.cleanupCounter++
@@ -1472,4 +1543,57 @@ func decodeConnectionEvent(data []byte) (ConnectionEvent, error) {
 		return event, err
 	}
 	return event, nil
+}
+
+// EndAllLocalSessions is the fail-closed reset after a revocation-history gap.
+// It closes this node's registered sessions only, without gossip or database I/O.
+func (ct *ConnectionTracker) EndAllLocalSessions() int {
+	if ct == nil {
+		return 0
+	}
+	ct.kickSessionsMu.Lock()
+	ct.sessionGeneration++
+	n := 0
+	for accountID, sessions := range ct.kickSessions {
+		for _, ch := range sessions {
+			select {
+			case <-ch:
+			default:
+				close(ch)
+			}
+			n++
+		}
+		delete(ct.kickSessions, accountID)
+	}
+	ct.kickSessionsMu.Unlock()
+	return n
+}
+
+// SessionGeneration is captured before every credential verdict. A revocation
+// conservatively fences all in-flight authentications, using constant memory.
+func (ct *ConnectionTracker) SessionGeneration() uint64 {
+	if ct == nil {
+		return 0
+	}
+	ct.kickSessionsMu.RLock()
+	defer ct.kickSessionsMu.RUnlock()
+	return ct.sessionGeneration
+}
+
+// RegisterSessionIfGeneration is atomic with revocation. An authentication that
+// crossed a removal/kick/reset receives an already-closed channel, so the normal
+// termination poller closes it instead of registering after the revocation passed.
+func (ct *ConnectionTracker) RegisterSessionIfGeneration(accountID int64, generation uint64) <-chan struct{} {
+	if ct == nil {
+		return ct.RegisterSession(accountID)
+	}
+	ch := make(chan struct{})
+	ct.kickSessionsMu.Lock()
+	defer ct.kickSessionsMu.Unlock()
+	if generation != ct.sessionGeneration {
+		close(ch)
+		return ch
+	}
+	ct.kickSessions[accountID] = append(ct.kickSessions[accountID], ch)
+	return ch
 }

@@ -107,6 +107,7 @@ func TestIMAP_MaintenanceRefusesNewLogins(t *testing.T) {
 	}
 	eventuallyOpenDrainSessions(t, s.DrainSessions, 1, "logged in before maintenance")
 
+	logs := common.CaptureLogs(t)
 	server.MaintenanceGate.SetRefusing(true)
 	for _, l := range logins {
 		err := l.login(dial())
@@ -115,6 +116,9 @@ func TestIMAP_MaintenanceRefusesNewLogins(t *testing.T) {
 			t.Errorf("%s while refusing: %v, want NO [UNAVAILABLE]", l.name, err)
 		}
 	}
+	// The refusal is the login's result: the session's line names the account, which
+	// the session's own user field does not yet.
+	logs.WaitForLine(t, "login refused: this backend is in maintenance", "address="+account.Email, "session=")
 	eventuallyOpenDrainSessions(t, s.DrainSessions, 1, "after the refused logins")
 	if _, err := before.Select("INBOX", nil).Wait(); err != nil {
 		t.Fatalf("session logged in before maintenance: %v", err)

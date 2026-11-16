@@ -20,6 +20,12 @@ import (
 var _ imapserver.SessionThread = (*IMAPSession)(nil)
 
 func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, algorithm imap.ThreadAlgorithm, charset string, criteria *imap.SearchCriteria) ([]imap.ThreadData, error) {
+	// RFC 5256 §1: a server offers each threading algorithm as a capability
+	// "consisting of "THREAD=" followed by a supported threading algorithm name".
+	if err := s.requireCapability(imap.Cap("THREAD="+string(algorithm)), "THREAD "+string(algorithm)); err != nil {
+		return nil, err
+	}
+
 	// Reject pathologically complex/deep criteria before building a query.
 	if err := s.validateSearchCriteria("THREAD", criteria); err != nil {
 		return nil, err
@@ -33,6 +39,10 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 			return nil, err
 		}
 	}
+
+	// The client's numbering holds still until the results are numbered (seqViewMu).
+	s.seqViewMu.RLock()
+	defer s.seqViewMu.RUnlock()
 
 	acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx)
 	if !acquired {
@@ -49,7 +59,8 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	selectedMailboxOwnerID := s.selectedMailbox.AccountID
 	selectedMailboxName := s.selectedMailbox.Name
 	mailboxMessageCount := s.currentNumMessages.Load()
-	criteria = s.decodeSearchCriteriaLocked(criteria)
+	view := s.seqViewLocked()
+	criteria = s.decodeSearchCriteriaLocked(view, criteria)
 	release()
 
 	if s.useMasterDB.Load() {
@@ -67,7 +78,7 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	// destMailbox.AccountID, LMTP and delivery resolve the owner likewise). Passing the
 	// session account here would make every shared-mailbox body search return nothing.
 	withSeqNums := numKind == imapserver.NumKindSeq
-	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(ctx, selectedMailboxID, selectedMailboxOwnerID, criteria, includeSubject, withSeqNums, s.server.threadMaxMessages)
+	messages, err := s.server.rdb.GetMessagesForThreadingWithRetry(view.context(ctx), selectedMailboxID, selectedMailboxOwnerID, criteria, includeSubject, withSeqNums, s.server.threadMaxMessages)
 	if errors.Is(err, db.ErrThreadTooManyMessages) {
 		// RFC 5530 section 3, LIMIT: "The operation ran up against an
 		// implementation limit of some kind".
@@ -82,6 +93,10 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 	if err != nil {
 		s.ErrorLog("failed to fetch messages for threading", "err", err)
 		return nil, fmt.Errorf("failed to fetch messages for threading: %w", err)
+	}
+	if withSeqNums {
+		// Thread only the messages the client knows, by its numbers for them.
+		messages = encodeResults(view, messages, func(m *db.ThreadMessageResult) *uint32 { return &m.Seq })
 	}
 
 	// No messages match the search criteria.
@@ -108,6 +123,8 @@ func (s *IMAPSession) Thread(ctx context.Context, numKind imapserver.NumKind, al
 func (s *IMAPSession) threadOrderedSubject(numKind imapserver.NumKind, messages []db.ThreadMessageResult) []imap.ThreadData {
 	// 1. Sort messages by subject, then by sent date, then by mailbox order. UID
 	// order is sequence order, and UID is always set; Seq is 0 for UID THREAD.
+	// SubjectSort arrives in i;unicode-casemap form, so comparing its octets is
+	// that collation (RFC 5256 §7, RFC 5051 §2).
 	sort.Slice(messages, func(i, j int) bool {
 		if messages[i].SubjectSort != messages[j].SubjectSort {
 			return messages[i].SubjectSort < messages[j].SubjectSort

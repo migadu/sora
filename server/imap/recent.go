@@ -13,9 +13,34 @@ import (
 // the one SELECT counted the RECENT response from (recentAboveUID). go-imap
 // hands SEARCH RECENT, NEW and OLD to the session as \Recent flag criteria;
 // SEARCH, SORT, THREAD and multimailbox SEARCH turn those into that UID range
-// before the query is built, so they agree with the RECENT count.
+// before the query is built, so they agree with the RECENT count. The FLAGS of
+// every FETCH response add \Recent from the same threshold (withRecentFlag).
 
 const flagRecent imap.Flag = "\\Recent"
+
+// recentFlagAboveLocked returns the UID above which a message of the selected
+// mailbox has \Recent in this session's FETCH FLAGS: the threshold SEARCH
+// RECENT answers from, as "The only reliable way to identify recent messages
+// is to look at message flags to see which have the \Recent flag set, or to do
+// a SEARCH RECENT" (RFC 3501 §7.3.2). An IMAP4rev2 session, where the flag is
+// deprecated (RFC 9051 Appendix E item 12), gets math.MaxUint32, above which
+// there is no UID. The caller holds s.mutex.
+func (s *IMAPSession) recentFlagAboveLocked() imap.UID {
+	if s.conn != nil && s.conn.IsIMAP4rev2() {
+		return math.MaxUint32
+	}
+	return s.recentAboveUID
+}
+
+// withRecentFlag returns the stored flags of message uid with \Recent added
+// when uid is above recentAbove (recentFlagAboveLocked). flags itself is left
+// as it was.
+func withRecentFlag(flags []imap.Flag, uid, recentAbove imap.UID) []imap.Flag {
+	if uid <= recentAbove {
+		return flags
+	}
+	return append(slices.Clip(flags), flagRecent)
+}
 
 // withSessionRecent returns criteria with its \Recent keys answered for mailbox
 // mailboxID: from the session's threshold in the selected mailbox, and as no

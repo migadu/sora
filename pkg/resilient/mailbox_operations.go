@@ -8,6 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/config"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/retry"
@@ -67,6 +68,32 @@ func (rd *ResilientDatabase) GetOwnedMailboxIDByNameWithRetry(ctx context.Contex
 	return result.(int64), nil
 }
 
+// MailboxNameIsBelowWithRetry reports whether name is below mbox in its owner's
+// hierarchy, as the database resolves names. Which names are one mailbox is the
+// database's call, LOWER(name) under its collation, which no Go case mapping
+// matches (under ICU "İx" is not "ix", and "ας" is "ΑΣ"). lower() leaves the
+// hierarchy delimiters alone, so of the leading parts of name only the one with as
+// many levels as mbox's name can name mbox: that one is looked up, on the primary,
+// and the mailbox found compared with mbox.
+func (rd *ResilientDatabase) MailboxNameIsBelowWithRetry(ctx context.Context, name string, mbox *db.DBMailbox) (bool, error) {
+	delim := string(consts.MailboxDelimiter)
+	levels := strings.Count(mbox.Name, delim) + 1
+	parts := strings.Split(name, delim)
+	if len(parts) <= levels {
+		return false, nil
+	}
+	ctx = context.WithValue(ctx, consts.UseMasterDBKey, true)
+	id, err := rd.GetOwnedMailboxIDByNameWithRetry(ctx, mbox.AccountID, strings.Join(parts[:levels], delim))
+	switch {
+	case err == nil:
+		return id == mbox.ID, nil
+	case errors.Is(err, consts.ErrMailboxNotFound):
+		return false, nil
+	default:
+		return false, err
+	}
+}
+
 // HasLiveDescendantsWithRetry reports whether any live mailbox sits below the given path.
 func (rd *ResilientDatabase) HasLiveDescendantsWithRetry(ctx context.Context, accountID int64, path string) (bool, error) {
 	op := func(ctx context.Context) (any, error) {
@@ -85,6 +112,19 @@ func (rd *ResilientDatabase) IsMailboxSharedWithRetry(ctx context.Context, mailb
 		return rd.getOperationalDatabaseForOperation(ctx, false).IsMailboxShared(ctx, mailboxID)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return false, err
+	}
+	return result.(bool), nil
+}
+
+// RenameCrossesSharedBoundaryWithRetry reports whether renaming mbox to newName would
+// take it, or a live descendant, across the shared namespace boundary.
+func (rd *ResilientDatabase) RenameCrossesSharedBoundaryWithRetry(ctx context.Context, shared config.SharedMailboxesConfig, mbox *db.DBMailbox, newName string) (bool, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).RenameCrossesSharedBoundary(ctx, shared, mbox, newName)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
 		return false, err
 	}
@@ -202,6 +242,36 @@ func (rd *ResilientDatabase) GetMailboxSummaryWithRetry(ctx context.Context, mai
 	return result.(*db.MailboxSummary), nil
 }
 
+// InReadSnapshotWithRetry runs fn inside a single REPEATABLE READ READ ONLY transaction
+// on the read pool (or write pool when consts.UseMasterDBKey is set on ctx), retrying
+// the entire snapshot as a unit on transient database errors. Snapshot-aware read
+// helpers called with snapCtx reuse the open transaction directly. The callback
+// context is scoped to fn and must only be used with this ResilientDatabase.
+func (rd *ResilientDatabase) InReadSnapshotWithRetry(ctx context.Context, fn func(ctx context.Context) error) error {
+	op := func(opCtx context.Context) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(opCtx, false).InReadSnapshot(opCtx, fn)
+	}
+	_, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	return err
+}
+
+// OptionalReadInSnapshot runs fn inside a PostgreSQL SAVEPOINT when ctx carries an
+// active InReadSnapshot transaction. Statement errors that rolled back cleanly to the
+// savepoint are returned as nonFatalErr so the caller can log/fall back on the still-
+// healthy snapshot transaction; context cancellation/deadlines, savepoint failures,
+// retryable transient errors, and database/connection failures are returned as fatalErr
+// so InReadSnapshotWithRetry can retry or surface them through the query breaker.
+func (rd *ResilientDatabase) OptionalReadInSnapshot(ctx context.Context, fn func(ctx context.Context) error) (nonFatalErr error, fatalErr error) {
+	err := db.InReadSavepoint(ctx, fn)
+	if err == nil {
+		return nil, nil
+	}
+	if ctx.Err() != nil || errors.Is(err, db.ErrReadSnapshotAborted) || rd.isRetryableError(err) || isDatabaseFailure(err) {
+		return nil, err
+	}
+	return err, nil
+}
+
 func (rd *ResilientDatabase) GetFirstUnseenSeqNumWithRetry(ctx context.Context, mailboxID int64) (uint32, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).GetFirstUnseenSeqNum(ctx, mailboxID)
@@ -225,6 +295,17 @@ func (rd *ResilientDatabase) GetMailboxSummariesBatchWithRetry(ctx context.Conte
 		return map[int64]*db.MailboxSummary{}, nil
 	}
 	return result.(map[int64]*db.MailboxSummary), nil
+}
+
+func (rd *ResilientDatabase) CountDeletedMessagesWithRetry(ctx context.Context, mailboxIDs []int64) (map[int64]uint32, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).CountDeletedMessages(ctx, mailboxIDs)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.(map[int64]uint32), nil
 }
 
 func (rd *ResilientDatabase) GetMailboxesWithRetry(ctx context.Context, AccountID int64, subscribed bool) ([]*db.DBMailbox, error) {
@@ -418,6 +499,19 @@ func (rd *ResilientDatabase) RecomputeMailboxUnseenWithRetry(ctx context.Context
 // inside one. Intended to be called periodically by the cleanup worker.
 func (rd *ResilientDatabase) ReconcileNegativeMailboxStatsWithRetry(ctx context.Context) (int64, error) {
 	return rd.getOperationalDatabaseForOperation(ctx, true).ReconcileNegativeMailboxStats(ctx)
+}
+
+// FindExcessUnseenCountsWithRetry checks one batch of mailboxes for a cached unseen_count
+// above the live count (see db.FindExcessUnseenCounts).
+func (rd *ResilientDatabase) FindExcessUnseenCountsWithRetry(ctx context.Context, accountID, afterMailboxID int64, limit int) (db.UnseenExcessBatch, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).FindExcessUnseenCounts(ctx, accountID, afterMailboxID, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return db.UnseenExcessBatch{}, err
+	}
+	return result.(db.UnseenExcessBatch), nil
 }
 
 func (rd *ResilientDatabase) GetPrimaryEmailForAccountWithRetry(ctx context.Context, accountID int64) (server.Address, error) {
@@ -638,6 +732,34 @@ func (rd *ResilientDatabase) GetSubscribedMailboxNamesWithRetry(ctx context.Cont
 	return result.([]string), nil
 }
 
+// GetSubscribedMailboxNamesByKeyWithRetry returns every subscribed name for the
+// account keyed by LOWER(mailbox_name) as the database computes it.
+func (rd *ResilientDatabase) GetSubscribedMailboxNamesByKeyWithRetry(ctx context.Context, accountID int64) (map[string]string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetSubscribedMailboxNamesByKey(ctx, accountID)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	names, _ := result.(map[string]string)
+	return names, nil
+}
+
+// MailboxNameKeysWithRetry returns, in order, the key of each of names: LOWER(name)
+// as the database computes it (db.MailboxNameKeys).
+func (rd *ResilientDatabase) MailboxNameKeysWithRetry(ctx context.Context, names []string) ([]string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).MailboxNameKeys(ctx, names)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	keys, _ := result.([]string)
+	return keys, nil
+}
+
 // HasMailboxWithSpecialUseWithRetry reports whether the account already has a live
 // mailbox carrying the given special-use attribute (RFC 6154 §5 uniqueness check).
 func (rd *ResilientDatabase) HasMailboxWithSpecialUseWithRetry(ctx context.Context, accountID int64, attr string) (bool, error) {
@@ -649,6 +771,20 @@ func (rd *ResilientDatabase) HasMailboxWithSpecialUseWithRetry(ctx context.Conte
 		return false, err
 	}
 	return result.(bool), nil
+}
+
+// GetPersonalMailboxNameBySpecialUseWithRetry returns the name of the account's
+// personal mailbox carrying the RFC 6154 special-use attribute attr, or
+// consts.ErrMailboxNotFound if there is none.
+func (rd *ResilientDatabase) GetPersonalMailboxNameBySpecialUseWithRetry(ctx context.Context, accountID int64, attr string) (string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetPersonalMailboxNameBySpecialUse(ctx, accountID, attr)
+	}
+	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op, consts.ErrMailboxNotFound)
+	if err != nil {
+		return "", err
+	}
+	return result.(string), nil
 }
 
 func (rd *ResilientDatabase) CountMessagesGreaterThanUIDWithRetry(ctx context.Context, mailboxID int64, minUID imap.UID) (uint32, error) {

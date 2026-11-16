@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -139,6 +140,34 @@ func TestRetentionPurgeWarnsPerDeletedMessage(t *testing.T) {
 		"That file was the only copy of a message the server accepted with 250 and forwarded nowhere. "+
 		"Deleting it at info level leaves no record an operator would notice.",
 		capture.warnLines())
+}
+
+// TestWorkerKeepsFailedMessagesWithoutRetention: failed_retention = "0" disables the
+// retention purge, as GetFailedRetention and CleanupOldFailedMessages document, but
+// NewWorker replaced any retention of 0 or less with 168h, so failed messages were
+// deleted after 7 days anyway (#643). For a Sieve redirect without :copy that file is
+// the only copy of the mail. A negative retention (refused by config validation) must
+// not delete anything either: measured against it, every failed message is overdue.
+func TestWorkerKeepsFailedMessagesWithoutRetention(t *testing.T) {
+	for _, retention := range []time.Duration{0, -time.Hour} {
+		t.Run(retention.String(), func(t *testing.T) {
+			queue, err := NewDiskQueue(t.TempDir(), 10, nil)
+			if err != nil {
+				t.Fatalf("Failed to create queue: %v", err)
+			}
+			id := failMessage(t, queue, "forwardee@example.com", "550 5.1.1 recipient rejected")
+			ageFailedMessage(t, queue, id, time.Now().Add(-8*24*time.Hour))
+
+			worker := NewWorker(queue, &mockRelayHandler{}, time.Minute, 10, 1, time.Hour, retention, nil)
+			worker.runCleanup()
+
+			for _, name := range []string{id + ".json", id + ".msg"} {
+				if _, err := os.Stat(filepath.Join(queue.failedDir, name)); err != nil {
+					t.Errorf("failed/%s with failed_retention %v: %v; the cleanup deleted the only copy of the message", name, retention, err)
+				}
+			}
+		})
+	}
 }
 
 // TestQueueDepthMetricsRefreshWithoutTraffic covers the alerting path. The failed

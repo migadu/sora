@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/emersion/go-message"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/helpers"
 	"github.com/stretchr/testify/assert"
@@ -43,11 +44,15 @@ func TestHeaderSearchMatchesEveryAddress(t *testing.T) {
 	base := time.Now().UnixNano()
 	opts := func(n int, recipients []helpers.Recipient) *InsertMessageOptions {
 		hash := fmt.Sprintf("everyaddr-%d-%d", base, n)
+		h := message.HeaderFromMap(map[string][]string{"Subject": {"test"}})
+		for _, r := range recipients {
+			h.Set(r.AddressType, r.EmailAddress)
+		}
 		return &InsertMessageOptions{
 			AccountID: accountID, MailboxID: inboxID, MailboxName: "INBOX",
 			S3Domain: "example.com", S3Localpart: "everyaddr", ContentHash: hash,
 			MessageID: fmt.Sprintf("<%s@example.com>", hash), InternalDate: time.Now(), SentDate: time.Now(),
-			Size: 100, Subject: fmt.Sprintf("message %d", n), BodyStructure: &bs, Recipients: recipients,
+			Size: 100, Subject: fmt.Sprintf("message %d", n), BodyStructure: &bs, Recipients: recipients, HeaderPresence: helpers.ExtractHeaderPresence(h),
 		}
 	}
 
@@ -85,7 +90,7 @@ func TestHeaderSearchMatchesEveryAddress(t *testing.T) {
 		return uids
 	}
 	header := func(key, value string) *imap.SearchCriteria {
-		return &imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: value}}}
+		return &imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: value, IsHeader: true}}}
 	}
 
 	cases := []struct {
@@ -232,7 +237,7 @@ func TestHeaderSearchOnRowsWithoutExtraAddresses(t *testing.T) {
 		return uids
 	}
 	header := func(key, value string) imap.SearchCriteria {
-		return imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: value}}}
+		return imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: value, IsHeader: true}}}
 	}
 
 	both := []imap.UID{1, 2}
@@ -241,11 +246,11 @@ func TestHeaderSearchOnRowsWithoutExtraAddresses(t *testing.T) {
 		assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{header(key, "nobody")}}), "NOT %s on rows without extra_addresses", key)
 	}
 	assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{{Text: []string{"nobody"}}}}), "NOT TEXT on rows without extra_addresses")
-	// The empty term tests header presence on these rows too: both have a From and a To,
-	// neither has a Cc (cc_email_sort '' and no extra_addresses at all).
+	// NULL presence explicitly retains the old predicate: even an absent Cc
+	// matches an empty term. No historical/lazy backfill is performed.
 	for _, key := range []string{"From", "To"} {
 		assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Header: header(key, "").Header}), `HEADER %s "" on rows without extra_addresses`, key)
 	}
-	assert.Empty(t, search(&imap.SearchCriteria{Header: header("Cc", "").Header}), `HEADER Cc "" on rows without extra_addresses`)
-	assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{header("Cc", "")}}), `NOT HEADER Cc "" on rows without extra_addresses`)
+	assert.ElementsMatch(t, both, search(&imap.SearchCriteria{Header: header("Cc", "").Header}), `legacy CC "" retains historical false positive`)
+	assert.Empty(t, search(&imap.SearchCriteria{Not: []imap.SearchCriteria{header("Cc", "")}}), `legacy NOT CC "" retains historical complement`)
 }

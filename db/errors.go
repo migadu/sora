@@ -45,6 +45,13 @@ var (
 	// Connection errors
 	ErrFailedToConnect = errors.New("failed to connect to database")
 
+	// ErrConnectionClosed indicates the database ended the session a statement ran
+	// on: PostgreSQL shutting down under it, a pooler in front of it (PgBouncer)
+	// dropping the client because the server connection under it failed, or a
+	// pooled connection that the database side (or a relay in front of it) closed,
+	// which pgx then reports as closed.
+	ErrConnectionClosed = errors.New("database connection closed")
+
 	// ErrDBLockTimeout indicates a statement was canceled because it waited longer
 	// than lock_timeout for a row lock (PostgreSQL SQLSTATE 55P03). This is a
 	// transient contention condition, not a fault: the caller should back off and
@@ -64,14 +71,23 @@ func ClassifyDBError(err error) error {
 		return nil
 	}
 
-	// Prefer the SQLSTATE code when a structured pgx error is available: it is
-	// language/version independent, unlike the human-readable message text.
+	// Prefer the structured fields when the server sent the error: the SQLSTATE code
+	// and the unlocalized severity are language/version independent, unlike the
+	// human-readable message text.
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) {
-		switch pgErr.Code {
-		case "55P03": // lock_not_available — lock_timeout elapsed
+		switch {
+		case endsSession(pgErr):
+			return errors.Join(ErrConnectionClosed, err)
+		case pgErr.Code == "55P03": // lock_not_available — lock_timeout elapsed
 			return errors.Join(ErrDBLockTimeout, err)
 		}
+	}
+
+	// pgx closes a connection once its socket fails or the server ends the session,
+	// and a statement on it then fails with pgconn.ErrConnClosed ("conn closed").
+	if errors.Is(err, pgconn.ErrConnClosed) {
+		return errors.Join(ErrConnectionClosed, err)
 	}
 
 	msg := err.Error()
@@ -96,4 +112,23 @@ func ClassifyDBError(err error) error {
 	}
 
 	return err
+}
+
+// endsSession reports whether a server error ended the session it arrived on. The
+// severity decides: FATAL "Reports an error that caused the current session to abort"
+// and PANIC "Reports an error that caused all database sessions to abort" (PostgreSQL
+// documentation, "Message Severity Levels"), and pgx closes the connection on a FATAL
+// (pgconn's default OnPgError). That is PostgreSQL shutting down under the statement
+// or terminating its backend (57P01), and PgBouncer ending its client's session when
+// the server connection under it fails or cannot be made, which it reports as FATAL
+// 08P01. The code cannot decide: PostgreSQL also sends 08P01 at ERROR for a malformed
+// protocol message, after which the session goes on.
+func endsSession(pgErr *pgconn.PgError) bool {
+	// V is the S field never localized (PostgreSQL 9.6 and later); PgBouncer sends
+	// only S.
+	severity := pgErr.SeverityUnlocalized
+	if severity == "" {
+		severity = pgErr.Severity
+	}
+	return severity == "FATAL" || severity == "PANIC"
 }
