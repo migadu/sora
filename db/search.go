@@ -804,9 +804,20 @@ func substringCond(expr, placeholder string) string {
 // brackets and possibly several IDs, is a substring of it (RFC 3501 §6.4.4). An empty
 // column (the header was absent) yields NULL, which matches nothing; an empty term
 // then tests for the header's presence, as RFC 9051 §6.4.4 describes.
+//
+// An id may open with a quoted string holding spaces (helpers.SplitMessageIDs, whose
+// rule this is), so a column containing a quote is split with msgIDListTokenRE
+// instead; no other column pays for the regex.
 func msgIDListExpr(column string) string {
-	return fmt.Sprintf(`'<' || replace(LOWER(NULLIF(%s, '')), ' ', '> <') || '>'`, column)
+	return fmt.Sprintf(`CASE WHEN strpos(%[1]s, '"') > 0 `+
+		`THEN '<' || array_to_string(ARRAY(SELECT t.m[1] FROM regexp_matches(LOWER(%[1]s), '%[2]s', 'g') WITH ORDINALITY AS t(m, n) ORDER BY t.n), '> <') || '>' `+
+		`ELSE '<' || replace(LOWER(NULLIF(%[1]s, '')), ' ', '> <') || '>' END`, column, msgIDListTokenRE)
 }
+
+// msgIDListTokenRE matches one id of a space-joined list: a quoted string with the
+// rest of the id, or a run of non-spaces. An RE with alternation takes the longest
+// match, so a quote that never closes is an ordinary character, as in Go.
+const msgIDListTokenRE = `"(?:[^"\\]|\\.)*"[^ ]*|[^ ]+`
 
 // messageIDFieldExpr brackets the normalized ID stored by go-message's Header.MessageID.
 // The current ingress parser cannot return an ID beginning with '<'; synthetic IDs

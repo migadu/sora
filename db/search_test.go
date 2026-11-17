@@ -101,7 +101,7 @@ func TestBuildSearchHeaderConditions(t *testing.T) {
 		{
 			name:        "References maps to the references column",
 			header:      imap.SearchCriteriaHeaderField{Key: "References", Value: "<parent@example.com>"},
-			wantContain: `strpos('<' || replace(LOWER(NULLIF(m."references", '')), ' ', '> <') || '>', @`,
+			wantContain: `strpos(CASE WHEN strpos(m."references", '"') > 0`,
 		},
 		{
 			name:        "non-indexed header matches nothing",

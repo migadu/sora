@@ -27,11 +27,10 @@ func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 	// "". A synthetic ID is not the header; passed on, it came out in doubled brackets.
 	envelope.MessageID = headerMessageID(msg.MessageID)
 
-	// Split the In-Reply-To header into individual message IDs
-	if msg.InReplyTo != "" {
-		envelope.InReplyTo = strings.Split(msg.InReplyTo, " ")
-	} else {
-		envelope.InReplyTo = nil
+	// Split the In-Reply-To header into individual message IDs; a quoted local part
+	// may hold a space (helpers.SplitMessageIDs).
+	if ids := helpers.SplitMessageIDs(msg.InReplyTo); len(ids) > 0 {
+		envelope.InReplyTo = ids
 	}
 
 	var recipients []helpers.Recipient

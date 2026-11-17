@@ -49,3 +49,46 @@ func TrimReferences(ids []string, maxBytes int) string {
 	}
 	return strings.Join(kept[tail(maxBytes):], " ")
 }
+
+// SplitMessageIDs splits a stored message_id, in_reply_to or "references" value into
+// its ids. The columns join ids with single ASCII spaces, and that space is the only
+// separator: go-message keeps the quoting an obsolete local part needs (RFC 5322
+// §3.6.4 obs-id-left), so a quoted string opening an id may hold spaces
+// (`"foo bar"@example.com`), and an id may hold '<', '>' or '"' in a domain literal
+// and any non-ASCII rune, NBSP included, outside quotes. A quote that never closes is
+// an ordinary character. db.msgIDListExpr is the same rule in SQL; keep the two in
+// step.
+func SplitMessageIDs(s string) []string {
+	ids := []string{}
+	for i := 0; i < len(s); {
+		if s[i] == ' ' {
+			i++
+			continue
+		}
+		start := i
+		if s[i] == '"' {
+			if end := quotedStringEnd(s, i); end > 0 {
+				i = end
+			}
+		}
+		for i < len(s) && s[i] != ' ' {
+			i++
+		}
+		ids = append(ids, s[start:i])
+	}
+	return ids
+}
+
+// quotedStringEnd returns the index just past the quoted string opening at s[i], or 0
+// when the quote never closes. A backslash quotes the next byte (RFC 5322 §3.2.1).
+func quotedStringEnd(s string, i int) int {
+	for j := i + 1; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			j++
+		case '"':
+			return j + 1
+		}
+	}
+	return 0
+}
