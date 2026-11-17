@@ -6,6 +6,7 @@ import (
 	"io"
 	"strings"
 	"testing"
+	"testing/iotest"
 
 	"github.com/emersion/go-message"
 	"github.com/migadu/sora/server/sieveengine"
@@ -120,6 +121,9 @@ func TestVacationMIMEMalformedDoesNotSendOrConsumePeriod(t *testing.T) {
 		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: text/plain; charset=x-unknown\r\nContent-Transfer-Encoding: base64\r\n\r\n!notbase64!\r\n--b--\r\n",
 		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Description: a\x00b\r\n\r\nbody\r\n--b--\r\n",
 		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nX-Description: caf\xc3\xa9\r\n\r\nbody\r\n--b--\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b--junk\r\n",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b--junk",
+		"Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: multipart/alternative; boundary=c\r\n\r\n--c\r\n\r\nAway\r\n--c--junk\r\n--b--\r\n",
 	} {
 		t.Run(reason, func(t *testing.T) {
 			q := &captureRelayQueue{}
@@ -253,5 +257,48 @@ func TestVacationMIMEEncapsulatedMessageValidation(t *testing.T) {
 		if err := writeVacationMIME(&wire, message.Header{}, reason); err == nil {
 			t.Errorf("message/rfc822 accepted forbidden %s encoding", encoding)
 		}
+	}
+}
+
+func TestVacationMIMEMultipartDelimiterFraming(t *testing.T) {
+	for _, tc := range []struct {
+		name, reason string
+		valid        bool
+	}{
+		{"close delimiter CRLF", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b--\r\n", true},
+		{"close delimiter transport padding CRLF", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b \t\r\n\r\nAway\r\n--b-- \t\r\nepilogue\r\n", true},
+		{"close delimiter at EOF", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b--", true},
+		{"close delimiter transport padding at EOF", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b-- \t", true},
+		{"nested inner boundary with outer prefix", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: multipart/alternative; boundary=b-inner\r\n\r\n--b-inner\r\n\r\nAway\r\n--b-inner\r\nContent-Type: text/html\r\n\r\n<p>Away</p>\r\n--b-inner--\r\n--b--\r\n", true},
+		{"nested inner close delimiter without trailing CRLF before outer close", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: multipart/alternative; boundary=b-inner\r\n\r\n--b-inner\r\n\r\nAway\r\n--b-inner--\r\n--b--", true},
+		{"epilogue line starting with close delimiter after valid close", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b--\r\n--b--epilogue\r\n", true},
+		{"binary child payload with bare LF pseudo-boundary and long run", "Content-Type: multipart/mixed; boundary=b\r\nContent-Transfer-Encoding: binary\r\n\r\n--b\r\nContent-Transfer-Encoding: binary\r\n\r\n" + strings.Repeat("\xff", 8192) + "\n--b--junk\r\n\r\n--b--\r\n", true},
+
+		{"close delimiter trailing junk CRLF", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b--junk\r\n", false},
+		{"close delimiter trailing junk at EOF", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b--junk", false},
+		{"close delimiter LWSP then junk", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b-- \tjunk\r\n", false},
+		{"close delimiter extra hyphen", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b---\r\n", false},
+		{"empty part followed by close delimiter junk", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\n--b--junk\r\n", false},
+		{"nested close delimiter trailing junk CRLF", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: multipart/alternative; boundary=b-inner\r\n\r\n--b-inner\r\n\r\nAway\r\n--b-inner--junk\r\n--b--\r\n", false},
+		{"nested close delimiter trailing junk before outer boundary", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\nContent-Type: multipart/alternative; boundary=b-inner\r\n\r\n--b-inner\r\n\r\nAway\r\n--b-inner--junk\r\n--b--", false},
+		{"encapsulated message multipart close delimiter junk", "Content-Type: message/rfc822\r\n\r\nSubject: Away\r\nContent-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b--junk\r\n", false},
+		{"malformed opening boundary skipped as preamble", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b junk\r\n\r\nDropped\r\n--b\r\n\r\nAway\r\n--b--\r\n", false},
+		{"binary multipart bare LF delimiter", "Content-Type: multipart/mixed; boundary=b\r\nContent-Transfer-Encoding: binary\r\n\r\n--b\nContent-Transfer-Encoding: binary\r\n\r\nAway\n--b--\n", false},
+		{"binary multipart bare LF before initial delimiter", "Content-Type: multipart/mixed; boundary=b\r\nContent-Transfer-Encoding: binary\r\n\r\npreamble\n--b\r\nContent-Transfer-Encoding: binary\r\n\r\nAway\r\n--b--\r\n", false},
+		{"binary multipart bare LF on close delimiter", "Content-Type: multipart/mixed; boundary=b\r\nContent-Transfer-Encoding: binary\r\n\r\n--b\r\nContent-Transfer-Encoding: binary\r\n\r\nAway\r\n--b--\n", false},
+		{"binary multipart bare CR on close delimiter", "Content-Type: multipart/mixed; boundary=b\r\nContent-Transfer-Encoding: binary\r\n\r\n--b\r\nContent-Transfer-Encoding: binary\r\n\r\nAway\r\n--b--\r", false},
+		{"missing close delimiter", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n", false},
+		{"incomplete close delimiter single dash", "Content-Type: multipart/mixed; boundary=b\r\n\r\n--b\r\n\r\nAway\r\n--b-", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertVacationMIMEWire(t, tc.reason, tc.valid)
+			header, body, err := readVacationMIMEHeader(iotest.OneByteReader(strings.NewReader(tc.reason)))
+			if err == nil {
+				err = validateVacationMIME(message.Header{Header: header}, iotest.OneByteReader(body), "text/plain", 0)
+			}
+			if (err == nil) != tc.valid {
+				t.Fatalf("bytewise valid=%v: err=%v", tc.valid, err)
+			}
+		})
 	}
 }
