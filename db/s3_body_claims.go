@@ -85,7 +85,7 @@ func sourceBodyClaims(ctx context.Context, tx pgx.Tx, mailboxID, destMailboxID, 
 		return nil, err
 	}
 	// A MOVE within one mailbox retains its existing account/S3 identities.
-	if cross && mailboxID != destMailboxID {
+	if mailboxID != destMailboxID && (cross || len(destObjects) > 0) {
 		bodies := make(map[string]struct{}, min(len(hashes)+len(destObjects), MaxCrossAccountBodies+1))
 		for _, list := range [][]string{hashes, destObjects} {
 			for _, hash := range list {

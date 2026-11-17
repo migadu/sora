@@ -248,6 +248,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		headerPresence = helpers.ExtractHeaderPresence(messageContent.Header)
 		messageIDRaw = helpers.ExtractMessageIDRaw(messageContent.Header, messageID)
 	} else {
+		headerPresence = helpers.ExtractRawHeaderPresence(fullMessageBytes)
 		messageIDRaw = helpers.ExtractRawMessageIDFromBytes(fullMessageBytes)
 	}
 

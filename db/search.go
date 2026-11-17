@@ -249,7 +249,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		// turning a name no message can have into Message-ID or In-Reply-To.
 		lowerKey := lowerASCII(header.Key)
 		if header.Value == "" {
-			if bit, supported := helpers.HeaderPresenceBit(lowerKey); supported && header.IsHeader {
+			// RFC 9051 §6.4.4 / §7.5.2: an absent Subject: header makes the ENVELOPE
+			// SUBJECT member NIL, whereas a present Subject: (even empty) is a string.
+			// SUBJECT "" (IsHeader == false) therefore shares Subject: header presence.
+			if bit, supported := helpers.HeaderPresenceBit(lowerKey); supported && (header.IsHeader || lowerKey == "subject") {
 				param := nextParam()
 				args[param] = ""
 				old := emptyHeaderLegacyCond(datePrefix, lowerKey, "@"+param)

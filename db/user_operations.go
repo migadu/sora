@@ -448,9 +448,9 @@ func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accou
 // one that is merely pending two-phase cleanup, rather than misreporting it as an orphan.
 func (db *Database) GetMessagesByContentHash(ctx context.Context, accountID int64, contentHash string) ([]MessageHashInfo, error) {
 	query := `
-		SELECT m.id, m.uid, mb.name as mailbox_path, m.subject, m.uploaded, m.content_hash, (m.expunged_at IS NOT NULL) AS expunged
+		SELECT m.id, m.uid, COALESCE(mb.name, m.mailbox_path, '') as mailbox_path, m.subject, m.uploaded, m.content_hash, (m.expunged_at IS NOT NULL) AS expunged
 		FROM messages m
-		JOIN mailboxes mb ON m.mailbox_id = mb.id
+		LEFT JOIN mailboxes mb ON m.mailbox_id = mb.id
 		WHERE m.account_id = $1 AND m.content_hash = $2
 		ORDER BY m.id
 	`
@@ -615,20 +615,28 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		return err
 	}
 
-	var currentFlags int
+	var currentFlagsPtr *int
 	var currentCustomFlags []byte
 	err = tx.QueryRow(ctx, `
 		SELECT ms.flags, ms.custom_flags
 		FROM messages m
 		JOIN mailboxes mb ON mb.id = m.mailbox_id
-		JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
 		WHERE m.id = $1 AND m.account_id = $2 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
-	`, messageID, ownerID).Scan(&currentFlags, &currentCustomFlags)
+	`, messageID, ownerID).Scan(&currentFlagsPtr, &currentCustomFlags)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return consts.ErrDBNotFound
 	}
 	if err != nil {
 		return fmt.Errorf("failed to get current flags: %w", err)
+	}
+	var currentFlags int
+	if currentFlagsPtr != nil {
+		currentFlags = *currentFlagsPtr
+	} else {
+		if err := db.ensureMessageStateForLockedMailbox(ctx, tx, mailboxID, []int64{messageID}); err != nil {
+			return err
+		}
 	}
 
 	var customFlags []string

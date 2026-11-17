@@ -15,7 +15,9 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 // Crash without sql.DB.Close: committed data is deliberately left in WAL, not
@@ -327,4 +329,260 @@ func TestExporterDryRunFailureDoesNotLeakDescriptors(t *testing.T) {
 		attempt()
 	}
 	require.Equal(t, before, countExportSnapshotFDs(), "failed private reads must close connections, pipes and directory descriptors")
+}
+
+func TestExporterDryRunSnapshotTempDirPathShapes(t *testing.T) {
+	newSource := func(t *testing.T) string {
+		t.Helper()
+		dir := filepath.Join(t.TempDir(), "maildir")
+		require.NoError(t, os.MkdirAll(filepath.Join(dir, "cur"), 0700))
+		require.NoError(t, os.WriteFile(filepath.Join(dir, "cur", "seed.eml"), []byte("body"), 0600))
+		d, err := sql.Open("sqlite", filepath.Join(dir, maildirCacheName))
+		require.NoError(t, err)
+		_, err = d.Exec(`CREATE TABLE messages(hash TEXT,mailbox TEXT,filename TEXT); INSERT INTO messages VALUES('seed','INBOX','seed.eml')`)
+		require.NoError(t, err)
+		require.NoError(t, d.Close())
+		return dir
+	}
+
+	t.Run("relative dot TMPDIR", func(t *testing.T) {
+		source := newSource(t)
+		work := t.TempDir()
+		t.Chdir(work)
+		t.Setenv("TMPDIR", ".")
+
+		e, err := NewExporter(context.Background(), source, "dryrun@example.com", 1, nil, nil, ExporterOptions{DryRun: true})
+		require.NoError(t, err)
+		exists, name, err := e.isMessageExported("seed", "INBOX")
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, "seed.eml", name)
+		require.NoError(t, e.Close())
+		assert.Empty(t, dirNames(t, work))
+	})
+
+	t.Run("relative subdirectory TMPDIR", func(t *testing.T) {
+		source := newSource(t)
+		work := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(work, "tmp"), 0700))
+		t.Chdir(work)
+		t.Setenv("TMPDIR", "tmp")
+
+		e, err := NewExporter(context.Background(), source, "dryrun@example.com", 1, nil, nil, ExporterOptions{DryRun: true})
+		require.NoError(t, err)
+		exists, name, err := e.isMessageExported("seed", "INBOX")
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, "seed.eml", name)
+		require.NoError(t, e.Close())
+		assert.Empty(t, dirNames(t, filepath.Join(work, "tmp")))
+	})
+
+	t.Run("relative localhost TMPDIR", func(t *testing.T) {
+		source := newSource(t)
+		work := t.TempDir()
+		require.NoError(t, os.Mkdir(filepath.Join(work, "localhost"), 0700))
+		t.Chdir(work)
+		t.Setenv("TMPDIR", "localhost")
+
+		e, err := NewExporter(context.Background(), source, "dryrun@example.com", 1, nil, nil, ExporterOptions{DryRun: true})
+		require.NoError(t, err)
+		exists, name, err := e.isMessageExported("seed", "INBOX")
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, "seed.eml", name)
+		require.NoError(t, e.Close())
+		assert.Empty(t, dirNames(t, filepath.Join(work, "localhost")))
+	})
+
+	t.Run("URI special characters and symlinked TMPDIR", func(t *testing.T) {
+		source := newSource(t)
+		root := t.TempDir()
+		realTmp := filepath.Join(root, "tmp?a#b%25c")
+		require.NoError(t, os.Mkdir(realTmp, 0700))
+		linkTmp := filepath.Join(root, "tmp-link")
+		require.NoError(t, os.Symlink(realTmp, linkTmp))
+		t.Setenv("TMPDIR", linkTmp)
+
+		e, err := NewExporter(context.Background(), source, "dryrun@example.com", 1, nil, nil, ExporterOptions{DryRun: true})
+		require.NoError(t, err)
+		exists, name, err := e.isMessageExported("seed", "INBOX")
+		require.NoError(t, err)
+		assert.True(t, exists)
+		assert.Equal(t, "seed.eml", name)
+		require.NoError(t, e.Close())
+		assert.Empty(t, dirNames(t, realTmp))
+	})
+}
+
+func TestExporterDryRunRefusesUnsafeTempDir(t *testing.T) {
+	cases := []struct {
+		name                string
+		tmpMode, parentMode os.FileMode
+		otherOwner          bool
+		protected           bool
+		refused             bool
+	}{
+		{"others can write in TMPDIR (unprotected)", 0777, 0700, false, false, true},
+		{"others can write in TMPDIR (protected)", 0777, 0700, false, true, true},
+		{"group can write in TMPDIR", 0770, 0700, false, true, true},
+		{"others can write above TMPDIR", 0700, 0777, false, true, true},
+		{"TMPDIR belongs to another user", 0700, 0700, true, true, true},
+		{"others can write in TMPDIR with sticky bit", 0777 | os.ModeSticky, 0700, false, false, false},
+		{"others can write in TMPDIR with sticky bit and protected hard links", 0777 | os.ModeSticky, 0700, false, true, false},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			realProtection := hardLinksProtected
+			t.Cleanup(func() { hardLinksProtected = realProtection })
+			hardLinksProtected = func() bool { return c.protected }
+
+			source := t.TempDir()
+			d, err := sql.Open("sqlite", filepath.Join(source, maildirCacheName))
+			require.NoError(t, err)
+			_, err = d.Exec(`CREATE TABLE messages(hash TEXT,mailbox TEXT,filename TEXT); INSERT INTO messages VALUES('seed','INBOX','seed.eml')`)
+			require.NoError(t, err)
+			require.NoError(t, d.Close())
+
+			parent := t.TempDir()
+			tmpDir := filepath.Join(parent, "tmp")
+			require.NoError(t, os.Mkdir(tmpDir, 0700))
+			require.NoError(t, os.Chmod(tmpDir, c.tmpMode))
+			require.NoError(t, os.Chmod(parent, c.parentMode))
+			if c.otherOwner {
+				realGeteuid := geteuid
+				t.Cleanup(func() { geteuid = realGeteuid })
+				geteuid = func() int { return os.Geteuid() + 1 }
+			}
+			t.Setenv("TMPDIR", tmpDir)
+
+			e, err := NewExporter(context.Background(), source, "dryrun@example.com", 1, nil, nil, ExporterOptions{DryRun: true})
+			if e != nil {
+				require.NoError(t, e.Close())
+			}
+			if !c.refused {
+				require.NoError(t, err)
+				assert.Empty(t, dirNames(t, tmpDir))
+				return
+			}
+			require.Error(t, err)
+			assert.ErrorContains(t, err, "TMPDIR")
+			assert.Empty(t, dirNames(t, tmpDir), "refused dry-run must not create or leave entries in unsafe TMPDIR")
+		})
+	}
+}
+
+func TestExporterDryRunConfinesPrivateTempDirAgainstSwapAndCleanup(t *testing.T) {
+	newSource := func(t *testing.T) string {
+		t.Helper()
+		dir := t.TempDir()
+		d, err := sql.Open("sqlite", filepath.Join(dir, maildirCacheName))
+		require.NoError(t, err)
+		_, err = d.Exec(`CREATE TABLE messages(hash TEXT,mailbox TEXT,filename TEXT); INSERT INTO messages VALUES('seed','INBOX','seed.eml')`)
+		require.NoError(t, err)
+		require.NoError(t, d.Close())
+		return dir
+	}
+
+	t.Run("symlink swap at creation in sticky TMPDIR", func(t *testing.T) {
+		source := newSource(t)
+		tmpDir := sharedTempDir(t)
+		precious := t.TempDir()
+		require.NoError(t, os.WriteFile(filepath.Join(precious, "keep"), []byte("precious"), 0600))
+
+		realMkdirTemp := mkdirTemp
+		t.Cleanup(func() { mkdirTemp = realMkdirTemp })
+		mkdirTemp = func(dir, pattern string) (string, error) {
+			name, err := realMkdirTemp(dir, pattern)
+			if err == nil {
+				require.NoError(t, os.Rename(name, name+".moved"))
+				require.NoError(t, os.Symlink(precious, name))
+			}
+			return name, err
+		}
+
+		e, err := NewExporter(context.Background(), source, "dryrun@example.com", 1, nil, nil, ExporterOptions{DryRun: true})
+		if e != nil {
+			_ = e.Close()
+		}
+		require.Error(t, err, "must refuse private preview directory replaced by a symlink")
+		assert.Equal(t, []string{"keep"}, dirNames(t, precious), "must not write snapshot into or delete symlink target")
+		_ = tmpDir
+	})
+
+	t.Run("directory replacement before Close preserves replacement contents", func(t *testing.T) {
+		source := newSource(t)
+		sharedTempDir(t)
+
+		e, err := NewExporter(context.Background(), source, "dryrun@example.com", 1, nil, nil, ExporterOptions{DryRun: true})
+		require.NoError(t, err)
+		private := e.privateCacheDir
+		require.NotEmpty(t, private)
+
+		replacement := filepath.Join(t.TempDir(), "replacement")
+		require.NoError(t, os.Mkdir(replacement, 0700))
+		require.NoError(t, os.WriteFile(filepath.Join(replacement, "keep"), []byte("other user's file"), 0600))
+		require.NoError(t, os.WriteFile(filepath.Join(replacement, maildirCacheName), []byte("other user's db"), 0600))
+
+		moved := private + ".moved"
+		require.NoError(t, os.Rename(private, moved))
+		t.Cleanup(func() { _ = os.RemoveAll(moved); _ = os.RemoveAll(private) })
+		require.NoError(t, os.Rename(replacement, private))
+
+		require.NoError(t, e.Close())
+		assert.ElementsMatch(t, []string{"keep", maildirCacheName}, dirNames(t, private),
+			"Close must not remove files from a directory renamed onto privateCacheDir")
+		assert.Empty(t, dirNames(t, moved), "Close must unlink its own snapshot files via the held directory descriptor")
+	})
+}
+
+func TestOpenExportSnapshotSourceClearsNonblockAndRejectsFIFO(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, maildirCacheName), []byte("db-bytes"), 0600))
+	require.NoError(t, os.WriteFile(filepath.Join(dir, maildirCacheName+"-wal"), []byte("wal-bytes"), 0600))
+	require.NoError(t, makeExportSnapshotFIFO(filepath.Join(dir, "fifo-db")))
+	require.NoError(t, makeExportSnapshotFIFO(filepath.Join(dir, "fifo-wal")))
+
+	rootFD, err := unix.Open(dir, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = unix.Close(rootFD) })
+
+	for _, tc := range []struct {
+		name string
+		flag int
+	}{
+		{maildirCacheName, unix.O_RDWR},
+		{maildirCacheName + "-wal", unix.O_RDONLY},
+	} {
+		t.Run("regular_"+tc.name, func(t *testing.T) {
+			f, err := openExportSnapshotSource(rootFD, tc.name, tc.flag)
+			require.NoError(t, err)
+			defer f.Close()
+
+			conn, err := f.SyscallConn()
+			require.NoError(t, err)
+			var flags int
+			var flErr error
+			require.NoError(t, conn.Control(func(fd uintptr) {
+				flags, flErr = unix.FcntlInt(fd, unix.F_GETFL, 0)
+			}))
+			require.NoError(t, flErr)
+			assert.Zero(t, flags&unix.O_NONBLOCK, "regular snapshot source %s must have O_NONBLOCK cleared before io.Copy", tc.name)
+		})
+	}
+
+	for _, tc := range []struct {
+		name string
+		flag int
+	}{
+		{"fifo-db", unix.O_RDWR},
+		{"fifo-wal", unix.O_RDONLY},
+	} {
+		t.Run("reject_"+tc.name, func(t *testing.T) {
+			f, err := openExportSnapshotSource(rootFD, tc.name, tc.flag)
+			require.Error(t, err)
+			assert.Nil(t, f)
+		})
+	}
 }

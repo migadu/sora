@@ -796,11 +796,21 @@ an older source message has none. Missing source state is represented by empty
 flags and keywords, matching the source's existing displayed state. Delivery,
 APPEND, imports and restore also create state for their newly inserted rows.
 
+Explicit IMAP STORE and User API flag-write requests initialize missing state
+only for the live messages they target, then apply the requested mutation. This
+does not recover lost historical flags. Reads, SELECT and background work do not
+repair missing state, and no historical backfill command or scan is provided.
+
 This is a forward-only repair after all writers have been upgraded. Existing
 messages without state are left unchanged; their historical SEARCH UNSEEN,
-STATUS counts and flag-update inconsistencies are not repaired. There is no
+STATUS counts remain unchanged until an explicit flag-write targets them. There is no
 historical backfill, backfill migration or startup scan for this change. Older
 writers and transactions started before upgrade can still create missing rows.
+
+New APPENDs whose structured MIME parsing is degraded still record searchable
+header presence from their raw header block. This applies only to the new
+ingress row; legacy NULL masks remain unknown, with no scan, S3 read or repair
+command to populate historical rows.
 
 ### Import body admission connections
 
