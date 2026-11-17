@@ -137,6 +137,20 @@ func (c *S3Cache) readState(ctx context.Context, key string) ([]byte, certificat
 	return data, state, aws.ToString(result.ETag), true, err
 }
 func (c *S3Cache) getSnapshot(ctx context.Context, name string) ([]byte, publicationGeneration, error) {
+	if isChallengeCacheKey(name) {
+		raw, err := c.getObject(ctx, S3ObjectKey(name))
+		if err != nil {
+			return nil, publicationGeneration{}, err
+		}
+		data, state, err := decodeCertificateState(raw)
+		if err != nil {
+			return nil, publicationGeneration{}, err
+		}
+		if state.Deleted || state.Absent {
+			return nil, publicationGeneration{}, autocert.ErrCacheMiss
+		}
+		return data, publicationGeneration{}, nil
+	}
 	ctx, cancel := context.WithTimeout(ctx, s3OperationTimeout)
 	defer cancel()
 	data, state, _, exists, err := c.readState(ctx, S3ObjectKey(name))
@@ -191,7 +205,7 @@ func (c *S3Cache) putGeneration(ctx context.Context, name string, data []byte, g
 			return errors.New("certificate store returned no ETag; refusing unfenced publication")
 		}
 		if exists && !state.Deleted && !state.Absent {
-			if olderCertificate(data, current) {
+			if isCertificateCacheKey(name) && olderCertificate(data, current) {
 				return nil
 			}
 			previous, _ := certificateFingerprint(current)
@@ -349,7 +363,7 @@ func olderCertificate(incoming, current []byte) bool {
 	}
 	aFP, _ := certificateFingerprint(incoming)
 	bFP, _ := certificateFingerprint(current)
-	return aFP != bFP && (b.NotBefore.After(a.NotBefore) || (b.NotBefore.Equal(a.NotBefore) && !b.NotAfter.Before(a.NotAfter)))
+	return aFP != bFP && (b.NotBefore.After(a.NotBefore) || (b.NotBefore.Equal(a.NotBefore) && b.NotAfter.After(a.NotAfter)))
 }
 
 func missingS3Object(err error) bool {
