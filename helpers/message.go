@@ -38,6 +38,10 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 	defer mr.Close()
 
 	var plaintextBody, htmlBody *string
+	// Text parts whose Content-Type parameters do not parse, read without
+	// their charset: the text of last resort, used only without any
+	// well-formed text part.
+	var lenientPlain, lenientHTML *string
 	var skippedParts []string // Track reasons for skipped parts (for debugging)
 
 	for plaintextBody == nil {
@@ -76,13 +80,16 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 			continue
 		}
 
-		mediaType, _, err := header.ContentType()
-		if err != nil {
-			// Malformed Content-Type header (e.g., invalid media parameters).
-			// Skip this part and continue - plaintext extraction is best-effort for FTS.
-			skippedParts = append(skippedParts, fmt.Sprintf("invalid Content-Type: %v", err))
-			continue
-		} else if mediaType != "text/plain" && mediaType != "text/html" {
+		// go-message keeps the media type when only the parameters are
+		// malformed. Such a text part is still text (RFC 2045 §5.2 even
+		// recommends assuming text/plain for an invalid field), so it is
+		// not dropped, but it is read without its charset: a well-formed
+		// alternative, if there is one, is the better text.
+		mediaType, _, typeErr := header.ContentType()
+		if mediaType != "text/plain" && mediaType != "text/html" {
+			if typeErr != nil {
+				skippedParts = append(skippedParts, fmt.Sprintf("invalid Content-Type: %v", typeErr))
+			}
 			continue
 		}
 
@@ -95,14 +102,23 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 		}
 		s := string(b)
 
-		switch mediaType {
-		case "text/plain":
-			plaintextBody = &s
-		case "text/html":
-			if htmlBody == nil {
-				htmlBody = &s
+		switch {
+		case typeErr != nil && mediaType == "text/plain":
+			if lenientPlain == nil {
+				lenientPlain = &s
 			}
+		case typeErr != nil:
+			if lenientHTML == nil {
+				lenientHTML = &s
+			}
+		case mediaType == "text/plain":
+			plaintextBody = &s
+		case htmlBody == nil:
+			htmlBody = &s
 		}
+	}
+	if plaintextBody == nil && htmlBody == nil {
+		plaintextBody, htmlBody = lenientPlain, lenientHTML
 	}
 
 	// If we don't have a plaintext body but we have an HTML body, convert it to plaintext
