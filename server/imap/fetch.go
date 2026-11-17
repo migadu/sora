@@ -392,7 +392,11 @@ func (s *IMAPSession) fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 			if s.IMAPUser != nil {
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
-			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, recentAbove, markSeen, view.tracker, preview); err != nil {
+			// Unsolicited NOTIFY MessageNew fetches (progress != nil) push one-off
+			// event attributes, often while the client sits in IDLE; they must
+			// neither populate nor evict the session's chunk-fetch section cache.
+			retainSections := progress == nil
+			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, recentAbove, markSeen, view.tracker, preview, retainSections); err != nil {
 				if progress != nil {
 					progress.failed = msg.UID
 				}
@@ -429,7 +433,7 @@ func (s *IMAPSession) fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 // recentAbove is the session's \Recent threshold (recentFlagAboveLocked);
 // markSeen is whether the FETCH implicitly sets \Seen; preview is the command's
 // PREVIEW state, nil unless PREVIEW was requested.
-func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, recentAbove imap.UID, markSeen bool, tracker *imapserver.SessionTracker, preview *previewRun) (retErr error) {
+func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.FetchWriter, msg *db.Message, options *imap.FetchOptions, selectedMailboxID int64, recentAbove imap.UID, markSeen bool, tracker *imapserver.SessionTracker, preview *previewRun, retainSections bool) (retErr error) {
 	s.DebugLog("fetching message", "uid", msg.UID, "seq", msg.Seq)
 
 	// msg.Seq is the client's sequence number (Fetch translated it, see seqView).
@@ -462,7 +466,7 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 	var binary *decodedBinary
 	if len(options.BinarySection) > 0 || len(options.BinarySectionSize) > 0 {
 		var err error
-		if binary, err = s.decodeBinary(ctx, &bodyData, &bodyDataFetched, options, msg); err != nil {
+		if binary, err = s.decodeBinaryWithRetention(ctx, &bodyData, &bodyDataFetched, options, msg, retainSections); err != nil {
 			return err
 		}
 		defer s.freeSectionCopies(binary.charged)
@@ -478,7 +482,7 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		if binary != nil {
 			priorCopies = binary.charged
 		}
-		if sections, err = s.extractBodySections(ctx, &bodyData, &bodyDataFetched, options, msg, priorCopies); err != nil {
+		if sections, err = s.extractBodySectionsWithRetention(ctx, &bodyData, &bodyDataFetched, options, msg, priorCopies, retainSections); err != nil {
 			return err
 		}
 		defer s.freeSectionCopies(sections.charged)
@@ -745,6 +749,10 @@ func binaryParts(options *imap.FetchOptions) []*binaryPart {
 // Content-Transfer-Encoding, it MUST fail the request and issue a "NO" response
 // that contains the "UNKNOWN-CTE" response code."
 func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message) (*decodedBinary, error) {
+	return s.decodeBinaryWithRetention(ctx, bodyData, bodyDataFetched, options, msg, true)
+}
+
+func (s *IMAPSession) decodeBinaryWithRetention(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message, retainSections bool) (*decodedBinary, error) {
 	b := &decodedBinary{
 		sections: make([][]byte, len(options.BinarySection)),
 		sizes:    make([]uint32, len(options.BinarySectionSize)),
@@ -759,7 +767,7 @@ func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDa
 	}
 
 	for _, p := range binaryParts(options) {
-		if err := s.decodeBinaryPart(b, p, options, msg, bodyData, loadBody); err != nil {
+		if err := s.decodeBinaryPart(b, p, options, msg, bodyData, loadBody, retainSections); err != nil {
 			s.freeSectionCopies(b.charged)
 			return nil, err
 		}
@@ -771,7 +779,7 @@ func (s *IMAPSession) decodeBinary(ctx context.Context, bodyData *[]byte, bodyDa
 // section of p. A part named only with a <partial> is being fetched in chunks:
 // its decoded section is retained for the session's next chunk of it, as a BODY
 // section is (body_section_cache.go), and answered from there while it is.
-func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options *imap.FetchOptions, msg *db.Message, bodyData *[]byte, loadBody func() ([]byte, error)) error {
+func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options *imap.FetchOptions, msg *db.Message, bodyData *[]byte, loadBody func() ([]byte, error), retainSections bool) error {
 	key := binarySectionCacheKey(msg.ContentHash, p.part)
 	section := s.cachedBodySection(key) // charged to the retention while it is retained
 	retained := section != nil
@@ -843,7 +851,7 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 	}
 	// Retention is optional. A partial that fits the remaining budget must
 	// still work when keeping the full section does not, or is not eligible.
-	if !retained && key != "" && len(section) > 0 {
+	if retainSections && !retained && key != "" && len(section) > 0 {
 		if len(section) <= maxCachedBodySectionBytes {
 			if charged, ok := s.chargeSectionCopy(len(section)); ok {
 				if !s.retainBodySection(key, section) {
@@ -862,10 +870,10 @@ func (s *IMAPSession) decodeBinaryPart(b *decodedBinary, p *binaryPart, options 
 // longer be read, it releases any partial charges made for p and returns (false, nil) so
 // the caller falls back to loading and decoding the raw message.
 func (s *IMAPSession) answerBinaryFromSpill(b *decodedBinary, p *binaryPart, options *imap.FetchOptions, uid imap.UID, key string, spilledSize int, chunked bool, loadedBody int64) (bool, error) {
-	for _, i := range p.sizes {
-		b.sizes[i] = uint32(spilledSize)
-	}
 	if len(p.sections) == 0 {
+		for _, i := range p.sizes {
+			b.sizes[i] = uint32(spilledSize)
+		}
 		return true, nil
 	}
 	if !chunked {
@@ -881,25 +889,37 @@ func (s *IMAPSession) answerBinaryFromSpill(b *decodedBinary, p *binaryPart, opt
 		for _, i := range p.sections {
 			b.sections[i] = applyPartial(full, options.BinarySection[i].Partial)
 		}
+		for _, i := range p.sizes {
+			b.sizes[i] = uint32(spilledSize)
+		}
 		b.charged += charged
 		return true, nil
 	}
 
 	var partCharged int64
-	for _, i := range p.sections {
+	for done, i := range p.sections {
 		off, length := partialBounds(spilledSize, options.BinarySection[i].Partial)
 		n, ok := s.chargeSectionCopy(length)
 		if !ok {
+			for _, prev := range p.sections[:done] {
+				b.sections[prev] = nil
+			}
 			s.freeSectionCopies(partCharged)
 			return false, s.sectionMemoryRefused(uid, loadedBody+b.charged+partCharged+int64(length))
 		}
 		buf := make([]byte, length)
 		if !s.readSpilledSectionInto(key, off, buf) {
+			for _, prev := range p.sections[:done] {
+				b.sections[prev] = nil
+			}
 			s.freeSectionCopies(partCharged + n)
 			return false, nil
 		}
 		partCharged += n
 		b.sections[i] = buf
+	}
+	for _, i := range p.sizes {
+		b.sizes[i] = uint32(spilledSize)
 	}
 	b.charged += partCharged
 	return true, nil
@@ -944,9 +964,13 @@ type bodySections struct {
 // for. The sections are held, and charged, until the response is written.
 // priorCopies counts BINARY buffers already prepared for this same response.
 func (s *IMAPSession) extractBodySections(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message, priorCopies int64) (*bodySections, error) {
+	return s.extractBodySectionsWithRetention(ctx, bodyData, bodyDataFetched, options, msg, priorCopies, true)
+}
+
+func (s *IMAPSession) extractBodySectionsWithRetention(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, options *imap.FetchOptions, msg *db.Message, priorCopies int64, retainSections bool) (*bodySections, error) {
 	b := &bodySections{contents: make([][]byte, len(options.BodySection))}
 	for i, section := range options.BodySection {
-		content, charged, err := s.extractBodySection(ctx, bodyData, bodyDataFetched, section, msg, priorCopies+b.charged)
+		content, charged, err := s.extractBodySection(ctx, bodyData, bodyDataFetched, section, msg, priorCopies+b.charged, retainSections)
 		if err != nil {
 			s.freeSectionCopies(b.charged)
 			return nil, err
@@ -963,7 +987,7 @@ func (s *IMAPSession) extractBodySections(ctx context.Context, bodyData *[]byte,
 // of reloading and re-extracting the message for every chunk. A chunk of the
 // retained section is held as a copy of its own, which is what it charges:
 // the retention may give the section up before the response is written.
-func (s *IMAPSession) extractBodySection(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, section *imap.FetchItemBodySection, msg *db.Message, priorCopies int64) ([]byte, int64, error) {
+func (s *IMAPSession) extractBodySection(ctx context.Context, bodyData *[]byte, bodyDataFetched *bool, section *imap.FetchItemBodySection, msg *db.Message, priorCopies int64, retainSections bool) ([]byte, int64, error) {
 	var cacheKey string
 	if section.Partial != nil {
 		cacheKey = bodySectionCacheKey(msg.ContentHash, section)
@@ -1001,14 +1025,16 @@ func (s *IMAPSession) extractBodySection(ctx context.Context, bodyData *[]byte, 
 		if err != nil {
 			return nil, 0, err
 		}
-		s.spillBodySection(cacheKey, full)
+		if retainSections {
+			s.spillBodySection(cacheKey, full)
+		}
 		return chunk, charged, nil
 	}
 	charged, ok := s.chargeSectionCopy(len(full))
 	if !ok {
 		return nil, 0, s.sectionMemoryRefused(msg.UID, int64(len(*bodyData))+priorCopies+int64(len(full)))
 	}
-	if section.Partial == nil || !s.retainBodySection(cacheKey, full) {
+	if !retainSections || section.Partial == nil || !s.retainBodySection(cacheKey, full) {
 		return applyPartial(full, section.Partial), charged, nil
 	}
 	// The retained section carries the charge now.
