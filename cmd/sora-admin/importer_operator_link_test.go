@@ -14,9 +14,11 @@ import (
 // another user who can rename entries in the directory holding it, or in a directory
 // above it, can move such a link there, or (where users may hard-link a file they do
 // not own) keep a second name of it that has a single name again once the operator
-// removes the first. The link is followed only from a directory no user but root and
-// the operator can rename entries in, as renamableParent checks for the maildir cache
-// (#1868). Import, --sieve, export and the export's dry run share the walk.
+// removes the first. The link is followed only from a directory of root or the
+// operator that nobody else may write, sticky or not, below directories no user but
+// root and the operator can rename entries in, as renamableParent checks for the
+// maildir cache (#1868). Import, --sieve, export and the export's dry run share the
+// walk.
 
 // operatorLinkUses are the four ways a path reaches the walk, each with the
 // preparation of the directory the link leads to.
@@ -105,12 +107,45 @@ func TestLinkWalkFollowsTheOperatorsLinkOnlyWhereNoOtherUserCanRenameIt(t *testi
 			require.NoError(t, os.Mkdir(stage, 0755))
 			return stage, ""
 		}},
-		// As /tmp: others may create entries but rename only their own.
+		{"root's directory", func(t *testing.T, base string) (string, string) {
+			stage := filepath.Join(base, "stage")
+			require.NoError(t, os.Mkdir(stage, 0755))
+			directoryOwnedBy(t, 0, stage)
+			return stage, ""
+		}},
+		// As the operator's own directory in /tmp: the sticky bit keeps others from
+		// renaming the operator's directory, so nobody else can change what it names.
+		{"the operator's directory in a sticky directory others may write", func(t *testing.T, base string) (string, string) {
+			outer := filepath.Join(base, "tmp")
+			require.NoError(t, os.Mkdir(outer, 0755))
+			require.NoError(t, os.Chmod(outer, 0o777|os.ModeSticky))
+			stage := filepath.Join(outer, "stage")
+			require.NoError(t, os.Mkdir(stage, 0755))
+			return stage, ""
+		}},
+		// As /tmp itself: the sticky bit keeps others from renaming the operator's
+		// link, but not from creating an entry, so another user can have moved one
+		// of the operator's links there with rename(2) from a directory they can
+		// write, or (where hard links are not protected) given one a second name
+		// there that has a single name again once the operator removes the first.
 		{"a sticky directory others may write", func(t *testing.T, base string) (string, string) {
 			stage := filepath.Join(base, "stage")
 			require.NoError(t, os.Mkdir(stage, 0755))
 			require.NoError(t, os.Chmod(stage, 0o777|os.ModeSticky))
-			return stage, ""
+			return stage, stage
+		}},
+		{"root's sticky directory others may write", func(t *testing.T, base string) (string, string) {
+			stage := filepath.Join(base, "stage")
+			require.NoError(t, os.Mkdir(stage, 0755))
+			require.NoError(t, os.Chmod(stage, 0o777|os.ModeSticky))
+			directoryOwnedBy(t, 0, stage)
+			return stage, stage
+		}},
+		{"a sticky directory its group may write", func(t *testing.T, base string) (string, string) {
+			stage := filepath.Join(base, "stage")
+			require.NoError(t, os.Mkdir(stage, 0755))
+			require.NoError(t, os.Chmod(stage, 0o775|os.ModeSticky))
+			return stage, stage
 		}},
 		{"another user's directory", func(t *testing.T, base string) (string, string) {
 			stage := filepath.Join(base, "stage")
