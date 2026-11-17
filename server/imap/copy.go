@@ -277,9 +277,12 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 			}
 		}
 		for f, uids := range stripUIDsByFlag {
-			if _, rmErr := s.server.rdb.RemoveMessageFlagsBatchWithRetry(ctx, uids, destMailbox.ID, []imap.Flag{f}); rmErr != nil {
+			stripCtx, chainStrip := db.ChainModSeqWindow(writeCtx, destMailbox.ID)
+			if _, rmErr := s.server.rdb.RemoveMessageFlagsBatchWithRetry(stripCtx, uids, destMailbox.ID, []imap.Flag{f}); rmErr != nil {
 				// The copy already succeeded; log and continue rather than fail it.
 				s.WarnLog("failed to strip flag the user cannot set on COPY", "flag", string(f), "error", rmErr)
+			} else {
+				chainStrip()
 			}
 		}
 	}
