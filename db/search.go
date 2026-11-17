@@ -526,18 +526,18 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 		case imap.SortKeyFrom:
 			// FROM: sort by addr-mailbox (the local part) per RFC 5256 §3, not the
 			// full local@domain address. The stored column keeps the full email
-			// (DISPLAYFROM needs it); take the local part at sort time.
-			orderField = addressCasemapKey(fmt.Sprintf("split_part(%sfrom_email_sort, '@', 1)", colPrefix)) + octetCollation
+			// (DISPLAYFROM needs it); take the local part before the last '@' at sort time.
+			orderField = addressCasemapKey(addrMailboxExpr(colPrefix+"from_email_sort")) + octetCollation
 		case imap.SortKeyDisplayTo:
 			// DISPLAYTO: as DISPLAYFROM. to_name_sort is also NULL on rows written before
 			// migration 000006.
 			orderField = addressCasemapKey(fmt.Sprintf("COALESCE(NULLIF(%sto_name_sort, ''), %sto_email_sort)", colPrefix, colPrefix)) + octetCollation
 		case imap.SortKeyTo:
 			// TO: sort by addr-mailbox (local part) per RFC 5256 §3.
-			orderField = addressCasemapKey(fmt.Sprintf("split_part(%sto_email_sort, '@', 1)", colPrefix)) + octetCollation
+			orderField = addressCasemapKey(addrMailboxExpr(colPrefix+"to_email_sort")) + octetCollation
 		case imap.SortKeyCc:
 			// CC: sort by addr-mailbox (local part) per RFC 5256 §3.
-			orderField = addressCasemapKey(fmt.Sprintf("split_part(%scc_email_sort, '@', 1)", colPrefix)) + octetCollation
+			orderField = addressCasemapKey(addrMailboxExpr(colPrefix+"cc_email_sort")) + octetCollation
 		default:
 			// If the sort key is not supported, default to uid
 			orderField = fmt.Sprintf("%suid", colPrefix)
@@ -551,6 +551,12 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 	orderClauses = append(orderClauses, colPrefix+"uid ASC")
 
 	return "ORDER BY " + strings.Join(orderClauses, ", ")
+}
+
+// addrMailboxExpr extracts RFC 5256 §3 addr-mailbox (everything preceding the last '@')
+// from a stored email sort column so quoted local-parts containing '@' stay intact.
+func addrMailboxExpr(col string) string {
+	return fmt.Sprintf("CASE WHEN strpos(%[1]s, '@') > 0 THEN left(%[1]s, length(%[1]s) - strpos(reverse(%[1]s), '@')) ELSE %[1]s END", col)
 }
 
 func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix string, paramCounter *int) (string, pgx.NamedArgs, error) {
