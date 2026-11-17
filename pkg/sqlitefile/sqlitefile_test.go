@@ -118,6 +118,13 @@ func TestParse(t *testing.T) {
 		{"file:/x.db?mode=memory&mode=rwc", "/x.db", "mode=memory&mode=rwc"}, // the last mode wins
 		{"file:/x.db?vfs=unix&vfs=unix", "/x.db", "vfs=unix&vfs=unix"},
 		{"file:/x.db?vfs=&vfs=unix", "/x.db", "vfs=&vfs=unix"},
+		{"file:/x.db?_defensive=1", "/x.db", "_defensive=1"},
+		{"file:/x.db?_defensive=0", "/x.db", "_defensive=0"},
+		{"file:/x.db?_error_rc=1", "/x.db", "_error_rc=1"},
+		{"file:/x.db?_error_rc=0", "/x.db", "_error_rc=0"},
+		{"file:/x.db?_error_rc=", "/x.db", "_error_rc="},
+		{"file:/x.db?_error_rc=1&_error_rc=bad", "/x.db", "_error_rc=1&_error_rc=bad"},
+		{"file:/x.db?_error_rc=&_error_rc=bad", "/x.db", "_error_rc=&_error_rc=bad"},
 
 		// Names that open no file.
 		{":memory:", "", ""},
@@ -140,9 +147,145 @@ func TestParse(t *testing.T) {
 		}
 	}
 
-	for _, name := range []string{"file://example.com/x.db", "file://localhost:80/x.db", "file://user@localhost/x.db", "file:/x.db?mode=memor", "file:/x.db?mode=", "file:/x.db?mode=ro&mode=rwc", "file:/x.db?vfs=memdb&vfs=unix"} {
+	for _, name := range []string{
+		"file://example.com/x.db",
+		"file://localhost:80/x.db",
+		"file://user@localhost/x.db",
+		"file:/x.db?mode=memor",
+		"file:/x.db?mode=",
+		"file:/x.db?mode=ro&mode=rwc",
+		"file:/x.db?vfs=memdb&vfs=unix",
+		"file:/x.db?_defensive=bad",
+		"file:/x.db?_defensive=",
+		"file:/x.db?_defensive=1&_defensive=1",
+		"file:/x.db?_defensive=1&_defensive=0",
+		"file:/x.db?%5Fdefensive=bad",
+		"file:/x.db?_error_rc=bad",
+		"file:/x.db?_error_rc=bad&_error_rc=1",
+		"file:/x.db?%5Ferror_rc=bad",
+	} {
 		if path, _, err := Parse(name); err == nil {
-			t.Errorf("Parse(%q) = %q, nil; want an invalid authority, mode or VFS error", name, path)
+			t.Errorf("Parse(%q) = %q, nil; want an invalid authority, mode or driver parameter error", name, path)
 		}
+	}
+}
+
+// modernc.org/sqlite validates _defensive and _error_rc before sqlite3_open_v2.
+// Parse, CanCreate and Prepare must mirror that validation so rejected DSNs do
+// not create a missing database file or chmod an existing file before SQLite
+// opens it, while valid forms continue to pass both sqlitefile and the driver.
+func TestPrepareMatchesDriverPreOpenValidation(t *testing.T) {
+	for _, query := range []string{
+		"_defensive=bad",
+		"_defensive=",
+		"_defensive=on",
+		"_defensive=1&_defensive=1",
+		"_defensive=1&_defensive=0",
+		"%5Fdefensive=bad",
+		"_error_rc=bad",
+		"_error_rc=on",
+		"_error_rc=bad&_error_rc=1",
+		"%5Ferror_rc=bad",
+	} {
+		t.Run("reject/"+query, func(t *testing.T) {
+			driverPath := filepath.Join(t.TempDir(), "driver.db")
+			dsn, err := DSN(driverPath, query)
+			if err != nil {
+				t.Fatalf("DSN(%q, %q) error: %v", driverPath, query, err)
+			}
+			db, err := sql.Open("sqlite", dsn)
+			if err != nil {
+				t.Fatalf("sql.Open(%q) error: %v", dsn, err)
+			}
+			defer db.Close()
+			if err := db.Ping(); err == nil {
+				t.Fatalf("driver unexpectedly accepted %q", dsn)
+			}
+			if _, statErr := os.Stat(driverPath); !os.IsNotExist(statErr) {
+				t.Fatalf("driver touched %s before rejecting %q: %v", driverPath, dsn, statErr)
+			}
+
+			missingPath := filepath.Join(t.TempDir(), "missing.db")
+			if _, _, err := Parse("file:" + missingPath + "?" + query); err == nil {
+				t.Errorf("Parse accepted rejected driver query %q", query)
+			}
+			if _, err := CanCreate(query); err == nil {
+				t.Errorf("CanCreate accepted rejected driver query %q", query)
+			}
+			if err := Prepare(missingPath, query); err == nil {
+				t.Errorf("Prepare accepted rejected driver query %q", query)
+			}
+			if _, statErr := os.Stat(missingPath); !os.IsNotExist(statErr) {
+				t.Errorf("Prepare(%q) created %s before driver rejection (stat: %v)", query, missingPath, statErr)
+			}
+
+			existingPath := filepath.Join(t.TempDir(), "existing.db")
+			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+				p := existingPath + suffix
+				if err := os.WriteFile(p, []byte("keep mode"), 0644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(p, 0644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := Prepare(existingPath, query); err == nil {
+				t.Errorf("Prepare on existing file accepted rejected driver query %q", query)
+			}
+			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+				info, err := os.Stat(existingPath + suffix)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := info.Mode().Perm(); got != 0644 {
+					t.Errorf("Prepare(%q) mutated %s mode to %04o, want 0644", query, existingPath+suffix, got)
+				}
+			}
+		})
+	}
+
+	for _, query := range []string{
+		"_defensive=1",
+		"_defensive=0",
+		"_defensive=true",
+		"_defensive=false",
+		"_error_rc=1",
+		"_error_rc=0",
+		"_error_rc=true",
+		"_error_rc=false",
+		"_error_rc=",
+		"_error_rc=1&_error_rc=bad",
+		"_error_rc=&_error_rc=bad",
+	} {
+		t.Run("accept/"+query, func(t *testing.T) {
+			dbPath := filepath.Join(t.TempDir(), "valid.db")
+			gotPath, gotQuery, err := Parse("file:" + dbPath + "?" + query)
+			if err != nil || gotPath != dbPath || gotQuery != query {
+				t.Fatalf("Parse(%q) = %q, %q, %v; want %q, %q, nil", query, gotPath, gotQuery, err, dbPath, query)
+			}
+			canCreate, err := CanCreate(query)
+			if err != nil || !canCreate {
+				t.Fatalf("CanCreate(%q) = %v, %v; want true, nil", query, canCreate, err)
+			}
+			if err := Prepare(dbPath, query); err != nil {
+				t.Fatalf("Prepare(%q) error: %v", query, err)
+			}
+			info, err := os.Stat(dbPath)
+			if err != nil || info.Mode().Perm() != 0600 {
+				t.Fatalf("prepared file stat = %v, %v; want mode 0600", info, err)
+			}
+			dsn, err := DSN(dbPath, query)
+			if err != nil {
+				t.Fatalf("DSN(%q) error: %v", query, err)
+			}
+			db, err := sql.Open("sqlite", dsn)
+			if err != nil {
+				t.Fatalf("sql.Open(%q) error: %v", dsn, err)
+			}
+			defer db.Close()
+			if err := db.Ping(); err != nil {
+				t.Fatalf("driver rejected valid query %q: %v", query, err)
+			}
+		})
 	}
 }

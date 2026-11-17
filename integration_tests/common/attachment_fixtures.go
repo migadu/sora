@@ -11,7 +11,17 @@ import (
 // delivery tests so each ingestion path exercises the same malformed MIME.
 func AttachmentKeywordRegressionCases() []struct{ Name, MIME, Keyword string } {
 	msg := func(lines ...string) string { return strings.Join(lines, "\r\n") + "\r\n" }
+	unrelatedNBSP := "Content-Disposition: inline; size=\u00a012; filename=monthly report.png"
+	unrelatedDuplicate := `Content-Disposition: inline; note="a\\b"; note="a\b"; filename=monthly report.png`
 	return []struct{ Name, MIME, Keyword string }{
+		{"recovered filename unrelated NBSP outside related", msg("Content-Type: image/png", unrelatedNBSP, "", "PNG"), "$hasattachment"},
+		{"recovered filename unrelated MSIE duplicate outside related", msg("Content-Type: image/png", unrelatedDuplicate, "", "PNG"), "$hasattachment"},
+		{"recovered filename unrelated NBSP related", msg("Content-Type: multipart/related; boundary=b", "",
+			"--b", "Content-Type: text/html", "", "<p>body</p>",
+			"--b", "Content-Type: image/png", unrelatedNBSP, "", "PNG", "--b--"), ""},
+		{"recovered filename unrelated MSIE duplicate related", msg("Content-Type: multipart/related; boundary=b", "",
+			"--b", "Content-Type: text/html", "", "<p>body</p>",
+			"--b", "Content-Type: image/png", unrelatedDuplicate, "", "PNG", "--b--"), ""},
 		{"recovered filename related single separator", msg("Content-Type: multipart/related; boundary=b", "",
 			"--b", "Content-Type: text/html", "", "<p>body</p>",
 			"--b", "Content-Type: image/png", "Content-Disposition: inline; filename=monthly report.png;", "", "PNG", "--b--"), "$hasnoattachment"},
