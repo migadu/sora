@@ -104,7 +104,8 @@ func TestMessageIDRawRetainsLongFoldedFieldsAndLaterDuplicates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	parsedID, _ := (mail.Header{Header: e.Header}).MessageID()
+	mh := mail.Header{Header: e.Header}
+	parsedID, _ := mh.MessageID()
 	for name, got := range map[string]*string{
 		"structured": ExtractMessageIDRaw(e.Header, parsedID),
 		"degraded":   ExtractRawMessageIDFromBytes([]byte(raw)),
