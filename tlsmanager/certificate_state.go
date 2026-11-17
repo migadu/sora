@@ -340,6 +340,7 @@ func (c *S3Cache) ExpireObject(ctx context.Context, key, expectedETag string, no
 		return false, nil
 	}
 	state.Absent = true
+	state.Unproven = false
 	for _, version := range versions {
 		pendingVersion(&state, version, info.NotAfter)
 	}

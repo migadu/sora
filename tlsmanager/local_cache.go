@@ -293,10 +293,11 @@ func ioReadAllLocal(f *os.File) ([]byte, error) { return io.ReadAll(f) }
 // preserving ordinary certificate/private-key byte formats for active entries.
 func DecodeCertificateCacheData(raw []byte) (data []byte, absent bool, err error) {
 	data, state, err := decodeCertificateState(raw)
-	if err == nil && state.Unproven {
+	absent = state.Deleted || state.Absent
+	if err == nil && !absent && state.Unproven {
 		err = errUnprovenSharedCertificate
 	}
-	return data, state.Deleted || state.Absent, err
+	return data, absent, err
 }
 
 // WriteLocalCertificateFile writes the certificate plus source-generation metadata

@@ -365,85 +365,73 @@ func listTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string, 
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)
 	}
 
-	// List all objects in autocert/ prefix
+	// List all objects in autocert/ prefix first so legacy autocert/deleted-<hash>
+	// markers (which sort after autocert/cert-<hash>) are known before decoding certs.
 	prefix := "autocert/"
-	objChan, errChan := s3store.ListObjects(ctx, prefix, false)
+	objectKeys, knownKeys, err := listAutocertKeys(ctx, s3store)
+	if err != nil {
+		return fmt.Errorf("error listing S3 objects: %w", err)
+	}
 
 	// Collect certificate information
 	var certs []CertificateInfo
 
-	// Read from channels
-	for {
-		// Both channels closed, we're done
-		if objChan == nil && errChan == nil {
-			break
+	for _, key := range objectKeys {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
-		select {
-		case obj, ok := <-objChan:
-			if !ok {
-				// Channel closed, we're done
-				objChan = nil
-				continue
-			}
+		logger.Info("Received object from S3", "key", key)
 
-			logger.Info("Received object from S3", "key", obj.Key)
+		// Skip non-certificate objects and ACME account private keys
+		if !strings.HasPrefix(key, prefix+"cert-") || isACMEAccountKey(key) {
+			continue
+		}
 
-			// Skip non-certificate objects
-			if !strings.HasPrefix(obj.Key, prefix+"cert-") {
-				continue
-			}
+		certInfo := CertificateInfo{
+			S3Key: key,
+		}
 
-			certInfo := CertificateInfo{
-				S3Key: obj.Key,
-			}
+		// Try to determine domain from key
+		// Format: autocert/cert-<sha256(domain)> or autocert/cert-<sha256(domain+rsa)>
+		certInfo.Domain, certInfo.CacheName = tryDecodeDomain(key, cfg.TLS.LetsEncrypt.Domains)
 
-			// Try to determine domain from key
-			// Format: autocert/cert-<sha256(domain)> or autocert/cert-<sha256(domain+rsa)>
-			certInfo.Domain, certInfo.CacheName = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
-
-			// Download certificate from S3 to parse it
-			reader, err := s3store.Get(obj.Key)
+		// Download certificate from S3 to parse it
+		reader, err := s3store.Get(key)
+		if err != nil {
+			logger.Warn("Failed to download certificate from S3", "key", key, "error", err)
+			certInfo.CertType = "Error"
+		} else {
+			// Read certificate data
+			certData, err := io.ReadAll(reader)
+			reader.Close()
 			if err != nil {
-				logger.Warn("Failed to download certificate from S3", "key", obj.Key, "error", err)
+				logger.Warn("Failed to read certificate from S3", "key", key, "error", err)
 				certInfo.CertType = "Error"
 			} else {
-				// Read certificate data
-				certData, err := io.ReadAll(reader)
-				reader.Close()
-				if err != nil {
-					logger.Warn("Failed to read certificate from S3", "key", obj.Key, "error", err)
+				markerData, markerErr := readLegacyDeletionMarker(ctx, s3store, key, certData, knownKeys)
+				if markerErr != nil {
+					logger.Warn("Failed to read certificate deletion marker from S3", "key", key, "error", markerErr)
 					certInfo.CertType = "Error"
 				} else {
-					certData, absent, decodeErr := tlsmanager.DecodeCertificateCacheData(certData)
-					if decodeErr != nil {
-						return decodeErr
-					}
+					decodedData, absent, decodeErr := tlsmanager.DecodeCertificateObjectData(certData, markerData)
 					if absent {
 						continue
 					}
-					parseCertificateData(certData, &certInfo)
+					if decodeErr != nil {
+						logger.Warn("Invalid or unproven certificate state in S3", "key", key, "error", decodeErr)
+						certInfo.CertType = "Invalid"
+					} else {
+						parseCertificateData(decodedData, &certInfo)
+					}
 				}
 			}
-
-			// Check if certificate exists in local cache
-			certInfo.InLocalCache, certInfo.LocalPath = checkLocalCache(cacheDir, certInfo.CacheName)
-
-			certs = append(certs, certInfo)
-
-		case err, ok := <-errChan:
-			if !ok {
-				// Error channel closed
-				errChan = nil
-				continue
-			}
-			if err != nil {
-				return fmt.Errorf("error listing S3 objects: %w", err)
-			}
-
-		case <-ctx.Done():
-			return ctx.Err()
 		}
+
+		// Check if certificate exists in local cache
+		certInfo.InLocalCache, certInfo.LocalPath = checkLocalCache(cacheDir, certInfo.CacheName)
+
+		certs = append(certs, certInfo)
 	}
 
 	if len(certs) == 0 {
@@ -624,13 +612,59 @@ func expiredLocalCopy(cacheDir, cacheName string, now time.Time) (string, error)
 		return "", nil
 	}
 	localPath := filepath.Join(cacheDir, cacheName)
-	data, err := os.ReadFile(localPath)
+	root, err := os.OpenRoot(cacheDir)
 	if os.IsNotExist(err) {
 		return "", nil
 	}
 	if err != nil {
 		return "", fmt.Errorf("failed to read local cache file %s: %w", localPath, err)
 	}
+	defer root.Close()
+
+	var data []byte
+	for attempt := 0; attempt < 3; attempt++ {
+		linfo, err := root.Lstat(cacheName)
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to read local cache file %s: %w", localPath, err)
+		}
+		if !linfo.Mode().IsRegular() {
+			return "", fmt.Errorf("failed to read local cache file %s: certificate cache entry %q is not regular", localPath, cacheName)
+		}
+
+		f, err := root.OpenFile(cacheName, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+		if os.IsNotExist(err) {
+			return "", nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("failed to read local cache file %s: %w", localPath, err)
+		}
+		info, statErr := f.Stat()
+		if statErr != nil {
+			f.Close()
+			return "", fmt.Errorf("failed to read local cache file %s: %w", localPath, statErr)
+		}
+		if !info.Mode().IsRegular() {
+			f.Close()
+			return "", fmt.Errorf("failed to read local cache file %s: certificate cache entry %q is not regular", localPath, cacheName)
+		}
+		if !os.SameFile(linfo, info) {
+			f.Close()
+			if attempt == 2 {
+				return "", fmt.Errorf("failed to read local cache file %s: concurrent entry replacement", localPath)
+			}
+			continue
+		}
+		data, err = io.ReadAll(f)
+		f.Close()
+		if err != nil {
+			return "", fmt.Errorf("failed to read local cache file %s: %w", localPath, err)
+		}
+		break
+	}
+
 	var local CertificateInfo
 	if err := parseCertificate(data, &local); err != nil {
 		return "", fmt.Errorf("failed to parse local cache file %s: %w", localPath, err)
@@ -809,7 +843,7 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 			// Marked even when S3 lacks it: a running node may hold a copy it has yet
 			// to write to S3, and the domain's certificates are what is being deleted.
 			marks = append(marks, key)
-			exists, err := tlsObjectActive(ctx, s3store, key)
+			exists, err := tlsObjectDeletable(ctx, s3store, key, nil)
 			if err != nil {
 				return fmt.Errorf("failed to look up %s in S3: %w", key, err)
 			}
@@ -858,9 +892,12 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 		prefix, isPrefix := strings.CutSuffix(searchKey, "...")
 
 		if !isPrefix {
+			if isACMEAccountKey(searchKey) {
+				return fmt.Errorf("refusing to delete ACME account key %s", searchKey)
+			}
 			// storage.DeleteContext succeeds for a missing key, so look first: a key
 			// that is not there must not be reported as deleted.
-			exists, err := tlsObjectActive(ctx, s3store, searchKey)
+			exists, err := tlsObjectDeletable(ctx, s3store, searchKey, nil)
 			if err != nil {
 				return fmt.Errorf("failed to look up %s in S3: %w", searchKey, err)
 			}
@@ -874,39 +911,27 @@ func deleteTLSCertificate(ctx context.Context, cfg AdminConfig, cacheDir string,
 			// Search for matching certificates by prefix
 			fmt.Printf("Searching for certificates matching prefix: %s\n", searchKey)
 
-			objChan, errChan := s3store.ListObjects(ctx, "autocert/", false)
+			objectKeys, knownKeys, err := listAutocertKeys(ctx, s3store)
+			if err != nil {
+				return fmt.Errorf("error searching S3: %w", err)
+			}
 
 			var matches []string
-			for {
-				if objChan == nil && errChan == nil {
-					break
+			for _, key := range objectKeys {
+				if err := ctx.Err(); err != nil {
+					return err
 				}
-
-				select {
-				case obj, ok := <-objChan:
-					if !ok {
-						objChan = nil
-						continue
-					}
-					if strings.HasPrefix(obj.Key, prefix) {
-						active, err := tlsObjectActive(ctx, s3store, obj.Key)
-						if err != nil {
-							return err
-						}
-						if active {
-							matches = append(matches, obj.Key)
-						}
-					}
-				case err, ok := <-errChan:
-					if !ok {
-						errChan = nil
-						continue
-					}
+				if !strings.HasPrefix(key, "autocert/cert-") || isACMEAccountKey(key) {
+					continue
+				}
+				if strings.HasPrefix(key, prefix) {
+					active, err := tlsObjectDeletable(ctx, s3store, key, knownKeys)
 					if err != nil {
-						return fmt.Errorf("error searching S3: %w", err)
+						return err
 					}
-				case <-ctx.Done():
-					return ctx.Err()
+					if active {
+						matches = append(matches, key)
+					}
 				}
 			}
 
@@ -997,9 +1022,13 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		return fmt.Errorf("failed to initialize S3 storage: %w", err)
 	}
 
-	// List all certificates
+	// List all objects in autocert/ first so legacy autocert/deleted-<hash> markers
+	// are known before inspecting autocert/cert-<hash> entries.
 	prefix := "autocert/"
-	objChan, errChan := s3store.ListObjects(ctx, prefix, false)
+	objectKeys, knownKeys, err := listAutocertKeys(ctx, s3store)
+	if err != nil {
+		return fmt.Errorf("error listing S3 objects: %w", err)
+	}
 
 	var expiredCerts []expiredCertificate
 	now := time.Now()
@@ -1014,85 +1043,78 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 		return fmt.Errorf("%d operation(s) failed: %w", len(failures), errors.Join(failures...))
 	}
 
-	// Read from channels
-	for {
-		if objChan == nil && errChan == nil {
-			break
+	for _, key := range objectKeys {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
 
-		select {
-		case obj, ok := <-objChan:
-			if !ok {
-				objChan = nil
-				continue
-			}
+		// Skip non-certificate objects
+		if !strings.HasPrefix(key, prefix+"cert-") {
+			continue
+		}
 
-			// Skip non-certificate objects
-			if !strings.HasPrefix(obj.Key, prefix+"cert-") {
-				continue
-			}
+		certInfo := CertificateInfo{
+			S3Key: key,
+		}
+		certInfo.Domain, certInfo.CacheName = tryDecodeDomain(key, cfg.TLS.LetsEncrypt.Domains)
 
-			certInfo := CertificateInfo{
-				S3Key: obj.Key,
-			}
-			certInfo.Domain, certInfo.CacheName = tryDecodeDomain(obj.Key, cfg.TLS.LetsEncrypt.Domains)
+		// autocert stores its ACME account key under "acme_account+key" (or legacy
+		// "acme_account.key"), which S3Cache hashes under autocert/cert- as a
+		// private-key-only PEM entry with no certificate.
+		if isACMEAccountKey(key) {
+			continue
+		}
 
-			// autocert stores its ACME account key under "acme_account+key" (or legacy
-			// "acme_account.key"), which S3Cache hashes under autocert/cert- as a
-			// private-key-only PEM entry with no certificate.
-			if obj.Key == tlsmanager.S3ObjectKey("acme_account+key") || obj.Key == tlsmanager.S3ObjectKey("acme_account.key") {
-				continue
-			}
+		// Download and parse certificate to check expiry
+		certData, version, etag, err := readTLSObject(ctx, s3store, key)
+		if err != nil {
+			logger.Warn("Failed to download certificate", "key", key, "error", err)
+			failures = append(failures, fmt.Errorf("read S3 object %s: %w", key, err))
+			continue
+		}
 
-			// Download and parse certificate to check expiry
-			certData, version, etag, err := readTLSObject(ctx, s3store, obj.Key)
-			if err != nil {
-				logger.Warn("Failed to download certificate", "key", obj.Key, "error", err)
-				failures = append(failures, fmt.Errorf("read S3 object %s: %w", obj.Key, err))
-				continue
-			}
-
-			pending, expiry, pendingErr := tlsmanager.PendingCertificateCleanup(certData)
-			if pendingErr != nil {
-				failures = append(failures, pendingErr)
-				continue
-			}
+		markerData, markerErr := readLegacyDeletionMarker(ctx, s3store, key, certData, knownKeys)
+		if markerErr != nil {
+			logger.Warn("Failed to read certificate deletion marker", "key", key, "error", markerErr)
+			failures = append(failures, fmt.Errorf("read S3 deletion marker for %s: %w", key, markerErr))
+			continue
+		}
+		pending, pendingExpiry, pendingErr := tlsmanager.PendingCertificateCleanup(certData)
+		if pendingErr != nil {
+			failures = append(failures, fmt.Errorf("decode S3 object %s: %w", key, pendingErr))
+			continue
+		}
+		decodedData, absent, decodeErr := tlsmanager.DecodeCertificateObjectData(certData, markerData)
+		if decodeErr != nil {
+			failures = append(failures, fmt.Errorf("decode S3 object %s: %w", key, decodeErr))
+			continue
+		}
+		if absent {
 			if pending {
-				certInfo.Expiry = expiry
+				certInfo.Expiry = pendingExpiry
 				certInfo.CertType = "pending history"
 				expiredCerts = append(expiredCerts, expiredCertificate{CertificateInfo: certInfo, historyOnly: true})
-				continue
 			}
-			certData, absent, decodeErr := tlsmanager.DecodeCertificateCacheData(certData)
-			if decodeErr != nil {
-				failures = append(failures, decodeErr)
-				continue
-			}
-			if absent {
-				continue
-			}
-			if err := parseCertificate(certData, &certInfo); err != nil {
-				logger.Warn("Failed to parse certificate", "key", obj.Key, "error", err)
-				failures = append(failures, fmt.Errorf("parse S3 object %s: %w", obj.Key, err))
-				continue
-			}
+			continue
+		}
+		if err := parseCertificate(decodedData, &certInfo); err != nil {
+			logger.Warn("Failed to parse certificate", "key", key, "error", err)
+			failures = append(failures, fmt.Errorf("parse S3 object %s: %w", key, err))
+			continue
+		}
 
-			// Check if expired
-			if certInfo.Expiry.Before(now) {
-				expiredCerts = append(expiredCerts, expiredCertificate{CertificateInfo: certInfo, version: version, etag: etag})
-			}
-
-		case err, ok := <-errChan:
-			if !ok {
-				errChan = nil
-				continue
-			}
-			if err != nil {
-				return fmt.Errorf("error listing S3 objects: %w", err)
-			}
-
-		case <-ctx.Done():
-			return ctx.Err()
+		// Check if expired
+		if certInfo.Expiry.Before(now) {
+			expiredCerts = append(expiredCerts, expiredCertificate{
+				CertificateInfo:   certInfo,
+				version:           version,
+				etag:              etag,
+				hasPendingHistory: pending,
+			})
+		} else if pending {
+			certInfo.Expiry = pendingExpiry
+			certInfo.CertType = "pending history"
+			expiredCerts = append(expiredCerts, expiredCertificate{CertificateInfo: certInfo, historyOnly: true})
 		}
 	}
 
@@ -1163,7 +1185,7 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 				err = cache.QueueExpiredVersion(ctx, cert.S3Key, cert.version, cert.Expiry)
 			}
 		}
-		if err == nil && (cert.historyOnly || cert.version != "") {
+		if err == nil && (cert.historyOnly || cert.hasPendingHistory || cert.version != "") {
 			cleaned, cleanErr := cache.CleanupExpiredVersions(ctx, cert.S3Key, now)
 			err = cleanErr
 			gone = gone || cleaned > 0
@@ -1199,9 +1221,10 @@ func cleanTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 // expiredCertificate identifies the S3 object clean read and found expired.
 type expiredCertificate struct {
 	CertificateInfo
-	version     string
-	etag        string
-	historyOnly bool
+	version           string
+	etag              string
+	historyOnly       bool
+	hasPendingHistory bool
 }
 
 // readTLSObject downloads the object at key with its opaque ETag and the version the
@@ -1234,6 +1257,16 @@ func readTLSObject(ctx context.Context, s3store *storage.S3Storage, key string) 
 // the shared entry lease only if its bytes still match. A concurrent replacement
 // remains canonical; no rename-aside window makes the entry temporarily missing.
 func removeExpiredLocalCopy(path string, now time.Time) (removed bool, err error) {
+	linfo, err := os.Lstat(path)
+	if os.IsNotExist(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !linfo.Mode().IsRegular() {
+		return false, fmt.Errorf("certificate cache entry %q is not regular", filepath.Base(path))
+	}
 	data, err := tlsmanager.ReadLocalCertificateFile(context.Background(), path)
 	if os.IsNotExist(err) {
 		return false, nil
@@ -1537,9 +1570,15 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 			}
 
 			objectData := certData
-			certData, absent, decodeErr := tlsmanager.DecodeCertificateCacheData(certData)
+			markerData, markerErr := readLegacyDeletionMarker(ctx, s3store, s3Key, objectData, nil)
+			if markerErr != nil {
+				logger.Warn("Failed to read certificate deletion marker from S3", "domain", domain, "type", variant.name, "error", markerErr)
+				failures = append(failures, fmt.Errorf("read %s certificate deletion marker for %s (S3 object %s): %w", variant.name, domain, s3Key, markerErr))
+				continue
+			}
+			certData, absent, decodeErr := tlsmanager.DecodeCertificateObjectData(objectData, markerData)
 			if decodeErr != nil {
-				failures = append(failures, decodeErr)
+				failures = append(failures, fmt.Errorf("decode %s certificate for %s (S3 object %s): %w", variant.name, domain, s3Key, decodeErr))
 				continue
 			}
 			if absent {
@@ -1614,9 +1653,63 @@ func cacheTLSCertificates(ctx context.Context, cfg AdminConfig, cacheDir string,
 	return nil
 }
 
+func isACMEAccountKey(s3Key string) bool {
+	return s3Key == tlsmanager.S3ObjectKey("acme_account+key") || s3Key == tlsmanager.S3ObjectKey("acme_account.key")
+}
+
+func listAutocertKeys(ctx context.Context, s3store *storage.S3Storage) ([]string, map[string]struct{}, error) {
+	objChan, errChan := s3store.ListObjects(ctx, "autocert/", false)
+	var keys []string
+	known := make(map[string]struct{})
+	for objChan != nil || errChan != nil {
+		select {
+		case obj, ok := <-objChan:
+			if !ok {
+				objChan = nil
+				continue
+			}
+			keys = append(keys, obj.Key)
+			known[obj.Key] = struct{}{}
+		case err, ok := <-errChan:
+			if !ok {
+				errChan = nil
+				continue
+			}
+			if err != nil {
+				return nil, nil, err
+			}
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	return keys, known, nil
+}
+
+func readLegacyDeletionMarker(ctx context.Context, store *storage.S3Storage, certKey string, raw []byte, knownKeys map[string]struct{}) ([]byte, error) {
+	markerKey, ok := tlsmanager.LegacyDeletionMarkerKey(certKey, raw)
+	if !ok {
+		return nil, nil
+	}
+	if knownKeys != nil {
+		if _, exists := knownKeys[markerKey]; !exists {
+			return nil, nil
+		}
+	}
+	markerData, _, _, err := readTLSObject(ctx, store, markerKey)
+	if err != nil {
+		var missing *types.NoSuchKey
+		if errors.As(err, &missing) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return markerData, nil
+}
+
 // A logical tombstone remains as the publication fence but is not a certificate
-// available to delete/list. Preserve typed NoSuchKey versus service/bucket errors.
-func tlsObjectActive(ctx context.Context, store *storage.S3Storage, key string) (bool, error) {
+// available to delete/list unless it carries an unproven legacy state that tls delete
+// must overwrite with an explicit deletion barrier.
+func tlsObjectDeletable(ctx context.Context, store *storage.S3Storage, key string, knownKeys map[string]struct{}) (bool, error) {
 	raw, _, _, err := readTLSObject(ctx, store, key)
 	if err != nil {
 		var missing *types.NoSuchKey
@@ -1625,6 +1718,16 @@ func tlsObjectActive(ctx context.Context, store *storage.S3Storage, key string) 
 		}
 		return false, err
 	}
-	_, absent, err := tlsmanager.DecodeCertificateCacheData(raw)
+	if tlsmanager.UnprovenCertificateTombstone(raw) {
+		return true, nil
+	}
+	markerData, err := readLegacyDeletionMarker(ctx, store, key, raw, knownKeys)
+	if err != nil {
+		return false, err
+	}
+	_, absent, err := tlsmanager.DecodeCertificateObjectData(raw, markerData)
+	if tlsmanager.IsUnprovenCertificateError(err) {
+		return true, nil
+	}
 	return !absent, err
 }
