@@ -30,7 +30,7 @@ func parseMIMEHeader(raw string, contentType bool) mimeHeaderValue {
 		}
 	}
 	// Keep independently valid parameters and RFC 2231 alternatives when a
-	// filename repair would be ambiguous or another parameter remains invalid.
+	// filename repair would be ambiguous or the filename itself remains invalid.
 	return v
 }
 
