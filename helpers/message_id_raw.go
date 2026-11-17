@@ -14,8 +14,9 @@ import (
 // It returns nil when:
 //   - no Message-ID header field is present, or
 //   - there is a single Message-ID field whose unfolded trimmed value equals
-//     "<" + SanitizeUTF8(parsedMessageID) + ">" and contains neither a leading '<'
-//     inside parsedMessageID nor a '[' domain-literal bracket.
+//     "<" + SanitizeUTF8(parsedMessageID) + ">" and parsedMessageID contains none
+//     of '<', '>', or '[' (so the field text contains no additional "<...>"
+//     whole-ID substring or domain-literal bracket).
 //
 // Otherwise it returns the unfolded trimmed field text (joining multiple
 // Message-ID header fields with "\n", since no single unfolded field contains
@@ -49,8 +50,7 @@ func ExtractMessageIDRaw(header message.Header, parsedMessageID string) *string 
 	saneParsed := SanitizeUTF8(parsedMessageID)
 	if len(values) == 1 &&
 		saneParsed != "" &&
-		!strings.HasPrefix(saneParsed, "<") &&
-		!strings.Contains(saneParsed, "[") &&
+		!strings.ContainsAny(saneParsed, "<>[") &&
 		values[0] == "<"+saneParsed+">" {
 		return nil
 	}
