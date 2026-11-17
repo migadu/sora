@@ -1,6 +1,10 @@
 package helpers
 
-import "strings"
+import (
+	"strings"
+	"unicode"
+	"unicode/utf8"
+)
 
 // MaxReferencesBytes bounds messages."references". The column is in no index, so the
 // bound only keeps a pathological header from bloating the row; at 60-70 bytes per ID it
@@ -48,4 +52,52 @@ func TrimReferences(ids []string, maxBytes int) string {
 		return kept[0] + " " + strings.Join(kept[i:], " ")
 	}
 	return strings.Join(kept[tail(maxBytes):], " ")
+}
+
+// SplitMessageIDs splits a stored message_id, in_reply_to or "references" value, or a
+// bracketed list of message ids, into bare ids. The columns join ids with single
+// spaces; white space, '<' and '>' separate ids, except inside a quoted string that
+// opens an id. go-message keeps the quoting an obsolete local part needs (RFC 5322
+// §3.6.4 obs-id-left), so `"foo bar"@example.com` and `"<x>"@example.com` are one id.
+// A quote with no closing quote is an ordinary character. db.msgIDListExpr is the
+// same rule in SQL; keep the two in step.
+func SplitMessageIDs(s string) []string {
+	isSep := func(r rune) bool { return r == '<' || r == '>' || unicode.IsSpace(r) }
+	ids := []string{}
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		if isSep(r) {
+			i += size
+			continue
+		}
+		start := i
+		if s[i] == '"' {
+			if end := quotedStringEnd(s, i); end > 0 {
+				i = end
+			}
+		}
+		for i < len(s) {
+			r, size := utf8.DecodeRuneInString(s[i:])
+			if isSep(r) {
+				break
+			}
+			i += size
+		}
+		ids = append(ids, s[start:i])
+	}
+	return ids
+}
+
+// quotedStringEnd returns the index just past the quoted string opening at s[i], or 0
+// when the quote never closes. A backslash quotes the next byte (RFC 5322 §3.2.1).
+func quotedStringEnd(s string, i int) int {
+	for j := i + 1; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			j++
+		case '"':
+			return j + 1
+		}
+	}
+	return 0
 }
