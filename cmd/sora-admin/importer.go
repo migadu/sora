@@ -1878,6 +1878,21 @@ func openLinkCheckedRoot(path string, mode rootWalk) (*os.Root, error) {
 				if parent != "" {
 					return nil, fmt.Errorf("refusing %s: %s is a symbolic link of the user this runs as (uid %d), but users other than root and uid %d can rename entries in %s, on its path (owner uid %d, mode %04o), and so may have given it this name; name the directory it leads to instead", given, name, euid, euid, parent, owner, perm)
 				}
+				// The pathname checks may have inspected a replacement after this
+				// walk opened a directory. Apply the same rule to the pinned
+				// ancestry that supplied the link, not just its current name.
+				for at, label := len(dirs)-1, resolved; at >= 0; at, label = at-1, filepath.Dir(label) {
+					info, err := fstatDir(dirs[at], label)
+					if err != nil {
+						return nil, fmt.Errorf("refusing %s: failed to check the opened directory holding symbolic link %s: %w", given, name, err)
+					}
+					owner := fileUID(info)
+					writable := info.Mode().Perm()&0o022 != 0
+					stickyAncestor := at < len(dirs)-1 && info.Mode()&os.ModeSticky != 0
+					if (owner != 0 && owner != euid) || (writable && !stickyAncestor) {
+						return nil, fmt.Errorf("refusing %s: %s is a symbolic link of the user this runs as (uid %d), but its opened directory ancestry at %s permits another user to name it (owner uid %d, mode %04o); name the directory it leads to instead", given, name, euid, label, owner, info.Mode().Perm())
+					}
+				}
 			default:
 				next = append(next, step{link: name, linkUID: uid})
 			}
