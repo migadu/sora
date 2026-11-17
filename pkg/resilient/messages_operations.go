@@ -184,8 +184,15 @@ var destObjectKeepalive = 30 * time.Second
 // move with a *DestObjectError, which the write circuit breaker does not count and the
 // retry does not repeat (the S3 calls retry on their own). A statement keeps the
 // transaction alive at least every destObjectKeepalive.
+//
+// A fresh complete-source preflight under account-rekey guards refuses an
+// oversized cross-account command before destination locks or storage callbacks.
+// This also counts legacy rows already owned by the destination.
 func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(ctx context.Context, contentHash string) error) (map[imap.UID]imap.UID, error) {
 	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
+		if err := rd.getOperationalDatabaseForOperation(opCtx, true).CheckCopyMoveBodyBudget(opCtx, tx, srcMailboxID, destMailboxID, destAccountID, ids, destObjects); err != nil {
+			return nil, err
+		}
 		if len(destObjects) > 0 {
 			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
 				return nil, err
@@ -199,7 +206,7 @@ func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]i
 		}
 		return rd.getOperationalDatabaseForOperation(opCtx, true).MoveMessages(opCtx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, sourceHashes, destObjects)
 	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op, db.ErrCrossAccountBodyLimit)
 	if err != nil {
 		return nil, err
 	}
