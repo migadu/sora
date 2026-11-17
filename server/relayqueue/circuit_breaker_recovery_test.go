@@ -176,6 +176,11 @@ func TestCircuitBreakerAutoRecovery(t *testing.T) {
 	}
 
 success:
+	// A handler's success precedes durable local terminal cleanup (the file
+	// leaves processing/ only after SendToExternalRelay returns). Join workers
+	// before asserting that all queue files have been removed.
+	worker.Stop()
+
 	// Verify circuit breaker is now CLOSED (fully recovered)
 	finalState := cb.State()
 	if finalState != circuitbreaker.StateClosed {

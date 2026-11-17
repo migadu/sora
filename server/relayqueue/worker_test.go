@@ -21,6 +21,33 @@ type mockRelayHandler struct {
 	deliveryDelay time.Duration
 }
 
+// waitThenStopWorker polls until done holds (or timeout passes), then joins the
+// worker. A handler returns before the worker moves the message out of
+// processing/, so a test that asserts queue state must join the worker first;
+// polling instead of a fixed sleep keeps slow -race runs from timing out early.
+// On timeout it only logs, leaving the caller's assertions to report specifics.
+func waitThenStopWorker(t *testing.T, worker *Worker, timeout time.Duration, done func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for !done() {
+		if time.Now().After(deadline) {
+			t.Logf("worker did not reach the expected state within %v", timeout)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	worker.Stop()
+}
+
+// queueFailedCount returns the failed/ count, or -1 if stats cannot be read.
+func queueFailedCount(q *DiskQueue) int {
+	_, _, failed, err := q.GetStats()
+	if err != nil {
+		return -1
+	}
+	return failed
+}
+
 type mockMessage struct {
 	From    string
 	To      string
@@ -198,12 +225,11 @@ func TestWorkerProcessMessage(t *testing.T) {
 	}
 	defer worker.Stop()
 
-	// Wait for processing
-	time.Sleep(200 * time.Millisecond)
+	waitThenStopWorker(t, worker, 5*time.Second, func() bool { return handler.getMessageCount() == 1 })
 
 	// Verify message was delivered
 	if handler.getMessageCount() != 1 {
-		t.Errorf("Expected 1 delivered message, got %d", handler.getMessageCount())
+		t.Fatalf("Expected 1 delivered message, got %d", handler.getMessageCount())
 	}
 
 	delivered := handler.getMessage(0)
@@ -261,7 +287,7 @@ func TestWorkerProcessMultipleMessages(t *testing.T) {
 	defer worker.Stop()
 
 	// Wait for processing (two batches of 5)
-	time.Sleep(500 * time.Millisecond)
+	waitThenStopWorker(t, worker, 5*time.Second, func() bool { return handler.getMessageCount() == numMessages })
 
 	// Verify all messages were delivered
 	if handler.getMessageCount() != numMessages {
@@ -309,7 +335,7 @@ func TestWorkerRetryOnFailure(t *testing.T) {
 	defer worker.Stop()
 
 	// Wait for retries (50ms initial + 50ms backoff + 100ms backoff + processing time)
-	time.Sleep(500 * time.Millisecond)
+	waitThenStopWorker(t, worker, 5*time.Second, func() bool { return handler.getMessageCount() == 1 })
 
 	// Verify message was eventually delivered
 	if handler.getMessageCount() != 1 {
@@ -357,7 +383,7 @@ func TestWorkerMaxAttemptsFailure(t *testing.T) {
 	defer worker.Stop()
 
 	// Wait for all attempts (20ms * 3 attempts + backoff delays + buffer)
-	time.Sleep(500 * time.Millisecond)
+	waitThenStopWorker(t, worker, 5*time.Second, func() bool { return queueFailedCount(queue) == 1 })
 
 	// Verify message is in failed state
 	pending, processing, failed, err := queue.GetStats()
@@ -476,8 +502,7 @@ func TestWorkerNilHandler(t *testing.T) {
 	}
 	defer worker.Stop()
 
-	// Wait for processing
-	time.Sleep(200 * time.Millisecond)
+	waitThenStopWorker(t, worker, 5*time.Second, func() bool { return queueFailedCount(queue) == 1 })
 
 	// Message should be moved to failed (max attempts = 1, no handler)
 	_, _, failed, err := queue.GetStats()
@@ -607,8 +632,8 @@ func TestWorkerImmediateProcessing(t *testing.T) {
 	}
 	defer worker.Stop()
 
-	// Wait for immediate processing (should be < 1 second, not waiting for 10s interval)
-	time.Sleep(200 * time.Millisecond)
+	// Wait for immediate processing (well under the 10s interval)
+	waitThenStopWorker(t, worker, 2*time.Second, func() bool { return handler.getMessageCount() == 1 })
 
 	elapsed := time.Since(startTime)
 	if elapsed > 2*time.Second {
