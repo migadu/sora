@@ -59,3 +59,54 @@ func TestCredentialChangesMigrationLifecycle(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, count(), "recreated feed records one event without duplicate triggers")
 }
+
+// A database whose triggers were installed out-of-band must migrate without any lock on
+// accounts or credentials: every login reads credentials, so a queued lock there stalls them.
+func TestCredentialChangesMigrationPreparedTakesNoTableLocks(t *testing.T) {
+	d := setupTestDatabaseWithSuffix(t, "_feed_migration")
+	defer d.Close()
+	ctx := context.Background()
+	up, err := os.ReadFile("migrations/000069_credential_changes.up.sql")
+	require.NoError(t, err)
+	_, err = d.GetWritePool().Exec(ctx, string(up))
+	require.NoError(t, err)
+
+	conn, err := d.GetWritePool().Acquire(ctx)
+	require.NoError(t, err)
+	defer conn.Release()
+	locker, err := d.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	_, err = locker.Exec(ctx, "LOCK TABLE accounts, credentials, credential_changes IN ACCESS EXCLUSIVE MODE")
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, "SET lock_timeout = '200ms'")
+	require.NoError(t, err)
+	_, err = conn.Exec(ctx, string(up))
+	_, _ = conn.Exec(ctx, "RESET lock_timeout")
+	require.NoError(t, locker.Rollback(ctx))
+	require.NoError(t, err, "the prepared migration must only inspect catalogs, even with the tables exclusively locked")
+}
+
+// A same-named trigger that does not call record_credential_change is not a prepared one.
+func TestCredentialChangesMigrationReplacesForeignTrigger(t *testing.T) {
+	d := setupTestDatabaseWithSuffix(t, "_feed_migration")
+	defer d.Close()
+	ctx := context.Background()
+	up, err := os.ReadFile("migrations/000069_credential_changes.up.sql")
+	require.NoError(t, err)
+	pool := d.GetWritePool()
+	_, err = pool.Exec(ctx, string(up))
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `CREATE OR REPLACE FUNCTION foreign_credential_trigger() RETURNS TRIGGER AS $$ BEGIN RETURN NULL; END; $$ LANGUAGE plpgsql;
+		DROP TRIGGER trigger_accounts_removed ON accounts;
+		CREATE CONSTRAINT TRIGGER trigger_accounts_removed AFTER DELETE ON accounts
+			DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION foreign_credential_trigger()`)
+	require.NoError(t, err)
+	t.Cleanup(func() { _, _ = pool.Exec(ctx, "DROP FUNCTION IF EXISTS foreign_credential_trigger() CASCADE") })
+
+	_, err = pool.Exec(ctx, string(up))
+	require.NoError(t, err)
+	var ours bool
+	require.NoError(t, pool.QueryRow(ctx, `SELECT tgfoid = 'record_credential_change()'::regprocedure
+		FROM pg_trigger WHERE tgrelid = 'accounts'::regclass AND tgname = 'trigger_accounts_removed'`).Scan(&ours))
+	require.True(t, ours)
+}

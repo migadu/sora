@@ -65,3 +65,64 @@ func TestInitialModSeqMigrationLifecycle(t *testing.T) {
 	require.NoError(t, c.QueryRow(ctx, `SELECT initial_modseq FROM message_state WHERE message_id=4`).Scan(&initial))
 	require.Equal(t, int64(40), initial)
 }
+
+// A database prepared out-of-band must migrate without any lock on message_state, which every
+// flag change writes. ADD COLUMN IF NOT EXISTS would lock it even with the column present.
+func TestInitialModSeqMigrationPreparedTakesNoTableLock(t *testing.T) {
+	d := setupTestDatabase(t)
+	defer d.Close()
+	ctx := context.Background()
+	up, err := os.ReadFile("migrations/000071_message_state_initial_modseq.up.sql")
+	require.NoError(t, err)
+	c, err := d.GetWritePool().Acquire(ctx)
+	require.NoError(t, err)
+	defer c.Release()
+	name := fmt.Sprintf("initial_version_lock_%d", time.Now().UnixNano())
+	schema := pgx.Identifier{name}.Sanitize()
+	_, err = c.Exec(ctx, "CREATE SCHEMA "+schema+"; SET search_path="+schema)
+	require.NoError(t, err)
+	defer c.Exec(ctx, "RESET search_path; DROP SCHEMA "+schema+" CASCADE")
+	_, err = c.Exec(ctx, `CREATE TABLE message_state(message_id bigint PRIMARY KEY, updated_modseq bigint)`)
+	require.NoError(t, err)
+	_, err = c.Exec(ctx, string(up))
+	require.NoError(t, err)
+
+	locker, err := d.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	_, err = locker.Exec(ctx, "LOCK TABLE "+pgx.Identifier{name, "message_state"}.Sanitize()+" IN ACCESS EXCLUSIVE MODE")
+	require.NoError(t, err)
+	_, err = c.Exec(ctx, "SET lock_timeout = '200ms'")
+	require.NoError(t, err)
+	_, err = c.Exec(ctx, string(up))
+	_, _ = c.Exec(ctx, "RESET lock_timeout")
+	require.NoError(t, locker.Rollback(ctx))
+	require.NoError(t, err, "the prepared migration must only inspect catalogs, even with message_state exclusively locked")
+}
+
+// A same-named trigger that does not call preserve_message_state_initial_modseq is replaced.
+func TestInitialModSeqMigrationReplacesForeignTrigger(t *testing.T) {
+	d := setupTestDatabase(t)
+	defer d.Close()
+	ctx := context.Background()
+	up, err := os.ReadFile("migrations/000071_message_state_initial_modseq.up.sql")
+	require.NoError(t, err)
+	c, err := d.GetWritePool().Acquire(ctx)
+	require.NoError(t, err)
+	defer c.Release()
+	schema := pgx.Identifier{fmt.Sprintf("initial_version_foreign_%d", time.Now().UnixNano())}.Sanitize()
+	_, err = c.Exec(ctx, "CREATE SCHEMA "+schema+"; SET search_path="+schema)
+	require.NoError(t, err)
+	defer c.Exec(ctx, "RESET search_path; DROP SCHEMA "+schema+" CASCADE")
+	_, err = c.Exec(ctx, `CREATE TABLE message_state(message_id bigint PRIMARY KEY, updated_modseq bigint, initial_modseq bigint);
+		CREATE FUNCTION foreign_state_trigger() RETURNS TRIGGER AS $$ BEGIN RETURN NEW; END; $$ LANGUAGE plpgsql;
+		CREATE TRIGGER trigger_message_state_initial_modseq BEFORE INSERT OR UPDATE ON message_state
+			FOR EACH ROW EXECUTE FUNCTION foreign_state_trigger()`)
+	require.NoError(t, err)
+	_, err = c.Exec(ctx, string(up))
+	require.NoError(t, err)
+	_, err = c.Exec(ctx, `INSERT INTO message_state(message_id, updated_modseq) VALUES (1, 10)`)
+	require.NoError(t, err)
+	var initial int64
+	require.NoError(t, c.QueryRow(ctx, `SELECT initial_modseq FROM message_state WHERE message_id = 1`).Scan(&initial))
+	require.Equal(t, int64(10), initial, "the foreign trigger must have been replaced by the migration's")
+}
