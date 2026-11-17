@@ -3,14 +3,9 @@ package helpers
 import (
 	"bytes"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/emersion/go-message"
 )
-
-// MaxMessageIDRawBytes bounds pathological Message-ID headers while remaining well
-// above RFC 5322's 998-character line limit.
-const MaxMessageIDRawBytes = 16384
 
 // ExtractMessageIDRaw extracts the unfolded RFC 5322 Message-ID field text when
 // messages.message_id cannot represent it losslessly for IMAP HEADER Message-ID
@@ -60,7 +55,7 @@ func ExtractMessageIDRaw(header message.Header, parsedMessageID string) *string 
 		return nil
 	}
 
-	joined := truncateUTF8String(strings.Join(values, "\n"), MaxMessageIDRawBytes)
+	joined := strings.Join(values, "\n")
 	return &joined
 }
 
@@ -125,17 +120,19 @@ func ExtractRawMessageIDFromBytes(raw []byte) *string {
 	if len(values) == 0 {
 		return nil
 	}
-	joined := truncateUTF8String(strings.Join(values, "\n"), MaxMessageIDRawBytes)
+	joined := strings.Join(values, "\n")
 	return &joined
 }
 
 // SanitizeMessageIDRaw sanitizes a caller-supplied *string for storage in
-// messages.message_id_raw.
+// messages.message_id_raw. Retain the complete field body: RFC 5322 limits
+// physical line length, not the total length of a folded field. Ingress message
+// limits already bound the source bytes.
 func SanitizeMessageIDRaw(raw *string) *string {
 	if raw == nil {
 		return nil
 	}
-	s := truncateUTF8String(SanitizeUTF8(*raw), MaxMessageIDRawBytes)
+	s := SanitizeUTF8(*raw)
 	return &s
 }
 
@@ -180,15 +177,4 @@ func unfoldRFC5322FieldBody(b []byte) string {
 		out.WriteByte(b[i])
 	}
 	return strings.Trim(out.String(), " \t")
-}
-
-func truncateUTF8String(s string, maxBytes int) string {
-	if len(s) <= maxBytes {
-		return s
-	}
-	s = s[:maxBytes]
-	for len(s) > 0 && !utf8.ValidString(s) {
-		s = s[:len(s)-1]
-	}
-	return s
 }

@@ -157,3 +157,31 @@ func TestIMAP_HeaderMessageIDFieldTextFidelity(t *testing.T) {
 		}
 	}
 }
+
+func TestIMAP_HeaderMessageIDLongFoldedTail(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	srv, account := common.SetupIMAPServer(t)
+	defer srv.Close()
+	c := dialRawIMAP(t, srv.Address)
+	c.do(fmt.Sprintf("LOGIN %s %s", account.Email, account.Password))
+	defer c.do("LOGOUT")
+	const tail = "TailNeedleBeyondSixteenKiB"
+	value := "(" + strings.Repeat(strings.Repeat("x", 900)+"\r\n ", 20) + tail + ") <long@example.com>"
+	c.appendMsg("INBOX", "From: a@example.com\r\nMessage-ID: "+value+"\r\nMessage-ID: <later@example.com>\r\n\r\nbody\r\n")
+	c.do("SELECT INBOX")
+	check := func() {
+		t.Helper()
+		for _, term := range []string{tail, "<later@example.com>"} {
+			lines, _ := c.do(fmt.Sprintf(`UID SEARCH HEADER Message-ID %q`, term))
+			got := parseSearchUIDs(lines)
+			if len(got) != 1 || got[0] != 1 {
+				t.Fatalf("HEADER Message-ID %q = %v, want [1]; transcript %v", term, got, lines)
+			}
+		}
+	}
+	check()
+	c.do("CREATE LongCopy")
+	c.do("UID COPY 1 LongCopy")
+	c.do("SELECT LongCopy")
+	check()
+}
