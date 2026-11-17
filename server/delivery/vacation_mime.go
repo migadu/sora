@@ -247,6 +247,11 @@ func (r *vacationMultipartBoundaryReader) Read(p []byte) (int, error) {
 			r.err = finishErr
 			return 0, finishErr
 		}
+	} else if err != nil {
+		// MultipartReader may recognize a prefetched close marker before it
+		// observes an error returned with those bytes. Retain the source error
+		// for the final drain even if its next Read would return EOF.
+		r.err = err
 	}
 	return n, err
 }
