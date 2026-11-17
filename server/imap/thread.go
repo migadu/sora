@@ -449,10 +449,10 @@ func messageReferences(msg *db.ThreadMessageResult) []string {
 }
 
 // extractIDs splits a stored Message-ID, In-Reply-To or References value into
-// message ids. The messages table holds them without angle brackets, several
-// joined by a space (db.InsertMessage); a bracketed value splits the same way, and
-// every id comes back bare, so ids from the three columns compare equal. A quoted
-// local part stays one id (helpers.SplitMessageIDs).
+// message ids. The messages table holds them without angle brackets, several joined
+// by a space (db.InsertMessage); a synthetic message_id never gets here
+// (headerMessageID). A quoted local part stays one id (helpers.SplitMessageIDs), so
+// ids from the three columns compare equal.
 func extractIDs(s string) []string {
 	return helpers.SplitMessageIDs(s)
 }

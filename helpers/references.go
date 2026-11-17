@@ -1,10 +1,6 @@
 package helpers
 
-import (
-	"strings"
-	"unicode"
-	"unicode/utf8"
-)
+import "strings"
 
 // MaxReferencesBytes bounds messages."references". The column is in no index, so the
 // bound only keeps a pathological header from bloating the row; at 60-70 bytes per ID it
@@ -54,20 +50,19 @@ func TrimReferences(ids []string, maxBytes int) string {
 	return strings.Join(kept[tail(maxBytes):], " ")
 }
 
-// SplitMessageIDs splits a stored message_id, in_reply_to or "references" value, or a
-// bracketed list of message ids, into bare ids. The columns join ids with single
-// spaces; white space, '<' and '>' separate ids, except inside a quoted string that
-// opens an id. go-message keeps the quoting an obsolete local part needs (RFC 5322
-// §3.6.4 obs-id-left), so `"foo bar"@example.com` and `"<x>"@example.com` are one id.
-// A quote with no closing quote is an ordinary character. db.msgIDListExpr is the
-// same rule in SQL; keep the two in step.
+// SplitMessageIDs splits a stored message_id, in_reply_to or "references" value into
+// its ids. The columns join ids with single ASCII spaces, and that space is the only
+// separator: go-message keeps the quoting an obsolete local part needs (RFC 5322
+// §3.6.4 obs-id-left), so a quoted string opening an id may hold spaces
+// (`"foo bar"@example.com`), and an id may hold '<', '>' or '"' in a domain literal
+// and any non-ASCII rune, NBSP included, outside quotes. A quote that never closes is
+// an ordinary character. db.msgIDListExpr is the same rule in SQL; keep the two in
+// step.
 func SplitMessageIDs(s string) []string {
-	isSep := func(r rune) bool { return r == '<' || r == '>' || unicode.IsSpace(r) }
 	ids := []string{}
 	for i := 0; i < len(s); {
-		r, size := utf8.DecodeRuneInString(s[i:])
-		if isSep(r) {
-			i += size
+		if s[i] == ' ' {
+			i++
 			continue
 		}
 		start := i
@@ -76,12 +71,8 @@ func SplitMessageIDs(s string) []string {
 				i = end
 			}
 		}
-		for i < len(s) {
-			r, size := utf8.DecodeRuneInString(s[i:])
-			if isSep(r) {
-				break
-			}
-			i += size
+		for i < len(s) && s[i] != ' ' {
+			i++
 		}
 		ids = append(ids, s[start:i])
 	}
