@@ -273,3 +273,31 @@ func TestStripAttachmentsBoundsNesting(t *testing.T) {
 		t.Errorf("texts = %q, want only the shallow part", texts)
 	}
 }
+
+// TestStripAttachmentsTrailingSemicolons checks that a boundary parameter
+// followed by ";;" or "; ;" is still found: mime.ParseMediaType rejects those
+// with no parameters, which left the multipart unreadable (#1802).
+func TestStripAttachmentsTrailingSemicolons(t *testing.T) {
+	for _, suffix := range []string{";", ";;", "; ;"} {
+		msg := crlf(`From: a@example.org
+To: user@example.com
+Subject: test
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary=outer` + suffix + `
+
+--outer
+Content-Type: text/plain; charset=utf-8
+
+hello words
+` + pdfPart)
+		out, err := StripAttachments([]byte(msg))
+		if err != nil {
+			t.Errorf("suffix %q: StripAttachments: %v", suffix, err)
+			continue
+		}
+		types, texts := parseTrainingCopy(t, out)
+		if !reflect.DeepEqual(types, []string{"multipart/mixed", "text/plain"}) || !reflect.DeepEqual(texts, []string{"hello words"}) {
+			t.Errorf("suffix %q: training copy has types %q and texts %q, want the text part without the PDF", suffix, types, texts)
+		}
+	}
+}
