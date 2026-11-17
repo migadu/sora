@@ -307,8 +307,9 @@ type IMAPServer struct {
 	preview *previewState
 
 	// Node-wide total of body-section bytes retained by sessions for <offset.size>
-	// chunk fetches (see body_section_cache.go).
-	bodySectionCacheBytes atomic.Int64
+	// chunk fetches, in memory and spilled to temp files (see body_section_cache.go).
+	bodySectionCacheBytes   atomic.Int64
+	spilledBodySectionBytes atomic.Int64
 
 	// PROXY protocol support
 	proxyReader *serverPkg.ProxyProtocolReader

@@ -1369,7 +1369,7 @@ func (db *Database) RenameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	return db.renameMailbox(ctx, tx, mailboxID, AccountID, newName, newParentID, nil)
 }
 
-func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64, changes *[]MailboxNameMutation) error {
+func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int64, AccountID int64, newName string, newParentID *int64, capture *mailboxRenameCapture) error {
 	// The same names createMailbox refuses: control characters, empty levels and
 	// "." / ".." levels (maildir-export path traversal).
 	if !helpers.MailboxNameValid(newName) {
@@ -1605,7 +1605,7 @@ func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 	}
 
 	var beforeNames map[int64]MailboxNameMutation
-	if changes != nil {
+	if capture != nil {
 		beforeNames = make(map[int64]MailboxNameMutation)
 		rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE account_id=$1 AND deleted_at IS NULL AND (id=$2 OR path LIKE $3 || '%')`, ownerAccountID, mailboxID, oldPath)
 		if err != nil {
@@ -1715,7 +1715,7 @@ func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		return fmt.Errorf("failed to move subscriptions during rename of mailbox %d: %w", mailboxID, err)
 	}
 
-	if changes != nil {
+	if capture != nil {
 		ids := make([]int64, 0, len(beforeNames))
 		for id := range beforeNames {
 			ids = append(ids, id)
@@ -1733,7 +1733,8 @@ func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 			}
 			n := beforeNames[id]
 			n.AfterName, n.AfterKey = name, key
-			*changes = append(*changes, n)
+			n.SubscribedSet = capture.viewer != 0 && capture.viewer != ownerAccountID
+			capture.changes = append(capture.changes, n)
 		}
 		rows.Close()
 		if err := rows.Err(); err != nil {

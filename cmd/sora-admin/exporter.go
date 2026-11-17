@@ -50,6 +50,7 @@ type Exporter struct {
 	db              *sql.DB
 	dbPath          string // Path to the SQLite database file
 	privateCacheDir string // Dry-run snapshot, removed after closing its SQLite connection
+	privateCache    *privateTempDir
 	rdb             *resilient.ResilientDatabase
 	s3              objectStorage
 	options         ExporterOptions
@@ -97,9 +98,10 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		maildirPath = effectiveMaildirPath(maildirPath)
 		dbPath := filepath.Join(maildirPath, maildirCacheName)
 		var cache *sql.DB
+		var privateCache *privateTempDir
 		var privateDir string
 		if root != nil {
-			cache, privateDir, err = openExportCacheForDryRun(ctx, root)
+			cache, privateCache, err = openExportCacheForDryRun(ctx, root)
 			if err != nil || cache == nil {
 				root.Close()
 				root = nil
@@ -107,9 +109,13 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 			if err != nil {
 				return nil, err
 			}
+			if privateCache != nil {
+				privateDir = privateCache.path
+			}
 		}
 		return &Exporter{ctx: ctx, maildirPath: maildirPath, root: root, email: email,
-			jobs: jobs, db: cache, dbPath: dbPath, privateCacheDir: privateDir, rdb: rdb, s3: s3,
+			jobs: jobs, db: cache, dbPath: dbPath, privateCacheDir: privateDir,
+			privateCache: privateCache, rdb: rdb, s3: s3,
 			options: options, startTime: time.Now(), uidMappings: make(map[string][]UIDFileMapping),
 			keywordIndex: make(map[string]map[string]int)}, nil
 	}
@@ -241,8 +247,11 @@ func (exporter *Exporter) Close() error {
 		closeErr = errors.Join(closeErr, exporter.root.Close())
 		exporter.root = nil
 	}
-	if exporter.privateCacheDir != "" {
-		closeErr = errors.Join(closeErr, os.RemoveAll(exporter.privateCacheDir))
+	if exporter.privateCache != nil {
+		closeErr = errors.Join(closeErr, exporter.privateCache.cleanup())
+		exporter.privateCache = nil
+		exporter.privateCacheDir = ""
+	} else if exporter.privateCacheDir != "" {
 		exporter.privateCacheDir = ""
 	}
 	return closeErr

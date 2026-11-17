@@ -138,7 +138,8 @@ func TestS3ImporterRefusesATempDirOthersCanReplaceItsDirectoryIn(t *testing.T) {
 		{"others can write above TMPDIR", 0700, 0777, false, false, true},
 		{"TMPDIR belongs to another user", 0700, 0700, true, false, true},
 		{"others can write in TMPDIR with the sticky bit", 0777 | os.ModeSticky, 0700, false, false, false},
-		{"others can write in TMPDIR with protected hard links", 0777, 0777, false, true, false},
+		{"others can write in TMPDIR with the sticky bit and protected hard links", 0777 | os.ModeSticky, 0700, false, true, false},
+		{"others can write in TMPDIR with protected hard links", 0777, 0777, false, true, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -168,7 +169,7 @@ func TestS3ImporterRefusesATempDirOthersCanReplaceItsDirectoryIn(t *testing.T) {
 				require.NoError(t, err)
 				return
 			}
-			assert.ErrorContains(t, err, "refusing to keep the S3 import's work database in "+filepath.Join(realTmpDir, "sora-s3-import-"))
+			assert.ErrorContains(t, err, "refusing to keep the S3 import's work database in "+realTmpDir)
 			assert.ErrorContains(t, err, "TMPDIR")
 			assert.Empty(t, dirNames(t, tmpDir), "the refused run left its directory in TMPDIR")
 		})
@@ -178,11 +179,9 @@ func TestS3ImporterRefusesATempDirOthersCanReplaceItsDirectoryIn(t *testing.T) {
 // The run's directory is made by its name in TMPDIR, and --cleanup-db removes it with
 // everything in it. A user who may rename entries of TMPDIR (one without the sticky
 // bit) can move it aside the moment it appears and put a symbolic link to another
-// directory at its name. The run must not take that directory for its own: --cleanup-db
-// would remove it, with everything in it, often as root, and where hard links are not
-// protected the refusal of such a TMPDIR would check the parents of that directory
-// instead of TMPDIR. Where they are protected nothing is checked, and the database is
-// then created through the link, but only the link is removed.
+// directory at its name. Even where hard links are protected, rename and symlink swaps
+// in a non-sticky TMPDIR are still allowed by the kernel, so such a TMPDIR must be
+// refused before creating anything and without writing into or removing the link's target.
 func TestS3ImporterCleanupRemovesOnlyItsOwnDirectory(t *testing.T) {
 	for _, protected := range []bool{true, false} {
 		t.Run(fmt.Sprintf("protected hard links %t", protected), func(t *testing.T) {
@@ -211,13 +210,61 @@ func TestS3ImporterCleanupRemovesOnlyItsOwnDirectory(t *testing.T) {
 			}
 
 			assert.FileExists(t, filepath.Join(precious, "keep"), "--cleanup-db removed the directory the link at the run's directory named")
-			if protected {
-				require.NoError(t, err)
-				return
-			}
 			assert.ErrorContains(t, err, "refusing to keep the S3 import's work database in ")
 			assert.ErrorContains(t, err, "can rename entries of "+realTmpDir+" above it")
 			assert.Equal(t, []string{"keep"}, dirNames(t, precious), "the refused run wrote in the directory the link named")
 		})
 	}
+}
+
+func TestS3ImporterConfinesPrivateDirectoryAgainstSwapAndCleanup(t *testing.T) {
+	t.Run("symlink swap at creation in sticky TMPDIR", func(t *testing.T) {
+		for _, protected := range []bool{true, false} {
+			t.Run(fmt.Sprintf("protected_%t", protected), func(t *testing.T) {
+				realProtection, realMkdirTemp := hardLinksProtected, mkdirTemp
+				t.Cleanup(func() { hardLinksProtected, mkdirTemp = realProtection, realMkdirTemp })
+				hardLinksProtected = func() bool { return protected }
+				sharedTempDir(t)
+				precious := t.TempDir()
+				require.NoError(t, os.WriteFile(filepath.Join(precious, "keep"), []byte("not the import's\n"), 0600))
+				mkdirTemp = func(dir, pattern string) (string, error) {
+					name, err := realMkdirTemp(dir, pattern)
+					if err == nil {
+						require.NoError(t, os.Rename(name, name+".moved"))
+						require.NoError(t, os.Symlink(precious, name))
+					}
+					return name, err
+				}
+
+				si, err := NewS3Importer(context.Background(), nil, nil, S3ImporterOptions{Workers: 1, CleanupDB: true})
+				if si != nil {
+					_ = si.Close()
+				}
+				require.Error(t, err, "must refuse private directory replaced with a symlink")
+				assert.Equal(t, []string{"keep"}, dirNames(t, precious), "must not create work database through swapped symlink")
+			})
+		}
+	})
+
+	t.Run("directory replacement before Close preserves replacement contents", func(t *testing.T) {
+		sharedTempDir(t)
+		si, err := NewS3Importer(context.Background(), nil, nil, S3ImporterOptions{Workers: 1, CleanupDB: true})
+		require.NoError(t, err)
+		dir := filepath.Dir(si.dbPath)
+
+		replacement := filepath.Join(t.TempDir(), "replacement")
+		require.NoError(t, os.Mkdir(replacement, 0700))
+		require.NoError(t, os.WriteFile(filepath.Join(replacement, "keep"), []byte("other user's file"), 0600))
+		require.NoError(t, os.WriteFile(filepath.Join(replacement, s3ImportDBName), []byte("other user's db"), 0600))
+
+		moved := dir + ".moved"
+		require.NoError(t, os.Rename(dir, moved))
+		t.Cleanup(func() { _ = os.RemoveAll(moved); _ = os.RemoveAll(dir) })
+		require.NoError(t, os.Rename(replacement, dir))
+
+		require.NoError(t, si.Close())
+		assert.ElementsMatch(t, []string{"keep", s3ImportDBName}, dirNames(t, dir),
+			"Close must not remove files from a directory renamed onto the work directory path")
+		assert.Empty(t, dirNames(t, moved), "Close must unlink its own work database files via the held directory descriptor")
+	})
 }
