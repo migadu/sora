@@ -15,12 +15,43 @@ import (
 	"github.com/migadu/sora/logger"
 )
 
+// MaxCrossAccountBodies bounds all distinct source bodies when any selected row
+// is rekeyed to another account, including legacy rows already owned by the
+// destination. Source/destination global body claims and FTS locks remain held
+// through commit. Their budget excludes source-account and ordinary SQL locks,
+// and concurrent commands still need shared lock-table capacity. Pure same-owner
+// commands retain their existing policy. COPY cannot be split into partial commits.
+const MaxCrossAccountBodies = 1000
+
+// ErrCrossAccountBodyLimit refuses an oversized cross-account source budget.
+// Account guards may be held for a fresh check, but no body lock, storage callback
+// or message write has started.
+var ErrCrossAccountBodyLimit = fmt.Errorf("a copy or move into another account's mailbox is limited to %d distinct source bodies", MaxCrossAccountBodies)
+
+// CheckCrossAccountBodies checks a protocol preflight map containing every selected
+// source UID when any row is rekeyed. The actual write transaction repeats the
+// complete-source check under account-rekey guards. Repeated bodies count once.
+func CheckCrossAccountBodies(sourceHashes map[imap.UID]string) error {
+	if len(sourceHashes) <= MaxCrossAccountBodies {
+		return nil
+	}
+	bodies := make(map[string]struct{}, MaxCrossAccountBodies+1)
+	for _, hash := range sourceHashes {
+		bodies[hash] = struct{}{}
+		if len(bodies) > MaxCrossAccountBodies {
+			return ErrCrossAccountBodyLimit
+		}
+	}
+	return nil
+}
+
 // LockS3ObjectsSharedInTx takes the S3 object locks (GetS3ObjectLockID) of accountID's
 // contentHashes in shared mode on tx, in id order, waiting for an exclusive holder (for at
 // most the transaction's lock_timeout). They last until tx ends. Shared holders do not
-// exclude one another; they keep out every exclusive locker of the same objects: the
-// cleaner's and the purge's deletes (which only try the lock and skip a busy object), a
-// restore, sora-admin rekey, and the uploader's write gate.
+// exclude one another; they keep out the exclusive holders used by typed durable
+// body cleanup (the cleaner and purge skip a busy object). Restore, rekey admission and the uploader gate share
+// immutable claims. Each lock consumes a lock-table entry until tx ends; callers
+// budget their batches, including the complete-source COPY/MOVE check.
 //
 // The statement carries the ids as literals, so it goes over the simple protocol and
 // leaves no portal or snapshot behind: a transaction that holds the locks across S3 round
@@ -89,7 +120,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		logger.Info("Database: moving messages within the same mailbox, will assign new UIDs", "mailbox_id", srcMailboxID)
 	}
 
-	if err := lockS3SourceClaims(ctx, tx, srcMailboxID, ids); err != nil {
+	if err := lockS3SourceClaims(ctx, tx, srcMailboxID, destMailboxID, destAccountID, ids, destObjects); err != nil {
 		return nil, err
 	}
 
@@ -337,10 +368,8 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	if err := db.restagePendingUploads(ctx, tx, destMailboxID, keptUIDs, rekeyedUIDs, instanceID); err != nil {
 		return nil, err
 	}
-	if len(rekeyedUIDs) > 0 {
-		if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
-			return nil, err
-		}
+	if err := db.restageFTS(ctx, tx, destMailboxID, rekeyedUIDs); err != nil {
+		return nil, err
 	}
 
 	// Mark the original messages as expunged in the source mailbox
