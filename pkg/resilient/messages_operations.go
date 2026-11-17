@@ -193,7 +193,7 @@ func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]i
 		if err := rd.getOperationalDatabaseForOperation(opCtx, true).CheckCopyMoveBodyBudget(opCtx, tx, srcMailboxID, destMailboxID, destAccountID, ids, destObjects); err != nil {
 			return nil, err
 		}
-		if len(destObjects) > 0 {
+		if srcMailboxID != destMailboxID && len(destObjects) > 0 {
 			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
 				return nil, err
 			}

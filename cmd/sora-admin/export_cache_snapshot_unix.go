@@ -22,13 +22,21 @@ const sqliteLockLength = 512
 // exportSnapshotDirFD is, in the helper, the descriptor of the directory that holds
 // the cache: openExportCacheForDryRun passes the root the dry run checked as the
 // helper's first extra file, and every source file is opened and checked through it.
+// exportSnapshotDestDirFD is the verified 0700 private destination directory, passed
+// as the second extra file so no destination path is resolved again.
 const exportSnapshotDirFD = 3
+const exportSnapshotDestDirFD = 4
 
-func copyExportCacheSnapshot(req exportSnapshotRequest) error {
+func copyExportCacheSnapshot(exportSnapshotRequest) error {
 	root := exportSnapshotDirFD
 	var st unix.Stat_t
 	if err := unix.Fstat(root, &st); err != nil || st.Mode&unix.S_IFMT != unix.S_IFDIR {
 		return fmt.Errorf("the cache directory was not passed to the snapshot helper")
+	}
+	destination := exportSnapshotDestDirFD
+	var destSt unix.Stat_t
+	if err := unix.Fstat(destination, &destSt); err != nil || destSt.Mode&unix.S_IFMT != unix.S_IFDIR || destSt.Mode&0o777 != 0700 {
+		return fmt.Errorf("the private snapshot directory was not passed to the snapshot helper")
 	}
 	name := maildirCacheName
 	// O_RDWR is needed for F_WRLCK, but no source descriptor is ever written.
@@ -59,11 +67,6 @@ func copyExportCacheSnapshot(req exportSnapshotRequest) error {
 	if _, err := lstatAt(root, name+"-journal"); !os.IsNotExist(err) {
 		return fmt.Errorf("cache has a rollback journal or cannot inspect it; recover/close it before preview: %v", err)
 	}
-	destination, err := os.OpenRoot(req.Destination)
-	if err != nil {
-		return err
-	}
-	defer destination.Close()
 	if err := copyExportSnapshotFile(destination, name, f); err != nil {
 		return err
 	}
@@ -102,8 +105,9 @@ func copyExportCacheSnapshot(req exportSnapshotRequest) error {
 }
 
 // openExportSnapshotSource opens name in the directory root with flag, never
-// following a link at the name, and with O_NONBLOCK, so that a FIFO there does not
-// wait for a writer.
+// following a link at the name, and with O_NONBLOCK so that a FIFO there does not
+// wait for a writer. Once Fstat confirms a regular file, O_NONBLOCK is cleared
+// before wrapping in os.NewFile so io.Copy reads in normal blocking mode.
 func openExportSnapshotSource(root int, name string, flag int) (*os.File, error) {
 	var fd int
 	err := ignoringEINTR(func() (err error) {
@@ -112,6 +116,19 @@ func openExportSnapshotSource(root int, name string, flag int) (*os.File, error)
 	})
 	if err != nil {
 		return nil, &fs.PathError{Op: "openat", Path: name, Err: err}
+	}
+	var st unix.Stat_t
+	if err := ignoringEINTR(func() error { return unix.Fstat(fd, &st) }); err != nil {
+		_ = unix.Close(fd)
+		return nil, &fs.PathError{Op: "fstat", Path: name, Err: err}
+	}
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		_ = unix.Close(fd)
+		return nil, &fs.PathError{Op: "openat", Path: name, Err: fmt.Errorf("not a regular file")}
+	}
+	if err := unix.SetNonblock(fd, false); err != nil {
+		_ = unix.Close(fd)
+		return nil, &fs.PathError{Op: "setnonblock", Path: name, Err: err}
 	}
 	return os.NewFile(uintptr(fd), name), nil
 }
@@ -127,11 +144,16 @@ func verifyExportSnapshotSource(root int, name string, before os.FileInfo) error
 	return nil
 }
 
-func copyExportSnapshotFile(destination *os.Root, name string, source *os.File) error {
-	f, err := destination.OpenFile(name, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
-	if err != nil {
+func copyExportSnapshotFile(destination int, name string, source *os.File) error {
+	var fd int
+	err := ignoringEINTR(func() (err error) {
+		fd, err = unix.Openat(destination, name, unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0600)
 		return err
+	})
+	if err != nil {
+		return &fs.PathError{Op: "openat", Path: name, Err: err}
 	}
+	f := os.NewFile(uintptr(fd), name)
 	_, copyErr := io.Copy(f, source)
 	closeErr := f.Close()
 	if copyErr != nil {

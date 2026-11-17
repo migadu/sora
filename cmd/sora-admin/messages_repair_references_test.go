@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -84,6 +85,74 @@ func TestMessagesRepairReferences(t *testing.T) {
 	require.Equal(t, &filled, references(first))
 	require.Equal(t, &filled, references(original))
 	require.Nil(t, references(orphan))
+}
+
+// TestMessagesRepairReferencesRejectsPositionalArgs: unexpected positional arguments
+// (such as "apply" without "--" or trailing words after "--apply") must fail with a
+// non-zero exit status before connecting to or modifying the database.
+func TestMessagesRepairReferencesRejectsPositionalArgs(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	ctx := context.Background()
+
+	account := common.CreateTestAccount(t, rdb)
+	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, account.Email)
+	require.NoError(t, err)
+	inbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, "INBOX")
+	require.NoError(t, err)
+
+	donor := insertAdminTestMessage(t, ctx, rdb, accountID, inbox.ID, inbox.Name, "pos-donor")
+	target := insertAdminTestMessage(t, ctx, rdb, accountID, inbox.ID, inbox.Name, "pos-target")
+	pool := rdb.GetOperationalDatabase().GetWritePool()
+	_, err = pool.Exec(ctx, `UPDATE messages SET "references" = 'donor@example.com' WHERE id = $1`, donor)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `
+		UPDATE messages SET content_hash = (SELECT content_hash FROM messages WHERE id = $1), "references" = NULL
+		WHERE id = $2`, donor, target)
+	require.NoError(t, err)
+
+	name := os.Getenv("SORA_TEST_DB_NAME")
+	if name == "" {
+		name = "sora_test_db"
+	}
+	configPath := filepath.Join(t.TempDir(), "config.toml")
+	configBody := fmt.Sprintf("[database.write]\nhosts = [\"localhost\"]\nport = 5432\nuser = \"postgres\"\nname = %q\n", name)
+	require.NoError(t, os.WriteFile(configPath, []byte(configBody), 0o600))
+
+	start := strconv.FormatInt(donor-1, 10)
+	for _, tc := range []struct {
+		name   string
+		args   []string
+		badArg string
+	}{
+		{
+			name:   "apply without dashes",
+			args:   []string{"--config", configPath, "messages", "repair-references", "apply"},
+			badArg: "apply",
+		},
+		{
+			name:   "positional arg after flags",
+			args:   []string{"--config", configPath, "messages", "repair-references", "--start-after", start, "apply"},
+			badArg: "apply",
+		},
+		{
+			name:   "trailing arg after --apply",
+			args:   []string{"--config", configPath, "messages", "repair-references", "--start-after", start, "--apply", "extra"},
+			badArg: "extra",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out, code := runAdminMain(t, tc.args...)
+			require.NotEqual(t, 0, code, "unexpected positional argument must exit non-zero:\n%s", out)
+			require.Contains(t, out, fmt.Sprintf("Error: unexpected argument %q", tc.badArg))
+			require.Contains(t, out, "Usage:")
+			require.NotContains(t, out, "Checked ")
+
+			var refs *string
+			require.NoError(t, pool.QueryRow(ctx, `SELECT "references" FROM messages WHERE id = $1`, target).Scan(&refs))
+			require.Nil(t, refs, "database must remain untouched when positional arguments are rejected")
+		})
+	}
 }
 
 // repairReferencesTotals reads the fillable and unfillable totals from the summary line
