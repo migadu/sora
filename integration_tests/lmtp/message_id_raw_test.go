@@ -21,7 +21,7 @@ func TestLMTP_MessageIDRawUsesFinalEditedHeaders(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	addr, _ := startTestLMTPServerWithOptions(t, rdb, lmtpserver.LMTPServerOptions{})
+	addr, _ := startTestLMTPServerWithOptions(t, rdb, lmtpserver.LMTPServerOptions{SieveExtensions: []string{"fileinto", "envelope", "mailbox", "subaddress", "variables", "editheader"}})
 	setActiveSieveScript(t, rdb, id, `require ["editheader"]; deleteheader "Message-ID"; addheader "Message-ID" "(FinalNeedle) <edited@example.com>"; keep;`)
 	msg := fmt.Sprintf("From: sender@example.com\r\nTo: %s\r\nMessage-ID: (OriginalNeedle) <original@example.com>\r\nSubject: final raw id\r\n\r\nbody\r\n", account.Email)
 	if response := deliverLMTPRaw(t, addr, "sender@example.com", account.Email, msg); !strings.HasPrefix(response, "250") {
