@@ -15,6 +15,7 @@ import (
 	"github.com/k3a/html2text"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
+	"golang.org/x/net/html"
 	"lukechampine.com/blake3"
 )
 
@@ -198,7 +199,16 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 			cleanedHTML = cleanedHTML[:maxHTMLForConversion]
 		}
 
-		plaintext := html2text.HTML2Text(cleanedHTML)
+		// html2text mistakes a raw '<' in text for a tag and an apostrophe
+		// in an unquoted attribute for the start of a quoted value. Let the
+		// HTML5 tokenizer escape text and quote attributes before conversion,
+		// preserving the rest of a malformed HTML-only message for FTS.
+		z := html.NewTokenizer(strings.NewReader(cleanedHTML))
+		var normalized strings.Builder
+		for token := z.Next(); token != html.ErrorToken; token = z.Next() {
+			normalized.WriteString(z.Token().String())
+		}
+		plaintext := html2text.HTML2Text(normalized.String())
 		plaintextBody = &plaintext
 	}
 
