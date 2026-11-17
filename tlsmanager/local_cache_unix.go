@@ -6,11 +6,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/google/uuid"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"golang.org/x/sys/unix"
 )
 
@@ -68,17 +70,53 @@ func lockLocalEntry(ctx context.Context, parent *os.Root, name string) (func(), 
 		}
 	}
 }
+func openLocalNoFollow(parent *os.Root, name string, flag int) (int, error) {
+	path := filepath.Join(parent.Name(), name)
+	if name == "" || name == "." || name == ".." || strings.ContainsRune(name, '/') {
+		return -1, &os.PathError{Op: "openat", Path: path, Err: unix.EINVAL}
+	}
+	dir, err := parent.Open(".")
+	if err != nil {
+		return -1, err
+	}
+	defer dir.Close()
+	conn, err := dir.SyscallConn()
+	if err != nil {
+		return -1, err
+	}
+	fd := -1
+	var openErr error
+	if err := conn.Control(func(dirfd uintptr) {
+		for {
+			fd, openErr = unix.Openat(int(dirfd), name, flag|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+			if !errors.Is(openErr, unix.EINTR) {
+				break
+			}
+		}
+	}); err != nil {
+		return -1, err
+	}
+	if openErr != nil {
+		return -1, &os.PathError{Op: "openat", Path: path, Err: openErr}
+	}
+	return fd, nil
+}
+
 func openLocalLease(parent *os.Root, name string) (*os.File, error) {
 	for {
-		f, err := parent.OpenFile(name, os.O_RDWR|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+		fd, err := openLocalNoFollow(parent, name, os.O_RDWR|unix.O_NONBLOCK)
 		if err == nil {
-			return f, nil
+			if err := unix.SetNonblock(fd, false); err != nil {
+				_ = unix.Close(fd)
+				return nil, err
+			}
+			return os.NewFile(uintptr(fd), filepath.Join(parent.Name(), name)), nil
 		}
 		if !os.IsNotExist(err) {
 			return nil, err
 		}
 		temp := localPrivatePrefix + "temp-" + uuid.NewString()
-		f, err = parent.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
+		f, err := parent.OpenFile(temp, os.O_CREATE|os.O_EXCL|os.O_RDWR, 0600)
 		if err != nil {
 			return nil, err
 		}
@@ -113,18 +151,34 @@ func giveLocalFile(parent *os.Root, f *os.File) error {
 	}
 	return f.Chown(int(st.Uid), int(st.Gid))
 }
+
+var readLocalRegularAll = ioReadAllLocal
+
 func readLocalRegular(parent *os.Root, name string) ([]byte, error) {
-	f, err := parent.OpenFile(name, os.O_RDONLY|unix.O_NONBLOCK, 0)
+	fd, err := openLocalNoFollow(parent, name, os.O_RDONLY|unix.O_NONBLOCK)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-	info, err := f.Stat()
+	var st unix.Stat_t
+	for {
+		err = unix.Fstat(fd, &st)
+		if !errors.Is(err, unix.EINTR) {
+			break
+		}
+	}
 	if err != nil {
+		_ = unix.Close(fd)
 		return nil, err
 	}
-	if !info.Mode().IsRegular() {
+	if st.Mode&unix.S_IFMT != unix.S_IFREG {
+		_ = unix.Close(fd)
 		return nil, fmt.Errorf("certificate cache entry %q is not regular", name)
 	}
-	return ioReadAllLocal(f)
+	if err := unix.SetNonblock(fd, false); err != nil {
+		_ = unix.Close(fd)
+		return nil, err
+	}
+	f := os.NewFile(uintptr(fd), filepath.Join(parent.Name(), name))
+	defer f.Close()
+	return readLocalRegularAll(f)
 }
