@@ -180,7 +180,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		// The row is locked now, so its hash is the one the INSERT below copies: a row
 		// re-keyed to the owner must still have the hash the caller made its body
 		// available for under the owner's key (sourceHashes).
-		if sourceAccountID != destAccountID && contentHash != sourceHashes[sourceUID] {
+		if srcMailboxID != destMailboxID && sourceAccountID != destAccountID && contentHash != sourceHashes[sourceUID] {
 			return nil, fmt.Errorf("%w: UID %d", ErrMoveSourceChanged, sourceUID)
 		}
 		messageIDs = append(messageIDs, messageID)
