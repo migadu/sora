@@ -55,6 +55,13 @@ func TestS3ImportRefusesStaleReadAfterHolderLossAndCompletedDelete(t *testing.T)
 	var killed bool
 	require.NoError(t, pool.QueryRow(ctx, `SELECT pg_terminate_backend($1)`, outerPID).Scan(&killed))
 	require.True(t, killed)
+	// Termination signals the holder asynchronously. Cleanup only tries its lock,
+	// so establish release before requiring the replacement DELETE to run.
+	require.Eventually(t, func() bool {
+		var held bool
+		err := pool.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE pid=$1 AND locktype='advisory' AND granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))`, outerPID).Scan(&held)
+		return err == nil && !held
+	}, 5*time.Second, 5*time.Millisecond)
 	candidate := db.UserScopedObjectForCleanup{AccountID: 0, ContentHash: hash, S3Domain: domain, S3Localpart: local}
 	_, err = f.rdb.ExecuteWithS3BodyCleanup(ctx, []db.UserScopedObjectForCleanup{candidate}, time.Hour, func(c context.Context, objects []db.UserScopedObjectForCleanup) (db.S3BodyCleanupResult, error) {
 		require.Len(t, objects, 1)
