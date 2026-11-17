@@ -6,14 +6,13 @@ import (
 	"fmt"
 	"slices"
 	"sort"
-	"strings"
 	"time"
-	"unicode"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
 )
 
@@ -450,13 +449,12 @@ func messageReferences(msg *db.ThreadMessageResult) []string {
 }
 
 // extractIDs splits a stored Message-ID, In-Reply-To or References value into
-// message ids. The messages table holds them without angle brackets, several
-// joined by a space (db.InsertMessage); a bracketed value splits the same way, and
-// every id comes back bare, so ids from the three columns compare equal.
+// message ids. The messages table holds them without angle brackets, several joined
+// by a space (db.InsertMessage); a synthetic message_id never gets here
+// (headerMessageID). A quoted local part stays one id (helpers.SplitMessageIDs), so
+// ids from the three columns compare equal.
 func extractIDs(s string) []string {
-	return strings.FieldsFunc(s, func(r rune) bool {
-		return r == '<' || r == '>' || unicode.IsSpace(r)
-	})
+	return helpers.SplitMessageIDs(s)
 }
 
 // sortByEarliest orders nodes by the earliest sent date in each subtree, then by
