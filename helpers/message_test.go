@@ -319,7 +319,8 @@ func TestExtractPlaintextBody_MalformedContentTransferEncoding(t *testing.T) {
 					t.Logf("Extraction succeeded with warnings: %v", extractErr)
 				}
 			} else {
-				// For degraded entities, we may get nil result but no crash
+				assert.Nil(t, result)
+				assert.Error(t, extractErr)
 				if extractErr != nil {
 					t.Logf("Extraction failed as expected: %v", extractErr)
 				}
