@@ -132,16 +132,22 @@ an operator who is not root, or a user's own `~/Maildir -> ~/mail/Maildir` does.
 of the user running `sora-admin` leads only where that user could name directly. A user who can
 replace `~/Maildir` could otherwise point it at another user's maildir and have that read into the
 account. A link of the user running `sora-admin`, when that user is not root, is followed only
-from a directory no other user can rename entries in: the directory that holds the link and every
-directory above it must belong to root or to that user, and others may write in them only where
-the sticky bit is set (as on `/tmp`), the rule for the directories above the cache
-([section 8](#8-the-sqlite-cache-sora-maildirdb)). This holds whether or not the system protects
-hard links, since moving the link needs none. Otherwise another user could have moved the
-link there, or kept a hard link to it, and given it the name the path reaches. Any other link
-makes the import refuse to start, naming the link, its owner and the directory it leads to (for
-the running user's link, the directory others can rename entries in), before the
-`sora-maildir.db` cache is created; name that directory itself to import it. A link's owner
-says who made it, not who gave it its name, so where users may hard-link a file they do not own (macOS and the BSDs, and Linux with `fs.protected_hardlinks = 0`)
+from a directory that belongs to root or to that user and that its group and others may not
+write, sticky bit or not, below directories no other user can rename entries in: each of those
+must belong to root or to that user, and others may write in it only where the sticky bit is set
+(as on `/tmp`), the rule for the directories above the cache
+([section 8](#8-the-sqlite-cache-sora-maildirdb)). So `/tmp/ops/alice`, in the operator's own
+`0755` directory, is followed, and `/tmp/alice` is not: the sticky bit keeps other users from
+renaming the operator's link, not from creating an entry, so one of them could have moved a
+link of the operator's to `/tmp/alice` from a directory they can write, or hard-linked one there.
+This holds whether or not the system protects hard links, since moving the link needs none.
+Otherwise another user could have moved the link there, or kept a hard link to it, and given it
+the name the path reaches. Any other link makes the import refuse to start, naming the link, its
+owner and the directory it leads to (for the running user's link, the directory others can
+create or rename entries in), before the `sora-maildir.db` cache is created; name that directory
+itself to import it. A link's owner says who made it, not who gave it its name, so where users
+may hard-link a file they do not own (macOS and the BSDs, and Linux with
+`fs.protected_hardlinks = 0`)
 a link with more than one name is refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise
 pass as root's link. The import sees only the names a link has when it runs: on such a system, a
 hard link a user made earlier to root's link (or to another user's link to their own maildir)
@@ -717,7 +723,7 @@ runs with more privileges, so message and Dovecot contents and Maildir child dir
 it are accessed through the opened target directory. `--maildir-path` itself, or a directory on
 the way to it, may be a symbolic link under the import's rule
 ([section 3](#3-the-maildir-layout-sora-reads)): only when the link belongs to root, to the user
-running `sora-admin` (from a directory no other user can rename entries in, when that user is not
+running `sora-admin` (from a directory only root or that user may write, when that user is not
 root), or to the owner of the directory it leads to. A user who can replace
 `~/Maildir`, or a directory above it, could
 otherwise point it at another user's maildir or home and have the account's mail, Dovecot files

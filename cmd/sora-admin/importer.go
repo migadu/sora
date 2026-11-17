@@ -1649,8 +1649,9 @@ const maxImportRootLinks = 255
 // so the operator can name the directory itself. The owner of a link says who made
 // it, not who gave it its name: where users may hard-link a file they do not own, a
 // link with more than one name is refused too, and a link of that user, when it is
-// not root, is followed only from a directory no other user can rename entries in
-// (renamableParent), where nobody else can have moved or hard-linked it into place.
+// not root, is followed only from a directory of root or of that user that nobody
+// else may write, sticky or not, below directories no other user can rename entries
+// in (renamableParent): nobody else can then have moved or hard-linked it into place.
 //
 // path is walked a component at a time by descriptor from the file system root (a
 // relative one from the working directory), as the system resolves it: a ".." after a
@@ -1849,14 +1850,28 @@ func openLinkCheckedRoot(path string, mode rootWalk) (*os.Root, error) {
 			case uid == euid:
 				// A link of the user this runs as, not root, is trusted as leading
 				// only where that user could name directly, which holds only if that
-				// user also gave it this name. Another user who can rename an entry
-				// of the directory holding it, or of one above, may have moved it
-				// here, or kept such a hard link (#1868), so it is followed only from
-				// a directory nobody else can rename entries in: the rule
-				// maildirCacheLinkRule applies to the cache's directory.
+				// user also gave it this name (#1868). Another user who can rename an
+				// entry of a directory above the one holding it may have put a
+				// directory of their own there: the rule maildirCacheLinkRule applies
+				// above the cache's directory (renamableParent). One who can create
+				// an entry in the directory holding it may have moved the link there
+				// with rename(2) from a directory they can write, or, where hard
+				// links are not protected, given it a second name there that has a
+				// single name again once the operator removes the first. The sticky
+				// bit (/tmp) keeps others from renaming an entry they do not own, not
+				// from creating one, so that directory may be writable by its owner
+				// only, as checkNamedByOwner requires of a directory holding a link.
 				parent, owner, perm, err := renamableParent(name, int(euid))
+				if err == nil && parent == "" {
+					if owner, perm, err = directoryOwnerAndMode(resolved); err == nil && perm&0o022 != 0 {
+						parent = resolved
+					}
+				}
 				if err != nil {
 					return nil, fmt.Errorf("refusing %s: failed to check the directories holding the symbolic link %s: %w", given, name, err)
+				}
+				if parent == resolved {
+					return nil, fmt.Errorf("refusing %s: %s is a symbolic link of the user this runs as (uid %d), but users other than root and uid %d can create entries in %s, the directory holding it (owner uid %d, mode %04o), and so may have given it this name; name the directory it leads to instead", given, name, euid, euid, parent, owner, perm)
 				}
 				if parent != "" {
 					return nil, fmt.Errorf("refusing %s: %s is a symbolic link of the user this runs as (uid %d), but users other than root and uid %d can rename entries in %s, on its path (owner uid %d, mode %04o), and so may have given it this name; name the directory it leads to instead", given, name, euid, euid, parent, owner, perm)
