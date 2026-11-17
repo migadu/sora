@@ -55,3 +55,29 @@ func TestExtractPlaintextBodyMalformedHTMLPreservesText(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractPlaintextBodyHTMLNormalizationControls(t *testing.T) {
+	for _, tc := range []struct{ name, html, want string }{
+		{"entities decoded once", `<p>&amp;lt;tag&amp;gt; &lt;3 &#39;one&#39; &amp;</p>`, `&lt;tag&gt; <3 'one' &`},
+		{"excluded sections", `<script>hiddenscriptsecret()</script><style>.hiddenstylesecret {}</style><p>Visible message</p>`, "Visible message"},
+		{"link target", `<p><a href="https://example.com/?a=1&amp;b=2">Label</a> tail</p>`, "https://example.com/?a=1&b=2 tail"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := "Content-Type: text/html; charset=utf-8\r\n\r\n" + tc.html
+			entity, err := message.Read(strings.NewReader(raw))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := ExtractPlaintextBody(entity)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got == nil {
+				t.Fatal("ExtractPlaintextBody returned no text")
+			}
+			if strings.TrimSpace(*got) != tc.want {
+				t.Fatalf("ExtractPlaintextBody = %q, want %q", *got, tc.want)
+			}
+		})
+	}
+}

@@ -44,3 +44,7 @@ func testLMTPFTSBody(t *testing.T, mimeBody, want string) {
 		t.Fatalf("LMTP lost partial FTS text: %q", text)
 	}
 }
+
+func TestLMTP_FTSMalformedHTMLPreservesText(t *testing.T) {
+	testLMTPFTSBody(t, "Content-Type: text/html; charset=utf-8\r\n\r\n<p>I <3 this, it's great.</p><p>Price <$50 - don't miss</p><td width=50' >cell text</td><p>tailmarker</p>\r\n", "tailmarker")
+}
