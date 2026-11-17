@@ -26,7 +26,7 @@ For the code layout and conventions, see [HACKING.md](HACKING.md).
 
 ## 1. What you need
 
-- **Go 1.25 or newer.** `go.mod` says `go 1.25.0`.
+- **Go 1.26 or newer.** `go.mod` says `go 1.26.0`.
 - **PostgreSQL** on `localhost:5432`, for the database tests and the integration tests. The
   project supports PostgreSQL 14 and newer (see [DATABASE.md](DATABASE.md)).
   - The role `postgres` must be able to log in over TCP from `localhost` **without a password**.
