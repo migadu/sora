@@ -407,6 +407,8 @@ type MessageHashInfo struct {
 	Subject     string
 	Uploaded    bool
 	ContentHash string
+	S3Domain    string
+	S3Localpart string
 	Expunged    bool // true if the message is soft-deleted (expunged_at IS NOT NULL), pending cleanup
 }
 
@@ -442,13 +444,26 @@ func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accou
 	return messages, rows.Err()
 }
 
+func scanMessageHashInfos(rows pgx.Rows) ([]MessageHashInfo, error) {
+	var messages []MessageHashInfo
+	for rows.Next() {
+		var msg MessageHashInfo
+		err := rows.Scan(&msg.ID, &msg.UID, &msg.MailboxPath, &msg.Subject, &msg.Uploaded, &msg.ContentHash, &msg.S3Domain, &msg.S3Localpart, &msg.Expunged)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan message: %w", err)
+		}
+		messages = append(messages, msg)
+	}
+	return messages, rows.Err()
+}
+
 // GetMessagesByContentHash retrieves all messages with a specific content hash for an
 // account, INCLUDING expunged (soft-deleted) messages. Each result carries an Expunged
 // flag so callers (e.g. content-hash verification) can distinguish a live reference from
 // one that is merely pending two-phase cleanup, rather than misreporting it as an orphan.
 func (db *Database) GetMessagesByContentHash(ctx context.Context, accountID int64, contentHash string) ([]MessageHashInfo, error) {
 	query := `
-		SELECT m.id, m.uid, COALESCE(mb.name, m.mailbox_path, '') as mailbox_path, m.subject, m.uploaded, m.content_hash, (m.expunged_at IS NOT NULL) AS expunged
+		SELECT m.id, m.uid, COALESCE(mb.name, m.mailbox_path, '') as mailbox_path, COALESCE(m.subject, ''), m.uploaded, m.content_hash, m.s3_domain, m.s3_localpart, (m.expunged_at IS NOT NULL) AS expunged
 		FROM messages m
 		LEFT JOIN mailboxes mb ON m.mailbox_id = mb.id
 		WHERE m.account_id = $1 AND m.content_hash = $2
@@ -461,40 +476,141 @@ func (db *Database) GetMessagesByContentHash(ctx context.Context, accountID int6
 	}
 	defer rows.Close()
 
-	var messages []MessageHashInfo
-	for rows.Next() {
-		var msg MessageHashInfo
-		err := rows.Scan(&msg.ID, &msg.UID, &msg.MailboxPath, &msg.Subject, &msg.Uploaded, &msg.ContentHash, &msg.Expunged)
-		if err != nil {
-			return nil, fmt.Errorf("failed to scan message: %w", err)
-		}
-		messages = append(messages, msg)
-	}
-
-	return messages, rows.Err()
+	return scanMessageHashInfos(rows)
 }
 
-// MarkMessagesAsNotUploaded marks messages as not uploaded by their S3 keys
+// GetMessagesByContentObject retrieves all messages of accountID that reference the exact
+// S3 object (s3_domain, s3_localpart, content_hash), INCLUDING expunged messages.
+func (db *Database) GetMessagesByContentObject(ctx context.Context, accountID int64, obj ContentObject) ([]MessageHashInfo, error) {
+	query := `
+		SELECT m.id, m.uid, COALESCE(mb.name, m.mailbox_path, '') as mailbox_path, COALESCE(m.subject, ''), m.uploaded, m.content_hash, m.s3_domain, m.s3_localpart, (m.expunged_at IS NOT NULL) AS expunged
+		FROM messages m
+		LEFT JOIN mailboxes mb ON m.mailbox_id = mb.id
+		WHERE m.account_id = $1 AND m.s3_domain = $2 AND m.s3_localpart = $3 AND m.content_hash = $4
+		ORDER BY m.id
+	`
+
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, accountID, obj.S3Domain, obj.S3Localpart, obj.ContentHash)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query messages by content object: %w", err)
+	}
+	defer rows.Close()
+
+	return scanMessageHashInfos(rows)
+}
+
+// MarkMessagesAsNotUploaded marks non-expunged uploaded messages as not uploaded by their
+// S3 keys (<domain>/<localpart>/<hash>, where <localpart> may contain '/'). It acquires
+// shared S3 object locks in the transaction (verifying outer holder continuity when called
+// under ExecuteWithSharedS3ObjectLocks) and skips any row whose (account_id, content_hash)
+// has a pending_uploads entry so an in-flight upload is never left unuploaded after its
+// pending_uploads row is cleared.
 func (db *Database) MarkMessagesAsNotUploaded(ctx context.Context, s3Keys []string) (int64, error) {
 	if len(s3Keys) == 0 {
 		return 0, nil
 	}
 
-	// Extract content hashes from S3 keys (format: domain/localpart/hash)
-	// We'll match on content_hash, s3_domain, and s3_localpart
+	domains := make([]string, 0, len(s3Keys))
+	localparts := make([]string, 0, len(s3Keys))
+	hashes := make([]string, 0, len(s3Keys))
+	for _, key := range s3Keys {
+		first, last := strings.Index(key, "/"), strings.LastIndex(key, "/")
+		if first <= 0 || last <= first+1 || last == len(key)-1 {
+			return 0, fmt.Errorf("invalid S3 key %q", key)
+		}
+		domains = append(domains, key[:first])
+		localparts = append(localparts, key[first+1:last])
+		hashes = append(hashes, key[last+1:])
+	}
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	if err != nil {
+		return 0, fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if err := LockS3ObjectsSharedInTx(ctx, tx, 0, hashes); err != nil {
+		return 0, err
+	}
+
+	count, err := markMessagesAsNotUploadedInTx(ctx, tx, domains, localparts, hashes)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("failed to commit mark messages as not uploaded: %w", err)
+	}
+	return count, nil
+}
+
+// MarkMessagesAsNotUploadedIfAbsent serializes a fresh storage check and exact-key
+// repair against upload admission/finalization on one writable lock holder. A
+// shared outer lock would let an upload finish after HEAD observed absence but
+// before the UPDATE snapshot. An already-admitted upload retains its pending row
+// and causes a conservative skip, including when it belongs to another account.
+// The callback only checks existence: no body deletion or protocol activation occurs.
+func (d *Database) MarkMessagesAsNotUploadedIfAbsent(ctx context.Context, obj ContentObject, exists func(context.Context) (bool, error)) (int64, error) {
+	if obj.S3Domain == "" || obj.S3Localpart == "" || obj.ContentHash == "" || exists == nil {
+		return 0, fmt.Errorf("invalid missing-object repair request")
+	}
+	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	lock, err := d.beginAdvisoryLockTx(lockCtx, pgx.ReadWrite)
+	if err != nil {
+		return 0, err
+	}
+	defer lock.Release()
+	if err := lock.Lock(lockCtx, GetS3ObjectLockID(0, obj.ContentHash)); err != nil {
+		return 0, err
+	}
+	guarded, done := lock.Guard(ctx)
+	defer done()
+	if err := lock.CheckS3BodyClaims(guarded, []string{obj.ContentHash}); err != nil {
+		return 0, err
+	}
+	var pending bool
+	if err := lock.run(guarded, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pending_uploads WHERE content_hash=$1)`, obj.ContentHash).Scan(&pending)
+	}); err != nil {
+		return 0, err
+	}
+	if pending {
+		return 0, nil
+	}
+	present, err := exists(guarded)
+	if err != nil || present {
+		return 0, err
+	}
+	var count int64
+	if err := lock.run(guarded, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		count, err = markMessagesAsNotUploadedInTx(ctx, tx, []string{obj.S3Domain}, []string{obj.S3Localpart}, []string{obj.ContentHash})
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	if err := lock.commit(guarded); err != nil {
+		return 0, fmt.Errorf("failed to commit missing-object repair: %w", err)
+	}
+	return count, nil
+}
+
+func markMessagesAsNotUploadedInTx(ctx context.Context, tx pgx.Tx, domains, localparts, hashes []string) (int64, error) {
 	query := `
-		UPDATE messages
+		UPDATE messages m
 		SET uploaded = FALSE
-		WHERE (s3_domain, s3_localpart, content_hash) IN (
-			SELECT
-				split_part(unnest($1::text[]), '/', 1),
-				split_part(unnest($1::text[]), '/', 2),
-				split_part(unnest($1::text[]), '/', 3)
+		WHERE (m.s3_domain, m.s3_localpart, m.content_hash) IN (
+			SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
 		)
-		AND expunged_at IS NULL
+		AND m.uploaded = TRUE
+		AND m.expunged_at IS NULL
+		AND NOT EXISTS (
+			SELECT 1 FROM pending_uploads pu
+			WHERE pu.account_id = m.account_id AND pu.content_hash = m.content_hash
+		)
 	`
 
-	result, err := db.GetWritePool().Exec(ctx, query, s3Keys)
+	result, err := tx.Exec(ctx, query, domains, localparts, hashes)
 	if err != nil {
 		return 0, fmt.Errorf("failed to mark messages as not uploaded: %w", err)
 	}
@@ -639,9 +755,12 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		}
 	}
 
-	var customFlags []string
+	customFlags := []string{}
 	if len(currentCustomFlags) > 0 {
 		json.Unmarshal(currentCustomFlags, &customFlags)
+	}
+	if customFlags == nil {
+		customFlags = []string{}
 	}
 	storedCustomFlags := slices.Clone(customFlags)
 

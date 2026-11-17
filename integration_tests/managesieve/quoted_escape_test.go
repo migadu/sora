@@ -57,6 +57,8 @@ func TestManageSieve_InvalidQuotedEscapeRefused(t *testing.T) {
 		{"AUTHENTICATE initial response", false, "AUTHENTICATE \"PLAIN\" \"" + plain[:4] + "\\" + plain[4:] + "\"\r\n", false},
 		{"LOGIN", false, fmt.Sprintf("LOGIN \"%s\" \"\\%s\"\r\n", account.Email, account.Password), false},
 		{"PUTSCRIPT name, non-sync literal content", true, fmt.Sprintf("PUTSCRIPT \"a\\b\" {%d+}\r\n%s\r\n", len(smuggled), smuggled), true},
+		// No space is needed before the marker: "ab"{5+} is a name and a literal too.
+		{"PUTSCRIPT name, non-sync literal right after the quote", true, fmt.Sprintf("PUTSCRIPT \"a\\b\"{%d+}\r\n%s\r\n", len(smuggled), smuggled), true},
 		{"AUTHENTICATE mechanism, literal response", false, fmt.Sprintf("AUTHENTICATE \"PL\\AIN\" {%d+}\r\n%s\r\n", len(plain), plain), true},
 	}
 
