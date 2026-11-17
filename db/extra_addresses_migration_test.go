@@ -110,6 +110,86 @@ func TestExtraAddressesMigrationPreparation(t *testing.T) {
 		require.NoError(t, conn.QueryRow(ctx, `SELECT to_regclass('idx_messages_mailbox_headers') IS NOT NULL`).Scan(&oldExists))
 		require.True(t, oldExists)
 	})
+
+	// Migration 000070's v3 index carries every v2 column, so a database prepared straight
+	// for v3 must not be made to build v2 first.
+	up70, err := os.ReadFile("migrations/000070_messages_header_presence.up.sql")
+	require.NoError(t, err)
+	indexExists := func(t *testing.T, conn *pgxpool.Conn, name string) bool {
+		t.Helper()
+		var exists bool
+		require.NoError(t, conn.QueryRow(ctx, `SELECT to_regclass($1) IS NOT NULL`, name).Scan(&exists))
+		return exists
+	}
+	prepareV3 := func(t *testing.T, conn *pgxpool.Conn) {
+		t.Helper()
+		_, err := conn.Exec(ctx, `ALTER TABLE messages ADD COLUMN extra_addresses TEXT, ADD COLUMN header_presence SMALLINT;
+			CREATE INDEX idx_messages_mailbox_headers_v3 ON messages(mailbox_id) INCLUDE (extra_addresses, header_presence)`)
+		require.NoError(t, err)
+	}
+
+	t.Run("prepared v3 large database skips v2 and never locks messages", func(t *testing.T) {
+		conn, schema := open(t, true)
+		prepareV3(t, conn)
+		_, err := conn.Exec(ctx, `DROP INDEX idx_messages_mailbox_headers`)
+		require.NoError(t, err)
+
+		locker, err := database.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer locker.Rollback(ctx)
+		_, err = locker.Exec(ctx, "LOCK TABLE "+pgx.Identifier{schema, "messages"}.Sanitize()+" IN ACCESS EXCLUSIVE MODE")
+		require.NoError(t, err)
+		_, err = conn.Exec(ctx, "SET lock_timeout = '200ms'")
+		require.NoError(t, err)
+		defer conn.Exec(ctx, "RESET lock_timeout")
+		_, err = conn.Exec(ctx, string(up))
+		require.NoError(t, err, "a valid v3 must stand in for v2 with only a catalog check")
+		_, err = conn.Exec(ctx, string(up70))
+		require.NoError(t, err, "migration 70 must then find its preparation complete")
+		require.False(t, indexExists(t, conn, "idx_messages_mailbox_headers_v2"))
+		require.True(t, indexExists(t, conn, "idx_messages_mailbox_headers_v3"))
+	})
+
+	t.Run("small database with valid v3 drops old index without building v2", func(t *testing.T) {
+		conn, _ := open(t, false)
+		prepareV3(t, conn)
+		_, err := conn.Exec(ctx, string(up))
+		require.NoError(t, err)
+		require.False(t, indexExists(t, conn, "idx_messages_mailbox_headers_v2"))
+		require.False(t, indexExists(t, conn, "idx_messages_mailbox_headers"))
+		require.True(t, indexExists(t, conn, "idx_messages_mailbox_headers_v3"))
+	})
+
+	t.Run("large database with valid v3 but old index still present refuses", func(t *testing.T) {
+		conn, _ := open(t, true)
+		prepareV3(t, conn)
+		_, err := conn.Exec(ctx, string(up))
+		require.ErrorContains(t, err, "more than 25000")
+		require.True(t, indexExists(t, conn, "idx_messages_mailbox_headers"))
+	})
+
+	t.Run("invalid v3 preserves old index", func(t *testing.T) {
+		conn, _ := open(t, false)
+		_, err := conn.Exec(ctx, `ALTER TABLE messages ADD COLUMN extra_addresses TEXT; INSERT INTO messages(id) VALUES (1),(1)`)
+		require.NoError(t, err)
+		_, err = conn.Exec(ctx, `CREATE UNIQUE INDEX CONCURRENTLY idx_messages_mailbox_headers_v3 ON messages(id)`)
+		require.Error(t, err, "duplicate ids must leave an invalid concurrent index")
+		_, err = conn.Exec(ctx, string(up))
+		require.ErrorContains(t, err, "idx_messages_mailbox_headers_v3 is INVALID")
+		require.True(t, indexExists(t, conn, "idx_messages_mailbox_headers"))
+		require.False(t, indexExists(t, conn, "idx_messages_mailbox_headers_v2"))
+	})
+
+	t.Run("valid v3 next to invalid v2 refuses", func(t *testing.T) {
+		conn, _ := open(t, false)
+		prepareV3(t, conn)
+		_, err := conn.Exec(ctx, `DROP INDEX idx_messages_mailbox_headers; INSERT INTO messages(id) VALUES (1),(1)`)
+		require.NoError(t, err)
+		_, err = conn.Exec(ctx, `CREATE UNIQUE INDEX CONCURRENTLY idx_messages_mailbox_headers_v2 ON messages(id)`)
+		require.Error(t, err)
+		_, err = conn.Exec(ctx, string(up))
+		require.ErrorContains(t, err, "idx_messages_mailbox_headers_v2 is INVALID")
+	})
 }
 
 func TestExtraAddressesMigrationRollbackPreparation(t *testing.T) {

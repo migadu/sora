@@ -12,6 +12,8 @@
 --            cc_email_sort, extra_addresses, header_presence) WHERE expunged_at IS NULL;
 -- Verify pg_index.indisvalid AND indisready; a failed build must be dropped
 -- CONCURRENTLY and retried. Only then DROP INDEX CONCURRENTLY idx_messages_mailbox_headers_v2.
+-- A database not yet at migration 59 skips v2: add extra_addresses too, build v3, and
+-- drop idx_messages_mailbox_headers instead; migration 59 accepts a valid v3 for v2.
 -- Both indexes occupy space and receive writes during replacement; provision that
 -- temporary disk/IO load. Older writers ignore the nullable column; v3 covers v2.
 -- Deploy upgraded writers, but do not backfill rows created before/during rollout.

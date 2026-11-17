@@ -46,9 +46,17 @@
 --      binaries during the rollout) with scripts/backfill_extra_addresses.sql. Until then those
 --      messages are found by their first From/To/Cc address only, as before this migration.
 --
+-- Deploying through migration 000070 as well: skip v2. Migration 000070 replaces it with
+-- idx_messages_mailbox_headers_v3, which carries every v2 column plus header_presence, so
+-- building v2 only to drop it again costs a second full build. Instead do step 1, add
+-- header_presence the same way (000070), build v3 as in step 2 with the DDL in
+-- 000070_messages_header_presence.up.sql, and once it is valid drop idx_messages_mailbox_headers
+-- as in step 3. This migration accepts a valid v3 in place of v2, and 000070 then only
+-- inspects the catalog. Binaries without either migration search through v3 just as well.
+--
 -- On more than 25,000 messages, this migration refuses unfinished preparation before any
 -- DDL. A small database can safely do the work here, as migration 000050 also does. A failed
--- concurrent build is always refused: an existing INVALID v2 index must never cause the
+-- concurrent build is always refused: an existing INVALID v2 or v3 index must never cause the
 -- valid old covering index to be dropped.
 --
 -- Recovery if startup refused: stop the new binaries and complete steps 1-3 above using a
@@ -65,6 +73,8 @@ DECLARE
     has_column boolean;
     has_v2 boolean;
     valid_v2 boolean;
+    has_v3 boolean;
+    valid_v3 boolean;
     has_old boolean;
     message_rows bigint;
 BEGIN
@@ -75,27 +85,35 @@ BEGIN
     SELECT EXISTS (SELECT 1 FROM pg_index
                    WHERE indexrelid = to_regclass('idx_messages_mailbox_headers_v2') AND indisvalid AND indisready)
       INTO valid_v2;
+    -- Migration 000070's v3 index covers every v2 column; a prepared v3 stands in for v2.
+    has_v3 := to_regclass('idx_messages_mailbox_headers_v3') IS NOT NULL;
+    SELECT EXISTS (SELECT 1 FROM pg_index
+                   WHERE indexrelid = to_regclass('idx_messages_mailbox_headers_v3') AND indisvalid AND indisready)
+      INTO valid_v3;
     has_old := to_regclass('idx_messages_mailbox_headers') IS NOT NULL;
 
     -- Catalog-only fast path: even a bounded count would lock messages and wait behind
     -- an exclusive lock. A fully prepared production database needs no table access.
-    IF has_column AND valid_v2 AND NOT has_old THEN
+    IF has_column AND NOT has_old AND (valid_v2 OR (valid_v3 AND NOT has_v2)) THEN
         RETURN;
     END IF;
     IF has_v2 AND NOT valid_v2 THEN
         RAISE EXCEPTION 'Migration 59: idx_messages_mailbox_headers_v2 is INVALID. Keep the old index; DROP INDEX CONCURRENTLY idx_messages_mailbox_headers_v2, then complete steps 1-3 in 000059_messages_extra_addresses.up.sql. If schema_migrations is 59 dirty, verify preparation, force 58 and retry.';
     END IF;
+    IF has_v3 AND NOT valid_v3 THEN
+        RAISE EXCEPTION 'Migration 59: idx_messages_mailbox_headers_v3 is INVALID. Keep the old index; DROP INDEX CONCURRENTLY idx_messages_mailbox_headers_v3, then complete the preparation in 000059_messages_extra_addresses.up.sql. If schema_migrations is 59 dirty, verify preparation, force 58 and retry.';
+    END IF;
 
     SELECT count(*) INTO message_rows FROM (SELECT 1 FROM messages LIMIT 25001) s;
     IF message_rows > 25000 THEN
-        RAISE EXCEPTION 'Migration 59: messages has more than 25000 rows and out-of-band preparation is incomplete. Refusing a blocking index rebuild/drop. Complete steps 1-3 in 000059_messages_extra_addresses.up.sql (add extra_addresses, CREATE INDEX CONCURRENTLY v2, verify indisvalid, DROP INDEX CONCURRENTLY old). If schema_migrations is 59 dirty, verify preparation, run sora-admin --config config.toml migrate force 58 and retry.';
+        RAISE EXCEPTION 'Migration 59: messages has more than 25000 rows and out-of-band preparation is incomplete. Refusing a blocking index rebuild/drop. Complete steps 1-3 in 000059_messages_extra_addresses.up.sql (add extra_addresses, CREATE INDEX CONCURRENTLY v2 or, when also deploying 000070, v3, verify indisvalid, DROP INDEX CONCURRENTLY old). If schema_migrations is 59 dirty, verify preparation, run sora-admin --config config.toml migrate force 58 and retry.';
     END IF;
 
     IF NOT has_column THEN
         ALTER TABLE messages ADD COLUMN extra_addresses TEXT;
     END IF;
 
-    IF NOT has_v2 THEN
+    IF NOT has_v2 AND NOT valid_v3 THEN
         CREATE INDEX idx_messages_mailbox_headers_v2 ON messages (mailbox_id)
           INCLUDE (id, uid, content_hash, created_modseq, expunged_modseq, internal_date, sent_date, size,
                    subject, subject_sort, from_email_sort, from_name_sort, to_email_sort, to_name_sort,
