@@ -89,7 +89,8 @@ func CanCreate(params string) (bool, error) {
 
 // modernc.org/sqlite validates these parameters before opening SQLite. Mirror
 // that validation before permission preparation can create or change a file.
-// Empty and identical repeated VFS values follow its getVFSName semantics.
+// Empty and identical repeated VFS values follow its getVFSName semantics;
+// _error_rc and _defensive follow getErrorRcMode and getDefensiveMode.
 func validateDriverQuery(query string) error {
 	params, err := url.ParseQuery(query)
 	if err != nil {
@@ -101,6 +102,19 @@ func validateDriverQuery(query string) error {
 			return fmt.Errorf("conflicting vfs query parameters: %v", params["vfs"])
 		}
 		vfs = value
+	}
+	if v := params.Get("_error_rc"); v != "" {
+		if _, err := strconv.ParseBool(v); err != nil {
+			return fmt.Errorf("invalid _error_rc value %q: %w", v, err)
+		}
+	}
+	if values, ok := params["_defensive"]; ok {
+		if len(values) != 1 {
+			return fmt.Errorf("_defensive must be specified exactly once, got %d values", len(values))
+		}
+		if _, err := strconv.ParseBool(values[0]); err != nil {
+			return fmt.Errorf("invalid _defensive value %q: %w", values[0], err)
+		}
 	}
 	return nil
 }
