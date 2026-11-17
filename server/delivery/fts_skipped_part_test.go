@@ -99,3 +99,7 @@ func testDeliverMessageFTSBody(t *testing.T, mimeBody, want string) {
 	require.True(t, strings.Contains(textBody, want) || indexed,
 		"messages_fts_v2 must hold the text part's text, got text_body %q", textBody)
 }
+
+func TestDeliverMessage_FTSMalformedHTMLPreservesText(t *testing.T) {
+	testDeliverMessageFTSBody(t, "Content-Type: text/html; charset=utf-8\r\n\r\n<p>I <3 this, it's great.</p><p>Price <$50 - don't miss</p><td width=50' >cell text</td><p>tailmarker</p>\r\n", "tailmarker")
+}

@@ -84,3 +84,7 @@ func testAppendFTSBody(t *testing.T, mimeBody, want string) {
 		t.Fatalf("UID SEARCH BODY %q = %v, want [%d]: the text part's text was not indexed", want, uids, appended.UID)
 	}
 }
+
+func TestIMAP_AppendFTSMalformedHTMLPreservesText(t *testing.T) {
+	testAppendFTSBody(t, "Content-Type: text/html; charset=utf-8\r\n\r\n<p>I <3 this, it's great.</p><p>Price <$50 - don't miss</p><td width=50' >cell text</td><p>tailmarker</p>\r\n", "tailmarker")
+}
