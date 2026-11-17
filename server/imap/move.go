@@ -127,63 +127,70 @@ func (s *IMAPSession) Move(ctx context.Context, w *imapserver.MoveWriter, numSet
 		sourceUIDs = append(sourceUIDs, msg.UID)
 	}
 
-	// The hash each cross-account body is made available for below. MoveMessages moves a
-	// source only if it still has it, since a rekey can rename it before the rows are locked.
-	sourceHashes := crossAccountSourceHashes(messages, destMailbox.AccountID)
-	if selectedMailboxID != destMailbox.ID && checkCrossAccountSourceBudget(messages, sourceHashes) != nil {
-		return s.crossAccountBodyLimitError("MOVE")
-	}
-
-	// Identify cross-account operations and relocate S3 objects if necessary.
-	destS3Domain := s.Session.User.Domain()
-	destS3Localpart := s.Session.User.LocalPart()
-	if destMailbox.AccountID != s.AccountID() {
-		domain, localpart, err := s.server.rdb.ResolveAccountS3Owner(ctx, destMailbox.AccountID)
-		if err != nil {
-			return s.internalError("failed to resolve owner for destination mailbox: %v", err)
-		}
-		destS3Domain = domain
-		destS3Localpart = localpart
-	}
-
-	// A cross-account move re-keys its rows to the destination owner's S3 path. A body
-	// already in S3 must exist under that path when they commit: MoveMessagesWithRetry
-	// checks or copies it (ensureDestObject) in the move's own transaction while that
-	// holds the object's lock, the lock the cleaner takes before it deletes an object no
-	// row it can see references, which the moved rows are not until that transaction
-	// commits. A body still staged locally is linked to the owner's staging path instead,
-	// for the upload MoveMessages re-stages.
 	type destObject struct {
 		sourceKey, destKey string
 		sourcePending      bool
 	}
-	destObjects := make(map[string]destObject)
+	var sourceHashes map[imap.UID]string
+	var destObjects map[string]destObject
 	var destHashes []string
-	for _, msg := range messages {
-		if msg.AccountID == destMailbox.AccountID {
-			continue // Same owner: body already lives under the correct S3 path.
+	destS3Domain := s.Session.User.Domain()
+	destS3Localpart := s.Session.User.LocalPart()
+
+	// A MOVE within one mailbox keeps every row's account and S3 key (db.MoveMessages),
+	// so cross-account body staging and S3 copies apply only across mailboxes.
+	if selectedMailboxID != destMailbox.ID {
+		// The hash each cross-account body is made available for below. MoveMessages moves a
+		// source only if it still has it, since a rekey can rename it before the rows are locked.
+		sourceHashes = crossAccountSourceHashes(messages, destMailbox.AccountID)
+		if checkCrossAccountSourceBudget(messages, sourceHashes) != nil {
+			return s.crossAccountBodyLimitError("MOVE")
 		}
-		if !msg.IsUploaded {
-			if s.server.uploader == nil {
-				continue
-			}
-			// A local body is linked for the owner's pending upload. If its staging
-			// file is on another node, defer the S3 fallback to the locked phase.
-			staged, err := s.stageCrossAccountBody("move", msg.ContentHash, msg.AccountID, destMailbox.AccountID)
+
+		// Identify cross-account operations and relocate S3 objects if necessary.
+		if destMailbox.AccountID != s.AccountID() {
+			domain, localpart, err := s.server.rdb.ResolveAccountS3Owner(ctx, destMailbox.AccountID)
 			if err != nil {
-				return err
+				return s.internalError("failed to resolve owner for destination mailbox: %v", err)
 			}
-			if staged {
-				continue
-			}
+			destS3Domain = domain
+			destS3Localpart = localpart
 		}
-		if _, seen := destObjects[msg.ContentHash]; !seen {
-			destObjects[msg.ContentHash] = destObject{
-				sourceKey:     helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash),
-				destKey:       helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash),
-				sourcePending: !msg.IsUploaded,
+
+		// A cross-account move re-keys its rows to the destination owner's S3 path. A body
+		// already in S3 must exist under that path when they commit: MoveMessagesWithRetry
+		// checks or copies it (ensureDestObject) in the move's own transaction while that
+		// holds the object's lock, the lock the cleaner takes before it deletes an object no
+		// row it can see references, which the moved rows are not until that transaction
+		// commits. A body still staged locally is linked to the owner's staging path instead,
+		// for the upload MoveMessages re-stages.
+		destObjects = make(map[string]destObject)
+		for _, msg := range messages {
+			if msg.AccountID == destMailbox.AccountID {
+				continue // Same owner: body already lives under the correct S3 path.
 			}
-			destHashes = append(destHashes, msg.ContentHash)
+			if !msg.IsUploaded {
+				if s.server.uploader == nil {
+					continue
+				}
+				// A local body is linked for the owner's pending upload. If its staging
+				// file is on another node, defer the S3 fallback to the locked phase.
+				staged, err := s.stageCrossAccountBody("move", msg.ContentHash, msg.AccountID, destMailbox.AccountID)
+				if err != nil {
+					return err
+				}
+				if staged {
+					continue
+				}
+			}
+			if _, seen := destObjects[msg.ContentHash]; !seen {
+				destObjects[msg.ContentHash] = destObject{
+					sourceKey:     helpers.NewS3Key(msg.S3Domain, msg.S3Localpart, msg.ContentHash),
+					destKey:       helpers.NewS3Key(destS3Domain, destS3Localpart, msg.ContentHash),
+					sourcePending: !msg.IsUploaded,
+				}
+				destHashes = append(destHashes, msg.ContentHash)
+			}
 		}
 	}
 

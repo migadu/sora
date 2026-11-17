@@ -5,6 +5,7 @@ package resilient
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -159,3 +160,124 @@ func TestCrossAccountCopyAtTheBodyCapHoldsTheCleanerOff(t *testing.T) {
 		t.Errorf("the cleaner confirmed %v as an orphan after COPY committed rows for it", orphans)
 	}
 }
+
+// Same-mailbox CopyMessagesWithRetry must fail immediately before taking
+// destination S3 locks or invoking ensureDestObject, and same-mailbox
+// MoveMessagesWithRetry must succeed with nil sourceHashes while skipping
+// destination S3 locks and ensureDestObject even on > MaxCrossAccountBodies
+// legacy contributor rows.
+func TestSameMailboxCopyMoveWithRetrySkipsDestObjectsAndSourceHashes(t *testing.T) {
+	ctx := context.Background()
+	cfg := testDatabaseConfig()
+	plain := newTestPool(t, cfg, nil)
+	rdb := newTestResilientDatabase(cfg, plain)
+	const bodies = crossAccountBodyCap + 1
+
+	t.Run("COPY", func(t *testing.T) {
+		f := newCrossAccountMoveFixture(t, plain, bodies)
+		if _, err := plain.Exec(ctx, `UPDATE messages SET mailbox_id = $2 WHERE mailbox_id = $1`, f.srcID, f.destID); err != nil {
+			t.Fatalf("place legacy contributor rows in shared mailbox: %v", err)
+		}
+		if _, err := plain.Exec(ctx, `UPDATE mailboxes SET highest_uid = $2 WHERE id = $1`, f.destID, bodies); err != nil {
+			t.Fatalf("update highest_uid: %v", err)
+		}
+		uids := make([]imap.UID, bodies)
+		for i := range uids {
+			uids[i] = imap.UID(i + 1)
+		}
+		checks, held := 0, 0
+		ensure := func(_ context.Context, hash string) error {
+			if checks++; checks == 1 {
+				held = heldAdvisoryLocks(t, plain, f.ownerID, hash)
+			}
+			return nil
+		}
+		_, _, err := rdb.CopyMessagesWithRetry(ctx, &uids, f.destID, f.destID, f.ownerID,
+			"example.net", "owner", "test-instance", f.sourceHashes(), f.hashes, ensure)
+		if err == nil || !strings.Contains(err.Error(), "source and destination mailboxes cannot be the same") {
+			t.Fatalf("same-mailbox CopyMessagesWithRetry err = %v, want same-mailbox error", err)
+		}
+		if checks != 0 || held != 0 {
+			t.Errorf("same-mailbox CopyMessagesWithRetry made %d S3 checks and held %d advisory locks, want 0 and 0", checks, held)
+		}
+	})
+
+	t.Run("MOVE", func(t *testing.T) {
+		f := newCrossAccountMoveFixture(t, plain, bodies)
+		if _, err := plain.Exec(ctx, `UPDATE messages SET mailbox_id = $2 WHERE mailbox_id = $1`, f.srcID, f.destID); err != nil {
+			t.Fatalf("place legacy contributor rows in shared mailbox: %v", err)
+		}
+		if _, err := plain.Exec(ctx, `UPDATE mailboxes SET highest_uid = $2 WHERE id = $1`, f.destID, bodies); err != nil {
+			t.Fatalf("update highest_uid: %v", err)
+		}
+		uids := make([]imap.UID, bodies)
+		for i := range uids {
+			uids[i] = imap.UID(i + 1)
+		}
+		checks, held := 0, 0
+		ensure := func(_ context.Context, hash string) error {
+			if checks++; checks == 1 {
+				held = heldAdvisoryLocks(t, plain, f.ownerID, hash)
+			}
+			return nil
+		}
+		uidMap, err := rdb.MoveMessagesWithRetry(ctx, &uids, f.destID, f.destID, f.ownerID,
+			"example.net", "owner", "test-instance", nil, f.hashes, ensure)
+		if err != nil {
+			t.Fatalf("same-mailbox MoveMessagesWithRetry failed: %v", err)
+		}
+		if len(uidMap) != bodies {
+			t.Errorf("same-mailbox MoveMessagesWithRetry moved %d rows, want %d", len(uidMap), bodies)
+		}
+		if checks != 0 || held != 0 {
+			t.Errorf("same-mailbox MoveMessagesWithRetry made %d S3 checks and held %d advisory locks, want 0 and 0", checks, held)
+		}
+		if n := countLiveMessages(t, plain, f.destID); n != bodies {
+			t.Errorf("same-mailbox MoveMessagesWithRetry left %d live messages, want %d", n, bodies)
+		}
+	})
+}
+
+// When cross-account source rows are concurrently expunged before the write
+// transaction reads them (so cross == false), oversized destObjects must still be
+// refused with ErrCrossAccountBodyLimit before locking or copying destObjects.
+func TestCrossAccountCopyMoveOversizedDestObjectsWithNoCrossRowsRefusedBeforeLocks(t *testing.T) {
+	ctx := context.Background()
+	cfg := testDatabaseConfig()
+	plain := newTestPool(t, cfg, nil)
+	rdb := newTestResilientDatabase(cfg, plain)
+	const bodies = crossAccountBodyCap + 1
+
+	for _, command := range []string{"COPY", "MOVE"} {
+		t.Run(command, func(t *testing.T) {
+			f := newCrossAccountMoveFixture(t, plain, bodies)
+			if _, err := plain.Exec(ctx, `UPDATE messages SET expunged_at = now(), expunged_modseq = nextval('messages_modseq') WHERE mailbox_id = $1`, f.srcID); err != nil {
+				t.Fatalf("expunge source rows: %v", err)
+			}
+			uids := make([]imap.UID, bodies)
+			for i := range uids {
+				uids[i] = imap.UID(i + 1)
+			}
+			checks, held := 0, 0
+			ensure := func(_ context.Context, hash string) error {
+				if checks++; checks == 1 {
+					held = heldAdvisoryLocks(t, plain, f.ownerID, hash)
+				}
+				return nil
+			}
+			var err error
+			if command == "COPY" {
+				_, _, err = rdb.CopyMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID,
+					"example.net", "owner", "test-instance", f.sourceHashes(), f.hashes, ensure)
+			} else {
+				_, err = rdb.MoveMessagesWithRetry(ctx, &uids, f.srcID, f.destID, f.ownerID,
+					"example.net", "owner", "test-instance", f.sourceHashes(), f.hashes, ensure)
+			}
+			if !errors.Is(err, db.ErrCrossAccountBodyLimit) || checks != 0 || held != 0 {
+				t.Errorf("%s with %d destObjects and 0 live cross rows: err = %v, checks = %d, held = %d; want ErrCrossAccountBodyLimit, 0, 0",
+					command, bodies, err, checks, held)
+			}
+		})
+	}
+}
+
