@@ -1648,7 +1648,9 @@ const maxImportRootLinks = 255
 // directly, as maildirCacheLinkRule trusts them. Any other link is refused, naming it,
 // so the operator can name the directory itself. The owner of a link says who made
 // it, not who gave it its name: where users may hard-link a file they do not own, a
-// link with more than one name is refused too.
+// link with more than one name is refused too, and a link of that user, when it is
+// not root, is followed only from a directory no other user can rename entries in
+// (renamableParent), where nobody else can have moved or hard-linked it into place.
 //
 // path is walked a component at a time by descriptor from the file system root (a
 // relative one from the working directory), as the system resolves it: a ".." after a
@@ -1842,7 +1844,24 @@ func openLinkCheckedRoot(path string, mode rootWalk) (*os.Root, error) {
 				return nil, fmt.Errorf("refusing %s: %s is a symbolic link with %d names, and on this system any user may have given it this one with a hard link; name the directory it leads to instead", given, name, nlink)
 			}
 			next := split(target)
-			if uid := fileUID(again); uid != 0 && uid != euid {
+			switch uid := fileUID(again); {
+			case uid == 0:
+			case uid == euid:
+				// A link of the user this runs as, not root, is trusted as leading
+				// only where that user could name directly, which holds only if that
+				// user also gave it this name. Another user who can rename an entry
+				// of the directory holding it, or of one above, may have moved it
+				// here, or kept such a hard link (#1868), so it is followed only from
+				// a directory nobody else can rename entries in: the rule
+				// maildirCacheLinkRule applies to the cache's directory.
+				parent, owner, perm, err := renamableParent(name, int(euid))
+				if err != nil {
+					return nil, fmt.Errorf("refusing %s: failed to check the directories holding the symbolic link %s: %w", given, name, err)
+				}
+				if parent != "" {
+					return nil, fmt.Errorf("refusing %s: %s is a symbolic link of the user this runs as (uid %d), but users other than root and uid %d can rename entries in %s, on its path (owner uid %d, mode %04o), and so may have given it this name; name the directory it leads to instead", given, name, euid, euid, parent, owner, perm)
+				}
+			default:
 				next = append(next, step{link: name, linkUID: uid})
 			}
 			steps = append(next, steps...)
