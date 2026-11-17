@@ -310,13 +310,24 @@ func TestThreadRefs_OrdersThreadsByLatestArrival(t *testing.T) {
 
 func TestExtractIDs(t *testing.T) {
 	cases := map[string][]string{
-		"":                  {},
-		"  ":                {},
-		"a@x":               {"a@x"},
-		"a@x b@x":           {"a@x", "b@x"},
-		"  a@x \t b@x\r\n ": {"a@x", "b@x"},
-		"<a@x> <b@x>":       {"a@x", "b@x"},
-		"<a@x><b@x>":        {"a@x", "b@x"},
+		"":        {},
+		" ":       {},
+		"a@x":     {"a@x"},
+		"a@x b@x": {"a@x", "b@x"},
+		// go-message keeps the quoting a local part needs (RFC 5322 §3.6.4
+		// obs-id-left), so white space, '<' and '>' inside quotes belong to the id.
+		`"foo bar"@x b@x`: {`"foo bar"@x`, "b@x"},
+		`"<inner>"@x`:     {`"<inner>"@x`},
+		`"a\" b"@x c@x`:   {`"a\" b"@x`, "c@x"},
+		// A no-fold-literal may hold '<', '>' and '"' (dtext), and atext any
+		// non-ASCII rune, NBSP included: only the joining space separates ids.
+		`a@[x>y] z@x`:          {"a@[x>y]", "z@x"},
+		`a@[<x>] z@x`:          {"a@[<x>]", "z@x"},
+		`a@[>"] "x y"@x`:       {`a@[>"]`, `"x y"@x`},
+		"a\u00a0b@x z@x":       {"a\u00a0b@x", "z@x"},
+		"\"q r\"@x a\u3000b@x": {`"q r"@x`, "a\u3000b@x"},
+		// A quote that never closes is no quoted string.
+		`"unterminated b@x`: {`"unterminated`, "b@x"},
 	}
 	for in, want := range cases {
 		assert.Equal(t, want, extractIDs(in), "extractIDs(%q)", in)
