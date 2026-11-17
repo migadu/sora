@@ -1602,7 +1602,8 @@ func (ct *ConnectionTracker) SessionGeneration() uint64 {
 // crossed a removal/kick/credential change of its account, or a reset, receives an
 // already-closed channel, so the normal termination poller closes it instead of
 // registering after the revocation passed. A revocation of another account does not
-// fence it (#1882), save for one hashed to the same slot.
+// fence it (#1882), save for one hashed to the same slot. A generation newer than
+// this tracker is invalid and is also refused.
 func (ct *ConnectionTracker) RegisterSessionIfGeneration(accountID int64, generation uint64) <-chan struct{} {
 	if ct == nil {
 		return ct.RegisterSession(accountID)
@@ -1610,7 +1611,7 @@ func (ct *ConnectionTracker) RegisterSessionIfGeneration(accountID int64, genera
 	ch := make(chan struct{})
 	ct.kickSessionsMu.Lock()
 	defer ct.kickSessionsMu.Unlock()
-	if ct.resetAt > generation || ct.revokedAt[revocationSlot(accountID)] > generation {
+	if generation > ct.sessionGeneration || ct.resetAt > generation || ct.revokedAt[revocationSlot(accountID)] > generation {
 		close(ch)
 		return ch
 	}
