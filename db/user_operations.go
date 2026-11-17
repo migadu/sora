@@ -639,9 +639,12 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 		}
 	}
 
-	var customFlags []string
+	customFlags := []string{}
 	if len(currentCustomFlags) > 0 {
 		json.Unmarshal(currentCustomFlags, &customFlags)
+	}
+	if customFlags == nil {
+		customFlags = []string{}
 	}
 	storedCustomFlags := slices.Clone(customFlags)
 
