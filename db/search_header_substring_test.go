@@ -209,7 +209,7 @@ var headerIndexHeapOnlyColumns = map[string]bool{
 // idx_messages_mailbox_headers. One missing column silently turns every header search back
 // into the heap filter measured at 38 s, and nothing else would notice.
 func TestHeaderIndexCoversLightweightSearch(t *testing.T) {
-	_, indexed := headerIndex(t)
+	indexName, indexed := headerIndex(t)
 	var db *Database
 	colRef := regexp.MustCompile(`\bm\.("references"|[a-z_]+)`)
 	referenced := map[string]string{} // column -> where it was seen
@@ -225,8 +225,8 @@ func TestHeaderIndexCoversLightweightSearch(t *testing.T) {
 	criteria := &imap.SearchCriteria{
 		Header: []imap.SearchCriteriaHeaderField{
 			{Key: "From", Value: "a"}, {Key: "To", Value: "a"}, {Key: "Cc", Value: "a"}, {Key: "Subject", Value: "a"},
-			{Key: "References", Value: "a"}, {Key: "Message-Id", Value: "a"}, {Key: "In-Reply-To", Value: "a"},
-			{Key: "Bcc", Value: "a"}, {Key: "Reply-To", Value: "a"},
+			{Key: "References", Value: "a"}, {Key: "Message-Id", Value: "a"}, {Key: "Message-Id", Value: "<id@host>"},
+			{Key: "In-Reply-To", Value: "a"}, {Key: "Bcc", Value: "a"}, {Key: "Reply-To", Value: "a"},
 		},
 		Text: []string{"a"}, Body: []string{"a"},
 		Since: now, Before: now, SentSince: now, SentBefore: now, Larger: 1, Smaller: 2,
@@ -274,6 +274,70 @@ func TestHeaderIndexCoversLightweightSearch(t *testing.T) {
 	for _, col := range []string{"from_email_sort", "subject", "subject_sort", "content_hash", "internal_date", "size", "extra_addresses"} {
 		assert.Contains(t, referenced, col, "harness check: the probe must reference %s", col)
 	}
+
+	t.Run("Message-ID criteria and TOAST-safe raw index", func(t *testing.T) {
+		require.Equal(t, "idx_messages_mailbox_headers_v3", indexName)
+		assert.False(t, indexed["message_id_raw"],
+			"unbounded message_id_raw must stay out of %s so large folded Message-ID headers remain TOAST-safe", indexName)
+
+		mig73, err := os.ReadFile("migrations/000073_messages_message_id_raw.up.sql")
+		require.NoError(t, err)
+		var mig73Code []string
+		for _, line := range strings.Split(string(mig73), "\n") {
+			if !strings.HasPrefix(strings.TrimSpace(line), "--") {
+				mig73Code = append(mig73Code, line)
+			}
+		}
+		rawIdxDef := regexp.MustCompile(`(?s)CREATE INDEX idx_messages_mailbox_message_id_raw\s+ON messages \(([^)]+)\)\s*(?:INCLUDE \(([^)]*)\)\s*)?WHERE ([^;]+);`)
+		rawMatch := rawIdxDef.FindStringSubmatch(strings.ReplaceAll(strings.Join(mig73Code, "\n"), "IF NOT EXISTS ", ""))
+		require.NotNil(t, rawMatch, "000073 must define idx_messages_mailbox_message_id_raw")
+		rawBtreeCols := map[string]bool{}
+		for _, part := range []string{rawMatch[1], rawMatch[2]} {
+			for _, c := range strings.Split(part, ",") {
+				if col := strings.TrimSpace(c); col != "" {
+					rawBtreeCols[col] = true
+				}
+			}
+		}
+		assert.Equal(t, map[string]bool{"mailbox_id": true, "id": true}, rawBtreeCols,
+			"idx_messages_mailbox_message_id_raw must carry only (mailbox_id, id) in btree key/INCLUDE columns so oversized message_id_raw values remain TOAST-safe")
+		assert.False(t, rawBtreeCols["message_id_raw"],
+			"idx_messages_mailbox_message_id_raw must omit message_id_raw from btree key/INCLUDE columns")
+		assert.Contains(t, rawMatch[3], "message_id_raw IS NOT NULL",
+			"idx_messages_mailbox_message_id_raw predicate must scope non-canonical rows")
+
+		for _, tc := range []struct {
+			name  string
+			value string
+		}{
+			{name: "substring", value: "part"},
+			{name: "whole-ID", value: "<id@host>"},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				pc := 0
+				sql, _, err := db.buildSearchCriteria(&imap.SearchCriteria{
+					Header: []imap.SearchCriteriaHeaderField{{Key: "Message-ID", Value: tc.value}},
+				}, "p", &pc)
+				require.NoError(t, err)
+
+				seen := map[string]bool{}
+				for _, m := range colRef.FindAllStringSubmatch(sql, -1) {
+					seen[m[1]] = true
+				}
+				assert.True(t, seen["message_id"], "HEADER Message-ID %q must reference m.message_id", tc.value)
+				assert.True(t, seen["message_id_raw"], "HEADER Message-ID %q must reference m.message_id_raw", tc.value)
+				var uncovered []string
+				for col := range seen {
+					if !indexed[col] && !headerIndexHeapOnlyColumns[col] {
+						uncovered = append(uncovered, col)
+					}
+				}
+				sort.Strings(uncovered)
+				assert.Empty(t, uncovered,
+					"HEADER Message-ID %q referenced columns neither covered by %s nor declared in headerIndexHeapOnlyColumns", tc.value, indexName)
+			})
+		}
+	})
 }
 
 // hdrPlanNode is the subset of an EXPLAIN (ANALYZE, FORMAT JSON) node the plan-shape test reads.
