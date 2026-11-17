@@ -73,9 +73,13 @@ type Session struct {
 	// Successful counts happen at most once per account; failed counts can retry
 	// without creating another kick watcher. close() releases only successful counts.
 	registeredAccountIDs map[int64]accountRegistration
+	// rcptSessionGeneration is the ConnectionTracker revocation generation captured
+	// before handleRecipient resolves the current RCPT TO, handed to
+	// RegisterSessionIfGeneration once the backend accepts the recipient.
+	rcptSessionGeneration uint64
 	// kickedAccountID is the account whose kick ended the session, 0 if none. It is
-	// set by watchKick and logged by close(), on the session goroutine, which owns
-	// the fields the session logger reads.
+	// set by closeSessionOnKick / watchKick and logged by close(), on the session
+	// goroutine, which owns the fields the session logger reads.
 	kickedAccountID atomic.Int64
 
 	// Per-transaction state. The backend's view of a transaction must stay the MTA's:
@@ -626,7 +630,9 @@ func (s *Session) handleConnection() {
 			// Forward RCPT TO to backend
 			if s.backendConn != nil {
 				s.DebugLog("Forwarding RCPT TO to backend", "to", s.to)
-				s.forwardRCPT(line)
+				if !s.forwardRCPT(line) {
+					return
+				}
 			} else {
 				s.WarnLog("Cannot forward RCPT - no backend connection", "to", s.to)
 				s.sendResponse("451 4.4.1 Backend connection failed")
@@ -1206,6 +1212,7 @@ func hasASCIIControl(s string) bool {
 
 // handleRecipient looks up the recipient, determines routing, and sets session state.
 func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
+	s.rcptSessionGeneration = s.server.connTracker.SessionGeneration()
 	cacheGeneration := s.server.lookupCache.Generation()
 
 	address, err := server.NewAddress(to)
@@ -1894,7 +1901,8 @@ func (s *Session) backendRcptTo(command string) (backendCommand string, rewrote 
 }
 
 // forwardRCPT preserves canonical path and accepted forwarding tokens after validation.
-func (s *Session) forwardRCPT(command string) {
+// It reports whether the session may continue reading client commands.
+func (s *Session) forwardRCPT(command string) bool {
 	backendCommand, rewrote, resolvedRecipient := s.backendRcptTo(command)
 	if rewrote {
 		s.DebugLog("Rewrote RCPT TO for backend", "original_recipient", s.to, "resolved_recipient", resolvedRecipient, "backend_command", backendCommand)
@@ -1909,7 +1917,7 @@ func (s *Session) forwardRCPT(command string) {
 		s.DebugLog("Failed to send RCPT TO", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
 		s.loseBackend() // poisons the transaction if a recipient was already accepted
-		return
+		return true
 	}
 	s.backendWriter.Flush()
 
@@ -1919,7 +1927,7 @@ func (s *Session) forwardRCPT(command string) {
 		s.DebugLog("Failed to read RCPT TO response", "error", err)
 		s.sendResponse("451 4.4.2 Backend error")
 		s.loseBackend()
-		return
+		return true
 	}
 	s.DebugLog("Backend RCPT TO response", "response", strings.TrimSpace(response))
 
@@ -1948,34 +1956,41 @@ func (s *Session) forwardRCPT(command string) {
 
 		// Override the backend's 5xx response with our own 4xx to allow retry
 		s.sendResponse("451 4.3.0 Backend configuration issue, please try again later")
-		return
+		return true
 	} else if strings.HasPrefix(trimmedResponse, "4") {
 		// Backend rejected with temporary error (4xx) - forward as-is
 		s.InfoLog("backend temporarily rejected recipient", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to, "response", trimmedResponse)
-		_, _ = s.writeClientReply(response, false)
-		return
+		if _, err := s.writeClientReply(response, false); err != nil {
+			return false
+		}
+		return true
+	}
+
+	// The session now delivers to this recipient's account, on a new backend
+	// connection or on the one it already held: count it for that account
+	// (once per session, however many of its recipients follow). This comes
+	// before the reply, so an account revoked while RCPT TO was in flight
+	// closes the session with 421 instead of answering 250, and a later kick
+	// reaches the session from the moment the MTA learns of the acceptance.
+	if err := s.registerConnection(); err != nil {
+		if errors.Is(err, errSessionClosing) {
+			return false
+		}
+		s.InfoLog("rejected connection registration", "error", err)
 	}
 
 	// Backend accepted (2xx). From here on this transaction is the backend's: a
 	// lost backend can no longer be replaced.
 	s.acceptedRcpts++
 
-	// The session now delivers to this recipient's account, on a new backend
-	// connection or on the one it already held: count it for that account
-	// (once per session, however many of its recipients follow). This comes
-	// before the reply, so the account's kick reaches the session from the
-	// moment the MTA learns of the acceptance.
-	if err := s.registerConnection(); err != nil {
-		s.InfoLog("rejected connection registration", "error", err)
-	}
-
 	// Forward the backend's acceptance to the client.
 	if _, err := s.writeClientReply(response, false); err != nil {
-		return
+		return false
 	}
 
 	// Log routing decision at INFO level with sender, recipient, and routing method
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to)
+	return true
 }
 
 // close closes all connections.
@@ -2071,12 +2086,26 @@ func (s *Session) registerConnection() error {
 		// unregisters each account once.
 		registration, subscribed := s.registeredAccountIDs[s.accountID]
 		if !subscribed {
+			kick := s.server.connTracker.RegisterSessionIfGeneration(s.accountID, s.rcptSessionGeneration)
+			select {
+			case <-kick:
+				s.closeSessionOnKick(s.accountID)
+				return errSessionClosing
+			default:
+			}
 			if s.registeredAccountIDs == nil {
 				s.registeredAccountIDs = make(map[int64]accountRegistration)
 			}
-			registration.kick = s.server.connTracker.RegisterSession(s.accountID)
+			registration.kick = kick
 			s.registeredAccountIDs[s.accountID] = registration
 			go s.watchKick(s.accountID, registration.kick)
+		} else {
+			select {
+			case <-registration.kick:
+				s.closeSessionOnKick(s.accountID)
+				return errSessionClosing
+			default:
+			}
 		}
 		if registration.counted {
 			return nil
@@ -2114,13 +2143,25 @@ func (s *Session) watchKick(accountID int64, kick <-chan struct{}) {
 	if !s.kickedAccountID.CompareAndSwap(0, accountID) {
 		return // another of the session's accounts was kicked: that watcher ends it
 	}
+	s.closeSessionOnKick(accountID)
+}
+
+// closeSessionOnKick sends the single 421 kick notice under noticeMu, closes the
+// client connection, and cancels the session context. A synchronous caller
+// (registerConnection) does not return early on CompareAndSwap failure, so it
+// never races past an in-progress watcher before closingNoticeSent is set and
+// 421 has been written.
+func (s *Session) closeSessionOnKick(accountID int64) {
+	s.kickedAccountID.CompareAndSwap(0, accountID)
 
 	// Bound the wait for noticeMu (if the session goroutine is wedged flushing
 	// an earlier reply to an unresponsive client) and for TLS close_notify.
 	var aborted atomic.Bool
 	abortTimer := time.AfterFunc(kickNoticeTimeout, func() {
 		aborted.Store(true)
-		s.cancel()
+		if s.cancel != nil {
+			s.cancel()
+		}
 		s.mu.Lock()
 		client, backend := s.clientConn, s.backendConn
 		s.mu.Unlock()
@@ -2147,7 +2188,9 @@ func (s *Session) watchKick(accountID int64, kick <-chan struct{}) {
 	}
 	s.noticeMu.Unlock()
 
-	s.cancel()
+	if s.cancel != nil {
+		s.cancel()
+	}
 }
 
 func isClosingError(err error) bool {
@@ -2346,6 +2389,7 @@ func (s *Session) resetTransaction() {
 	s.backendHasMail = false
 	s.smtputf8 = false
 	s.declaredSize = ""
+	s.rcptSessionGeneration = 0
 }
 
 // restartSession ends the current transaction and drops a held backend, for an
