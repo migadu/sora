@@ -6,6 +6,7 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/helpers"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"strings"
 	"testing"
@@ -81,6 +82,8 @@ func TestHeaderPresenceForwardOnlyMixedPredicatesAndCopies(t *testing.T) {
 	require.ElementsMatch(t, uids, search(imap.SearchCriteria{Or: [][2]imap.SearchCriteria{{header("Cc", true), {Not: []imap.SearchCriteria{header("From", true)}}}}}))
 	require.Empty(t, search(imap.SearchCriteria{Header: header("Cc", true).Header, Not: []imap.SearchCriteria{header("From", true)}}))
 	require.ElementsMatch(t, []imap.UID{uids[4]}, search(header("Subject", true)), "known absence vs unchanged legacy subject predicate")
+	require.ElementsMatch(t, []imap.UID{uids[4]}, search(header("Subject", false)), `SUBJECT "" must match only present Subject or NULL legacy metadata`)
+	require.ElementsMatch(t, []imap.UID{uids[0], uids[1], uids[2], uids[3]}, search(imap.SearchCriteria{Not: []imap.SearchCriteria{header("Subject", false)}}), `NOT SUBJECT "" must match known absent Subject`)
 	// A new database row is not new ingested content: copy/move retain NULL.
 	dest := createTestMailbox(t, d, account, "PresenceCopies")
 	for _, i := range []int{0, 4} {
@@ -133,4 +136,144 @@ func TestHeaderPresenceForwardOnlyMixedPredicatesAndCopies(t *testing.T) {
 	require.Equal(t, 1, known)
 	require.Equal(t, 1, unknown)
 
+}
+
+func TestSubjectEmptySearchUsesHeaderPresence(t *testing.T) {
+	// Unit SQL generation check (nil *Database: buildSearchCriteria does not dereference receiver).
+	var nilDB *Database
+	subjectBit, ok := helpers.HeaderPresenceBit("subject")
+	require.True(t, ok)
+
+	for _, key := range []string{"Subject", "SUBJECT", "subject"} {
+		paramCounter := 0
+		explicitSQL, _, err := nilDB.buildSearchCriteria(&imap.SearchCriteria{
+			Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: "", IsHeader: true}},
+		}, "p", &paramCounter)
+		require.NoError(t, err)
+
+		paramCounter = 0
+		shorthandSQL, _, err := nilDB.buildSearchCriteria(&imap.SearchCriteria{
+			Header: []imap.SearchCriteriaHeaderField{{Key: key, Value: "", IsHeader: false}},
+		}, "p", &paramCounter)
+		require.NoError(t, err)
+
+		assert.Contains(t, shorthandSQL, fmt.Sprintf("(m.header_presence & %d) <> 0", subjectBit), "key %q", key)
+		assert.Equal(t, explicitSQL, shorthandSQL, "SUBJECT \"\" and HEADER %s \"\" share the presence/legacy predicate", key)
+	}
+
+	// Non-empty SUBJECT search still uses substring matching on LOWER(m.subject).
+	paramCounter := 0
+	nonEmptySQL, _, err := nilDB.buildSearchCriteria(&imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "hello", IsHeader: false}},
+	}, "p", &paramCounter)
+	require.NoError(t, err)
+	assert.Contains(t, nonEmptySQL, "strpos(LOWER(m.subject), @")
+	assert.NotContains(t, nonEmptySQL, "header_presence")
+
+	// PostgreSQL execution across absent, present-empty, non-empty, and NULL legacy rows.
+	d, account, box := setupSearchTestDatabase(t)
+	defer d.Close()
+	ctx := context.Background()
+	var bs imap.BodyStructure = &imap.BodyStructureSinglePart{Type: "text", Subtype: "plain", Size: 64}
+
+	fixtures := []struct {
+		raw     string
+		subject string
+		legacy  bool
+	}{
+		{raw: "From: a@example.com\r\n\r\nabsent subject", subject: "", legacy: false},
+		{raw: "From: a@example.com\r\nSubject:\r\n\r\nempty subject", subject: "", legacy: false},
+		{raw: "From: a@example.com\r\nSubject: Hello World\r\n\r\nnon-empty subject", subject: "Hello World", legacy: false},
+		{raw: "From: a@example.com\r\n\r\nlegacy absent subject", subject: "", legacy: true},
+		{raw: "From: a@example.com\r\nSubject: Legacy Subject\r\n\r\nlegacy present subject", subject: "Legacy Subject", legacy: true},
+	}
+
+	var uids []imap.UID
+	base := time.Now().UnixNano()
+	for i, fx := range fixtures {
+		ent, err := message.Read(strings.NewReader(fx.raw))
+		require.NoError(t, err)
+		mask := helpers.ExtractHeaderPresence(ent.Header)
+		if fx.legacy {
+			mask = nil
+		}
+		o := &InsertMessageOptions{
+			AccountID:      account,
+			MailboxID:      box,
+			MailboxName:    "INBOX",
+			ContentHash:    fmt.Sprintf("subj-presence-%d-%d", base, i),
+			MessageID:      fmt.Sprintf("subj-presence-%d-%d@example.org", base, i),
+			InternalDate:   time.Now().Add(time.Duration(i) * time.Second),
+			SentDate:       time.Now().Add(time.Duration(i) * time.Second),
+			Size:           64,
+			Subject:        fx.subject,
+			BodyStructure:  &bs,
+			Recipients:     helpers.ExtractRecipients(ent.Header),
+			HeaderPresence: mask,
+			S3Domain:       "example.com",
+			S3Localpart:    "subjpresence",
+		}
+		tx, err := d.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		_, uid, err := d.InsertMessage(ctx, tx, o, PendingUpload{
+			InstanceID:  "test",
+			ContentHash: o.ContentHash,
+			Size:        o.Size,
+			AccountID:   account,
+		})
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+		uids = append(uids, imap.UID(uid))
+	}
+
+	uidAbsent := uids[0]
+	uidEmpty := uids[1]
+	uidNonEmpty := uids[2]
+	uidLegacyAbsent := uids[3]
+	uidLegacyPresent := uids[4]
+
+	searchUIDs := func(c imap.SearchCriteria) []imap.UID {
+		xs, err := d.SearchMessagesWithCriteria(ctx, box, account, &c, 0, 100)
+		require.NoError(t, err)
+		got := []imap.UID{}
+		for _, x := range xs {
+			got = append(got, x.UID)
+		}
+		return got
+	}
+
+	subjEmpty := imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "", IsHeader: false}},
+	}
+	hdrSubjEmpty := imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "", IsHeader: true}},
+	}
+
+	wantPresentOrLegacy := []imap.UID{uidEmpty, uidNonEmpty, uidLegacyAbsent, uidLegacyPresent}
+	assert.ElementsMatch(t, wantPresentOrLegacy, searchUIDs(subjEmpty), `SUBJECT ""`)
+	assert.ElementsMatch(t, []imap.UID{uidAbsent}, searchUIDs(imap.SearchCriteria{Not: []imap.SearchCriteria{subjEmpty}}), `NOT SUBJECT ""`)
+	assert.ElementsMatch(t, wantPresentOrLegacy, searchUIDs(hdrSubjEmpty), `HEADER Subject ""`)
+	assert.ElementsMatch(t, []imap.UID{uidAbsent}, searchUIDs(imap.SearchCriteria{Not: []imap.SearchCriteria{hdrSubjEmpty}}), `NOT HEADER Subject ""`)
+
+	// Non-empty SUBJECT search remains case-insensitive substring matching.
+	assert.ElementsMatch(t, []imap.UID{uidNonEmpty}, searchUIDs(imap.SearchCriteria{
+		Header: []imap.SearchCriteriaHeaderField{{Key: "Subject", Value: "hello", IsHeader: false}},
+	}))
+
+	// SORT and THREAD with SUBJECT "" share the same search criteria builder.
+	sorted, err := d.SearchMessagesSorted(ctx, box, account, &subjEmpty, []imap.SortCriterion{{Key: imap.SortKeyArrival}}, 0, 100)
+	require.NoError(t, err)
+	var sortedUIDs []imap.UID
+	for _, s := range sorted {
+		sortedUIDs = append(sortedUIDs, s.UID)
+	}
+	assert.Equal(t, wantPresentOrLegacy, sortedUIDs, `SORT (ARRIVAL) SUBJECT ""`)
+
+	threadMsgs, err := d.GetMessagesForThreading(ctx, box, account, &subjEmpty, true, false, 100)
+	require.NoError(t, err)
+	var threadUIDs []imap.UID
+	for _, tm := range threadMsgs {
+		threadUIDs = append(threadUIDs, tm.UID)
+	}
+	assert.ElementsMatch(t, wantPresentOrLegacy, threadUIDs, `THREAD SUBJECT ""`)
 }

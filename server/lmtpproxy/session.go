@@ -233,15 +233,29 @@ func (s *Session) handleConnection() {
 		line = strings.TrimRight(line, "\r\n")
 		s.DebugLog("Client command", "line", line)
 
-		// Use the shared command parser. LMTP commands do not have tags.
-		_, command, args, err := server.ParseLine(line, false)
-		if err != nil {
-			s.sendResponse(fmt.Sprintf("500 5.5.2 Syntax error: %s", err.Error()))
-			continue
+		trimmedLine := strings.TrimSpace(line)
+		if trimmedLine == "" {
+			continue // Ignore empty lines
 		}
 
-		if command == "" {
-			continue // Ignore empty lines
+		verb, rawArgs, _ := strings.Cut(trimmedLine, " ")
+		command := server.ToUpperASCII(verb)
+		var args []string
+		if command != "MAIL" && command != "RCPT" {
+			// Use the shared command parser for non-MAIL/RCPT commands. MAIL and RCPT
+			// parse their path argument and RFC 5321 ESMTP parameter tail directly so
+			// IMAP-style quote grouping never rejects unclosed quotes in ESMTP parameters
+			// with 500 or merges space-separated ESMTP parameters inside quotes.
+			var err error
+			_, command, args, err = server.ParseLine(line, false)
+			if err != nil {
+				s.sendResponse(fmt.Sprintf("500 5.5.2 Syntax error: %s", err.Error()))
+				continue
+			}
+
+			if command == "" {
+				continue // Ignore empty lines
+			}
 		}
 
 		switch command {
@@ -305,7 +319,7 @@ func (s *Session) handleConnection() {
 				s.sendResponse("503 5.5.1 Sender already specified")
 				continue
 			}
-			fromParam, params, found := findParameter(args, "FROM:")
+			fromParam, params, found := parseCommandPathAndParams(rawArgs, "FROM:")
 			if !found {
 				s.sendResponse("501 5.5.4 Syntax error in MAIL command (missing FROM)")
 				continue
@@ -346,14 +360,14 @@ func (s *Session) handleConnection() {
 			s.sendResponse("250 2.1.0 Ok")
 
 		case "RCPT":
-			toParam, params, found := findParameter(args, "TO:")
+			toParam, params, found := parseCommandPathAndParams(rawArgs, "TO:")
 			if !found {
-				s.DebugLog("RCPT command missing TO parameter", "args", fmt.Sprintf("%v", args))
+				s.DebugLog("RCPT command missing TO parameter", "rawArgs", rawArgs)
 				s.sendResponse("501 5.5.4 Syntax error in RCPT command (missing TO)")
 				continue
 			}
 
-			s.DebugLog("Parsing RCPT TO", "toParam", toParam, "args", fmt.Sprintf("%v", args))
+			s.DebugLog("Parsing RCPT TO", "toParam", toParam, "params", fmt.Sprintf("%v", params))
 			to, ok := s.extractAddress(toParam)
 			if !ok || to == "" {
 				s.DebugLog("Failed to extract address", "toParam", toParam)
@@ -914,11 +928,7 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 	if len(trimmed) <= 4 || !server.EqualFoldASCII(trimmed[:4], "RCPT") || (trimmed[4] != ' ' && trimmed[4] != '\t') {
 		return "", nil, false
 	}
-	_, verb, args, err := server.ParseLine("RCPT "+strings.TrimSpace(trimmed[4:]), false)
-	if err != nil || verb != "RCPT" {
-		return "", nil, false
-	}
-	toParam, rest, found := findParameter(args, "TO:")
+	toParam, rest, found := parseCommandPathAndParams(trimmed[4:], "TO:")
 	if !found {
 		return "", nil, false
 	}
@@ -927,9 +937,6 @@ func parseRCPTCommand(command string) (address string, keptParams []string, ok b
 		return "", nil, false
 	}
 	for _, param := range rest {
-		if strings.HasPrefix(param, `"`) {
-			continue
-		}
 		key, val, hasEq := strings.Cut(param, "=")
 		if hasEq && server.EqualFoldASCII(key, "XRCPTFORWARD") && validXRCPTFORWARD(val) {
 			keptParams = append(keptParams, param)
@@ -1087,10 +1094,13 @@ func extractAddressString(param string) (address string, ok bool) {
 	// and this one has no domain.
 	param = strings.TrimSpace(param)
 	quoted := strings.HasPrefix(param, `"`)
-	if quoted && (len(param) < 2 || !strings.HasSuffix(param, `"`)) {
-		return "", false
+	if quoted {
+		var unquotedOK bool
+		param, unquotedOK = unquoteWholeString(param)
+		if !unquotedOK {
+			return "", false
+		}
 	}
-	param = server.UnquoteString(param)
 
 	if len(param) < 2 || hasASCIIControl(param) {
 		return "", false
@@ -1098,12 +1108,17 @@ func extractAddressString(param string) (address string, ok bool) {
 
 	// Handle <address> format with or without space-separated ESMTP parameters
 	// (RFC 5321 section 4.1.2 requires SP before any parameters; nothing may
-	// follow > inside a quoted parameter).
+	// follow > inside a quoted parameter). Angle brackets, spaces, or unbalanced
+	// quotes inside <...> are rejected so canonical forwarding ("<"+addr+">") can
+	// never break out of its path delimiters on the backend.
 	if param[0] == '<' {
-		endIdx := strings.Index(param, ">")
+		endIdx := strings.IndexByte(param, '>')
 		if endIdx > 0 && (endIdx+1 == len(param) || (!quoted && param[endIdx+1] == ' ')) {
 			// Found closing bracket - extract address between < and >
 			address = param[1:endIdx]
+			if strings.ContainsAny(address, "<> ") || hasUnbalancedQuotes(address) {
+				return "", false
+			}
 			return address, address != "" || !quoted
 		}
 		// No valid closing bracket found - invalid format
@@ -1113,14 +1128,71 @@ func extractAddressString(param string) (address string, ok bool) {
 	// Some clients might not use angle brackets (non-standard but handle it).
 	// Stop at the first space only for unquoted arguments; inside quotes a space
 	// is part of the quoted token and must not strip trailing parameters.
+	candidate := param
 	if idx := strings.IndexByte(param, ' '); idx >= 0 {
 		if quoted || idx == 0 {
 			return "", false
 		}
-		return param[:idx], true
+		candidate = param[:idx]
+	}
+	if strings.ContainsAny(candidate, "<>") || (!quoted && hasUnbalancedQuotes(candidate)) {
+		return "", false
 	}
 
-	return param, true
+	return candidate, true
+}
+
+func unquoteWholeString(str string) (string, bool) {
+	if len(str) < 2 || str[0] != '"' {
+		return "", false
+	}
+	var result strings.Builder
+	result.Grow(len(str) - 2)
+	escaped := false
+	for i := 1; i < len(str); i++ {
+		if escaped {
+			result.WriteByte(str[i])
+			escaped = false
+			continue
+		}
+		if str[i] == '\\' {
+			escaped = true
+			continue
+		}
+		if str[i] == '"' {
+			if i != len(str)-1 {
+				return "", false
+			}
+			return result.String(), true
+		}
+		result.WriteByte(str[i])
+	}
+	return "", false
+}
+
+func hasUnbalancedQuotes(s string) bool {
+	inQuotes := false
+	escaped := false
+	for i := 0; i < len(s); i++ {
+		if inQuotes {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if s[i] == '\\' {
+				escaped = true
+				continue
+			}
+			if s[i] == '"' {
+				inQuotes = false
+			}
+			continue
+		}
+		if s[i] == '"' {
+			inQuotes = true
+		}
+	}
+	return inQuotes
 }
 
 func hasASCIIControl(s string) bool {
@@ -2105,20 +2177,94 @@ func findParameter(args []string, prefix string) (value string, params []string,
 	return "", nil, false
 }
 
-// splitESMTPParameters splits unquoted parameter tokens on whitespace as go-smtp's
-// parseArgs (strings.Fields) does — server.ParseLine splits atoms only on ' ', not '\t'
-// — while keeping quoted tokens intact so a quoted string is never read as an ESMTP
-// parameter keyword.
+// parseCommandPathAndParams reads the FROM: or TO: path token from the raw argument
+// tail of a MAIL or RCPT command and splits the post-path ESMTP parameter tail solely
+// with strings.Fields, matching RFC 5321 section 4.1.2 and go-smtp's parseArgs (esmtp-param
+// has no quoted-string syntax).
+func parseCommandPathAndParams(rawArgs, prefix string) (pathToken string, params []string, found bool) {
+	rest := strings.TrimSpace(rawArgs)
+	if len(rest) < len(prefix) || !server.EqualFoldASCII(rest[:len(prefix)], prefix) {
+		return "", nil, false
+	}
+	rest = strings.TrimSpace(rest[len(prefix):])
+	if rest == "" {
+		return "", nil, false
+	}
+	pathToken, paramTail := splitPathAndParameterTail(rest)
+	return pathToken, strings.Fields(paramTail), true
+}
+
+func splitPathAndParameterTail(rest string) (pathToken, paramTail string) {
+	if rest[0] == '"' {
+		escaped := false
+		for i := 1; i < len(rest); i++ {
+			if escaped {
+				escaped = false
+				continue
+			}
+			if rest[i] == '\\' {
+				escaped = true
+				continue
+			}
+			if rest[i] == '"' {
+				end := i + 1
+				for end < len(rest) && rest[end] != ' ' {
+					end++
+				}
+				return rest[:end], rest[end:]
+			}
+		}
+		return rest, ""
+	}
+
+	if rest[0] == '<' {
+		inQuotes := false
+		escaped := false
+		for i := 1; i < len(rest); i++ {
+			if inQuotes {
+				if escaped {
+					escaped = false
+					continue
+				}
+				if rest[i] == '\\' {
+					escaped = true
+					continue
+				}
+				if rest[i] == '"' {
+					inQuotes = false
+				}
+				continue
+			}
+			switch rest[i] {
+			case '"':
+				inQuotes = true
+			case '>':
+				end := i + 1
+				for end < len(rest) && rest[end] != ' ' {
+					end++
+				}
+				return rest[:end], rest[end:]
+			case ' ':
+				return rest[:i], rest[i:]
+			}
+		}
+		return rest, ""
+	}
+
+	if idx := strings.IndexByte(rest, ' '); idx >= 0 {
+		return rest[:idx], rest[idx:]
+	}
+	return rest, ""
+}
+
+// splitESMTPParameters splits parameter tokens on whitespace as go-smtp's parseArgs
+// (strings.Fields) does; RFC 5321 ESMTP parameters have no quoted-string syntax.
 func splitESMTPParameters(raw []string) []string {
 	if len(raw) == 0 {
 		return nil
 	}
 	out := make([]string, 0, len(raw))
 	for _, tok := range raw {
-		if strings.HasPrefix(tok, `"`) {
-			out = append(out, tok)
-			continue
-		}
 		out = append(out, strings.Fields(tok)...)
 	}
 	return out

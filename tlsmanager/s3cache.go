@@ -184,6 +184,13 @@ func (c *S3Cache) getObject(ctx context.Context, s3Key string) ([]byte, error) {
 
 // Put stores certificate data in S3.
 func (c *S3Cache) Put(ctx context.Context, key string, data []byte) error {
+	if isChallengeCacheKey(key) {
+		data, _, err := decodeCertificateState(data)
+		if err != nil {
+			return err
+		}
+		return c.putObject(ctx, S3ObjectKey(key), data)
+	}
 	ctx, cancel := context.WithTimeout(ctx, s3OperationTimeout)
 	defer cancel()
 	g, present := ctx.Value(publicationContextKey{}).(publicationGeneration)
@@ -253,6 +260,20 @@ func (c *S3Cache) putObjectConditional(ctx context.Context, s3Key string, data [
 	return nil
 }
 
+func (c *S3Cache) deleteObject(ctx context.Context, s3Key string) error {
+	ctx, cancel := context.WithTimeout(ctx, s3OperationTimeout)
+	defer cancel()
+
+	_, err := c.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(c.bucket),
+		Key:    aws.String(s3Key),
+	})
+	if err != nil && !missingS3Object(err) {
+		return fmt.Errorf("failed to delete object from S3: %w", err)
+	}
+	return nil
+}
+
 // MarkDeleted records in the bucket that the certificate stored under the object key
 // certKey (see S3ObjectKey) was deleted, at the given time. sora-admin calls it before it
 // deletes the object: every node holds the certificate in its local fallback cache too,
@@ -292,6 +313,9 @@ func (c *S3Cache) DeletedAt(ctx context.Context, name string) (time.Time, error)
 
 // Delete removes certificate data from S3.
 func (c *S3Cache) Delete(ctx context.Context, key string) error {
+	if !isCertificateCacheKey(key) {
+		return c.deleteObject(ctx, S3ObjectKey(key))
+	}
 	return c.MarkDeleted(ctx, S3ObjectKey(key), time.Now())
 }
 

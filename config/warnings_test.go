@@ -40,3 +40,17 @@ func TestWarningsArePureAndRepeatable(t *testing.T) {
 		t.Fatalf("collection logged warnings outside its return value:\n%s", logs.String())
 	}
 }
+
+func TestWarningsIncludeInertPoolSkipForwardingWithoutServers(t *testing.T) {
+	cfg := NewDefaultConfig()
+	cfg.Pools = []PoolConfig{{
+		Name:                                  "primary",
+		Backends:                              []string{"10.0.0.1:143"},
+		Default:                               true,
+		RemoteSkipForwardingWithProxyProtocol: true,
+	}}
+	warnings := cfg.Warnings()
+	if len(warnings) == 0 {
+		t.Fatal("expected warning for inert [[pool]] remote_skip_forwarding_with_proxy_protocol")
+	}
+}
