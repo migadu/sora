@@ -221,6 +221,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	var actualPlaintextBody string
 	var recipients []helpers.Recipient
 	var headerPresence *int16
+	var messageIDRaw *string
 
 	if messageContent != nil {
 		mailHeader := mail.Header{Header: messageContent.Header}
@@ -245,8 +246,10 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 
 		recipients = helpers.ExtractRecipients(messageContent.Header)
 		headerPresence = helpers.ExtractHeaderPresence(messageContent.Header)
+		messageIDRaw = helpers.ExtractMessageIDRaw(messageContent.Header, messageID)
 	} else {
 		headerPresence = helpers.ExtractRawHeaderPresence(fullMessageBytes)
+		messageIDRaw = helpers.ExtractRawMessageIDFromBytes(fullMessageBytes)
 	}
 
 	// RFC 9051 §6.3.12: "If a date-time is specified, the internal date SHOULD be
@@ -410,6 +413,7 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 			BodyStructure:       &bodyStructure,
 			Recipients:          recipients,
 			HeaderPresence:      headerPresence,
+			MessageIDRaw:        messageIDRaw,
 			FTSRetention:        s.server.ftsRetention,
 		},
 		db.PendingUpload{

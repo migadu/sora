@@ -833,3 +833,19 @@ using a fresh source read after locking; delivery can still stage quarantined by
 without declaring them uploaded. S3 import inserts and marks a stored body uploaded
 in one transaction. Rekey old-body deletion uses the durable intent protocol, not
 just a held advisory lock. Historical inconsistent rows are not automatically repaired.
+
+### Raw Message-ID field text for newly ingested messages
+
+Migration 73 adds nullable `message_id_raw` and a partial mailbox index. New
+APPEND, LMTP delivery and imports retain the complete unfolded Message-ID field
+text when normalization alone would lose comments, malformed or empty values,
+quoted local parts, domain literals or duplicate fields. Canonical single IDs use
+the existing normalized value and store NULL in the new column. Whole-ID searches
+keep the existing equality index; noncanonical rows use the partial mailbox index.
+
+This is forward only. Existing rows are not scanned or backfilled, and COPY, MOVE
+and restore carry the stored value or NULL without reading historical bodies.
+Legacy NULL rows retain their prior normalized search behavior. For large tables,
+follow the preparation and rollback instructions in the migration 73 SQL files;
+the automatic migration refuses blocking DDL above 25,000 rows if preparation is
+incomplete.
