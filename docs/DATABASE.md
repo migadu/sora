@@ -796,11 +796,21 @@ an older source message has none. Missing source state is represented by empty
 flags and keywords, matching the source's existing displayed state. Delivery,
 APPEND, imports and restore also create state for their newly inserted rows.
 
+Explicit IMAP STORE and User API flag-write requests initialize missing state
+only for the live messages they target, then apply the requested mutation. This
+does not recover lost historical flags. Reads, SELECT and background work do not
+repair missing state, and no historical backfill command or scan is provided.
+
 This is a forward-only repair after all writers have been upgraded. Existing
 messages without state are left unchanged; their historical SEARCH UNSEEN,
-STATUS counts and flag-update inconsistencies are not repaired. There is no
+STATUS counts remain unchanged until an explicit flag-write targets them. There is no
 historical backfill, backfill migration or startup scan for this change. Older
 writers and transactions started before upgrade can still create missing rows.
+
+New APPENDs whose structured MIME parsing is degraded still record searchable
+header presence from their raw header block. This applies only to the new
+ingress row; legacy NULL masks remain unknown, with no scan, S3 read or repair
+command to populate historical rows.
 
 ### Import body admission connections
 
@@ -823,3 +833,19 @@ using a fresh source read after locking; delivery can still stage quarantined by
 without declaring them uploaded. S3 import inserts and marks a stored body uploaded
 in one transaction. Rekey old-body deletion uses the durable intent protocol, not
 just a held advisory lock. Historical inconsistent rows are not automatically repaired.
+
+### Raw Message-ID field text for newly ingested messages
+
+Migration 73 adds nullable `message_id_raw` and a partial mailbox index. New
+APPEND, LMTP delivery and imports retain the complete unfolded Message-ID field
+text when normalization alone would lose comments, malformed or empty values,
+quoted local parts, domain literals or duplicate fields. Canonical single IDs use
+the existing normalized value and store NULL in the new column. Whole-ID searches
+keep the existing equality index; noncanonical rows use the partial mailbox index.
+
+This is forward only. Existing rows are not scanned or backfilled, and COPY, MOVE
+and restore carry the stored value or NULL without reading historical bodies.
+Legacy NULL rows retain their prior normalized search behavior. For large tables,
+follow the preparation and rollback instructions in the migration 73 SQL files;
+the automatic migration refuses blocking DDL above 25,000 rows if preparation is
+incomplete.

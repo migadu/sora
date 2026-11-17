@@ -130,6 +130,7 @@ func TestMessageIDSearchPlan(t *testing.T) {
 		plan := explain(t, "<MSGID-4242@example.COM>", []imap.UID{4242})
 		used := messagesIndexes(t, plan)
 		assert.Contains(t, used, "idx_messages_message_id", "a whole bracketed ID must be looked up through idx_messages_message_id")
+		assert.Contains(t, used, "idx_messages_mailbox_message_id_raw", "non-canonical raw Message-ID rows must be checked through idx_messages_mailbox_message_id_raw")
 	})
 
 	t.Run("part of the ID reads only this mailbox", func(t *testing.T) {
@@ -140,44 +141,67 @@ func TestMessageIDSearchPlan(t *testing.T) {
 			assert.Contains(t, cond, "mailbox_id", "index %s must be scoped to the mailbox", name)
 		}
 	})
+
+	t.Run("nested bracketed ID inside domain-literal uses both indexes without seq scan", func(t *testing.T) {
+		_, err := db.GetWritePool().Exec(ctx, `
+			INSERT INTO messages
+			(account_id, mailbox_id, mailbox_path, uid, message_id, message_id_raw, in_reply_to, content_hash, s3_domain, s3_localpart,
+			 internal_date, size, subject, sent_date, body_structure, recipients_json, created_modseq,
+			 subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort)
+			VALUES ($1, $2, 'INBOX', $3, 'outer@[<inner@example.com>]', '<outer@[<inner@example.com>]>', '', 'midhash-domlit', 'd', 'lp-domlit',
+			        now(), 100, 'DomLit', now(), $4, '[]'::jsonb, nextval('messages_modseq'),
+			        'DOMLIT', 'sender', 'sender@example.com', 'me', 'me@example.com', NULL)`,
+			accountID, mailboxID, rows+1, bsBytes)
+		require.NoError(t, err)
+		plan := explain(t, "<inner@example.com>", []imap.UID{rows + 1})
+		used := messagesIndexes(t, plan)
+		assert.Contains(t, used, "idx_messages_message_id")
+		assert.Contains(t, used, "idx_messages_mailbox_message_id_raw")
+	})
 }
 
-// TestMessageIDSearchSQL pins the two shapes of a HEADER Message-ID criterion. Ordinary
-// whole-ID terms retain the indexed equality lookup on LOWER(message_id). Other terms
-// search the normalized ID rebuilt with brackets. Raw-header and domain-literal edge
-// cases remain outside that optimization's semantics; see #529.
+// TestMessageIDSearchSQL pins the SQL shapes of a HEADER Message-ID criterion (#529).
+// Whole bracketed IDs combine LOWER(message_id) equality (for canonical NULL rows) with
+// strpos on LOWER(message_id_raw) (for non-canonical rows). Other terms search
+// COALESCE(LOWER(message_id_raw), normalized). Terms containing CR/LF match FALSE.
 func TestMessageIDSearchSQL(t *testing.T) {
 	var db *Database // the builder never dereferences its receiver
-	const field = `CASE WHEN left(m.message_id, 1) <> '<' THEN '<' || LOWER(m.message_id) || '>' END`
+	const rawOrField = `COALESCE(LOWER(m.message_id_raw), CASE WHEN left(m.message_id, 1) <> '<' THEN '<' || LOWER(m.message_id) || '>' END)`
 
 	for _, tc := range []struct {
-		term      string
-		equality  bool
-		wantBound string
+		term     string
+		equality bool
+		wantArgs map[string]any
+		wantSQL  string
 	}{
-		{"<Support@Example.COM>", true, "support@example.com"},
-		{"Support@Example.COM", false, "support@example.com"},
-		{"example", false, "example"},
-		{"<support@", false, "<support@"},
-		{"@example.com>", false, "@example.com>"},
-		{"", false, ""},
-		{"<>", false, "<>"},
-		{"<a> <b>", false, "<a> <b>"},
-		{"<a@[x>", false, "<a@[x>"}, // the '>' could be inside a domain literal
+		{
+			term:     "<Support@Example.COM>",
+			equality: true,
+			wantArgs: map[string]any{"p1": "support@example.com", "p2": "<support@example.com>"},
+		},
+		{term: "Support@Example.COM", wantArgs: map[string]any{"p1": "support@example.com"}},
+		{term: "example", wantArgs: map[string]any{"p1": "example"}},
+		{term: "<support@", wantArgs: map[string]any{"p1": "<support@"}},
+		{term: "@example.com>", wantArgs: map[string]any{"p1": "@example.com>"}},
+		{term: "", wantArgs: map[string]any{"p1": ""}},
+		{term: "<>", wantArgs: map[string]any{"p1": "<>"}},
+		{term: "<a> <b>", wantArgs: map[string]any{"p1": "<a> <b>"}},
+		{term: "<a@[x>", wantArgs: map[string]any{"p1": "<a@[x>"}},
+		{term: "<a@x>\n<b@x>", wantArgs: map[string]any{}, wantSQL: "FALSE"},
 	} {
 		t.Run(tc.term, func(t *testing.T) {
 			criteria := &imap.SearchCriteria{Header: []imap.SearchCriteriaHeaderField{{Key: "Message-ID", Value: tc.term}}}
 			paramCounter := 0
 			query, args, err := db.buildSearchCriteria(criteria, "p", &paramCounter)
 			require.NoError(t, err)
-			require.Len(t, args, 1)
-			for _, v := range args {
-				assert.Equal(t, tc.wantBound, v)
-			}
-			if tc.equality {
-				assert.Equal(t, "LOWER(m.message_id) = @p1", query)
-			} else {
-				assert.Equal(t, "COALESCE(strpos("+field+", @p1) > 0, FALSE)", query)
+			assert.Equal(t, tc.wantArgs, map[string]any(args))
+			switch {
+			case tc.wantSQL != "":
+				assert.Equal(t, tc.wantSQL, query)
+			case tc.equality:
+				assert.Equal(t, "((m.message_id_raw IS NULL AND LOWER(m.message_id) = @p1) OR (m.message_id_raw IS NOT NULL AND strpos(LOWER(m.message_id_raw), @p2) > 0))", query)
+			default:
+				assert.Equal(t, "COALESCE(strpos("+rawOrField+", @p1) > 0, FALSE)", query)
 			}
 		})
 	}

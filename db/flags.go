@@ -206,15 +206,23 @@ func foldKeywordsWithMap(canonical map[string]string, keywords []string) []strin
 // under high concurrency.
 func (db *Database) resolveMessageID(ctx context.Context, tx pgx.Tx, messageUID imap.UID, mailboxID int64) (int64, error) {
 	var messageID int64
+	var missingState bool
 	err := tx.QueryRow(ctx, `
-		SELECT id FROM messages
-		WHERE uid = $1 AND mailbox_id = $2 AND expunged_at IS NULL
-	`, messageUID, mailboxID).Scan(&messageID)
+		SELECT m.id, (ms.message_id IS NULL)
+		FROM messages m
+		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
+		WHERE m.uid = $1 AND m.mailbox_id = $2 AND m.expunged_at IS NULL
+	`, messageUID, mailboxID).Scan(&messageID, &missingState)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return 0, fmt.Errorf("message UID %d in mailbox %d not found (may be expunged or moved)", messageUID, mailboxID)
 		}
 		return 0, fmt.Errorf("failed to resolve message ID for UID %d in mailbox %d: %w", messageUID, mailboxID, err)
+	}
+	if missingState {
+		if err := db.ensureMessageStateForLockedMailbox(ctx, tx, mailboxID, []int64{messageID}); err != nil {
+			return 0, err
+		}
 	}
 	return messageID, nil
 }

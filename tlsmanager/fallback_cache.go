@@ -93,6 +93,22 @@ func (fc *FallbackCache) markS3Available() {
 // Get retrieves a certificate, trying local cache first (fast), then S3 (slow)
 // This ensures TLS handshakes are fast when certificates are already cached locally.
 func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
+	if isChallengeCacheKey(name) {
+		s3Ctx, s3Cancel := context.WithTimeout(ctx, s3OperationTimeout)
+		defer s3Cancel()
+
+		data, err := fc.primary.Get(s3Ctx, name)
+		if err == nil {
+			fc.markS3Available()
+			return data, nil
+		}
+		if errors.Is(err, autocert.ErrCacheMiss) {
+			return nil, autocert.ErrCacheMiss
+		}
+		fc.markS3Unavailable()
+		return nil, fmt.Errorf("certificate cache read failed for %s: %w", name, err)
+	}
+
 	logger.Debug("FallbackCache: Get certificate (checking local cache first)", "name", name)
 
 	// STEP 1: Try local cache first (FAST - no network call)
@@ -190,6 +206,14 @@ func (fc *FallbackCache) Get(ctx context.Context, name string) ([]byte, error) {
 
 // Put stores a certificate, trying S3 first, then falling back to local cache
 func (fc *FallbackCache) Put(ctx context.Context, name string, data []byte) error {
+	if isChallengeCacheKey(name) {
+		if err := fc.primary.Put(ctx, name, data); err != nil {
+			fc.markS3Unavailable()
+			return err
+		}
+		fc.markS3Available()
+		return nil
+	}
 	g, hasGeneration := ctx.Value(publicationContextKey{}).(publicationGeneration)
 	if !hasGeneration {
 		_, current, err := fc.primarySnapshot(ctx, name)
@@ -234,6 +258,21 @@ func (fc *FallbackCache) syncToS3(name string, data []byte, g publicationGenerat
 
 // Delete removes a certificate from both S3 and fallback cache
 func (fc *FallbackCache) Delete(ctx context.Context, name string) error {
+	if isChallengeCacheKey(name) {
+		primaryErr := fc.primary.Delete(ctx, name)
+		if primaryErr != nil {
+			fc.markS3Unavailable()
+		} else {
+			fc.markS3Available()
+		}
+		var localErr error
+		if _, statErr := os.Lstat(localEntryPath(fc.fallbackDir, name)); statErr == nil || !os.IsNotExist(statErr) {
+			if err := fc.fallback.Delete(ctx, name); err != nil && !errors.Is(err, autocert.ErrCacheMiss) {
+				localErr = err
+			}
+		}
+		return errors.Join(primaryErr, localErr)
+	}
 	localData, localGeneration, localErr := fc.localSnapshot(ctx, name)
 	primaryErr := fc.primary.Delete(ctx, name)
 	if primaryErr != nil {
@@ -269,7 +308,7 @@ func (fc *FallbackCache) SyncAllToS3(ctx context.Context) error {
 	failed := 0
 
 	for _, entry := range entries {
-		if entry.IsDir() || isLocalPrivateFile(entry.Name()) {
+		if entry.IsDir() || isLocalPrivateFile(entry.Name()) || isChallengeCacheKey(entry.Name()) {
 			continue
 		}
 
