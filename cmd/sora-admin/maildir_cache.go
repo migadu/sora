@@ -198,14 +198,14 @@ func renamableParent(dir string, euid int) (parent string, owner int, mode uint3
 var directoryOwnerAndMode = func(path string) (owner int, mode uint32, err error) {
 	info, err := os.Lstat(path)
 	if err != nil {
-		return 0, 0, fmt.Errorf("failed to check database directory: %w", err)
+		return 0, 0, fmt.Errorf("failed to check directory: %w", err)
 	}
 	if !info.IsDir() {
-		return 0, 0, fmt.Errorf("refusing database directory %s: it is not a directory", path)
+		return 0, 0, fmt.Errorf("refusing directory %s: it is not a directory", path)
 	}
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
-		return 0, 0, fmt.Errorf("failed to check database directory %s: no owner", path)
+		return 0, 0, fmt.Errorf("failed to check directory %s: no owner", path)
 	}
 	return int(st.Uid), uint32(st.Mode) & 0o7777, nil
 }
