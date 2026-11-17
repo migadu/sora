@@ -202,19 +202,59 @@ type ModSeqWindow struct {
 
 type modSeqWindowKey struct{}
 
-// WithModSeqWindow returns a context in which InsertMessage, CopyMessages and
-// MoveMessages measure w for the messages they add to w.MailboxID.
+type modSeqWindowNode struct {
+	w    *ModSeqWindow
+	prev *modSeqWindowNode
+}
+
+// WithModSeqWindow returns a context in which InsertMessage, CopyMessages,
+// MoveMessages and RemoveMessageFlagsBatch measure w for the changes they make
+// to w.MailboxID. Multiple windows for distinct mailboxes (e.g. a move's source
+// and destination) may be attached; for the same mailbox, the innermost wins.
 func WithModSeqWindow(ctx context.Context, w *ModSeqWindow) context.Context {
-	return context.WithValue(ctx, modSeqWindowKey{}, w)
+	if w == nil {
+		return ctx
+	}
+	prev, _ := ctx.Value(modSeqWindowKey{}).(*modSeqWindowNode)
+	return context.WithValue(ctx, modSeqWindowKey{}, &modSeqWindowNode{w: w, prev: prev})
+}
+
+// ChainModSeqWindow returns a child context that measures a follow-up write to
+// mailboxID (such as COPY's post-insert flag strip) when ctx already tracks a
+// ModSeqWindow for mailboxID, plus a callback that extends the parent window
+// across the child iff no foreign write intervened (child.Before == parent.After).
+func ChainModSeqWindow(ctx context.Context, mailboxID int64) (context.Context, func()) {
+	parent := modSeqWindowFor(ctx, mailboxID)
+	if parent == nil {
+		return ctx, func() {}
+	}
+	child := &ModSeqWindow{MailboxID: mailboxID}
+	return WithModSeqWindow(ctx, child), func() {
+		parent.Chain(child)
+	}
+}
+
+// Chain extends w across next when next immediately follows w on the same
+// mailbox with no intervening write. If another write changed the mailbox in
+// between (next.Before != w.After), w is left unchained so that intervening
+// change is still reported.
+func (w *ModSeqWindow) Chain(next *ModSeqWindow) {
+	if w == nil || !w.Measured || next == nil || !next.Measured {
+		return
+	}
+	if next.MailboxID == w.MailboxID && next.Before == w.After {
+		w.After = next.After
+	}
 }
 
 // modSeqWindowFor returns the window ctx asks for mailboxID's changes, or nil.
 func modSeqWindowFor(ctx context.Context, mailboxID int64) *ModSeqWindow {
-	w, _ := ctx.Value(modSeqWindowKey{}).(*ModSeqWindow)
-	if w == nil || w.MailboxID != mailboxID {
-		return nil
+	for n, _ := ctx.Value(modSeqWindowKey{}).(*modSeqWindowNode); n != nil; n = n.prev {
+		if n.w.MailboxID == mailboxID {
+			return n.w
+		}
 	}
-	return w
+	return nil
 }
 
 // begin reads Before. The caller holds the mailbox row lock. A nil window does

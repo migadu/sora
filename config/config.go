@@ -1738,7 +1738,7 @@ type ServerConfig struct {
 	RemoteTLSCAFile                       string   `toml:"remote_tls_ca_file,omitempty"` // PEM file with CA certs for backend verification (private-CA / self-signed backends); empty = system roots
 	RemoteUseProxyProtocol                bool     `toml:"remote_use_proxy_protocol,omitempty"`
 	RemoteUseIDCommand                    bool     `toml:"remote_use_id_command,omitempty"`
-	RemoteSkipForwardingWithProxyProtocol bool     `toml:"remote_skip_forwarding_with_proxy_protocol"` // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
+	RemoteSkipForwardingWithProxyProtocol bool     `toml:"remote_skip_forwarding_with_proxy_protocol,omitempty"` // Explicitly omit ID/XCLIENT only when this leg sends PROXY (IMAP/POP3).
 	RemoteUseXCLIENT                      bool     `toml:"remote_use_xclient,omitempty"`
 	RemoteUseUTF8                         bool     `toml:"remote_use_utf8,omitempty"` // POP3 proxy only: advertise UTF8/LANG in pre-auth CAPA and mirror UTF8 to pool backends. Enable ONLY when every backend is sora: classic Outlook sends UTF8 post-auth when advertised, and non-sora backends reject it fatally (0x800CCC90).
 	ConnectTimeout                        string   `toml:"connect_timeout,omitempty"`
@@ -1795,6 +1795,12 @@ type ServerConfig struct {
 	IDVersion      string                   `toml:"id_version,omitempty"`      // IMAP ID command 'version' field (IMAP specific)
 	IDVendor       string                   `toml:"id_vendor,omitempty"`       // IMAP ID command 'vendor' field (IMAP specific)
 	IDSupportURL   string                   `toml:"id_support_url,omitempty"`  // IMAP ID command 'support-url' field (IMAP specific)
+
+	// hasPools records that the enclosing Config declares [[pool]] blocks, and
+	// poolWarnings carries file-level [[pool]] warnings on the first enabled server
+	// so start-up (WarnUnusedConfigOptions) and Config.Warnings stay in sync.
+	hasPools     bool
+	poolWarnings []string
 }
 
 // TimeoutSchedulerConfig holds global timeout scheduler configuration
@@ -3261,6 +3267,9 @@ func (s *ServerConfig) MetricsPath() string {
 
 // WarnUnusedConfigOptions logs warnings for config options that don't apply to this server type
 func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
+	for _, w := range s.poolWarnings {
+		logger("%s", w)
+	}
 	for _, k := range serverTypeKeys {
 		if k.set(s) && !slices.Contains(k.appliedBy, s.Type) {
 			logger("WARNING: Server %s (type: %s) has '%s' configured, but only %s servers apply it%s", s.Name, s.Type, k.name, strings.Join(k.appliedBy, ", "), serverTypeKeyNotes[k.name])
@@ -3345,6 +3354,7 @@ func (s *ServerConfig) WarnUnusedConfigOptions(logger func(format string, args .
 		if s.RemoteLookup != nil && s.RemoteLookup.RemoteTLSUseStartTLS && !s.RemoteLookup.RemoteTLS {
 			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_tls_use_starttls' configured without 'remote_lookup.remote_tls', so it is ignored and connections to lookup-routed backends are plaintext; set 'remote_lookup.remote_tls = true' to use STARTTLS", s.Name, s.Type)
 		}
+		s.warnInertSkipForwardingWithProxyProtocol(logger)
 	}
 
 	switch s.Type {
@@ -3591,17 +3601,76 @@ func (s *ServerConfig) warnKeysNotApplied(logger func(format string, args ...any
 	}
 }
 
+// warnInertSkipForwardingWithProxyProtocol warns when remote_skip_forwarding_with_proxy_protocol
+// is enabled on an imap_proxy or pop3_proxy leg where it can never take effect: on [[server]]
+// alongside [[pool]] blocks (where every route stamps its pool's or remote_lookup's policy), or
+// without remote_use_proxy_protocol and the protocol's forwarding command on the same leg.
+func (s *ServerConfig) warnInertSkipForwardingWithProxyProtocol(logger func(format string, args ...any)) {
+	var serverForwardKey, lookupForwardKey string
+	var serverForwards, lookupForwards bool
+	switch s.Type {
+	case "imap_proxy":
+		serverForwardKey = "'remote_use_id_command'"
+		lookupForwardKey = "'remote_lookup.remote_use_id_command'"
+		serverForwards = s.RemoteUseIDCommand
+		lookupForwards = s.RemoteLookup != nil && s.RemoteLookup.RemoteUseIDCommand
+	case "pop3_proxy":
+		serverForwardKey = "'remote_use_xclient'"
+		lookupForwardKey = "'remote_lookup.remote_use_xclient'"
+		serverForwards = s.RemoteUseXCLIENT
+		lookupForwards = s.RemoteLookup != nil && s.RemoteLookup.RemoteUseXCLIENT
+	default:
+		// Other server types already warn via serverTypeKeys and serverTableKeys.
+		return
+	}
+
+	if s.RemoteSkipForwardingWithProxyProtocol {
+		if s.hasPools {
+			logger("WARNING: Server %s (type: %s) has 'remote_skip_forwarding_with_proxy_protocol' configured, but it has no effect when [[pool]] blocks are configured: pool-routed connections use their [[pool]] setting and lookup-routed connections use 'remote_lookup.remote_skip_forwarding_with_proxy_protocol'", s.Name, s.Type)
+		} else {
+			var missing []string
+			if !s.RemoteUseProxyProtocol {
+				missing = append(missing, "'remote_use_proxy_protocol'")
+			}
+			if !serverForwards {
+				missing = append(missing, serverForwardKey)
+			}
+			if len(missing) > 0 {
+				logger("WARNING: Server %s (type: %s) has 'remote_skip_forwarding_with_proxy_protocol' configured without %s, so it has no effect", s.Name, s.Type, strings.Join(missing, " and "))
+			}
+		}
+	}
+
+	if s.RemoteLookup != nil && s.RemoteLookup.RemoteSkipForwardingWithProxyProtocol {
+		var missing []string
+		if !s.RemoteLookup.RemoteUseProxyProtocol {
+			missing = append(missing, "'remote_lookup.remote_use_proxy_protocol'")
+		}
+		if !lookupForwards {
+			missing = append(missing, lookupForwardKey)
+		}
+		if len(missing) > 0 {
+			logger("WARNING: Server %s (type: %s) has 'remote_lookup.remote_skip_forwarding_with_proxy_protocol' configured without %s, so it has no effect", s.Name, s.Type, strings.Join(missing, " and "))
+		}
+	}
+}
+
 // GetAllServers returns every [[server]] block that does not say enabled = false,
 // complete or not: the callers validate each one, so a block missing type, name or
 // addr is reported instead of being dropped.
 func (c *Config) GetAllServers() []ServerConfig {
 	var allServers []ServerConfig
+	hasPools := c.HasPools()
 
 	// Add dynamic servers
 	for _, server := range c.DynamicServers {
 		if server.IsEnabled() {
+			server.hasPools = hasPools
 			allServers = append(allServers, server)
 		}
+	}
+	if len(allServers) > 0 && hasPools {
+		allServers[0].poolWarnings = c.poolWarnings()
 	}
 
 	return allServers

@@ -94,6 +94,13 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		return nil, nil
 	}
 
+	if selectedMailboxID == destMailbox.ID {
+		return nil, &imap.Error{
+			Type: imap.StatusResponseTypeNo,
+			Text: "Cannot copy messages to the same mailbox",
+		}
+	}
+
 	// Collect source UIDs
 	var sourceUIDs []imap.UID
 	for _, msg := range messages {
@@ -103,7 +110,7 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 	// The hash each cross-account body is made available for below. CopyMessages copies a
 	// source only if it still has it, since a rekey can rename it before the INSERT.
 	sourceHashes := crossAccountSourceHashes(messages, destMailbox.AccountID)
-	if selectedMailboxID != destMailbox.ID && checkCrossAccountSourceBudget(messages, sourceHashes) != nil {
+	if checkCrossAccountSourceBudget(messages, sourceHashes) != nil {
 		return nil, s.crossAccountBodyLimitError("COPY")
 	}
 
@@ -270,9 +277,12 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 			}
 		}
 		for f, uids := range stripUIDsByFlag {
-			if _, rmErr := s.server.rdb.RemoveMessageFlagsBatchWithRetry(ctx, uids, destMailbox.ID, []imap.Flag{f}); rmErr != nil {
+			stripCtx, chainStrip := db.ChainModSeqWindow(writeCtx, destMailbox.ID)
+			if _, rmErr := s.server.rdb.RemoveMessageFlagsBatchWithRetry(stripCtx, uids, destMailbox.ID, []imap.Flag{f}); rmErr != nil {
 				// The copy already succeeded; log and continue rather than fail it.
 				s.WarnLog("failed to strip flag the user cannot set on COPY", "flag", string(f), "error", rmErr)
+			} else {
+				chainStrip()
 			}
 		}
 	}

@@ -570,6 +570,9 @@ func (rd *ResilientDatabase) ResolveAccountS3Owner(ctx context.Context, accountI
 // for MOVE, a fresh complete-source preflight under account-rekey guards refuses
 // an oversized cross-account command before destination locks or storage callbacks.
 func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(context.Context, string) error) (map[imap.UID]imap.UID, []int64, error) {
+	if srcMailboxID == destMailboxID {
+		return nil, nil, fmt.Errorf("source and destination mailboxes cannot be the same")
+	}
 	var capturedUIDMap map[imap.UID]imap.UID
 	var capturedIDs []int64
 	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {

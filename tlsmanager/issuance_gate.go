@@ -51,11 +51,11 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 		return data, err
 	}
 
-	g.capturePublication(ctx, name)
 	domain, isCertificate := certificateDomain(name)
 	if !isCertificate {
 		return nil, err
 	}
+	g.capturePublication(ctx, name)
 	if refusal := g.manager.refuseKeyIssuance(ctx, domain, name); refusal != nil {
 		return nil, refusal
 	}
@@ -65,12 +65,15 @@ func (g *issuanceGate) Get(ctx context.Context, name string) ([]byte, error) {
 }
 
 func (g *issuanceGate) Put(ctx context.Context, name string, data []byte) error {
-	ctx = g.publicationContext(ctx, name)
+	domain, isCertificate := certificateDomain(name)
+	if isCertificate {
+		ctx = g.publicationContext(ctx, name)
+	}
 	err := g.underlying.Put(ctx, name, data)
 	// The order is finished either way - a failed Put does not mean it is still running -
 	// so give back this variant's share of the cluster-wide claim regardless. ctx is the
 	// context of the exchange that ordered the certificate, which names its orders.
-	if domain, isCertificate := certificateDomain(name); isCertificate {
+	if isCertificate {
 		g.manager.releaseKeyIssuance(domain, name, exchangeEnd(ctx))
 	}
 	return err
@@ -97,6 +100,16 @@ func certificateDomain(name string) (string, bool) {
 		return "", false
 	}
 	return strings.TrimSuffix(name, "+rsa"), true
+}
+
+func isCertificateCacheKey(name string) bool {
+	_, ok := certificateDomain(strings.ToLower(strings.TrimSpace(name)))
+	return ok
+}
+
+func isChallengeCacheKey(name string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	return strings.HasSuffix(name, "+http-01") || strings.HasSuffix(name, "+token")
 }
 
 // mayIssue reports whether this node is allowed to order certificates at all.
@@ -330,9 +343,6 @@ func (g *issuanceGate) capturePublication(ctx context.Context, name string) {
 	g.publicationMu.Unlock()
 }
 func (g *issuanceGate) publicationContext(ctx context.Context, name string) context.Context {
-	if _, isCertificate := certificateDomain(name); !isCertificate {
-		g.capturePublication(ctx, name)
-	}
 	until, ok := ctx.Deadline()
 	if !ok {
 		return ctx

@@ -170,3 +170,230 @@ func TestNotifyOwnCreateBelowAnInvisibleLevel(t *testing.T) {
 		t.Errorf("want no LIST for the client's own CREATE, got:\n%s", strings.Join(lists, "\r\n"))
 	}
 }
+
+// TestNotifyOwnRenameUnselectedInbox: RENAME INBOX moves INBOX's messages to
+// the new mailbox and soft-expunges INBOX without requiring INBOX to be
+// selected. When INBOX is watched as a non-selected mailbox, neither the new
+// mailbox nor INBOX gets a STATUS for the client's own RENAME INBOX, while a
+// later foreign delivery to INBOX still does.
+func TestNotifyOwnRenameUnselectedInbox(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	for _, mode := range []string{"authenticated", "other_selected"} {
+		t.Run(mode, func(t *testing.T) {
+			server, account := common.SetupIMAPServer(t)
+			defer server.Close()
+			login := fmt.Sprintf(`LOGIN "%s" "%s"`, account.Email, account.Password)
+
+			watcher := dialRawIMAP(t, server.Address)
+			watcher.do(login)
+			watcher.do("CREATE MarkerBox")
+			watcher.appendMsg("INBOX", notifyTestMessage)
+			if mode == "other_selected" {
+				watcher.do("CREATE Other")
+				watcher.do("SELECT Other")
+			}
+			watcher.do("NOTIFY SET (PERSONAL (MessageNew MessageExpunge MailboxName SubscriptionChange))")
+
+			untagged, _ := watcher.do("RENAME INBOX Saved")
+			got := splitUntaggedResponses(untagged)
+
+			other := dialRawIMAP(t, server.Address)
+			other.do(login)
+			other.appendMsg("MarkerBox", notifyTestMessage)
+
+			got = append(got, readNotifyUntil(t, watcher, 10*time.Second, func(resps []string) bool {
+				return slices.ContainsFunc(resps, func(resp string) bool {
+					m := notifyEventRe.FindStringSubmatch(resp)
+					return m != nil && m[1] == "STATUS" && m[2] == "MarkerBox"
+				})
+			})...)
+			got = append(got, notifyNoop(t, watcher)...)
+
+			var unexpected []string
+			for _, resp := range got {
+				m := notifyEventRe.FindStringSubmatch(resp)
+				if m == nil {
+					continue
+				}
+				if m[1] == "STATUS" && m[2] == "MarkerBox" {
+					continue
+				}
+				unexpected = append(unexpected, resp)
+			}
+			if len(unexpected) > 0 {
+				t.Errorf("want no NOTIFY event for own RENAME INBOX when INBOX is not selected, got:\n%s", strings.Join(unexpected, "\r\n"))
+			}
+
+			// A subsequent foreign delivery to INBOX must still be reported.
+			other.appendMsg("INBOX", notifyTestMessage)
+			afterForeign := readNotifyUntil(t, watcher, 10*time.Second, func(resps []string) bool {
+				return slices.ContainsFunc(resps, func(resp string) bool {
+					m := notifyEventRe.FindStringSubmatch(resp)
+					return m != nil && m[1] == "STATUS" && m[2] == "INBOX" && strings.Contains(resp, "MESSAGES 1")
+				})
+			})
+			if !slices.ContainsFunc(afterForeign, func(resp string) bool {
+				m := notifyEventRe.FindStringSubmatch(resp)
+				return m != nil && m[1] == "STATUS" && m[2] == "INBOX" && strings.Contains(resp, "MESSAGES 1")
+			}) {
+				t.Errorf("want STATUS INBOX (MESSAGES 1) for subsequent foreign delivery, got:\n%s", strings.Join(afterForeign, "\r\n"))
+			}
+		})
+	}
+}
+
+// TestNotifyOwnCopyWithoutFlagRights: when a user holds 'lri' without full flag
+// rights ('s', 't', 'w') on a watched shared mailbox, COPY strips disallowed
+// source flags after inserting the copied messages. Those post-copy flag-strip
+// updates are still part of the client's own COPY and must not emit a spurious
+// STATUS, while a subsequent foreign write to the shared mailbox still does.
+func TestNotifyOwnCopyWithoutFlagRights(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, owner, _ := common.SetupIMAPServerWithRealS3(t)
+	defer server.Close()
+
+	member := fmt.Sprintf("member-copy-%d@example.com", common.GetTimestamp())
+	if _, err := server.ResilientDB.CreateAccountWithRetry(context.Background(), db.CreateAccountRequest{
+		Email: member, Password: "password", HashType: "bcrypt", IsPrimary: true,
+	}); err != nil {
+		t.Fatalf("create member account: %v", err)
+	}
+
+	ownerConn := dialRawIMAP(t, server.Address)
+	ownerConn.do(fmt.Sprintf(`LOGIN "%s" "%s"`, owner.Email, owner.Password))
+	ownerConn.do("CREATE Shared/Team")
+	ownerConn.do("CREATE Shared/MarkerBox")
+	ownerConn.do(fmt.Sprintf(`SETACL Shared/Team "%s" lri`, member))
+	ownerConn.do(fmt.Sprintf(`SETACL Shared/MarkerBox "%s" lr`, member))
+
+	watcher := dialRawIMAP(t, server.Address)
+	watcher.do(fmt.Sprintf(`LOGIN "%s" "password"`, member))
+	watcher.appendMsg("INBOX", notifyTestMessage)
+	watcher.do("SELECT INBOX")
+	watcher.do(`UID STORE 1 +FLAGS (\Seen $Important)`)
+	watcher.do("NOTIFY SET (SUBTREE Shared (MessageNew MessageExpunge FlagChange))")
+
+	untagged, _ := watcher.do("UID COPY 1 Shared/Team")
+	got := splitUntaggedResponses(untagged)
+
+	ownerConn.appendMsg("Shared/MarkerBox", notifyTestMessage)
+	got = append(got, readNotifyUntil(t, watcher, 10*time.Second, func(resps []string) bool {
+		return slices.ContainsFunc(resps, func(resp string) bool {
+			m := notifyEventRe.FindStringSubmatch(resp)
+			return m != nil && m[1] == "STATUS" && m[2] == "Shared/MarkerBox"
+		})
+	})...)
+	got = append(got, notifyNoop(t, watcher)...)
+
+	var unexpected []string
+	for _, resp := range got {
+		m := notifyEventRe.FindStringSubmatch(resp)
+		if m != nil && m[1] == "STATUS" && m[2] != "Shared/MarkerBox" {
+			unexpected = append(unexpected, resp)
+		}
+	}
+	if len(unexpected) > 0 {
+		t.Errorf("want no STATUS for own COPY with flag stripping on Shared/Team, got:\n%s", strings.Join(unexpected, "\r\n"))
+	}
+
+	// A subsequent foreign delivery to Shared/Team must still emit STATUS.
+	ownerConn.appendMsg("Shared/Team", notifyTestMessage)
+	afterForeign := readNotifyUntil(t, watcher, 10*time.Second, func(resps []string) bool {
+		return slices.ContainsFunc(resps, func(resp string) bool {
+			m := notifyEventRe.FindStringSubmatch(resp)
+			return m != nil && m[1] == "STATUS" && m[2] == "Shared/Team" && strings.Contains(resp, "MESSAGES 2")
+		})
+	})
+	if !slices.ContainsFunc(afterForeign, func(resp string) bool {
+		m := notifyEventRe.FindStringSubmatch(resp)
+		return m != nil && m[1] == "STATUS" && m[2] == "Shared/Team" && strings.Contains(resp, "MESSAGES 2")
+	}) {
+		t.Errorf("want STATUS Shared/Team (MESSAGES 2) for subsequent foreign delivery, got:\n%s", strings.Join(afterForeign, "\r\n"))
+	}
+}
+
+// TestNotifyOwnNonOwnerRenameSubscribedSharedMailbox: db.RenameMailbox only
+// rewrites subscriptions owned by the mailbox owner, so when a non-owner
+// holding 'lx' renames a subscribed shared mailbox (and its subscribed child),
+// the new names are unsubscribed for the non-owner in the database. That
+// change is caused by the non-owner's own RENAME and must not emit spurious
+// SubscriptionChange LIST responses, while a subsequent foreign SUBSCRIBE on
+// another connection of the non-owner is still reported.
+func TestNotifyOwnNonOwnerRenameSubscribedSharedMailbox(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, owner := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	member := fmt.Sprintf("member-rename-%d@example.com", common.GetTimestamp())
+	if _, err := server.ResilientDB.CreateAccountWithRetry(context.Background(), db.CreateAccountRequest{
+		Email: member, Password: "password", HashType: "bcrypt", IsPrimary: true,
+	}); err != nil {
+		t.Fatalf("create member account: %v", err)
+	}
+
+	ownerConn := dialRawIMAP(t, server.Address)
+	ownerConn.do(fmt.Sprintf(`LOGIN "%s" "%s"`, owner.Email, owner.Password))
+	ownerConn.do("CREATE Shared/Team")
+	ownerConn.do("CREATE Shared/Team/Old")
+	ownerConn.do("CREATE Shared/Team/Old/Kid")
+	ownerConn.do(fmt.Sprintf(`SETACL Shared/Team "%s" lrkx`, member))
+	ownerConn.do(fmt.Sprintf(`SETACL Shared/Team/Old "%s" lrkx`, member))
+	ownerConn.do(fmt.Sprintf(`SETACL Shared/Team/Old/Kid "%s" lrkx`, member))
+
+	memberLogin := fmt.Sprintf(`LOGIN "%s" "password"`, member)
+	watcher := dialRawIMAP(t, server.Address)
+	watcher.do(memberLogin)
+	watcher.do("SUBSCRIBE Shared/Team/Old")
+	watcher.do("SUBSCRIBE Shared/Team/Old/Kid")
+	watcher.do("NOTIFY SET (SUBTREE Shared (MailboxName SubscriptionChange))")
+
+	untagged, _ := watcher.do("RENAME Shared/Team/Old Shared/Team/New")
+	got := splitUntaggedResponses(untagged)
+
+	ownerConn.do("CREATE Shared/Team/Marker1")
+	got = append(got, readNotifyUntil(t, watcher, 10*time.Second, func(resps []string) bool {
+		return slices.ContainsFunc(resps, func(resp string) bool {
+			return strings.Contains(resp, "Shared/Team/Marker1")
+		})
+	})...)
+	got = append(got, notifyNoop(t, watcher)...)
+
+	var unexpected []string
+	for _, resp := range got {
+		m := notifyEventRe.FindStringSubmatch(resp)
+		if m == nil || m[1] != "LIST" {
+			continue
+		}
+		if m[2] == "Shared/Team/Marker1" || (m[2] == "Shared/Team" && !strings.Contains(resp, `\NonExistent`)) {
+			continue
+		}
+		unexpected = append(unexpected, resp)
+	}
+	if len(unexpected) > 0 {
+		t.Errorf("want no LIST for non-owner's own RENAME of subscribed shared mailbox, got:\n%s", strings.Join(unexpected, "\r\n"))
+	}
+
+	// A subsequent SUBSCRIBE on another connection of the same non-owner must still emit LIST (\Subscribed).
+	memberOther := dialRawIMAP(t, server.Address)
+	memberOther.do(memberLogin)
+	memberOther.do("SUBSCRIBE Shared/Team/New")
+	ownerConn.do("CREATE Shared/Team/Marker2")
+
+	afterSub := readNotifyUntil(t, watcher, 10*time.Second, func(resps []string) bool {
+		var sawSub, sawMarker bool
+		for _, resp := range resps {
+			if m := notifyEventRe.FindStringSubmatch(resp); m != nil && m[1] == "LIST" {
+				sawSub = sawSub || (m[2] == "Shared/Team/New" && strings.Contains(resp, `\Subscribed`))
+				sawMarker = sawMarker || m[2] == "Shared/Team/Marker2"
+			}
+		}
+		return sawSub && sawMarker
+	})
+	if !slices.ContainsFunc(afterSub, func(resp string) bool {
+		m := notifyEventRe.FindStringSubmatch(resp)
+		return m != nil && m[1] == "LIST" && m[2] == "Shared/Team/New" && strings.Contains(resp, `\Subscribed`)
+	}) {
+		t.Errorf("want SubscriptionChange LIST (\\Subscribed) for foreign SUBSCRIBE after non-owner RENAME, got:\n%s", strings.Join(afterSub, "\r\n"))
+	}
+}

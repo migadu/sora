@@ -126,6 +126,7 @@ type messageMetadata struct {
 	bodyStructure        *imap.BodyStructure
 	recipients           []helpers.Recipient
 	headerPresence       *int16
+	messageIDRaw         *string
 	flags                []imap.Flag
 	preservedUID         *uint32
 	preservedUIDValidity *uint32
@@ -2694,6 +2695,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		bodyStructure:        &bodyStructure,
 		recipients:           recipients,
 		headerPresence:       helpers.ExtractHeaderPresence(messageContent.Header),
+		messageIDRaw:         helpers.ExtractMessageIDRaw(messageContent.Header, messageID),
 		flags:                flags,
 		preservedUID:         preservedUID,
 		preservedUIDValidity: preservedUIDValidity,
@@ -2835,6 +2837,30 @@ func (i *Importer) readBatch(batch []msgInfo) []uploadedMsg {
 	return read
 }
 
+// interruptedErr reports operator cancellation on i.ctx (SIGINT/SIGTERM), or nil when
+// i.ctx is unset or active. A cancelled batch guard ctx while interruptedErr() == nil
+// means the S3 object-lock holder was lost, not an operator interrupt.
+func (i *Importer) interruptedErr() error {
+	if i.ctx == nil {
+		return nil
+	}
+	return i.ctx.Err()
+}
+
+// guardLossReason returns the error that ended a batch's S3 object-lock guard context.
+func guardLossReason(ctx context.Context, err error) error {
+	if err != nil && !errors.Is(err, context.Canceled) {
+		return err
+	}
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	if err != nil {
+		return err
+	}
+	return ctx.Err()
+}
+
 // uploadBatchToS3 uploads the read messages to S3 in parallel using a worker pool and
 // returns the ones stored (in test mode, which stores nothing, all of them). It runs
 // under the bodies' S3 object locks, and ctx is cancelled if they are lost.
@@ -2844,6 +2870,16 @@ func (i *Importer) uploadBatchToS3(ctx context.Context, read []uploadedMsg) []up
 		mu       sync.Mutex
 		wg       sync.WaitGroup
 	)
+
+	recordGuardLostUpload := func(path string) {
+		if i.interruptedErr() != nil {
+			return
+		}
+		reason := guardLossReason(ctx, nil)
+		logger.Warn("S3 upload aborted because S3 object lock was lost", "path", path, "error", reason)
+		i.recordFailedPath(path, fmt.Sprintf("s3 object lock lost: %v", reason))
+		atomic.AddInt64(&i.failedMessages, 1)
+	}
 
 	// Use semaphore to limit concurrent uploads
 	sem := make(chan struct{}, i.jobs) // Reuse jobs config
@@ -2859,6 +2895,7 @@ func (i *Importer) uploadBatchToS3(ctx context.Context, read []uploadedMsg) []up
 			// Check for cancellation before S3 upload
 			select {
 			case <-ctx.Done():
+				recordGuardLostUpload(up.msg.path)
 				return
 			default:
 			}
@@ -2875,6 +2912,7 @@ func (i *Importer) uploadBatchToS3(ctx context.Context, read []uploadedMsg) []up
 						select {
 						case <-time.After(backoff):
 						case <-ctx.Done():
+							recordGuardLostUpload(up.msg.path)
 							return
 						}
 						backoff *= 2
@@ -2882,6 +2920,7 @@ func (i *Importer) uploadBatchToS3(ctx context.Context, read []uploadedMsg) []up
 					}
 					s3Err = putStoredBody(ctx, i.s3, s3Key, bytes.NewReader(up.content), int64(len(up.content)))
 					if ctx.Err() != nil {
+						recordGuardLostUpload(up.msg.path)
 						return
 					}
 					if s3Err == nil {
@@ -2908,12 +2947,13 @@ func (i *Importer) uploadBatchToS3(ctx context.Context, read []uploadedMsg) []up
 	return uploaded
 }
 
-// insertBatchToDB inserts all uploaded messages in a batch
-// It groups messages by mailbox and uses the highly-optimized InsertMessagesFromImporterBatchWithRetry
+// insertBatchToDB inserts all uploaded messages in a batch.
+// It groups messages by mailbox and uses the highly-optimized InsertMessagesFromImporterBatchWithRetry.
 //
-// It returns an error only when the import is interrupted (i.ctx cancelled): it then
-// stops and returns the messages committed before the interrupt along with the
-// error, and leaves the rest uncounted.
+// It returns an error when ctx is cancelled: on an operator interrupt (i.ctx cancelled)
+// remaining messages stay uncounted and pending for the next run, whereas on advisory-lock
+// guard loss (ctx cancelled while i.ctx is active) every uncommitted message is recorded
+// in failedPaths and counted in failedMessages before returning.
 func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) (inserted, present []markedMessage, err error) {
 	user := i.user
 
@@ -2925,13 +2965,30 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 	}
 
 	mailboxGroups := make(map[string][]groupedMsg)
+	var mailboxOrder []string
 
-	for _, up := range uploaded {
+	for upIdx, up := range uploaded {
 		// Get/create mailbox (cached)
 		mailbox, err := i.getOrCreateMailbox(ctx, user.AccountID(), up.msg.mailbox)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil, nil, err // interrupted; nothing is stored yet
+				if intErr := i.interruptedErr(); intErr != nil {
+					return nil, nil, intErr // interrupted; nothing is stored yet
+				}
+				reason := fmt.Sprintf("mailbox error: %v", guardLossReason(ctx, err))
+				var failed int64
+				for _, mbName := range mailboxOrder {
+					for _, gm := range mailboxGroups[mbName] {
+						i.recordFailedPath(gm.path, reason)
+						failed++
+					}
+				}
+				for _, rem := range uploaded[upIdx:] {
+					i.recordFailedPath(rem.msg.path, reason)
+					failed++
+				}
+				atomic.AddInt64(&i.failedMessages, failed)
+				return nil, nil, err
 			}
 			logger.Error("Failed to get or create mailbox", "mailbox", up.msg.mailbox, "error", err)
 			i.recordFailedPath(up.msg.path, fmt.Sprintf("mailbox error: %v", err))
@@ -2959,9 +3016,13 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
 			HeaderPresence:       up.metadata.headerPresence,
+			MessageIDRaw:         up.metadata.messageIDRaw,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 			FTSRetention:         i.options.FTSRetention,
+		}
+		if _, exists := mailboxGroups[up.msg.mailbox]; !exists {
+			mailboxOrder = append(mailboxOrder, up.msg.mailbox)
 		}
 		mailboxGroups[up.msg.mailbox] = append(mailboxGroups[up.msg.mailbox], groupedMsg{
 			opt:  opt,
@@ -2970,9 +3031,29 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 		})
 	}
 
+	slices.Sort(mailboxOrder)
+	recordRemainingGuardLoss := func(err error, currentRest []groupedMsg, nextMailboxIdx int) {
+		reason := fmt.Sprintf("db insert error: %v", guardLossReason(ctx, err))
+		var failed int64
+		for _, gm := range currentRest {
+			i.recordFailedPath(gm.path, reason)
+			failed++
+		}
+		for _, mbName := range mailboxOrder[nextMailboxIdx:] {
+			for _, gm := range mailboxGroups[mbName] {
+				i.recordFailedPath(gm.path, reason)
+				failed++
+			}
+		}
+		if failed > 0 {
+			atomic.AddInt64(&i.failedMessages, failed)
+		}
+	}
+
 	const maxBatchSize = 500
 
-	for mailboxName, group := range mailboxGroups {
+	for mbIdx, mailboxName := range mailboxOrder {
+		group := mailboxGroups[mailboxName]
 		for idx := 0; idx < len(group); idx += maxBatchSize {
 			end := idx + maxBatchSize
 			if end > len(group) {
@@ -2988,8 +3069,12 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 			_, _, insertedHashesBatch, err := i.rdb.InsertMessagesFromImporterBatchWithRetry(ctx, opts)
 			if err != nil {
 				if ctx.Err() != nil {
-					// Interrupted: inserting the chunk message by message on the
+					// Cancelled context: inserting the chunk message by message on the
 					// cancelled context would only fail each one.
+					if intErr := i.interruptedErr(); intErr != nil {
+						return inserted, present, intErr
+					}
+					recordRemainingGuardLoss(err, group[idx:], mbIdx+1)
 					return inserted, present, err
 				}
 				{
@@ -3000,11 +3085,16 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 					// per-message path reports each duplicate, UID conflict or failure
 					// by path instead of writing off the chunk.
 					logger.Info("Batch insert failed, falling back to individual inserts", "mailbox_id", opts[0].MailboxID, "chunk_size", len(chunk), "error", err)
-					for _, gm := range chunk {
+					for gmIdx, gm := range chunk {
 						_, _, indErr := i.rdb.InsertMessageFromImporterWithRetry(ctx, gm.opt)
 						if indErr != nil {
 							if ctx.Err() != nil {
-								return inserted, present, indErr // interrupted
+								if intErr := i.interruptedErr(); intErr != nil {
+									return inserted, present, intErr
+								}
+								rest := append(append([]groupedMsg(nil), chunk[gmIdx:]...), group[end:]...)
+								recordRemainingGuardLoss(indErr, rest, mbIdx+1)
+								return inserted, present, indErr
 							}
 							if errors.Is(indErr, consts.ErrUIDConflict) {
 								// The preserved UID is already taken in the target mailbox: the
@@ -3120,6 +3210,7 @@ func (i *Importer) insertBatchToDBWithTransaction(ctx context.Context, uploaded 
 			BodyStructure:        up.metadata.bodyStructure,
 			Recipients:           up.metadata.recipients,
 			HeaderPresence:       up.metadata.headerPresence,
+			MessageIDRaw:         up.metadata.messageIDRaw,
 			PreservedUID:         up.metadata.preservedUID,
 			PreservedUIDValidity: up.metadata.preservedUIDValidity,
 			FTSRetention:         i.options.FTSRetention,
@@ -3350,6 +3441,9 @@ func (i *Importer) processBatch(batch []msgInfo) error {
 		return i.storeBatch(ctx, batch, read)
 	})
 	if err != nil && !stored {
+		if intErr := i.interruptedErr(); intErr != nil {
+			return intErr
+		}
 		// Nothing of the batch was stored.
 		logger.Error("Batch not stored", "error", err)
 		for _, up := range read {
@@ -3410,9 +3504,26 @@ func (i *Importer) storeBatch(ctx context.Context, batch []msgInfo, read []uploa
 	// phase, whose database calls would only fail on the cancelled context. Uploads
 	// that saw it returned without counting their message, and none of the batch is
 	// stored yet: what was not counted stays pending for the next run.
-	if err := i.ctx.Err(); err != nil {
+	if err := i.interruptedErr(); err != nil {
 		logger.Info("Import interrupted, batch left for the next run", "uploaded", len(uploaded), "batch_size", len(batch))
 		return err
+	}
+
+	if ctx.Err() != nil {
+		// S3 object lock was lost during the upload phase while i.ctx remained active.
+		// uploadBatchToS3 already counted and recorded the messages that did not upload;
+		// any messages that finished uploading before lock loss cannot be inserted under
+		// a lost holder either, so record and count them as failed too.
+		reason := guardLossReason(ctx, nil)
+		logger.Error("S3 object lock lost during upload phase, batch aborted",
+			"uploaded", len(uploaded), "batch_size", len(batch), "error", reason)
+		for _, up := range uploaded {
+			i.recordFailedPath(up.msg.path, fmt.Sprintf("s3 object lock lost: %v", reason))
+		}
+		if len(uploaded) > 0 {
+			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
+		}
+		return reason
 	}
 
 	if len(uploaded) == 0 {
@@ -3436,8 +3547,8 @@ func (i *Importer) storeBatch(ctx context.Context, batch []msgInfo, read []uploa
 		// Safe path: Individual transactions per message (more resilient)
 		// Need to update SQLite after since each message commits individually
 		logger.Info("Using individual transaction mode")
-		// insertBatchToDB fails only on an interrupt, and successHashes then holds
-		// the messages committed before it: they are marked like any others.
+		// When insertBatchToDB stops early (interrupt or lock guard loss), successHashes
+		// holds the messages committed before it stopped: they are marked like any others.
 		var present []markedMessage
 		successHashes, present, err = i.insertBatchToDB(ctx, uploaded)
 		logger.Info("DB inserts complete, marking in SQLite", "count", len(successHashes)+len(present))
@@ -3462,7 +3573,7 @@ func (i *Importer) storeBatch(ctx context.Context, batch []msgInfo, read []uploa
 	}
 
 	if err != nil {
-		if i.ctx.Err() != nil {
+		if intErr := i.interruptedErr(); intErr != nil {
 			// Interrupted: the database calls failed on the cancelled context. What
 			// the batch did not store is not a failure: its cache rows stay unmarked,
 			// pending for the next run, and importMessages reports the interruption.
@@ -3471,7 +3582,7 @@ func (i *Importer) storeBatch(ctx context.Context, batch []msgInfo, read []uploa
 			atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
 			logger.Info("Import interrupted, rest of the batch left for the next run",
 				"imported", len(successHashes), "batch_size", len(batch))
-			return i.ctx.Err()
+			return intErr
 		}
 		logger.Error("Batch processing failed", "error", err)
 		// Everything in uploaded that wasn't successfully inserted is already tracked if individual mode
@@ -3488,6 +3599,10 @@ func (i *Importer) storeBatch(ctx context.Context, batch []msgInfo, read []uploa
 				i.recordFailedPath(up.msg.path, fmt.Sprintf("batch transaction aborted: %v", err))
 			}
 			atomic.AddInt64(&i.failedMessages, int64(len(uploaded)))
+		} else if len(successHashes) > 0 {
+			// In individual mode, successHashes were committed to PostgreSQL and marked
+			// in SQLite above; unstored messages were counted in insertBatchToDB.
+			atomic.AddInt64(&i.importedMessages, int64(len(successHashes)))
 		}
 		return err
 	}

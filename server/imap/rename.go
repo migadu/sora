@@ -212,9 +212,14 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 			if resolveErr != nil {
 				return s.internalError("failed to resolve S3 owner for INBOX rename: %v", resolveErr)
 			}
-			writeCtx, ownMessagesDone := s.beginOwnMessages(ctx, newMailbox.ID)
+			writeCtx, ownSrcDone := s.beginOwnStatus(ctx, oldMailbox.ID)
+			writeCtx, ownMessagesDone := s.beginOwnMessages(writeCtx, newMailbox.ID)
 			var moved map[imap.UID]imap.UID
 			moved, err = s.server.rdb.MoveMessagesWithRetry(writeCtx, &uids, oldMailbox.ID, newMailbox.ID, AccountID, domain, localpart, s.server.instanceID, nil, nil, nil)
+			if err == nil {
+				s.useMasterDB.Store(true)
+			}
+			ownSrcDone(err == nil && len(moved) > 0)
 			ownMessagesDone(slices.Collect(maps.Values(moved))...)
 		}
 		if err != nil {
@@ -296,7 +301,7 @@ func (s *IMAPSession) Rename(ctx context.Context, w *imapserver.RenameWriter, ex
 	// If len(newParts) <= 1, newParentMailboxID remains nil, which is correct for a top-level mailbox.
 
 	// Rename using the mailbox owner's AccountID
-	names, renameErr := s.server.rdb.RenameMailboxReturningNamesWithRetry(ctx, oldMailbox.ID, ownerAccountID, newName, newParentMailboxID)
+	names, renameErr := s.server.rdb.RenameMailboxReturningNamesWithRetry(ctx, oldMailbox.ID, ownerAccountID, AccountID, newName, newParentMailboxID)
 	err = renameErr
 	if err != nil {
 		if errors.Is(err, consts.ErrMailboxSharedBoundary) {
