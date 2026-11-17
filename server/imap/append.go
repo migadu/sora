@@ -237,11 +237,10 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 			references = nil
 		}
 
-		extractedPlaintext, extractErr := helpers.ExtractPlaintextBody(messageContent)
+		var extractErr error
+		actualPlaintextBody, extractErr = helpers.FTSPlaintextBody(messageContent)
 		if extractErr != nil {
-			s.DebugLog("failed to extract plaintext body, using empty string", "error", extractErr)
-		} else if extractedPlaintext != nil {
-			actualPlaintextBody = *extractedPlaintext
+			s.DebugLog("plaintext extraction encountered errors", "error", extractErr)
 		}
 
 		recipients = helpers.ExtractRecipients(messageContent.Header)

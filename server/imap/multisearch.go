@@ -92,13 +92,17 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 		// RFC 4314: SEARCH requires the 'r' (read) right. GetMailboxes also lists
 		// shared mailboxes that are visible with only the 'l' (lookup) right, and
 		// scope verbs may resolve to them; skip any the user cannot read so ESEARCH
-		// cannot leak message UIDs/counts from them.
-		hasRead, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, mbox.ID, accountID, 'r')
-		if err != nil {
-			return nil, s.internalError("failed to check read permission for %s: %v", mbox.Name, err)
-		}
-		if !hasRead {
-			continue
+		// cannot leak message UIDs/counts from them. The owner has every right
+		// (has_mailbox_right returns TRUE for it first), so only a mailbox another
+		// account owns costs the round trip, as in NOTIFY's STATUS fan-in.
+		if mbox.AccountID != accountID {
+			hasRead, err := s.server.rdb.CheckMailboxPermissionWithRetry(ctx, mbox.ID, accountID, db.ACLRightRead)
+			if err != nil {
+				return nil, s.internalError("failed to check read permission for %s: %v", mbox.Name, err)
+			}
+			if !hasRead {
+				continue
+			}
 		}
 
 		// mbox.AccountID, never the session accountID above: for a shared mailbox the FTS
@@ -198,8 +202,8 @@ func (s *IMAPSession) MultiSearch(ctx context.Context, source *imap.SearchSource
 //
 // Names are matched as the database matches them, by LOWER(name) under its
 // collation, which no Go case mapping matches (under ICU "İNBOX" is not the
-// INBOX): the mailboxes carry it as NameKey, and the names the source gives, and
-// INBOX, are resolved to theirs in one query. The selected mailbox is taken by ID.
+// INBOX): the mailboxes carry it as NameKey, and the names the source gives are
+// resolved to theirs in one query. The selected mailbox is taken by ID.
 func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.SearchSource, allMailboxes []*db.DBMailbox) ([]*db.DBMailbox, error) {
 	accountID := s.IMAPUser.AccountID()
 	delim := string(consts.MailboxDelimiter)
@@ -215,9 +219,6 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 	release()
 
 	var names []string
-	if source.Inboxes {
-		names = append(names, consts.MailboxInbox)
-	}
 	names = append(names, source.Subtree...)
 	names = append(names, source.SubtreeOne...)
 	names = append(names, source.Mailboxes...)
@@ -265,12 +266,11 @@ func (s *IMAPSession) resolveSearchSource(ctx context.Context, source *imap.Sear
 		}
 		add(m)
 	}
-	if source.Inboxes {
-		add(byKey[nextKeys(1)[0]])
-	}
-	if source.Personal {
+	if source.Personal || source.Inboxes {
 		// RFC 5465 §6.2: all selectable mailboxes in the personal namespace(s), as
 		// NOTIFY's PERSONAL watches them. A shared mailbox the user owns is not one.
+		// INBOXES (§6.3) is PERSONAL too, as NOTIFY's INBOXES: sora does not compute
+		// the mailboxes an MDA may deliver to (see eventsForMailbox).
 		sharedRoot := s.sharedNamespaceRoot()
 		for _, m := range allMailboxes {
 			if !inSharedNamespace(m.Name, sharedRoot) {
