@@ -802,6 +802,11 @@ STATUS counts and flag-update inconsistencies are not repaired. There is no
 historical backfill, backfill migration or startup scan for this change. Older
 writers and transactions started before upgrade can still create missing rows.
 
+New APPENDs whose structured MIME parsing is degraded still record searchable
+header presence from their raw header block. This applies only to the new
+ingress row; legacy NULL masks remain unknown, with no scan, S3 read or repair
+command to populate historical rows.
+
 ### Import body admission connections
 
 Maildir batches and S3 import workers hold one write-pool connection for shared
