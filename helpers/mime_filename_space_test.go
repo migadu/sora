@@ -1,11 +1,13 @@
 package helpers
 
 import (
+	"bytes"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/emersion/go-message"
+	"github.com/migadu/go-imap"
 )
 
 func TestMIMEHeaderFilenameSpaces(t *testing.T) {
@@ -25,6 +27,8 @@ func TestMIMEHeaderFilenameSpaces(t *testing.T) {
 		// recovered forms are too.
 		{"trailing separators", `inline; filename=monthly report.pdf;;`, "monthly report.pdf", false},
 		{"spaced trailing separators", `inline; filename=monthly report.pdf; ;`, "monthly report.pdf", false},
+		{"other parameter NBSP", "inline; size=\u00a012; filename=monthly report.pdf", "monthly report.pdf", false},
+		{"other parameter MSIE duplicate", `inline; note="a\\b"; note="a\b"; filename=monthly report.pdf`, "monthly report.pdf", false},
 		{"quoted control", `inline; filename="monthly report.pdf"`, "monthly report.pdf", true},
 		{"quoted semicolon control", `inline; filename="monthly; report.pdf"`, "monthly; report.pdf", true},
 		{"strict comments control", `inline (part); filename=(name)report.pdf`, "report.pdf", true},
@@ -89,6 +93,9 @@ func TestMIMEHeaderFilenameSpacesMatchQuoted(t *testing.T) {
 		{`inline; filename=x y.png; ;`, `inline; filename="x y.png"; ;`},
 		{"inline; filename=x y.png;\t;", "inline; filename=\"x y.png\";\t;"},
 		{`inline; filename=x y.png; size=12;;`, `inline; filename="x y.png"; size=12;;`},
+		{"inline; size=\u00a012; filename=x y.png", "inline; size=\u00a012; filename=\"x y.png\""},
+		{`inline; note="a\\b"; note="a\b"; filename=x y.png`, `inline; note="a\\b"; note="a\b"; filename="x y.png"`},
+		{"inline; filename=x y.png; note=\"a\"\u00a0", "inline; filename=\"x y.png\"; note=\"a\"\u00a0"},
 	} {
 		t.Run(test.raw, func(t *testing.T) {
 			got, want := parseMIMEHeader(test.raw, false), parseMIMEHeaderStrict(test.quoted, false)
@@ -104,6 +111,8 @@ func TestAttachmentKeywordFilenameSpaces(t *testing.T) {
 	for _, test := range []struct{ name, disposition, want string }{
 		{"reported inline image", `inline; filename=Concur _1_.png`, "$hasattachment"},
 		{"trailing separators", `inline; filename=monthly report.png;;`, "$hasattachment"},
+		{"other parameter NBSP", "inline; size=\u00a012; filename=monthly report.png", "$hasattachment"},
+		{"other parameter MSIE duplicate", `inline; note="a\\b"; note="a\b"; filename=monthly report.png`, "$hasattachment"},
 		{"ambiguous plain duplicate", `inline; filename=monthly report.png; filename=other.png`, ""},
 		{"ambiguous comments", `inline; filename=monthly (note) report.png`, ""},
 		{"missing separator", `inline; filename=monthly report.png size=12`, ""},
@@ -129,6 +138,8 @@ func TestAttachmentKeywordFilenameSpaces(t *testing.T) {
 		{"related trailing separator", `inline; filename=Concur _1_.png;`, "$hasnoattachment"},
 		{"related trailing separators", `inline; filename=Concur _1_.png;;`, ""},
 		{"related spaced trailing separators", `inline; filename=Concur _1_.png; ;`, ""},
+		{"related other parameter NBSP", "inline; size=\u00a012; filename=Concur _1_.png", ""},
+		{"related other parameter MSIE duplicate", `inline; note="a\\b"; note="a\b"; filename=Concur _1_.png`, ""},
 		{"related unclosed quote", `inline; filename=Concur _1_.png; note="unclosed`, ""},
 		{"related trailing comment", `inline; filename=Concur _1_.png (note)`, ""},
 		{"related raw control", "inline; filename=Concur \x00_1_.png", ""},
@@ -151,6 +162,32 @@ func TestAttachmentKeywordFilenameSpaces(t *testing.T) {
 			t.Fatalf("AttachmentKeyword = %q, %v; want unknown", keyword, known)
 		}
 	})
+
+	for _, test := range []struct{ name, unquoted, quoted string }{
+		{"other parameter NBSP", "inline; size=\u00a012; filename=x y.png", "inline; size=\u00a012; filename=\"x y.png\""},
+		{"other parameter MSIE duplicate", `inline; note="a\\b"; note="a\b"; filename=x y.png`, `inline; note="a\\b"; note="a\b"; filename="x y.png"`},
+	} {
+		t.Run("BODYSTRUCTURE parity/"+test.name, func(t *testing.T) {
+			raw := []byte("Content-Type: image/png\r\nContent-Disposition: " + test.unquoted + "\r\n\r\nPNG")
+			quotedRaw := []byte("Content-Type: image/png\r\nContent-Disposition: " + test.quoted + "\r\n\r\nPNG")
+
+			bs := ExtractBodyStructure(bytes.NewReader(raw))
+			part, ok := bs.(*imap.BodyStructureSinglePart)
+			if !ok {
+				t.Fatalf("ExtractBodyStructure = %T, want *imap.BodyStructureSinglePart", bs)
+			}
+			if part.Filename() != "x y.png" {
+				t.Fatalf("ExtractBodyStructure filename = %q, want %q", part.Filename(), "x y.png")
+			}
+			wantKeyword, wantKnown := AttachmentKeyword(quotedRaw)
+			if wantKeyword != KeywordHasAttachment || !wantKnown {
+				t.Fatalf("quoted AttachmentKeyword = %q, %v; want %q, true", wantKeyword, wantKnown, KeywordHasAttachment)
+			}
+			if gotKeyword, gotKnown := AttachmentKeyword(raw); gotKeyword != wantKeyword || gotKnown != wantKnown {
+				t.Fatalf("AttachmentKeyword = %q, %v; want %q, %v", gotKeyword, gotKnown, wantKeyword, wantKnown)
+			}
+		})
+	}
 }
 
 func TestFilenameSpacesTextDisposition(t *testing.T) {
