@@ -95,7 +95,7 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		if root != nil && exportRootOpened != nil {
 			exportRootOpened()
 		}
-		maildirPath = effectiveMaildirPath(maildirPath)
+		maildirPath = effectiveMaildirPath(maildirPath, root)
 		dbPath := filepath.Join(maildirPath, maildirCacheName)
 		var cache *sql.DB
 		var privateCache *privateTempDir
@@ -137,7 +137,7 @@ func NewExporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	if exportRootOpened != nil {
 		exportRootOpened()
 	}
-	maildirPath = effectiveMaildirPath(maildirPath)
+	maildirPath = effectiveMaildirPath(maildirPath, root)
 
 	// Use the shared SQLite database in the maildir path
 	dbPath := filepath.Join(maildirPath, maildirCacheName)

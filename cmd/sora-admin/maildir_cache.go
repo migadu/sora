@@ -241,24 +241,33 @@ func resolveMaildirDir(dir string) (string, error) {
 	return dir, nil
 }
 
-// effectiveMaildirPath keeps maildirPath when filepath.Clean(maildirPath) names the
-// same directory (including when maildirPath is itself a symbolic link to a
-// maildir), and otherwise returns the OS-resolved directory so os.OpenRoot,
-// filepath.Clean, and filepath.Join do not collapse a ".." across a symbolic link
-// onto a different or missing directory.
-func effectiveMaildirPath(maildirPath string) string {
-	info, err := os.Stat(maildirPath)
-	if err != nil {
+func hasDotDotComponent(path string) bool {
+	for _, part := range strings.Split(filepath.ToSlash(path), "/") {
+		if part == ".." {
+			return true
+		}
+	}
+	return false
+}
+
+// effectiveMaildirPath keeps maildirPath when it has no ".." component, or when
+// filepath.Clean(maildirPath) names the checked root directory, and otherwise
+// returns root.Name() so filepath.Clean and filepath.Join do not collapse a ".."
+// across a symbolic link onto a different, missing, or concurrently replaced
+// directory.
+func effectiveMaildirPath(maildirPath string, root *os.Root) string {
+	if !hasDotDotComponent(maildirPath) || root == nil {
 		return maildirPath
 	}
-	if cleanInfo, err := os.Stat(filepath.Clean(maildirPath)); err == nil && os.SameFile(info, cleanInfo) {
-		return maildirPath
+	if rootInfo, err := root.Stat("."); err == nil {
+		if cleanInfo, cleanErr := os.Stat(filepath.Clean(maildirPath)); cleanErr == nil && sameFileID(rootInfo, cleanInfo) {
+			return maildirPath
+		}
 	}
-	resolved, err := resolveMaildirDir(maildirPath)
-	if err != nil {
-		return maildirPath
+	if root.Name() != "" {
+		return root.Name()
 	}
-	return resolved
+	return maildirPath
 }
 
 // openMaildirCacheFile opens the maildir cache at path, an absolute name with no
