@@ -15,6 +15,18 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// openMaildirCacheAt opens the maildir cache in the directory at path, through the
+// root openImportRoot opens there, as an import does.
+func openMaildirCacheAt(t *testing.T, path string) (*sql.DB, error) {
+	t.Helper()
+	root, err := openImportRoot(path)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	return openMaildirCache(root)
+}
+
 // Import and export open sora-maildir.db in a directory the maildir's owner may be
 // able to write to (the maildir of an in-place import, or a copy made with rsync -a,
 // which keeps links; the destination of an export), and they often run as root. A
@@ -83,11 +95,11 @@ func TestMaildirCacheRefusesLinks(t *testing.T) {
 }
 
 // The check before the open leaves a window in which the owner can put a link at the
-// cache's name. Every connection is therefore checked again, after SQLite may have
-// read the header but before cache settings are applied, to have opened the file
-// under its own name and not through a link;
-// SQLite opens the cache without creating it, so a link to a missing file creates
-// nothing either.
+// cache's name. SQLite opens the name it is given (maildirCacheVFS) with O_NOFOLLOW,
+// so a link there is refused, and every connection is checked again, before cache
+// settings are applied, to have opened the file under its own name and not through a
+// link. SQLite opens the cache without creating it, so a link to a missing file
+// creates nothing either.
 func TestMaildirCacheRefusesALinkSwappedInBeforeSQLiteOpensIt(t *testing.T) {
 	targets := map[string][]byte{
 		"empty file":          {},
@@ -108,14 +120,13 @@ func TestMaildirCacheRefusesALinkSwappedInBeforeSQLiteOpensIt(t *testing.T) {
 			path := filepath.Join(dir, maildirCacheName)
 			require.NoError(t, os.Symlink(outside, path))
 
-			cache, err := openMaildirCacheFile(path)
+			cache, err := openMaildirCacheFile(path, nil)
 			require.NoError(t, err)
 			defer cache.Close()
 			err = cache.Ping()
 
 			require.Error(t, err)
 			if content != nil {
-				assert.ErrorContains(t, err, "through a symbolic link")
 				got, err := os.ReadFile(outside)
 				require.NoError(t, err)
 				assert.Equal(t, content, got, "wrote the file the link names")
@@ -142,7 +153,7 @@ func TestMaildirCacheOpensThroughALinkedMaildirPath(t *testing.T) {
 		"link" + string(filepath.Separator) + ".." + string(filepath.Separator) + "Maildir",
 	} {
 		t.Run(maildirPath, func(t *testing.T) {
-			cache, err := openMaildirCache(maildirPath)
+			cache, err := openMaildirCacheAt(t, maildirPath)
 			require.NoError(t, err)
 			assertMaildirCacheSettings(t, cache)
 			require.NoError(t, cache.Close())
@@ -222,7 +233,7 @@ func TestMaildirCacheChecksTheDirectoryItIsOpenedIn(t *testing.T) {
 
 	// A link beside ./Maildir is not beside the cache.
 	require.NoError(t, os.Symlink(outside, filepath.Join(root, "Maildir", maildirCacheName+"-wal")))
-	cache, err := openMaildirCache(maildirPath)
+	cache, err := openMaildirCacheAt(t, maildirPath)
 	require.NoError(t, err, "refused a link in a directory the cache is not in")
 	require.NoError(t, cache.Close())
 	require.FileExists(t, filepath.Join(root, "a", "Maildir", maildirCacheName))
@@ -230,7 +241,7 @@ func TestMaildirCacheChecksTheDirectoryItIsOpenedIn(t *testing.T) {
 	// A link beside the cache, in a/Maildir, is refused by its name.
 	link := filepath.Join(root, "a", "Maildir", maildirCacheName+"-shm")
 	require.NoError(t, os.Symlink(outside, link))
-	_, err = openMaildirCache(maildirPath)
+	_, err = openMaildirCacheAt(t, maildirPath)
 	assert.ErrorContains(t, err, link+": it is a symbolic link")
 	assert.NoFileExists(t, outside)
 }
