@@ -91,7 +91,7 @@ func TestVerifyFixMissingDoesNotUndoUploadDuringHead(t *testing.T) {
 }
 
 func TestVerifyFixMissingSameHolderControls(t *testing.T) {
-	for _, mode := range []string{"missing", "present", "other_account_pending", "quarantined", "canceled", "holder_lost"} {
+	for _, mode := range []string{"missing", "present", "other_account_pending", "admitted_upload", "quarantined", "canceled", "head_error", "holder_lost"} {
 		t.Run(mode, func(t *testing.T) {
 			f := newRekeyFixture(t)
 			account, domain, local := f.account("verify-holder-" + mode)
@@ -107,6 +107,13 @@ func TestVerifyFixMissingSameHolderControls(t *testing.T) {
 			if mode == "other_account_pending" {
 				other, _, _ := f.account("verify-other-pending")
 				f.exec(`INSERT INTO pending_uploads(instance_id,content_hash,size,account_id) VALUES('other-pending',$1,$2,$3)`, hash, len(body), other)
+			}
+			var admittedPending int64
+			if mode == "admitted_upload" {
+				require.NoError(t, f.rdb.QueryRowWithRetry(f.ctx, `INSERT INTO pending_uploads(instance_id,content_hash,size,account_id) VALUES('admitted-before-repair',$1,$2,$3) RETURNING id`, hash, len(body), account).Scan(&admittedPending))
+				gate, err := f.rdb.PassS3WriteGateWithRetry(f.ctx, admittedPending, account, hash, "admitted-before-repair", time.Minute)
+				require.NoError(t, err)
+				require.Equal(t, db.S3WriteOpen, gate)
 			}
 			if mode == "quarantined" {
 				f.exec(`INSERT INTO s3_body_delete_intents(content_hash,operation_id,object_keys,retire_snapshot) VALUES($1,'11111111-1111-4111-8111-111111111111',$2,'[]')`, hash, []string{key})
@@ -127,6 +134,10 @@ func TestVerifyFixMissingSameHolderControls(t *testing.T) {
 					}
 					killResult <- err
 				}
+				if mode == "head_error" {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
 				mem.ServeHTTP(w, r)
 			}))
 			defer srv.Close()
@@ -143,7 +154,7 @@ func TestVerifyFixMissingSameHolderControls(t *testing.T) {
 				exists, _, err := s3.ExistsContext(guarded, key)
 				return exists, err
 			})
-			if mode == "quarantined" || mode == "canceled" || mode == "holder_lost" {
+			if mode == "quarantined" || mode == "canceled" || mode == "head_error" || mode == "holder_lost" {
 				require.Error(t, err)
 				require.Zero(t, count)
 			} else {
@@ -152,8 +163,12 @@ func TestVerifyFixMissingSameHolderControls(t *testing.T) {
 			if mode == "holder_lost" {
 				require.NoError(t, <-killResult)
 			}
-			if mode == "other_account_pending" || mode == "quarantined" || mode == "canceled" {
+			if mode == "other_account_pending" || mode == "admitted_upload" || mode == "quarantined" || mode == "canceled" {
 				require.False(t, checked)
+			}
+			if mode == "admitted_upload" {
+				require.NoError(t, s3.PutContext(f.ctx, key, bytes.NewReader(body), int64(len(body))))
+				require.NoError(t, f.rdb.CompleteLeasedS3UploadWithRetry(f.ctx, admittedPending, "admitted-before-repair", hash, account, []string{key}))
 			}
 			var uploaded bool
 			require.NoError(t, f.rdb.QueryRowWithRetry(f.ctx, `SELECT uploaded FROM messages WHERE id=$1`, row).Scan(&uploaded))
