@@ -393,8 +393,9 @@ func (s *IMAPSession) fetch(ctx context.Context, w *imapserver.FetchWriter, numS
 				metrics.TrackDomainMessage("imap", s.IMAPUser.Domain(), "fetched")
 			}
 			// Unsolicited NOTIFY MessageNew fetches (progress != nil) push one-off
-			// event attributes, often while the client sits in IDLE; they must
-			// neither populate nor evict the session's chunk-fetch section cache.
+			// event attributes, often while the client sits in IDLE. Skip new
+			// retention or replacement of the session's chunk-fetch cache;
+			// normal memory admission may still reclaim in-memory retention.
 			retainSections := progress == nil
 			if err := s.writeMessageFetchData(ctx, w, &msg, options, selectedMailboxID, recentAbove, markSeen, view.tracker, preview, retainSections); err != nil {
 				if progress != nil {
