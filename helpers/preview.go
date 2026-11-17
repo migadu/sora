@@ -109,7 +109,7 @@ func MessagePreview(r io.Reader) (preview string) {
 			// present, otherwise by the first child. Other children are
 			// resources, not alternative message bodies, even if textual.
 			if parent.relatedRootSeen || (parent.hasRelatedStart &&
-				(parent.relatedStart == "" || strings.TrimSpace(current.Header.Get("Content-ID")) != parent.relatedStart)) {
+				(parent.relatedStart == "" || mimeContentID(current.Header.Get("Content-ID")) != parent.relatedStart)) {
 				continue
 			}
 			parent.relatedRootSeen = true
@@ -138,7 +138,7 @@ func MessagePreview(r io.Reader) (preview string) {
 					start, hasStart := params["start"]
 					readers = append(readers, multipartFrame{
 						reader: mr, mediaType: mediaType,
-						relatedStart: strings.TrimSpace(start), hasRelatedStart: hasStart,
+						relatedStart: mimeContentID(start), hasRelatedStart: hasStart,
 					})
 				}
 			}

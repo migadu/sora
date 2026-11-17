@@ -35,10 +35,17 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 		return nil, fmt.Errorf("nil message entity")
 	}
 
-	var readers []message.MultipartReader
+	type multipartFrame struct {
+		reader          message.MultipartReader
+		mediaType       string
+		relatedStart    string
+		hasRelatedStart bool
+		relatedRootSeen bool
+	}
+	var readers []multipartFrame
 	defer func() {
 		for i := len(readers) - 1; i >= 0; i-- {
-			readers[i].Close()
+			readers[i].reader.Close()
 		}
 	}()
 
@@ -52,6 +59,7 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 	next := msg
 	for plaintextBody == nil {
 		var part *message.Entity
+		var parent *multipartFrame
 		var err error
 		if next != nil {
 			part = next
@@ -60,45 +68,80 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 			if len(readers) == 0 {
 				break
 			}
-			top := readers[len(readers)-1]
-			part, err = top.NextPart()
+			parent = &readers[len(readers)-1]
+			part, err = parent.reader.NextPart()
 			if err == io.EOF {
-				top.Close()
+				parent.reader.Close()
 				readers = readers[:len(readers)-1]
 				continue
-			} else if message.IsUnknownEncoding(err) {
-				// go-message reports an unknown Content-Transfer-Encoding (e.g.
-				// "7bit <center>") per part; the multipart reader goes on to the
-				// next one.
-				skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
-				continue
-			} else if message.IsUnknownCharset(err) {
-				// The part comes with its body not converted from the charset, which
-				// is still its best text: it is read as the single-part form is, and
-				// as PREVIEW reads it. Its transfer encoding is checked below along
-				// with single-part messages.
+			} else if part != nil && (message.IsUnknownCharset(err) || message.IsUnknownEncoding(err)) {
+				// The part still comes with its header (and, for an unknown
+				// charset, its transfer-decoded body). Container/disposition
+				// rules and the leaf Content-Transfer-Encoding check below
+				// handle it uniformly with single-part messages and PREVIEW.
 			} else if err != nil {
 				// A broken multipart (malformed part header, missing boundary or
 				// missing close delimiter) cannot yield more parts of its own, but
 				// popping it lets its parent advance to later sibling parts, matching
 				// MessagePreview.
 				skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
-				top.Close()
+				parent.reader.Close()
 				readers = readers[:len(readers)-1]
 				continue
 			}
 		}
 
 		header := part.Header
-		partType, _, _ := header.ContentType()
-		if strings.HasPrefix(partType, "multipart/") {
+		relatedRoot := parent != nil && parent.mediaType == "multipart/related"
+		if relatedRoot {
+			// RFC 2387 §3.2 selects the root by Content-ID when start is
+			// present, otherwise by the first child. Other children are
+			// resources, not alternative message bodies, even if textual.
+			if parent.relatedRootSeen || (parent.hasRelatedStart &&
+				(parent.relatedStart == "" || mimeContentID(header.Get("Content-ID")) != parent.relatedStart)) {
+				continue
+			}
+			parent.relatedRootSeen = true
+		}
+
+		disp, _, _ := header.ContentDisposition()
+		// RFC 2183 §2.8 assigns attachment semantics to unknown dispositions.
+		// Fail closed on malformed values too, while retaining a usable inline
+		// type when only its parameters were malformed.
+		// Related processing takes precedence over its direct children's
+		// disposition (RFC 2387 §4). Attachment ancestors remain excluded.
+		if !relatedRoot && header.Get("Content-Disposition") != "" && !strings.EqualFold(disp, "inline") {
+			continue
+		}
+
+		// go-message keeps the media type when only the parameters are
+		// malformed. Such a text part is still text (RFC 2045 §5.2 even
+		// recommends assuming text/plain for an invalid field), so it is
+		// not dropped, but it is read without its charset: a well-formed
+		// alternative, if there is one, is the better text.
+		mediaType, params, typeErr := header.ContentType()
+		if parent != nil && parent.mediaType == "multipart/digest" && header.Get("Content-Type") == "" {
+			// RFC 2046 §5.1.5 changes the default for direct digest children.
+			mediaType = "message/rfc822"
+		}
+		if mediaType == "multipart/encrypted" {
+			continue
+		}
+		if strings.HasPrefix(mediaType, "multipart/") {
 			if len(readers) < maxFTSMIMEDepth {
 				if mr := part.MultipartReader(); mr != nil {
-					readers = append(readers, mr)
+					start, hasStart := params["start"]
+					readers = append(readers, multipartFrame{
+						reader:          mr,
+						mediaType:       mediaType,
+						relatedStart:    mimeContentID(start),
+						hasRelatedStart: hasStart,
+					})
 				}
 			}
 			continue
 		}
+
 		// A single-part entity arrives without a NextPart error, and go-message
 		// reports only the charset error when both charset and encoding are
 		// unknown. Check every leaf so undecoded bytes are never indexed.
@@ -109,16 +152,6 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 			continue
 		}
 
-		if disp, _, _ := header.ContentDisposition(); disp != "inline" && (disp == "attachment" || !strings.HasPrefix(partType, "text/")) {
-			continue
-		}
-
-		// go-message keeps the media type when only the parameters are
-		// malformed. Such a text part is still text (RFC 2045 §5.2 even
-		// recommends assuming text/plain for an invalid field), so it is
-		// not dropped, but it is read without its charset: a well-formed
-		// alternative, if there is one, is the better text.
-		mediaType, _, typeErr := header.ContentType()
 		if mediaType != "text/plain" && mediaType != "text/html" {
 			if typeErr != nil {
 				skippedParts = append(skippedParts, fmt.Sprintf("invalid Content-Type: %v", typeErr))
