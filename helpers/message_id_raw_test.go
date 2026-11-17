@@ -52,11 +52,37 @@ func TestExtractMessageIDRaw(t *testing.T) {
 			want: strPtr("<outer@[<inner@example.com>]>"),
 		},
 		{
-			// go-message keeps quoting the local part needs, so "<" + message_id + ">"
-			// reproduces the field and the search loses nothing.
-			name: "required local-part quoting omitted",
-			raw:  "From: a@example.com\r\nMessage-ID: <\"<inner\"@example.com>\r\n\r\nbody\r\n",
+			// go-message keeps quoting the local part needs; when the parsed ID
+			// contains no '<', '>', or '[', "<" + message_id + ">" has no other
+			// whole-ID "<...>" substring and wholeMessageIDTerm loses nothing.
+			name: "required local-part quoting without angle brackets omitted",
+			raw:  "From: a@example.com\r\nMessage-ID: <\"foo bar\"@example.com>\r\n\r\nbody\r\n",
 			want: nil,
+		},
+		{
+			// An angle bracket inside a quoted local-part creates an additional
+			// "<...>" substring in the field text (here `<inner"@example.com>`)
+			// that wholeMessageIDTerm checks against message_id_raw.
+			name: "quoted local-part with opening angle bracket retained",
+			raw:  "From: a@example.com\r\nMessage-ID: <\"<inner\"@example.com>\r\n\r\nbody\r\n",
+			want: strPtr("<\"<inner\"@example.com>"),
+		},
+		{
+			// A '>' inside a quoted local-part creates `<"a>` as a whole-ID
+			// prefix of `<"a>"@example.com>`.
+			name: "quoted local-part with closing angle bracket retained",
+			raw:  "From: a@example.com\r\nMessage-ID: <\"a>\"@example.com>\r\n\r\nbody\r\n",
+			want: strPtr("<\"a>\"@example.com>"),
+		},
+		{
+			name: "quoted local-part with nested bracketed Message-ID retained",
+			raw:  "From: a@example.com\r\nMessage-ID: <\"<inner@example.com>\"@host.example>\r\n\r\nbody\r\n",
+			want: strPtr("<\"<inner@example.com>\"@host.example>"),
+		},
+		{
+			name: "quoted local-part with prefixed nested bracketed Message-ID retained",
+			raw:  "From: a@example.com\r\nMessage-ID: <\"prefix<inner@example.com>suffix\"@host.example>\r\n\r\nbody\r\n",
+			want: strPtr("<\"prefix<inner@example.com>suffix\"@host.example>"),
 		},
 		{
 			// go-message drops quoting the local part does not need (RFC 5256
