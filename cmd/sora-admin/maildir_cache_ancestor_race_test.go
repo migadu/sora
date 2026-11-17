@@ -68,7 +68,7 @@ func TestMaildirCacheRejectsDirectoryPivotDuringAncestryChecks(t *testing.T) {
 					restore()
 				}
 			})
-			cache, err := openMaildirCache(physical)
+			cache, err := openMaildirCacheAt(t, physical)
 			if err != nil {
 				assert.Contains(t, err.Error(), "maildir database")
 				return

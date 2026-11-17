@@ -36,9 +36,9 @@ each of them with the value stored for another message row with the same body
 and reads nothing from S3, so a message whose body no other row has a value for
 cannot be filled: it is counted and left as it is.
 
-Each batch is read in one statement through the read pool (a replica, when one is
-configured) and, with --apply, filled in one short transaction on the primary,
-with no session state. After a batch it prints the id to resume from at most
+Each batch is read from the primary in one statement and, with --apply, filled
+in one short transaction on the primary, with no session state. Admin CLI
+commands skip configured read replicas; database.read does not redirect this scan. After a batch it prints the id to resume from at most
 every 10 seconds; an interrupted run prints it too. Running it again is safe: a
 filled row is not counted again.
 
@@ -61,6 +61,11 @@ Examples:
 	}
 
 	fs.Parse(os.Args[3:])
+	if fs.NArg() > 0 {
+		fmt.Printf("Error: unexpected argument %q\n\n", fs.Arg(0))
+		fs.Usage()
+		os.Exit(1)
+	}
 	if *batchSize <= 0 {
 		fmt.Println("Error: --batch-size must be positive")
 		os.Exit(1)
