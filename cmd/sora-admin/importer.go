@@ -1648,7 +1648,10 @@ const maxImportRootLinks = 255
 // directly, as maildirCacheLinkRule trusts them. Any other link is refused, naming it,
 // so the operator can name the directory itself. The owner of a link says who made
 // it, not who gave it its name: where users may hard-link a file they do not own, a
-// link with more than one name is refused too.
+// link with more than one name is refused too, and a link of that user, when it is
+// not root, is followed only from a directory of root or of that user that nobody
+// else may write, sticky or not, below directories no other user can rename entries
+// in (renamableParent): nobody else can then have moved or hard-linked it into place.
 //
 // path is walked a component at a time by descriptor from the file system root (a
 // relative one from the working directory), as the system resolves it: a ".." after a
@@ -1709,9 +1712,9 @@ func openLinkCheckedRoot(path string, mode rootWalk) (*os.Root, error) {
 	}
 
 	// A step is a name to walk to, which may be missing when create says so (and is
-	// then created, or ends a preview), or, after the target of a link that is not
-	// root's, the check that the directory the target reached belongs to the link's
-	// owner.
+	// then created, or ends a preview), or, after the target of a link that is
+	// neither root's nor the running user's, the check that the directory the target
+	// reached belongs to the link's owner.
 	type step struct {
 		name    string
 		create  bool
@@ -1835,14 +1838,62 @@ func openLinkCheckedRoot(path string, mode rootWalk) (*os.Root, error) {
 			// root's /var/mail/bob, or bob's own link to his maildir, ~/Maildir.
 			// Only the names the link has now are seen: one alice made earlier has
 			// a single name again once /var/mail/bob is removed, or bob replaces his
-			// link, and is then followed as its owner's. Telling it apart would need
-			// a rule on who may write the directory holding the link; the operator can
-			// name the directory itself instead (docs/IMPORT_EXPORT.md, section 3).
+			// link, and is then followed as its owner's. For root's and the target
+			// owner's links that residual stays (only the running user's links are
+			// also checked for who may write the directory holding them, below); the
+			// operator can name the directory itself instead (docs/IMPORT_EXPORT.md,
+			// section 3).
 			if nlink := uint64(again.st.Nlink); nlink > 1 && !hardLinksProtected() {
 				return nil, fmt.Errorf("refusing %s: %s is a symbolic link with %d names, and on this system any user may have given it this one with a hard link; name the directory it leads to instead", given, name, nlink)
 			}
 			next := split(target)
-			if uid := fileUID(again); uid != 0 && uid != euid {
+			switch uid := fileUID(again); {
+			case uid == 0:
+			case uid == euid:
+				// A link of the user this runs as, not root, is trusted as leading
+				// only where that user could name directly, which holds only if that
+				// user also gave it this name (#1868). Another user who can rename an
+				// entry of a directory above the one holding it may have put a
+				// directory of their own there: the rule maildirCacheLinkRule applies
+				// above the cache's directory (renamableParent). One who can create
+				// an entry in the directory holding it may have moved the link there
+				// with rename(2) from a directory they can write, or, where hard
+				// links are not protected, given it a second name there that has a
+				// single name again once the operator removes the first. The sticky
+				// bit (/tmp) keeps others from renaming an entry they do not own, not
+				// from creating one, so that directory may be writable by its owner
+				// only, as checkNamedByOwner requires of a directory holding a link.
+				parent, owner, perm, err := renamableParent(name, int(euid))
+				if err == nil && parent == "" {
+					if owner, perm, err = directoryOwnerAndMode(resolved); err == nil && perm&0o022 != 0 {
+						parent = resolved
+					}
+				}
+				if err != nil {
+					return nil, fmt.Errorf("refusing %s: failed to check the directories holding the symbolic link %s: %w", given, name, err)
+				}
+				if parent == resolved {
+					return nil, fmt.Errorf("refusing %s: %s is a symbolic link of the user this runs as (uid %d), but users other than root and uid %d can create entries in %s, the directory holding it (owner uid %d, mode %04o), and so may have given it this name; name the directory it leads to instead", given, name, euid, euid, parent, owner, perm)
+				}
+				if parent != "" {
+					return nil, fmt.Errorf("refusing %s: %s is a symbolic link of the user this runs as (uid %d), but users other than root and uid %d can rename entries in %s, on its path (owner uid %d, mode %04o), and so may have given it this name; name the directory it leads to instead", given, name, euid, euid, parent, owner, perm)
+				}
+				// The pathname checks may have inspected a replacement after this
+				// walk opened a directory. Apply the same rule to the pinned
+				// ancestry that supplied the link, not just its current name.
+				for at, label := len(dirs)-1, resolved; at >= 0; at, label = at-1, filepath.Dir(label) {
+					info, err := fstatDir(dirs[at], label)
+					if err != nil {
+						return nil, fmt.Errorf("refusing %s: failed to check the opened directory holding symbolic link %s: %w", given, name, err)
+					}
+					owner := fileUID(info)
+					writable := info.Mode().Perm()&0o022 != 0
+					stickyAncestor := at < len(dirs)-1 && info.Mode()&os.ModeSticky != 0
+					if (owner != 0 && owner != euid) || (writable && !stickyAncestor) {
+						return nil, fmt.Errorf("refusing %s: %s is a symbolic link of the user this runs as (uid %d), but its opened directory ancestry at %s permits another user to name it (owner uid %d, mode %04o); name the directory it leads to instead", given, name, euid, label, owner, info.Mode().Perm())
+					}
+				}
+			default:
 				next = append(next, step{link: name, linkUID: uid})
 			}
 			steps = append(next, steps...)

@@ -131,14 +131,27 @@ on the way to it, may be a symbolic link only when the link belongs to root, to 
 an operator who is not root, or a user's own `~/Maildir -> ~/mail/Maildir` does. A link of root or
 of the user running `sora-admin` leads only where that user could name directly. A user who can
 replace `~/Maildir` could otherwise point it at another user's maildir and have that read into the
-account. Any other link makes the import refuse to start, naming the link, its owner and the
-directory it leads to, before the `sora-maildir.db` cache is created; name that directory itself
-to import it. A link's owner says who made it, not who gave it its name, so where users may
-hard-link a file they do not own (macOS and the BSDs, and Linux with `fs.protected_hardlinks = 0`)
+account. A link of the user running `sora-admin`, when that user is not root, is followed only
+from a directory that belongs to root or to that user and that its group and others may not
+write, sticky bit or not, below directories no other user can rename entries in: each of those
+must belong to root or to that user, and others may write in it only where the sticky bit is set
+(as on `/tmp`), the rule for the directories above the cache
+([section 8](#8-the-sqlite-cache-sora-maildirdb)). So `/tmp/ops/alice`, in the operator's own
+`0755` directory, is followed, and `/tmp/alice` is not: the sticky bit keeps other users from
+renaming the operator's link, not from creating an entry, so one of them could have moved a
+link of the operator's to `/tmp/alice` from a directory they can write, or hard-linked one there.
+This holds whether or not the system protects hard links, since moving the link needs none.
+Otherwise another user could have moved the link there, or kept a hard link to it, and given it
+the name the path reaches. Any other link makes the import refuse to start, naming the link, its
+owner and the directory it leads to (for the running user's link, the directory others can
+create or rename entries in), before the `sora-maildir.db` cache is created; name that directory
+itself to import it. A link's owner says who made it, not who gave it its name, so where users
+may hard-link a file they do not own (macOS and the BSDs, and Linux with
+`fs.protected_hardlinks = 0`)
 a link with more than one name is refused as well: `ln -P /var/mail/bob ~/Maildir` would otherwise
 pass as root's link. The import sees only the names a link has when it runs: on such a system, a
-hard link a user made earlier to root's link (or to a link of the user running `sora-admin`, or to
-another user's link to their own maildir) has one name again once that original name is removed
+hard link a user made earlier to root's link (or to another user's link to their own maildir)
+has one name again once that original name is removed
 (root deletes `/var/mail/bob`, or bob replaces his link), and it is then followed as the link of
 its owner. Where users may make such links, name the maildir's own directory, with no link on the
 way, as `--maildir-path` (or `--sieve`). These are
@@ -343,7 +356,8 @@ Very large UIDVALIDITY values in the uidlist are truncated to 32 bits.
 imported. If the file does not exist, it is ignored with a log line.
 
 The file is read through its directory, opened under the same rule for links on the way to it
-as `--maildir-path` ([section 3](#3-the-maildir-layout-sora-reads)): with `~/sieve` a link the user
+as `--maildir-path` ([section 3](#3-the-maildir-layout-sora-reads)), the condition on the
+directory holding a link of the user running `sora-admin` included: with `~/sieve` a link the user
 made to another user's directory, the script is not imported and the summary names the link. The
 usual file from Dovecot, the user's
 `~/.dovecot.sieve`, is a symbolic link the user owns, so a link is followed only when it is
@@ -709,7 +723,8 @@ runs with more privileges, so message and Dovecot contents and Maildir child dir
 it are accessed through the opened target directory. `--maildir-path` itself, or a directory on
 the way to it, may be a symbolic link under the import's rule
 ([section 3](#3-the-maildir-layout-sora-reads)): only when the link belongs to root, to the user
-running `sora-admin`, or to the owner of the directory it leads to. A user who can replace
+running `sora-admin` (from a directory only root or that user may write, when that user is not
+root), or to the owner of the directory it leads to. A user who can replace
 `~/Maildir`, or a directory above it, could
 otherwise point it at another user's maildir or home and have the account's mail, Dovecot files
 and `sora-maildir.db` written there. Any other link makes the export refuse to start, naming the
