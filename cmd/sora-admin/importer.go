@@ -1712,9 +1712,9 @@ func openLinkCheckedRoot(path string, mode rootWalk) (*os.Root, error) {
 	}
 
 	// A step is a name to walk to, which may be missing when create says so (and is
-	// then created, or ends a preview), or, after the target of a link that is not
-	// root's, the check that the directory the target reached belongs to the link's
-	// owner.
+	// then created, or ends a preview), or, after the target of a link that is
+	// neither root's nor the running user's, the check that the directory the target
+	// reached belongs to the link's owner.
 	type step struct {
 		name    string
 		create  bool
@@ -1838,9 +1838,11 @@ func openLinkCheckedRoot(path string, mode rootWalk) (*os.Root, error) {
 			// root's /var/mail/bob, or bob's own link to his maildir, ~/Maildir.
 			// Only the names the link has now are seen: one alice made earlier has
 			// a single name again once /var/mail/bob is removed, or bob replaces his
-			// link, and is then followed as its owner's. Telling it apart would need
-			// a rule on who may write the directory holding the link; the operator can
-			// name the directory itself instead (docs/IMPORT_EXPORT.md, section 3).
+			// link, and is then followed as its owner's. For root's and the target
+			// owner's links that residual stays (only the running user's links are
+			// also checked for who may write the directory holding them, below); the
+			// operator can name the directory itself instead (docs/IMPORT_EXPORT.md,
+			// section 3).
 			if nlink := uint64(again.st.Nlink); nlink > 1 && !hardLinksProtected() {
 				return nil, fmt.Errorf("refusing %s: %s is a symbolic link with %d names, and on this system any user may have given it this one with a hard link; name the directory it leads to instead", given, name, nlink)
 			}
