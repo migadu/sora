@@ -79,7 +79,7 @@ func testMaildirReservedLevelsRoundTrip(t *testing.T, mailboxes []string) {
 	// Remove export tracking DB before simulating import into a fresh account (or let
 	// scanMaildir populate fresh rows; exporter never called recordExport so messages
 	// table is empty).
-	assert.False(t, isMaildirFolder(filepath.Join(root, "Projects")),
+	assert.False(t, isMaildirFolder(os.DirFS(root), "Projects"),
 		"intermediate directory Projects (for Projects/new without mailbox Projects) must not be misdetected as a Maildir folder")
 
 	importer := newTestModeImporter(t, root, newMockResilientDatabase(), ImporterOptions{
