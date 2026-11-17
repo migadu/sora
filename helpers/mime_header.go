@@ -14,8 +14,24 @@ type mimeHeaderValue struct {
 
 // parseMIMEHeader follows the MIME token/quoted-string grammar, including RFC
 // 822 comments between tokens in both type and disposition fields (RFC 2183 §2
-// and RFC 2045 verified erratum 2586).
+// and RFC 2045 verified erratum 2586). A failed plain disposition filename may
+// be retried with unambiguous internal spaces quoted in a temporary copy.
 func parseMIMEHeader(raw string, contentType bool) mimeHeaderValue {
+	v := parseMIMEHeaderStrict(raw, contentType)
+	if contentType || v.complete || !v.invalid["filename"] {
+		return v
+	}
+	if repaired, ok := validateRecoveredFilename(raw); ok {
+		if recovered := parseMIMEHeaderStrict(repaired, false); recovered.complete {
+			return recovered
+		}
+	}
+	// Keep independently valid parameters and RFC 2231 alternatives when a
+	// filename repair would be ambiguous or another parameter remains invalid.
+	return v
+}
+
+func parseMIMEHeaderStrict(raw string, contentType bool) mimeHeaderValue {
 	v := mimeHeaderValue{params: make(map[string]string), invalid: make(map[string]bool), complete: true}
 	s := mimeHeaderScanner{rest: raw}
 	if !s.skipCFWS() {
