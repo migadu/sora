@@ -12,7 +12,6 @@ import (
 	"strings"
 
 	"github.com/emersion/go-message"
-	"github.com/emersion/go-message/mail"
 	"github.com/k3a/html2text"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
@@ -29,13 +28,19 @@ func stripBase64DataURIs(html string) string {
 	return dataURIRegex.ReplaceAllString(html, "[embedded-image]")
 }
 
+const maxFTSMIMEDepth = 32
+
 func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 	if msg == nil {
 		return nil, fmt.Errorf("nil message entity")
 	}
 
-	mr := mail.NewReader(msg)
-	defer mr.Close()
+	var readers []message.MultipartReader
+	defer func() {
+		for i := len(readers) - 1; i >= 0; i-- {
+			readers[i].Close()
+		}
+	}()
 
 	var plaintextBody, htmlBody *string
 	// Text parts whose Content-Type parameters do not parse, read without
@@ -44,39 +49,67 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 	var lenientPlain, lenientHTML *string
 	var skippedParts []string // Track reasons for skipped parts (for debugging)
 
+	next := msg
 	for plaintextBody == nil {
-		part, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		} else if message.IsUnknownEncoding(err) {
-			// go-message reports an unknown Content-Transfer-Encoding (e.g.
-			// "7bit <center>") per part, without the part; the reader goes on
-			// to the next one.
-			skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
-			continue
-		} else if message.IsUnknownCharset(err) {
-			// The part comes with its body not converted from the charset, which
-			// is still its best text: it is read as the single-part form is, and
-			// as PREVIEW reads it. go-message reports only the charset when the
-			// transfer encoding is unknown too, so check that it was decoded.
-			switch transferEncodingMechanism(part.Header.Get("Content-Transfer-Encoding")) {
-			case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
-			default:
+		var part *message.Entity
+		var err error
+		if next != nil {
+			part = next
+			next = nil
+		} else {
+			if len(readers) == 0 {
+				break
+			}
+			top := readers[len(readers)-1]
+			part, err = top.NextPart()
+			if err == io.EOF {
+				top.Close()
+				readers = readers[:len(readers)-1]
+				continue
+			} else if message.IsUnknownEncoding(err) {
+				// go-message reports an unknown Content-Transfer-Encoding (e.g.
+				// "7bit <center>") per part; the multipart reader goes on to the
+				// next one.
 				skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
 				continue
+			} else if message.IsUnknownCharset(err) {
+				// The part comes with its body not converted from the charset, which
+				// is still its best text: it is read as the single-part form is, and
+				// as PREVIEW reads it. Its transfer encoding is checked below along
+				// with single-part messages.
+			} else if err != nil {
+				// A broken multipart (malformed part header, missing boundary or
+				// missing close delimiter) cannot yield more parts of its own, but
+				// popping it lets its parent advance to later sibling parts, matching
+				// MessagePreview.
+				skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
+				top.Close()
+				readers = readers[:len(readers)-1]
+				continue
 			}
-		} else if err != nil {
-			// After any other NextPart() error (a malformed part header or
-			// boundary) the multipart reader cannot yield more parts. Rather than
-			// failing the entire extraction, we keep whatever plaintext/HTML we
-			// collected from earlier parts.
-			// This is acceptable because plaintext extraction is best-effort for FTS.
-			skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
-			break
 		}
 
-		header, ok := part.Header.(*mail.InlineHeader)
-		if !ok {
+		header := part.Header
+		partType, _, _ := header.ContentType()
+		if strings.HasPrefix(partType, "multipart/") {
+			if len(readers) < maxFTSMIMEDepth {
+				if mr := part.MultipartReader(); mr != nil {
+					readers = append(readers, mr)
+				}
+			}
+			continue
+		}
+		// A single-part entity arrives without a NextPart error, and go-message
+		// reports only the charset error when both charset and encoding are
+		// unknown. Check every leaf so undecoded bytes are never indexed.
+		switch transferEncodingMechanism(header.Get("Content-Transfer-Encoding")) {
+		case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
+		default:
+			skippedParts = append(skippedParts, fmt.Sprintf("unsupported Content-Transfer-Encoding: %q", header.Get("Content-Transfer-Encoding")))
+			continue
+		}
+
+		if disp, _, _ := header.ContentDisposition(); disp != "inline" && (disp == "attachment" || !strings.HasPrefix(partType, "text/")) {
 			continue
 		}
 
