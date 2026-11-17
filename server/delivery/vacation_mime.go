@@ -134,7 +134,8 @@ func validateVacationMIME(header message.Header, body io.Reader, defaultType str
 		if encoding == "quoted-printable" || encoding == "base64" {
 			return fmt.Errorf("invalid multipart transfer encoding %q", encoding)
 		}
-		reader := textproto.NewMultipartReader(body, params["boundary"])
+		mpBody := newVacationMultipartBoundaryReader(body, params["boundary"])
+		reader := textproto.NewMultipartReader(mpBody, params["boundary"])
 		childDefault := "text/plain"
 		if mediaType == "multipart/digest" {
 			childDefault = "message/rfc822" // RFC 2046 §5.1.5
@@ -157,9 +158,11 @@ func validateVacationMIME(header message.Header, body io.Reader, defaultType str
 			return fmt.Errorf("multipart entity has no body parts")
 		}
 		// NextPart stops at the final boundary. Drain the remaining source so
-		// its identity transfer encoding also constrains the epilogue.
-		_, err = io.Copy(io.Discard, body)
-		return err
+		// boundary framing and identity transfer encoding constrain the tail.
+		if _, err := io.Copy(io.Discard, mpBody); err != nil {
+			return err
+		}
+		return mpBody.finish()
 	}
 	// Charsets do not affect transfer-encoding validity and need no conversion.
 	if encoding == "quoted-printable" {
@@ -186,6 +189,175 @@ func validVacationMIMEBoundary(boundary string) bool {
 		return false
 	}
 	return true
+}
+
+type vacationMultipartState uint8
+
+const (
+	vacationMPBody vacationMultipartState = iota
+	vacationMPCR
+	vacationMPLineStart
+	vacationMPAfterBoundary
+	vacationMPOneDash
+	vacationMPDelimiterPadding
+	vacationMPDelimiterCR
+	vacationMPClosePadding
+	vacationMPCloseCR
+	vacationMPClosed
+)
+
+// Enforce strict RFC 2046 §5.1.1 boundary delimiter and close-delimiter wire
+// syntax without buffering the entity body. go-message's MultipartReader
+// tolerates malformed incoming boundaries (such as trailing non-LWSP bytes
+// after --boundary-- or bare-LF delimiters in binary multiparts).
+type vacationMultipartBoundaryReader struct {
+	reader       io.Reader
+	dashBoundary []byte
+	state        vacationMultipartState
+	match        int
+	parts        int
+	bareLF       bool
+	err          error
+}
+
+func newVacationMultipartBoundaryReader(body io.Reader, boundary string) *vacationMultipartBoundaryReader {
+	return &vacationMultipartBoundaryReader{
+		reader:       body,
+		dashBoundary: []byte("--" + boundary),
+		state:        vacationMPLineStart,
+	}
+}
+
+func (r *vacationMultipartBoundaryReader) Read(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+	n, err := r.reader.Read(p)
+	for _, b := range p[:n] {
+		if stepErr := r.step(b); stepErr != nil {
+			r.err = stepErr
+			return 0, stepErr
+		}
+	}
+	if err == io.EOF {
+		if finishErr := r.finish(); finishErr != nil {
+			r.err = finishErr
+			return 0, finishErr
+		}
+	}
+	return n, err
+}
+
+func (r *vacationMultipartBoundaryReader) step(b byte) error {
+	switch r.state {
+	case vacationMPClosed:
+		return nil
+	case vacationMPBody:
+		if b == '\r' {
+			r.state = vacationMPCR
+		} else if b == '\n' && r.parts == 0 {
+			r.state, r.match, r.bareLF = vacationMPLineStart, 0, true
+		}
+	case vacationMPCR:
+		if b == '\n' {
+			r.state, r.match, r.bareLF = vacationMPLineStart, 0, false
+		} else if b != '\r' {
+			r.state = vacationMPBody
+		}
+	case vacationMPLineStart:
+		if b == r.dashBoundary[r.match] {
+			r.match++
+			if r.match == len(r.dashBoundary) {
+				r.state = vacationMPAfterBoundary
+			}
+		} else if b == '\r' {
+			r.state = vacationMPCR
+		} else if b == '\n' && r.parts == 0 {
+			r.state, r.match, r.bareLF = vacationMPLineStart, 0, true
+		} else {
+			r.state = vacationMPBody
+		}
+	case vacationMPAfterBoundary:
+		switch b {
+		case '-':
+			r.state = vacationMPOneDash
+		case ' ', '\t':
+			if r.bareLF {
+				return fmt.Errorf("bare LF before multipart boundary")
+			}
+			r.state = vacationMPDelimiterPadding
+		case '\r':
+			if r.bareLF {
+				return fmt.Errorf("bare LF before multipart boundary")
+			}
+			r.state = vacationMPDelimiterCR
+		case '\n':
+			return fmt.Errorf("bare LF in multipart boundary")
+		default:
+			r.state = vacationMPBody
+		}
+	case vacationMPOneDash:
+		switch b {
+		case '-':
+			if r.bareLF {
+				return fmt.Errorf("bare LF before multipart boundary")
+			}
+			if r.parts == 0 {
+				return fmt.Errorf("multipart entity has no body parts")
+			}
+			r.state = vacationMPClosePadding
+		case '\r':
+			r.state = vacationMPCR
+		case '\n':
+			if r.parts == 0 {
+				r.state, r.match, r.bareLF = vacationMPLineStart, 0, true
+			} else {
+				r.state = vacationMPBody
+			}
+		default:
+			r.state = vacationMPBody
+		}
+	case vacationMPDelimiterPadding:
+		if b == '\r' {
+			r.state = vacationMPDelimiterCR
+		} else if b != ' ' && b != '\t' {
+			return fmt.Errorf("invalid multipart boundary delimiter")
+		}
+	case vacationMPDelimiterCR:
+		if b != '\n' {
+			return fmt.Errorf("invalid multipart boundary delimiter")
+		}
+		r.parts++
+		r.state, r.match, r.bareLF = vacationMPLineStart, 0, false
+	case vacationMPClosePadding:
+		if b == '\r' {
+			r.state = vacationMPCloseCR
+		} else if b != ' ' && b != '\t' {
+			return fmt.Errorf("invalid multipart close-delimiter")
+		}
+	case vacationMPCloseCR:
+		if b != '\n' {
+			return fmt.Errorf("invalid multipart close-delimiter")
+		}
+		r.state = vacationMPClosed
+	}
+	return nil
+}
+
+func (r *vacationMultipartBoundaryReader) finish() error {
+	if r.err != nil {
+		return r.err
+	}
+	if r.parts == 0 {
+		return fmt.Errorf("multipart entity has no body parts")
+	}
+	if r.state != vacationMPClosed && r.state != vacationMPClosePadding {
+		return fmt.Errorf("invalid multipart close-delimiter")
+	}
+	return nil
 }
 
 // Validate one bounded wire line before exposing any of its original bytes.
