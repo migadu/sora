@@ -93,3 +93,27 @@ func TestExtractRawMessageIDFromBytesDegraded(t *testing.T) {
 		t.Fatalf("expected nil when Message-ID only appears in body, got %q", *none)
 	}
 }
+
+// Folding keeps each physical line below RFC 5322's limit; the total field body
+// still has no 16 KiB protocol limit. A later duplicate field must also survive.
+func TestMessageIDRawRetainsLongFoldedFieldsAndLaterDuplicates(t *testing.T) {
+	const tail = "TailNeedleBeyondSixteenKiB"
+	value := "(" + strings.Repeat(strings.Repeat("x", 900)+"\r\n ", 20) + tail + ") <long@example.com>"
+	raw := "From: a@example.com\r\nMessage-ID: " + value + "\r\nMessage-ID: <later@example.com>\r\n\r\nbody\r\n"
+	e, err := message.Read(strings.NewReader(raw))
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsedID, _ := (mail.Header{Header: e.Header}).MessageID()
+	for name, got := range map[string]*string{
+		"structured": ExtractMessageIDRaw(e.Header, parsedID),
+		"degraded":   ExtractRawMessageIDFromBytes([]byte(raw)),
+	} {
+		if got == nil || !strings.Contains(*got, tail) || !strings.Contains(*got, "<later@example.com>") {
+			t.Errorf("%s lost the tail of a valid folded field or a later duplicate", name)
+		}
+	}
+	if got := SanitizeMessageIDRaw(&value); !strings.Contains(*got, tail) {
+		t.Error("storage sanitizer silently truncated the field")
+	}
+}
