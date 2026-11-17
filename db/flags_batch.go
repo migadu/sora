@@ -48,7 +48,7 @@ func filterConditionalFlagIDs(ids []int64, idToUID map[int64]imap.UID, modSeqs m
 // current mod-sequence. Callers hold the mailbox lock (lockMailboxStats), which
 // every flag writer takes, so that mod-sequence is still the message's own when
 // their UPDATE runs: it is the PrevModSeq of the write.
-func (db *Database) resolveMessageIDsBatch(ctx context.Context, tx pgx.Tx, mailboxID int64, messageUIDs []imap.UID) (map[int64]imap.UID, []int64, map[int64]int64, error) {
+func (db *Database) resolveMessageIDsBatch(ctx context.Context, tx pgx.Tx, mailboxID int64, messageUIDs []imap.UID, unchangedSince ...uint64) (map[int64]imap.UID, []int64, map[int64]int64, error) {
 	if len(messageUIDs) == 0 {
 		return nil, nil, nil, nil
 	}
@@ -81,7 +81,8 @@ func (db *Database) resolveMessageIDsBatch(ctx context.Context, tx pgx.Tx, mailb
 		idToUID[id] = imap.UID(uid)
 		modSeqs[id] = modSeq
 		messageIDs = append(messageIDs, id)
-		if missingState {
+		// A rejected conditional STORE must leave even the missing state unchanged.
+		if missingState && (len(unchangedSince) == 0 || uint64(modSeq) <= unchangedSince[0]) {
 			statelessIDs = append(statelessIDs, id)
 		}
 	}
@@ -159,7 +160,7 @@ func (db *Database) setMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		return nil, err
 	}
 
-	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
+	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs, unchangedSince...)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
 	}
@@ -268,7 +269,7 @@ func (db *Database) AddMessageFlagsBatch(ctx context.Context, tx pgx.Tx, message
 		return nil, err
 	}
 
-	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
+	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs, unchangedSince...)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
 	}
@@ -394,7 +395,7 @@ func (db *Database) RemoveMessageFlagsBatch(ctx context.Context, tx pgx.Tx, mess
 		return nil, err
 	}
 
-	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs)
+	idToUID, messageIDs, prevModSeqs, err := db.resolveMessageIDsBatch(ctx, tx, mailboxID, messageUIDs, unchangedSince...)
 	if err != nil || len(messageIDs) == 0 {
 		return nil, err
 	}
