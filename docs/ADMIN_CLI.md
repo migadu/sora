@@ -641,10 +641,10 @@ sora-admin --config config.toml messages repair-references --apply
   has a value for cannot be filled: it is counted and stays as it is.
 - The summary line gives the rows checked, how many have no stored References, how many can be
   filled and how many cannot. With `--apply` it also gives how many were filled.
-- Each batch is read in one statement through the read pool (a replica, when `[database.read]`
-  has one), then with `--apply` filled in one short transaction on the primary. It holds no
-  session state, so it runs through PgBouncer in transaction mode, and it can run while the
-  servers are serving mail.
+- The admin CLI skips configured read replicas: each batch is read from the primary in one
+  statement, then with `--apply` filled in one short primary transaction. `[database.read]`
+  does not redirect this command. It holds no session state, so it runs through PgBouncer in
+  transaction mode, and it can run while the servers are serving mail.
 - At most every 10 seconds, and when it fails, it prints the id to pass to `--start-after`. It
   is safe to run again: a filled row is not counted again. A message restored later with
   `messages restore` gets the value its expunged row had, so run the command again after
@@ -652,32 +652,6 @@ sora-admin --config config.toml messages repair-references --apply
 - The query scans message IDs in batches and looks for a same-hash donor for each candidate.
   Its plan and cost depend on the table statistics and batch arguments. The dry run uses the
   same read queries as `--apply`, so its elapsed time measures the read part on that database.
-
-### messages repair-header-presence
-
-Fills in the stored `header_presence` bitmask of live messages that have none (`NULL`). Messages
-stored before migration 000070 (and messages copied, moved, or restored from them) keep `NULL`
-`header_presence`, so empty `SEARCH HEADER From/To/Cc ""` and `FROM/TO/CC ""` use legacy
-predicates and match messages without the header.
-
-```sh
-sora-admin --config config.toml messages repair-header-presence
-sora-admin --config config.toml messages repair-header-presence --from-s3 --apply
-```
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--apply` | `false` | Fill the rows that can be filled. Without it, only count them and change nothing. |
-| `--from-s3` | `false` | Read RFC 5322 headers from S3 for uploaded rows that have no database donor. |
-| `--batch-size` | `1000` | Message rows read per batch. |
-| `--start-after` | `0` | Resume after this message id. |
-
-- Without `--from-s3`, uses only PostgreSQL and fills live `NULL` rows from another row with the
-  same `content_hash` whose `header_presence` is known.
-- With `--from-s3`, opens the S3 object for uploaded rows without a database donor, reads only
-  up to the blank line terminating the RFC 5322 header block, and records the exact bitmask.
-- Updates do not bump `modseq` or alter any other message or mailbox metadata, and each batch is
-  committed independently so `--start-after` can resume an interrupted run safely.
 
 ---
 
@@ -772,7 +746,7 @@ sora-admin --config config.toml verify s3 --email user@example.com --show-missin
 | `--email` | | The account (required). Its domain and local part also form the S3 prefix that is listed. Use the primary address. |
 | `--show-missing` | `false` | List every missing, orphaned and corrupt key. |
 | `--deep` | `false` | Download, decrypt and BLAKE3-hash every object. Slow: it transfers all of the account's mail. |
-| `--fix-orphaned` | `false` | Delete S3 objects under the prefix that no message uses, expunged or not. |
+| `--fix-orphaned` | `false` | Delete S3 objects under the prefix that no message (expunged or not, in any account) or pending upload uses. Requires `[s3] body_deletion_protocol = "global-hash-v1"` unless `--dry-run` is set. |
 | `--fix-missing` | `false` | Set `uploaded = false` on live messages whose object is missing. |
 | `--dry-run` | `false` | With the `--fix-*` flags, report and change nothing. |
 | `--batch-size` | `1000` | Messages per batch in the database-to-S3 pass. |
@@ -781,9 +755,9 @@ It runs two passes:
 
 1. **Database to S3.** Every live (not expunged) message's key gets a HEAD request; with
    `--deep`, the full body is also downloaded and checked.
-2. **S3 to database.** Every object under `domain/localpart/` of `--email` is looked up among all
-   message rows that reference it, expunged or not and in any account. Objects that no row uses
-   are reported as orphaned.
+2. **S3 to database.** Every object under canonical `domain/localpart/` of `--email` is looked up
+   among all message rows that reference it (expunged or not, and in any account) and all pending
+   uploads of its content hash. Objects that nothing references are reported as orphaned.
 
 Things to know before you use the fix flags:
 

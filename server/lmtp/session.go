@@ -303,22 +303,6 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	s.DebugLog("processing rcpt to command", "to", to)
 
-	// go-smtp refuses the RCPT parameters it knows but has not enabled (NOTIFY, ORCPT,
-	// RRVS) with 555; EnableRCPTExtensions, set for XRCPTFORWARD, hands every other one
-	// here. Refuse those the backend does not implement the same way, before the
-	// recipient is looked up. RFC 5321 section 4.1.1.11: "If the server SMTP does not
-	// recognize or cannot implement one or more of the parameters associated with a
-	// particular MAIL FROM or RCPT TO command, it will return code 555."
-	if param := unsupportedRcptParameter(opts); param != "" {
-		s.InfoLog("RCPT refused for an unknown parameter", "parameter", param)
-		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         555,
-			EnhancedCode: smtp.EnhancedCode{5, 5, 4},
-			Message:      "Unknown RCPT parameter",
-		}
-	}
-
 	toAddress, err := server.NewAddress(to)
 	if err != nil {
 		s.WarnLog("invalid to address", "error", err)
@@ -974,23 +958,16 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// reported as absent (db.InsertMessageOptions.SentDate).
 	s.DebugLog("message sent date", "sent_date", sentDate)
 
-	var plaintextBody *string
-	plaintextBodyResult, extractErr := helpers.ExtractPlaintextBody(messageContent)
+	plaintextBody, extractErr := helpers.FTSPlaintextBody(messageContent)
 	if extractErr != nil {
 		// Plaintext extraction had errors but may have succeeded partially.
 		// Log the issues for debugging malformed MIME (invalid Content-Type, truncated parts, etc.)
 		s.DebugLog("plaintext extraction encountered errors", "error", extractErr)
 	}
-	if plaintextBodyResult == nil {
-		// No plaintext or HTML body found in the message; use empty string fallback for FTS.
-		emptyStr := new(string)
-		plaintextBody = emptyStr
-	} else {
-		plaintextBody = plaintextBodyResult
-	}
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
 	headerPresence := helpers.ExtractHeaderPresence(messageContent.Header)
+	messageIDRaw := helpers.ExtractMessageIDRaw(messageContent.Header, messageID)
 
 	// Classify and extract the final stored MIME once, after editheader, and
 	// reuse both results for every destination. The structure
@@ -1090,7 +1067,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	for _, dest := range resolvedDestinations {
 		mailboxNames = append(mailboxNames, dest.Mailbox)
 		err = s.saveMessageToMailbox(ctx, dest.Target, fullMessageBytes, contentHash, deliveryHash,
-			subject, messageID, sentDate, sentDateUnknownZone, inReplyTo, references, bodyStructure, plaintextBody, recipients, headerPresence, storedFlags(dest.Destination))
+			subject, messageID, sentDate, sentDateUnknownZone, inReplyTo, references, bodyStructure, plaintextBody, recipients, headerPresence, messageIDRaw, storedFlags(dest.Destination))
 		if err == nil {
 			continue
 		}
@@ -1302,7 +1279,7 @@ func (s *LMTPSession) handleVacationResponse(ctx context.Context, reply sieveeng
 func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMailbox,
 	fullMessageBytes []byte, contentHash string, deliveryHash string, subject string, messageID string,
 	sentDate time.Time, sentDateUnknownZone bool, inReplyTo []string, references []string, bodyStructure *imap.BodyStructure,
-	plaintextBody *string, recipients []helpers.Recipient, headerPresence *int16,
+	plaintextBody string, recipients []helpers.Recipient, headerPresence *int16, messageIDRaw *string,
 	flags []imap.Flag) error {
 
 	// Create a context for read operations that respects session pinning
@@ -1349,7 +1326,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMa
 			InternalDate:        time.Now(),
 			Size:                size,
 			Subject:             subject,
-			PlaintextBody:       *plaintextBody,
+			PlaintextBody:       plaintextBody,
 			SentDate:            sentDate,
 			SentDateUnknownZone: sentDateUnknownZone,
 			InReplyTo:           inReplyTo,
@@ -1357,6 +1334,7 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMa
 			BodyStructure:       bodyStructure,
 			Recipients:          recipients,
 			HeaderPresence:      headerPresence,
+			MessageIDRaw:        messageIDRaw,
 			Flags:               flags, // Sieve-set flags (imap4flags) plus the attachment keyword; no \Seen -> unread
 			FTSRetention:        s.backend.ftsRetention,
 		},

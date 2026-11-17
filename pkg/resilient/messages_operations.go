@@ -184,9 +184,16 @@ var destObjectKeepalive = 30 * time.Second
 // move with a *DestObjectError, which the write circuit breaker does not count and the
 // retry does not repeat (the S3 calls retry on their own). A statement keeps the
 // transaction alive at least every destObjectKeepalive.
+//
+// A fresh complete-source preflight under account-rekey guards refuses an
+// oversized cross-account command before destination locks or storage callbacks.
+// This also counts legacy rows already owned by the destination.
 func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(ctx context.Context, contentHash string) error) (map[imap.UID]imap.UID, error) {
 	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
-		if len(destObjects) > 0 {
+		if err := rd.getOperationalDatabaseForOperation(opCtx, true).CheckCopyMoveBodyBudget(opCtx, tx, srcMailboxID, destMailboxID, destAccountID, ids, destObjects); err != nil {
+			return nil, err
+		}
+		if srcMailboxID != destMailboxID && len(destObjects) > 0 {
 			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
 				return nil, err
 			}
@@ -199,7 +206,7 @@ func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]i
 		}
 		return rd.getOperationalDatabaseForOperation(opCtx, true).MoveMessages(opCtx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, sourceHashes, destObjects)
 	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op, db.ErrCrossAccountBodyLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -436,32 +443,6 @@ func (rd *ResilientDatabase) FindNullReferencesWithRetry(ctx context.Context, af
 func (rd *ResilientDatabase) FillNullReferencesWithRetry(ctx context.Context, fills []db.ReferencesFill) (int64, error) {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, true).FillNullReferences(ctx, tx, fills)
-	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
-	if err != nil {
-		return 0, err
-	}
-	return result.(int64), nil
-}
-
-// FindNullHeaderPresenceWithRetry reads one batch of messages for the header_presence
-// repair (see db.FindNullHeaderPresence).
-func (rd *ResilientDatabase) FindNullHeaderPresenceWithRetry(ctx context.Context, afterID int64, limit int) (db.NullHeaderPresenceBatch, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).FindNullHeaderPresence(ctx, afterID, limit)
-	}
-	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
-	if err != nil {
-		return db.NullHeaderPresenceBatch{}, err
-	}
-	return result.(db.NullHeaderPresenceBatch), nil
-}
-
-// FillNullHeaderPresenceWithRetry writes resolved header_presence masks for one batch in a
-// short primary transaction (see db.FillNullHeaderPresence).
-func (rd *ResilientDatabase) FillNullHeaderPresenceWithRetry(ctx context.Context, fills []db.HeaderPresenceFill) (int64, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).FillNullHeaderPresence(ctx, tx, fills)
 	}
 	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
 	if err != nil {

@@ -111,6 +111,16 @@ CREATE DATABASE sora_mail_db OWNER sora ENCODING 'UTF8' TEMPLATE template0;
 - **`idle_in_transaction_session_timeout`**: if you set it, keep it well above one minute. Some
   of Sora's transactions stay open on purpose while they hold a lock across an S3 call, and
   run a statement at least every minute to stay alive (see [section 8](#8-pgbouncer-and-other-connection-poolers)).
+- **`max_locks_per_transaction`**: PostgreSQL has room for `max_locks_per_transaction` ×
+  (`max_connections` + `max_prepared_transactions`) locks for the whole server, advisory locks
+  included; once they are used up, every session fails with `out of shared memory` (SQLSTATE
+  `53200`). A batch of the cleanup cycle holds up to 1,000 advisory locks, and an IMAP `COPY` or
+  `MOVE` with any row handed to another owner is limited to 1,000 distinct source bodies,
+  including selected legacy rows already owned by the destination. Matching global source
+  and destination claims coalesce; body claims plus FTS locks consume at most 2,000 entries
+  for that command. Source-account guards and ordinary SQL locks are additional. Pure
+  same-owner commands retain their existing uncapped body-admission policy. This is not a
+  server-wide capacity guarantee: leave headroom for other lock classes and concurrent work.
 
 ---
 
@@ -786,11 +796,21 @@ an older source message has none. Missing source state is represented by empty
 flags and keywords, matching the source's existing displayed state. Delivery,
 APPEND, imports and restore also create state for their newly inserted rows.
 
+Explicit IMAP STORE and User API flag-write requests initialize missing state
+only for the live messages they target, then apply the requested mutation. This
+does not recover lost historical flags. Reads, SELECT and background work do not
+repair missing state, and no historical backfill command or scan is provided.
+
 This is a forward-only repair after all writers have been upgraded. Existing
 messages without state are left unchanged; their historical SEARCH UNSEEN,
-STATUS counts and flag-update inconsistencies are not repaired. There is no
+STATUS counts remain unchanged until an explicit flag-write targets them. There is no
 historical backfill, backfill migration or startup scan for this change. Older
 writers and transactions started before upgrade can still create missing rows.
+
+New APPENDs whose structured MIME parsing is degraded still record searchable
+header presence from their raw header block. This applies only to the new
+ingress row; legacy NULL masks remain unknown, with no scan, S3 read or repair
+command to populate historical rows.
 
 ### Import body admission connections
 
@@ -813,3 +833,19 @@ using a fresh source read after locking; delivery can still stage quarantined by
 without declaring them uploaded. S3 import inserts and marks a stored body uploaded
 in one transaction. Rekey old-body deletion uses the durable intent protocol, not
 just a held advisory lock. Historical inconsistent rows are not automatically repaired.
+
+### Raw Message-ID field text for newly ingested messages
+
+Migration 73 adds nullable `message_id_raw` and a partial mailbox index. New
+APPEND, LMTP delivery and imports retain the complete unfolded Message-ID field
+text when normalization alone would lose comments, malformed or empty values,
+quoted local parts, domain literals or duplicate fields. Canonical single IDs use
+the existing normalized value and store NULL in the new column. Whole-ID searches
+keep the existing equality index; noncanonical rows use the partial mailbox index.
+
+This is forward only. Existing rows are not scanned or backfilled, and COPY, MOVE
+and restore carry the stored value or NULL without reading historical bodies.
+Legacy NULL rows retain their prior normalized search behavior. For large tables,
+follow the preparation and rollback instructions in the migration 73 SQL files;
+the automatic migration refuses blocking DDL above 25,000 rows if preparation is
+incomplete.

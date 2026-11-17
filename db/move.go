@@ -15,12 +15,43 @@ import (
 	"github.com/migadu/sora/logger"
 )
 
+// MaxCrossAccountBodies bounds all distinct source bodies when any selected row
+// is rekeyed to another account, including legacy rows already owned by the
+// destination. Source/destination global body claims and FTS locks remain held
+// through commit. Their budget excludes source-account and ordinary SQL locks,
+// and concurrent commands still need shared lock-table capacity. Pure same-owner
+// commands retain their existing policy. COPY cannot be split into partial commits.
+const MaxCrossAccountBodies = 1000
+
+// ErrCrossAccountBodyLimit refuses an oversized cross-account source budget.
+// Account guards may be held for a fresh check, but no body lock, storage callback
+// or message write has started.
+var ErrCrossAccountBodyLimit = fmt.Errorf("a copy or move into another account's mailbox is limited to %d distinct source bodies", MaxCrossAccountBodies)
+
+// CheckCrossAccountBodies checks a protocol preflight map containing every selected
+// source UID when any row is rekeyed. The actual write transaction repeats the
+// complete-source check under account-rekey guards. Repeated bodies count once.
+func CheckCrossAccountBodies(sourceHashes map[imap.UID]string) error {
+	if len(sourceHashes) <= MaxCrossAccountBodies {
+		return nil
+	}
+	bodies := make(map[string]struct{}, MaxCrossAccountBodies+1)
+	for _, hash := range sourceHashes {
+		bodies[hash] = struct{}{}
+		if len(bodies) > MaxCrossAccountBodies {
+			return ErrCrossAccountBodyLimit
+		}
+	}
+	return nil
+}
+
 // LockS3ObjectsSharedInTx takes the S3 object locks (GetS3ObjectLockID) of accountID's
 // contentHashes in shared mode on tx, in id order, waiting for an exclusive holder (for at
 // most the transaction's lock_timeout). They last until tx ends. Shared holders do not
-// exclude one another; they keep out every exclusive locker of the same objects: the
-// cleaner's and the purge's deletes (which only try the lock and skip a busy object), a
-// restore, sora-admin rekey, and the uploader's write gate.
+// exclude one another; they keep out the exclusive holders used by typed durable
+// body cleanup (the cleaner and purge skip a busy object). Restore, rekey admission and the uploader gate share
+// immutable claims. Each lock consumes a lock-table entry until tx ends; callers
+// budget their batches, including the complete-source COPY/MOVE check.
 //
 // The statement carries the ids as literals, so it goes over the simple protocol and
 // leaves no portal or snapshot behind: a transaction that holds the locks across S3 round
@@ -89,7 +120,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		logger.Info("Database: moving messages within the same mailbox, will assign new UIDs", "mailbox_id", srcMailboxID)
 	}
 
-	if err := lockS3SourceClaims(ctx, tx, srcMailboxID, ids); err != nil {
+	if err := lockS3SourceClaims(ctx, tx, srcMailboxID, destMailboxID, destAccountID, ids, destObjects); err != nil {
 		return nil, err
 	}
 
@@ -100,6 +131,13 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// mailboxes cannot deadlock (A->B and B->A lock the same rows in the same order).
 	if err := lockMailboxStatsPair(ctx, tx, srcMailboxID, destMailboxID); err != nil {
 		return nil, fmt.Errorf("failed to lock mailbox stats for move on mailboxes %d and %d: %w", srcMailboxID, destMailboxID, err)
+	}
+	var srcWindow *ModSeqWindow
+	if srcMailboxID != destMailboxID {
+		srcWindow = modSeqWindowFor(ctx, srcMailboxID)
+	}
+	if err := srcWindow.begin(ctx, tx); err != nil {
+		return nil, err
 	}
 	window := modSeqWindowFor(ctx, destMailboxID)
 	if err := window.begin(ctx, tx); err != nil {
@@ -142,7 +180,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		// The row is locked now, so its hash is the one the INSERT below copies: a row
 		// re-keyed to the owner must still have the hash the caller made its body
 		// available for under the owner's key (sourceHashes).
-		if sourceAccountID != destAccountID && contentHash != sourceHashes[sourceUID] {
+		if srcMailboxID != destMailboxID && sourceAccountID != destAccountID && contentHash != sourceHashes[sourceUID] {
 			return nil, fmt.Errorf("%w: UID %d", ErrMoveSourceChanged, sourceUID)
 		}
 		messageIDs = append(messageIDs, messageID)
@@ -218,7 +256,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					m.account_id, m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
 					m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 					m.body_structure, m.recipients_json, m.s3_domain, m.s3_localpart,
-					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses, m.header_presence,
+					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses, m.header_presence, m.message_id_raw,
 					m.id AS original_id,
 					d.new_uid
 				FROM messages m
@@ -229,14 +267,14 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence, message_id_raw,
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence, message_id_raw,
 					$1 AS mailbox_id,
 					$2 AS mailbox_path,
 					nextval('messages_modseq') AS created_modseq,
@@ -274,7 +312,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					m.content_hash, m.uploaded, m.message_id, m.in_reply_to, m."references",
 					m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 					m.body_structure, m.recipients_json,
-					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses, m.header_presence,
+					m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses, m.header_presence, m.message_id_raw,
 					m.id AS original_id,
 					m.account_id AS src_account_id, m.s3_domain AS src_s3_domain, m.s3_localpart AS src_s3_localpart,
 					d.new_uid,
@@ -287,7 +325,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					account_id, content_hash, uploaded, message_id, in_reply_to, "references",
 					subject, sent_date, sent_utc_offset, sent_date_unknown, internal_date, size,
 					body_structure, recipients_json, s3_domain, s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence, message_id_raw,
 					mailbox_id, mailbox_path, created_modseq, uid
 				)
 				SELECT
@@ -302,7 +340,7 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 					-- (destObjects, above).
 					CASE WHEN src_account_id = $6 THEN src_s3_domain ELSE $7 END AS s3_domain,
 					CASE WHEN src_account_id = $6 THEN src_s3_localpart ELSE $8 END AS s3_localpart,
-					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence,
+					subject_sort, from_name_sort, from_email_sort, to_name_sort, to_email_sort, cc_email_sort, extra_addresses, header_presence, message_id_raw,
 					$1 AS mailbox_id,
 					$2 AS mailbox_path,
 					nextval('messages_modseq') AS created_modseq,
@@ -330,10 +368,8 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	if err := db.restagePendingUploads(ctx, tx, destMailboxID, keptUIDs, rekeyedUIDs, instanceID); err != nil {
 		return nil, err
 	}
-	if len(rekeyedUIDs) > 0 {
-		if err := db.restageFTS(ctx, tx, destMailboxID, newUIDs); err != nil {
-			return nil, err
-		}
+	if err := db.restageFTS(ctx, tx, destMailboxID, rekeyedUIDs); err != nil {
+		return nil, err
 	}
 
 	// Mark the original messages as expunged in the source mailbox
@@ -353,6 +389,9 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 		}
 	}
 
+	if err := srcWindow.end(ctx, tx); err != nil {
+		return nil, err
+	}
 	if err := window.end(ctx, tx); err != nil {
 		return nil, err
 	}

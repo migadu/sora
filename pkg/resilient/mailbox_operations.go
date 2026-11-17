@@ -566,11 +566,19 @@ func (rd *ResilientDatabase) ResolveAccountS3Owner(ctx context.Context, accountI
 // not commit, so nil is returned.
 // Destination object preparation follows MOVE's one-transaction contract: acquire
 // shared locks before S3 work, keep that transaction alive during the checks, and
-// give the row writes their own timeout afterwards. No lock handover is needed.
+// give the row writes their own timeout afterwards. No lock handover is needed. As
+// for MOVE, a fresh complete-source preflight under account-rekey guards refuses
+// an oversized cross-account command before destination locks or storage callbacks.
 func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(context.Context, string) error) (map[imap.UID]imap.UID, []int64, error) {
+	if srcMailboxID == destMailboxID {
+		return nil, nil, fmt.Errorf("source and destination mailboxes cannot be the same")
+	}
 	var capturedUIDMap map[imap.UID]imap.UID
 	var capturedIDs []int64
 	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
+		if err := rd.getOperationalDatabaseForOperation(opCtx, true).CheckCopyMoveBodyBudget(opCtx, tx, srcMailboxID, destMailboxID, destAccountID, uids, destObjects); err != nil {
+			return nil, err
+		}
 		if len(destObjects) > 0 {
 			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
 				return nil, err
@@ -590,7 +598,7 @@ func (rd *ResilientDatabase) CopyMessagesWithRetry(ctx context.Context, uids *[]
 		capturedIDs = ids
 		return uidMap, nil
 	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op, db.ErrCrossAccountBodyLimit)
 	if err != nil {
 		if errors.Is(err, ErrCommitOutcomeUnknown) {
 			// Hand back the in-flight capture so the caller can resolve the ambiguity.

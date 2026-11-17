@@ -209,4 +209,74 @@ func TestModSeqWindowSpansOneWrite(t *testing.T) {
 			assert.Greater(t, w.After, w.Before)
 		})
 	}
+
+	t.Run("MoveMessagesMeasuresSourceAndDestinationWindows", func(t *testing.T) {
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		uid, err := insert(ctx, tx, inboxID, "INBOX")
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+
+		srcBefore := getHighestModSeq(t, db, ctx, inboxID)
+		destBefore := getHighestModSeq(t, db, ctx, destID)
+		srcWin := &ModSeqWindow{MailboxID: inboxID}
+		destWin := &ModSeqWindow{MailboxID: destID}
+
+		moveTx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer moveTx.Rollback(ctx)
+		wctx := WithModSeqWindow(WithModSeqWindow(ctx, srcWin), destWin)
+		_, err = db.MoveMessages(wctx, moveTx, &[]imap.UID{uid}, inboxID, destID, accountID, "example.com", "modseqwindow", "test", nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, moveTx.Commit(ctx))
+
+		assert.True(t, srcWin.Measured)
+		assert.Equal(t, srcBefore, srcWin.Before)
+		assert.Equal(t, getHighestModSeq(t, db, ctx, inboxID), srcWin.After)
+		assert.Greater(t, srcWin.After, srcWin.Before)
+
+		assert.True(t, destWin.Measured)
+		assert.Equal(t, destBefore, destWin.Before)
+		assert.Equal(t, getHighestModSeq(t, db, ctx, destID), destWin.After)
+		assert.Greater(t, destWin.After, destWin.Before)
+	})
+
+	t.Run("RemoveMessageFlagsBatchChainsWindow", func(t *testing.T) {
+		parent := &ModSeqWindow{MailboxID: destID}
+		wctx := WithModSeqWindow(ctx, parent)
+		destBefore := getHighestModSeq(t, db, ctx, destID)
+
+		// Copy a message with \Seen into destID, then strip \Seen via ChainModSeqWindow.
+		tx1, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx1.Rollback(ctx)
+		srcUID, err := insert(ctx, tx1, inboxID, "INBOX")
+		require.NoError(t, err)
+		_, _, err = db.AddMessageFlags(ctx, tx1, srcUID, inboxID, []imap.Flag{imap.FlagSeen})
+		require.NoError(t, err)
+		require.NoError(t, tx1.Commit(ctx))
+
+		tx2, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx2.Rollback(ctx)
+		uidMap, _, err := db.CopyMessages(wctx, tx2, &[]imap.UID{srcUID}, inboxID, destID, accountID, "example.com", "modseqwindow", "test", nil, nil)
+		require.NoError(t, err)
+		require.NoError(t, tx2.Commit(ctx))
+		afterCopy := parent.After
+		assert.Greater(t, afterCopy, destBefore)
+
+		stripCtx, chain := ChainModSeqWindow(wctx, destID)
+		tx3, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx3.Rollback(ctx)
+		_, err = db.RemoveMessageFlagsBatch(stripCtx, tx3, []imap.UID{uidMap[srcUID]}, destID, []imap.Flag{imap.FlagSeen})
+		require.NoError(t, err)
+		require.NoError(t, tx3.Commit(ctx))
+		chain()
+
+		assert.Equal(t, destBefore, parent.Before)
+		assert.Equal(t, getHighestModSeq(t, db, ctx, destID), parent.After)
+		assert.Greater(t, parent.After, afterCopy)
+	})
 }

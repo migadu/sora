@@ -16,6 +16,10 @@ import (
 // purgeDomain purges all accounts for a given domain
 // It's resumable - accounts already purged are skipped
 func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
+	if err := cfg.S3.RequireBodyDeletionProtocol(); err != nil {
+		return err
+	}
+
 	// Connect to resilient database
 	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
@@ -29,6 +33,9 @@ func purgeDomain(ctx context.Context, cfg AdminConfig, domain string) error {
 // purgeDomainWithStorage is purgeDomain on a given database and storage. If s3Storage is
 // nil, each account's purge creates it from cfg.
 func purgeDomainWithStorage(ctx context.Context, cfg AdminConfig, rdb *resilient.ResilientDatabase, domain string, s3Storage objectStorage) error {
+	if err := cfg.S3.RequireBodyDeletionProtocol(); err != nil {
+		return err
+	}
 	fmt.Printf("Scanning for accounts in domain: %s\n\n", domain)
 
 	// Get all accounts for this domain

@@ -249,7 +249,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		// turning a name no message can have into Message-ID or In-Reply-To.
 		lowerKey := lowerASCII(header.Key)
 		if header.Value == "" {
-			if bit, supported := helpers.HeaderPresenceBit(lowerKey); supported && header.IsHeader {
+			// RFC 9051 §6.4.4 / §7.5.2: an absent Subject: header makes the ENVELOPE
+			// SUBJECT member NIL, whereas a present Subject: (even empty) is a string.
+			// SUBJECT "" (IsHeader == false) therefore shares Subject: header presence.
+			if bit, supported := helpers.HeaderPresenceBit(lowerKey); supported && (header.IsHeader || lowerKey == "subject") {
 				param := nextParam()
 				args[param] = ""
 				old := emptyHeaderLegacyCond(datePrefix, lowerKey, "@"+param)
@@ -271,20 +274,31 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			args[param] = lowerValue
 			conditions = append(conditions, substringCond(fmt.Sprintf("LOWER(%ssubject)", datePrefix), "@"+param))
 		case "message-id":
-			// Match substrings of the normalized Message-ID. Raw field text and
-			// exact header presence are not retained in message_id (see #529).
-			// Preserve the indexed equality lookup for ordinary whole-ID terms;
-			// other terms read this mailbox's rows, since the covering header
-			// index does not contain message_id.
-			param := nextParam()
-			if id, ok := wholeMessageIDTerm(lowerValue); ok {
-				args[param] = id
-				conditions = append(conditions, fmt.Sprintf("LOWER(%smessage_id) = @%s", datePrefix, param))
+			// Canonical single-ID messages store NULL in message_id_raw and serve whole
+			// bracketed-ID searches via idx_messages_message_id; messages with comments,
+			// empty/malformed values, quoted local-parts, domain-literal brackets, or
+			// multiple Message-ID fields store unfolded field text in message_id_raw
+			// (indexed via idx_messages_mailbox_message_id_raw) (#529).
+			if strings.ContainsAny(lowerValue, "\r\n") {
+				conditions = append(conditions, "FALSE")
 				break
 			}
+			if id, ok := wholeMessageIDTerm(lowerValue); ok {
+				eqParam := nextParam()
+				args[eqParam] = id
+				rawParam := nextParam()
+				args[rawParam] = lowerValue
+				conditions = append(conditions, fmt.Sprintf(
+					"((%smessage_id_raw IS NULL AND LOWER(%smessage_id) = @%s) OR (%smessage_id_raw IS NOT NULL AND %s))",
+					datePrefix, datePrefix, eqParam,
+					datePrefix, substringCond(fmt.Sprintf("LOWER(%smessage_id_raw)", datePrefix), "@"+rawParam)))
+				break
+			}
+			param := nextParam()
 			args[param] = lowerValue
-			// Synthetic IDs yield NULL; turn it into FALSE before NOT/OR.
-			conditions = append(conditions, "COALESCE("+substringCond(messageIDFieldExpr(datePrefix+"message_id"), "@"+param)+", FALSE)")
+			rawOrNormalized := fmt.Sprintf("COALESCE(LOWER(%smessage_id_raw), %s)", datePrefix, messageIDFieldExpr(datePrefix+"message_id"))
+			// Absent headers (message_id_raw IS NULL and synthetic message_id) yield NULL; turn into FALSE before NOT/OR.
+			conditions = append(conditions, "COALESCE("+substringCond(rawOrNormalized, "@"+param)+", FALSE)")
 		case "in-reply-to", "references":
 			// Both headers hold message IDs, which threading clients search with
 			// the angle brackets they are written with. The columns store the IDs

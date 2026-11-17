@@ -14,6 +14,10 @@ func TestDestructiveBodyCommandsDefaultPausedBeforeIO(t *testing.T) {
 	cfg := AdminConfig{}
 	err := purgeAccountWithStorage(context.Background(), cfg, nil, 1, "user@example.com", nil)
 	require.ErrorIs(t, err, config.ErrS3BodyDeletionPaused)
+	err = purgeDomain(context.Background(), cfg, "example.com")
+	require.ErrorIs(t, err, config.ErrS3BodyDeletionPaused)
+	err = purgeDomainWithStorage(context.Background(), cfg, nil, "example.com", nil)
+	require.ErrorIs(t, err, config.ErrS3BodyDeletionPaused)
 	err = verifyS3Storage(context.Background(), cfg, "user@example.com", false, true, false, false, 1, false)
 	require.ErrorIs(t, err, config.ErrS3BodyDeletionPaused)
 	report, err := rekeyAccount(context.Background(), nil, nil, 1, rekeyOptions{DeleteOldObjects: true})

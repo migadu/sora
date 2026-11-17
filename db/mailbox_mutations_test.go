@@ -34,6 +34,22 @@ func TestMailboxMutationResults(t *testing.T) {
 		return state
 	}
 
+	t.Run("ghost subscription mutations carry database name keys", func(t *testing.T) {
+		const name = "Absent/Key"
+		var key string
+		require.NoError(t, d.GetWritePool().QueryRow(ctx, "SELECT LOWER($1::text)", name).Scan(&key))
+		sub := changeSub(name, true)
+		require.True(t, sub.Changed)
+		require.Zero(t, sub.Mailbox.ID)
+		require.Equal(t, key, sub.NameKey)
+		noop := changeSub(name, true)
+		require.False(t, noop.Changed)
+		require.Equal(t, key, noop.NameKey)
+		unsub := changeSub(name, false)
+		require.True(t, unsub.Changed)
+		require.Zero(t, unsub.Mailbox.ID)
+		require.Equal(t, key, unsub.NameKey)
+	})
 	t.Run("creation identity and initial state do not adopt later subscription", func(t *testing.T) {
 		created := create("Original", nil)
 		require.True(t, created.Visible)
@@ -135,7 +151,7 @@ func TestMailboxMutationResults(t *testing.T) {
 		tx, err := d.GetWritePool().Begin(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
-		changes, err := d.RenameMailboxReturningNames(ctx, tx, parent.ID, accountID, "RenamedTree", nil)
+		changes, err := d.RenameMailboxReturningNames(ctx, tx, parent.ID, accountID, accountID, "RenamedTree", nil)
 		require.NoError(t, err)
 		require.NoError(t, tx.Commit(ctx))
 		byID := make(map[int64]MailboxNameMutation)
@@ -145,14 +161,52 @@ func TestMailboxMutationResults(t *testing.T) {
 		require.Len(t, byID, 2)
 		require.Equal(t, "Tree", byID[parent.ID].BeforeName)
 		require.Equal(t, "RenamedTree", byID[parent.ID].AfterName)
+		require.False(t, byID[parent.ID].SubscribedSet, "owner rename keeps prior snapshot subscription state")
 		require.Equal(t, child.Name, byID[child.ID].BeforeName)
 		require.Equal(t, "RenamedTree/Kid", byID[child.ID].AfterName)
+		require.False(t, byID[child.ID].SubscribedSet)
 		var key string
 		require.NoError(t, d.GetWritePool().QueryRow(ctx, "SELECT LOWER($1::text)", "RenamedTree/Kid").Scan(&key))
 		require.Equal(t, key, byID[child.ID].AfterKey)
 		got, err := d.GetMailboxByName(ctx, accountID, "RenamedTree/Kid")
 		require.NoError(t, err)
 		require.True(t, got.Subscribed)
+	})
+	t.Run("non-owner rename records viewer subscription on destination names", func(t *testing.T) {
+		viewerTx, err := d.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer viewerTx.Rollback(ctx)
+		viewerEmail := fmt.Sprintf("viewer_%d@example.com", time.Now().UnixNano())
+		viewerID, err := d.CreateAccount(ctx, viewerTx, CreateAccountRequest{
+			Email: viewerEmail, Password: "password", IsPrimary: true, HashType: "bcrypt",
+		})
+		require.NoError(t, err)
+		require.NoError(t, d.Subscribe(ctx, viewerTx, viewerID, "NonOwnerSrc"))
+		require.NoError(t, d.Subscribe(ctx, viewerTx, viewerID, "NonOwnerDst/GhostChild"))
+		require.NoError(t, viewerTx.Commit(ctx))
+
+		srcParent := create("NonOwnerSrc", nil)
+		srcChild := create("NonOwnerSrc/GhostChild", &srcParent.ID)
+
+		tx, err := d.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		changes, err := d.RenameMailboxReturningNames(ctx, tx, srcParent.ID, accountID, viewerID, "NonOwnerDst", nil)
+		require.NoError(t, err)
+		require.NoError(t, tx.Commit(ctx))
+
+		byID := make(map[int64]MailboxNameMutation)
+		for _, c := range changes {
+			byID[c.ID] = c
+		}
+		require.Len(t, byID, 2)
+		require.True(t, byID[srcParent.ID].SubscribedSet)
+		var parentSubscribed, childSubscribed bool
+		require.NoError(t, d.GetWritePool().QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=$1 AND LOWER(mailbox_name)=LOWER($2::text))", viewerID, "NonOwnerDst").Scan(&parentSubscribed))
+		require.False(t, parentSubscribed, "viewer's subscription stayed on NonOwnerSrc")
+		require.True(t, byID[srcChild.ID].SubscribedSet)
+		require.NoError(t, d.GetWritePool().QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=$1 AND LOWER(mailbox_name)=LOWER($2::text))", viewerID, "NonOwnerDst/GhostChild").Scan(&childSubscribed))
+		require.True(t, childSubscribed, "viewer already held a subscription on NonOwnerDst/GhostChild")
 	})
 }
 

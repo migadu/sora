@@ -26,7 +26,6 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
-	"github.com/migadu/sora/pkg/sqlitefile"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 	_ "modernc.org/sqlite"
@@ -73,6 +72,7 @@ type S3Importer struct {
 	rdb     s3ImportDB
 	db      *sql.DB
 	dbPath  string
+	tempDir *privateTempDir
 	options S3ImporterOptions
 
 	// user is the account the import is for. Run looks it up once (lookupAccount),
@@ -106,6 +106,23 @@ type S3ObjectInfo struct {
 // and a worker that commits while another does waits up to 5 seconds for the lock.
 const s3ImportDBParams = "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)"
 
+// s3ImportDBName is the name of the work database in the directory createS3ImportDir
+// makes for the run.
+const s3ImportDBName = "sora-s3-import.db"
+
+// mkdirTemp is os.MkdirTemp, replaceable in tests to model another user who renames
+// entries of the temporary directory the moment the run's directory appears in it.
+var mkdirTemp = os.MkdirTemp
+
+// createS3ImportDir creates and opens a confined 0700 directory for a run's work
+// database inside the resolved temporary directory (newPrivateTempDir), refusing any
+// TMPDIR or ancestor in which other users could rename entries, opening the new
+// directory without following links, and confining SQLite access and --cleanup-db
+// unlinking to that directory descriptor.
+func createS3ImportDir() (*privateTempDir, error) {
+	return newPrivateTempDir("sora-s3-import-*", s3ImportDBName, "the S3 import's work database")
+}
+
 // NewS3Importer creates a new S3Importer instance
 func NewS3Importer(ctx context.Context, rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, options S3ImporterOptions) (*S3Importer, error) {
 	// importFromS3 runs on exactly this many workers: with none it would never drain its queue.
@@ -115,27 +132,28 @@ func NewS3Importer(ctx context.Context, rdb *resilient.ResilientDatabase, s3 *st
 	// Wrap S3 storage with resilient patterns
 	resilientS3 := resilient.NewResilientS3Storage(s3)
 	// Create temporary SQLite database to track S3 objects. Every run gets a file of its
-	// own, created exclusively and readable by its owner only (os.CreateTemp): importFromS3
-	// imports every row in it into this run's account, so a run must never open another's.
-	f, err := os.CreateTemp(os.TempDir(), "sora-s3-import-*.db")
+	// own, in a directory of its own (createS3ImportDir), created exclusively and readable
+	// by its owner only: importFromS3 imports every row in it into this run's account, so
+	// a run must never open another's.
+	tempDir, err := createS3ImportDir()
 	if err != nil {
-		return nil, fmt.Errorf("failed to create temporary database: %w", err)
+		return nil, err
 	}
-	dbPath := f.Name()
-	if err := f.Close(); err != nil {
-		os.Remove(dbPath)
+	dbPath := filepath.Join(tempDir.path, s3ImportDBName)
+	if err := tempDir.createExclusiveDB(0600); err != nil {
+		_ = tempDir.cleanup()
 		return nil, fmt.Errorf("failed to create temporary database: %w", err)
 	}
 	logger.Info("Using temporary database", "path", dbPath)
 
-	dsn, err := sqlitefile.DSN(dbPath, s3ImportDBParams)
+	dsn, err := tempDir.sqliteDSN("mode=rw&" + s3ImportDBParams)
 	if err != nil {
-		os.Remove(dbPath)
+		_ = tempDir.cleanup()
 		return nil, err
 	}
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
-		os.Remove(dbPath)
+		_ = tempDir.cleanup()
 		return nil, fmt.Errorf("failed to open sqlite db: %w", err)
 	}
 
@@ -161,7 +179,7 @@ func NewS3Importer(ctx context.Context, rdb *resilient.ResilientDatabase, s3 *st
 	`)
 	if err != nil {
 		db.Close()
-		os.Remove(dbPath)
+		_ = tempDir.cleanup()
 		return nil, fmt.Errorf("failed to create s3_objects table: %w", err)
 	}
 
@@ -171,6 +189,7 @@ func NewS3Importer(ctx context.Context, rdb *resilient.ResilientDatabase, s3 *st
 		rdb:       rdb,
 		db:        db,
 		dbPath:    dbPath,
+		tempDir:   tempDir,
 		options:   options,
 		startTime: time.Now(),
 	}, nil
@@ -180,15 +199,26 @@ func NewS3Importer(ctx context.Context, rdb *resilient.ResilientDatabase, s3 *st
 func (si *S3Importer) Close() error {
 	if si.db != nil {
 		if err := si.db.Close(); err != nil {
+			if si.tempDir != nil {
+				_ = si.tempDir.closeDir()
+				si.tempDir = nil
+			}
 			return fmt.Errorf("failed to close s3 importer database: %w", err)
 		}
-		if si.options.CleanupDB {
-			logger.Info("Cleaning up temporary database", "path", si.dbPath)
-			if err := os.Remove(si.dbPath); err != nil {
-				return fmt.Errorf("failed to remove temporary database file: %w", err)
+		if si.tempDir != nil {
+			tempDir := si.tempDir
+			si.tempDir = nil
+			if si.options.CleanupDB {
+				logger.Info("Cleaning up temporary database", "path", tempDir.path)
+				if err := tempDir.cleanup(); err != nil {
+					return fmt.Errorf("failed to remove temporary database: %w", err)
+				}
+			} else {
+				if err := tempDir.closeDir(); err != nil {
+					return fmt.Errorf("failed to close temporary database directory: %w", err)
+				}
+				logger.Info("Temporary database saved", "path", si.dbPath)
 			}
-		} else {
-			logger.Info("Temporary database saved", "path", si.dbPath)
 		}
 	}
 	return nil
@@ -666,10 +696,9 @@ func (si *S3Importer) importStoredBody(ctx context.Context, obj S3ObjectInfo, us
 		bodyStructure = fallback
 	}
 
-	extractedPlaintext, err := helpers.ExtractPlaintextBody(messageContent)
-	var actualPlaintextBody string
-	if err == nil && extractedPlaintext != nil {
-		actualPlaintextBody = *extractedPlaintext
+	actualPlaintextBody, extractErr := helpers.FTSPlaintextBody(messageContent)
+	if extractErr != nil {
+		logger.Debug("Plaintext extraction encountered errors", "key", obj.Key, "error", extractErr)
 	}
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
@@ -711,6 +740,7 @@ func (si *S3Importer) importStoredBody(ctx context.Context, obj S3ObjectInfo, us
 			BodyStructure:       &bodyStructure,
 			Recipients:          recipients,
 			HeaderPresence:      helpers.ExtractHeaderPresence(messageContent.Header),
+			MessageIDRaw:        helpers.ExtractMessageIDRaw(messageContent.Header, messageID),
 			FTSRetention:        si.options.FTSRetention,
 		},
 		db.PendingUpload{
