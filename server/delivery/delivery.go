@@ -237,13 +237,13 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	}
 
 	// Extract plaintext body for FTS. A message with no text/plain or text/html part
-	// (attachment only) yields no text and no error; it is delivered with an empty
-	// body, as LMTP and APPEND do.
-	plaintextBody, err := helpers.ExtractPlaintextBody(messageEntity)
-	if err != nil || plaintextBody == nil {
-		emptyBody := ""
-		plaintextBody = &emptyBody
+	// (attachment only) is delivered with an empty body; one with a part the
+	// extraction had to skip keeps the text of the others, as with LMTP and APPEND.
+	bodyText, extractErr := helpers.FTSPlaintextBody(messageEntity)
+	if extractErr != nil {
+		d.Logger.Log("Plaintext extraction encountered errors: %v", extractErr)
 	}
+	plaintextBody := &bodyText
 
 	// Parse message metadata
 	mailHeader := mail.Header{Header: messageEntity.Header}

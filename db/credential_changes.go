@@ -3,9 +3,19 @@ package db
 import (
 	"context"
 	"fmt"
-	"github.com/jackc/pgx/v5"
+	"slices"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+// CredentialChangeEvent is one visible credential_changes row at a statement snapshot.
+type CredentialChangeEvent struct {
+	ID        int64
+	AccountID int64
+	WriterXID int64
+	Removed   bool
+}
 
 // CredentialChanges is the visible primary feed at one statement snapshot.
 type CredentialChanges struct {
@@ -17,6 +27,7 @@ type CredentialChanges struct {
 	NextCursor int64
 	Accounts   []int64
 	Removed    []int64
+	Events     []CredentialChangeEvent
 }
 
 // GetCredentialChangesSince reads ALL currently visible events whose writing
@@ -28,23 +39,74 @@ func (d *Database) GetCredentialChangesSince(ctx context.Context, cursor int64) 
 	if cursor < 0 {
 		return CredentialChanges{}, fmt.Errorf("invalid credential change cursor: %d", cursor)
 	}
-	var c CredentialChanges
-	err := d.GetWritePool().QueryRow(ctx, `
+	rows, err := d.GetWritePool().Query(ctx, `
   WITH boundary AS MATERIALIZED (
    SELECT statement_timestamp() AS read_at,
           pg_snapshot_xmin(pg_current_snapshot())::text::bigint AS next_cursor
   )
-  SELECT b.read_at, b.next_cursor,
-         COALESCE(array_agg(DISTINCT c.account_id ORDER BY c.account_id) FILTER (WHERE c.id IS NOT NULL), '{}'),
-         COALESCE(array_agg(DISTINCT c.account_id ORDER BY c.account_id) FILTER (WHERE c.ends_sessions AND NOT EXISTS (
-          SELECT 1 FROM accounts a WHERE a.id=c.account_id AND a.deleted_at IS NULL)), '{}')
+  SELECT b.read_at,
+         b.next_cursor,
+         c.id,
+         c.account_id,
+         c.writer_xid,
+         CASE WHEN c.ends_sessions THEN NOT EXISTS (
+          SELECT 1 FROM accounts a WHERE a.id=c.account_id AND a.deleted_at IS NULL
+         ) ELSE FALSE END
   FROM boundary b
   LEFT JOIN credential_changes c ON c.writer_xid >= $1
-  GROUP BY b.read_at,b.next_cursor
- `, cursor).Scan(&c.ReadAt, &c.NextCursor, &c.Accounts, &c.Removed)
+  ORDER BY c.id
+ `, cursor)
 	if err != nil {
 		return CredentialChanges{}, fmt.Errorf("failed to read credential changes: %w", err)
 	}
+	defer rows.Close()
+
+	c := CredentialChanges{
+		Accounts: []int64{},
+		Removed:  []int64{},
+	}
+	hasBoundary := false
+	for rows.Next() {
+		var (
+			readAt     time.Time
+			nextCursor int64
+			id         *int64
+			accountID  *int64
+			writerXID  *int64
+			removed    bool
+		)
+		if err := rows.Scan(&readAt, &nextCursor, &id, &accountID, &writerXID, &removed); err != nil {
+			return CredentialChanges{}, fmt.Errorf("failed to read credential changes: %w", err)
+		}
+		if !hasBoundary {
+			c.ReadAt = readAt
+			c.NextCursor = nextCursor
+			hasBoundary = true
+		}
+		if id != nil {
+			ev := CredentialChangeEvent{
+				ID:        *id,
+				AccountID: *accountID,
+				WriterXID: *writerXID,
+				Removed:   removed,
+			}
+			c.Events = append(c.Events, ev)
+			c.Accounts = append(c.Accounts, ev.AccountID)
+			if ev.Removed {
+				c.Removed = append(c.Removed, ev.AccountID)
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return CredentialChanges{}, fmt.Errorf("failed to read credential changes: %w", err)
+	}
+	if !hasBoundary {
+		return CredentialChanges{}, fmt.Errorf("failed to read credential changes: empty snapshot boundary")
+	}
+	slices.Sort(c.Accounts)
+	c.Accounts = slices.Compact(c.Accounts)
+	slices.Sort(c.Removed)
+	c.Removed = slices.Compact(c.Removed)
 	return c, nil
 }
 

@@ -465,9 +465,14 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 	// Configure XCLIENT support (always enabled)
 	s.EnableXCLIENT = true
 
-	// Configure XRCPTFORWARD support (always enabled)
-	// Enable custom RCPT TO parameters like XRCPTFORWARD
+	// XRCPTFORWARD (always enabled) is the only custom RCPT parameter taken. go-smtp
+	// refuses any other with 555 where it stands among the parameters, so the first
+	// parameter refused decides the reply, as on the LMTP proxy. RFC 5321 section
+	// 4.1.1.11: "If the server SMTP does not recognize or cannot implement one or more
+	// of the parameters associated with a particular MAIL FROM or RCPT TO command, it
+	// will return code 555."
 	s.EnableRCPTExtensions = true
+	s.RCPTExtensions = []string{"XRCPTFORWARD"}
 
 	// SMTPUTF8 (RFC 6531): advertise the extension and accept its MAIL parameter, so an
 	// internationalized envelope (non-ASCII local part, U-label domain) is delivered

@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapclient"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/integration_tests/common"
@@ -130,20 +131,36 @@ func (f *sourceRekeyFixture) startCopy() <-chan error {
 // rekey re-keys the contributor's body as sora-admin import rekey does (moveBody), keeping
 // the old object for readers that still hold the old hash: under the S3 object lock of the
 // new key, write the BLAKE3 object, then move the contributor's rows to it.
-func (f *sourceRekeyFixture) rekey(t *testing.T) {
-	t.Helper()
+func (f *sourceRekeyFixture) rekey() error {
 	rdb := f.server.ResilientDB
-	err := rdb.ExecuteWithS3ObjectLock(context.Background(), f.canonical.ContentHash, f.contributorID, func(ctx context.Context) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// Match the actual rekey writer: its inner SQL admission is shared too.
+	return rdb.ExecuteWithSharedS3ObjectLocks(ctx, f.contributorID, []string{f.canonical.ContentHash}, func(ctx context.Context) error {
 		if err := f.s3.Put(f.canonical.Key(), bytes.NewReader(f.body), int64(len(f.body))); err != nil {
 			return err
 		}
 		rows, err := rdb.RekeyContentHashWithRetry(ctx, f.contributorID, f.legacy, f.canonical.ContentHash)
 		if err == nil && rows != 1 {
-			return fmt.Errorf("re-keyed %d rows, want 1", rows)
+			return fmt.Errorf("re-keyed %d rows, want1", rows)
 		}
 		return err
 	})
-	require.NoError(t, err, "rekey")
+}
+
+// startBlockedRekey requests a rekey while COPY/MOVE holds its source-account
+// guard. The real PostgreSQL wait proves that the source hash cannot change
+// during storage preparation or the later mailbox wait.
+func (f *sourceRekeyFixture) startBlockedRekey(t *testing.T) <-chan error {
+	t.Helper()
+	done := make(chan error, 1)
+	go func() { done <- f.rekey() }()
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := f.server.ResilientDB.GetDatabase().GetWritePool().QueryRow(context.Background(), `SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND mode='ExclusiveLock' AND database=(SELECT oid FROM pg_database WHERE datname=current_database()) AND classid=$1::bigint::oid AND objid=hashint8($2::bigint)::oid AND objsubid=2)`, int64(consts.SoraContentRekeyLockClassID), f.contributorID).Scan(&waiting)
+		return err == nil && waiting
+	}, 3*time.Second, 10*time.Millisecond, "rekey must wait for the in-flight source-account guard")
+	return done
 }
 
 // checkOwnerCopy checks what a COPY that raced with the rekey left behind
@@ -243,9 +260,10 @@ func (b *copyBarrier) release(t *testing.T) {
 	require.NoError(t, b.tx.Rollback(context.Background()))
 }
 
-// TestCrossAccountCopyOfSourceRekeyedBeforeInsert re-keys the source body after a
+// TestCrossAccountCopyOfSourceRekeyedBeforeInsert requests a rekey after a
 // cross-account COPY made it exist under the owner's key for the old hash and before the
-// COPY inserts its rows (#761). The COPY must not commit a row under the new hash, whose
+// COPY inserts its rows (#761). Current source admission serializes the rekey until
+// COPY ends; it must not commit a row under a new hash whose
 // object under the owner's key nothing wrote.
 func TestCrossAccountCopyOfSourceRekeyedBeforeInsert(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
@@ -259,14 +277,17 @@ func TestCrossAccountCopyOfSourceRekeyedBeforeInsert(t *testing.T) {
 	barrier.waitBlocked(t)
 	require.NotEmpty(t, f.fake.Keys(f.ownerKey(f.legacy.ContentHash)), "the COPY copied the body under the owner's key for the old hash")
 
-	f.rekey(t)
+	rekeyDone := f.startBlockedRekey(t)
 	barrier.release(t)
-	f.checkOwnerCopy(t, <-copyDone)
+	copyErr := <-copyDone
+	require.NoError(t, <-rekeyDone)
+	f.checkOwnerCopy(t, copyErr)
 }
 
-// TestCrossAccountCopyOfSourceRekeyedBeforeObjectCheck re-keys the source body after a
+// TestCrossAccountCopyOfSourceRekeyedBeforeObjectCheck requests a rekey after a
 // cross-account COPY read it and before the COPY checks the owner's object, i.e. before
-// the copy's transaction first reads the source rows. The COPY makes the object exist for
+// the storage check. Its fresh preflight holds the source-account guard, so the
+// rekey waits until COPY ends. The COPY makes the object exist for
 // the hash it read, so it must not commit a row under the new one.
 func TestCrossAccountCopyOfSourceRekeyedBeforeObjectCheck(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
@@ -279,7 +300,9 @@ func TestCrossAccountCopyOfSourceRekeyedBeforeObjectCheck(t *testing.T) {
 	copyDone := f.startCopy()
 	barrier.waitBlocked(t)
 
-	f.rekey(t)
+	rekeyDone := f.startBlockedRekey(t)
 	barrier.release(t)
-	f.checkOwnerCopy(t, <-copyDone)
+	copyErr := <-copyDone
+	require.NoError(t, <-rekeyDone)
+	f.checkOwnerCopy(t, copyErr)
 }

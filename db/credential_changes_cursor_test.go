@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -189,4 +190,97 @@ func TestCredentialChangesSnapshotKeepsPreparedWriterEligible(t *testing.T) {
 	after, err := d.GetCredentialChangesSince(ctx, before.NextCursor)
 	require.NoError(t, err)
 	require.Contains(t, after.Accounts, slowID)
+}
+
+type observedEvent struct {
+	ID        int64
+	AccountID int64
+	WriterXID int64
+	Removed   bool
+}
+
+func extractCredentialChangeEvents(t *testing.T, changes CredentialChanges) []observedEvent {
+	t.Helper()
+	field := reflect.ValueOf(changes).FieldByName("Events")
+	if !field.IsValid() {
+		t.Fatalf("CredentialChanges.Events missing: watcher cannot deduplicate already-applied rows while snapshot xmin is pinned")
+	}
+	out := make([]observedEvent, field.Len())
+	for i := range field.Len() {
+		ev := field.Index(i)
+		out[i] = observedEvent{
+			ID:        ev.FieldByName("ID").Int(),
+			AccountID: ev.FieldByName("AccountID").Int(),
+			WriterXID: ev.FieldByName("WriterXID").Int(),
+			Removed:   ev.FieldByName("Removed").Bool(),
+		}
+	}
+	return out
+}
+
+func TestCredentialChangesPinnedXminExposesDistinctEventIdentities(t *testing.T) {
+	d := setupTestDatabaseWithSuffix(t, "_feed_pinned")
+	defer d.Close()
+	ctx := context.Background()
+
+	accountA, emailA := credentialChangesAccount(t, d, "pinned-a")
+	accountB, emailB := credentialChangesAccount(t, d, "pinned-b")
+
+	pinTx, err := d.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer pinTx.Rollback(ctx)
+	var pinXID int64
+	require.NoError(t, pinTx.QueryRow(ctx, "SELECT pg_current_xact_id()::text::bigint").Scan(&pinXID))
+
+	inTx(t, d, func(tx pgx.Tx) {
+		require.NoError(t, d.UpdateAccount(ctx, tx, UpdateAccountRequest{
+			Email: emailA, Password: "second-password", HashType: "bcrypt",
+		}))
+		require.NoError(t, d.DeleteAccount(ctx, tx, emailB))
+	})
+
+	first, err := d.GetCredentialChangesSince(ctx, 0)
+	require.NoError(t, err)
+	require.LessOrEqual(t, first.NextCursor, pinXID)
+	require.Contains(t, first.Accounts, accountA)
+	require.Contains(t, first.Accounts, accountB)
+	require.Contains(t, first.Removed, accountB)
+	require.NotContains(t, first.Removed, accountA)
+
+	firstEvents := extractCredentialChangeEvents(t, first)
+	var firstAID, firstBID int64
+	for _, ev := range firstEvents {
+		switch ev.AccountID {
+		case accountA:
+			firstAID = ev.ID
+			require.GreaterOrEqual(t, ev.WriterXID, first.NextCursor)
+			require.False(t, ev.Removed)
+		case accountB:
+			firstBID = ev.ID
+			require.GreaterOrEqual(t, ev.WriterXID, first.NextCursor)
+			require.True(t, ev.Removed)
+		}
+	}
+	require.Positive(t, firstAID)
+	require.Positive(t, firstBID)
+
+	inTx(t, d, func(tx pgx.Tx) {
+		require.NoError(t, d.UpdateAccount(ctx, tx, UpdateAccountRequest{
+			Email: emailA, Password: "third-password", HashType: "bcrypt",
+		}))
+	})
+
+	second, err := d.GetCredentialChangesSince(ctx, first.NextCursor)
+	require.NoError(t, err)
+	require.Equal(t, first.NextCursor, second.NextCursor, "open transaction must keep snapshot xmin pinned")
+
+	var accountAEventIDs []int64
+	for _, ev := range extractCredentialChangeEvents(t, second) {
+		if ev.AccountID == accountA {
+			accountAEventIDs = append(accountAEventIDs, ev.ID)
+		}
+	}
+	require.Len(t, accountAEventIDs, 2, "a second password change while xmin is pinned must carry a distinct event ID")
+	require.Contains(t, accountAEventIDs, firstAID)
+	require.Greater(t, accountAEventIDs[1], accountAEventIDs[0])
 }
