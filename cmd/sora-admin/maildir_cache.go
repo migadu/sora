@@ -367,3 +367,147 @@ func notRegularMaildirCache(path string, info fs.FileInfo) error {
 	}
 	return fmt.Errorf("refusing maildir database file %s: it is %s", path, what)
 }
+
+// privateTempDir confines a run's private temporary SQLite directory (used by S3
+// import work databases and export dry-run cache snapshots) from creation through
+// cleanup. Unlike openMaildirCache, which opens an existing operator-selected maildir
+// already checked by openLinkCheckedRoot, a private temporary directory is created by
+// path under TMPDIR: any non-sticky writable or foreign-owned TMPDIR or ancestor lets
+// another local user swap TMPDIR or the newly created directory via rename/symlink
+// regardless of fs.protected_hardlinks.
+type privateTempDir struct {
+	path   string
+	dir    *os.File
+	info   fs.FileInfo
+	dbName string
+}
+
+func newPrivateTempDir(prefix, dbName, purpose string) (*privateTempDir, error) {
+	tmp, err := resolveMaildirDir(os.TempDir())
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary database directory: %w", err)
+	}
+	euid := geteuid()
+	parent, owner, mode, err := renamableParent(filepath.Join(tmp, "probe"), euid)
+	if err != nil {
+		return nil, fmt.Errorf("failed to check where to keep %s: %w", purpose, err)
+	}
+	if parent != "" {
+		return nil, fmt.Errorf("refusing to keep %s in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory or symbolic link of their own in its place; set TMPDIR to a directory that, like every directory above it, only root and uid %d can write, unless it has the sticky bit (as /tmp has)",
+			purpose, tmp, euid, parent, owner, mode, euid)
+	}
+	created, err := mkdirTemp(tmp, prefix)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create temporary database directory: %w", err)
+	}
+	var fd int
+	err = ignoringEINTR(func() (err error) {
+		fd, err = unix.Open(created, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_NOFOLLOW|unix.O_CLOEXEC, 0)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("refusing to keep %s in %s: %w", purpose, created, &fs.PathError{Op: "open", Path: created, Err: err})
+	}
+	dirFile := os.NewFile(uintptr(fd), created)
+	info, err := dirFile.Stat()
+	if err != nil {
+		dirFile.Close()
+		return nil, fmt.Errorf("failed to inspect temporary database directory %s: %w", created, err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.IsDir() || int(st.Uid) != euid || info.Mode().Perm() != 0700 {
+		dirFile.Close()
+		return nil, fmt.Errorf("refusing to keep %s in %s: unexpected directory owner or mode %04o", purpose, created, info.Mode().Perm())
+	}
+	lstatInfo, err := os.Lstat(created)
+	if err != nil || !os.SameFile(info, lstatInfo) {
+		dirFile.Close()
+		if err != nil {
+			return nil, fmt.Errorf("refusing to keep %s in %s: %w", purpose, created, err)
+		}
+		return nil, fmt.Errorf("refusing to keep %s in %s: directory was replaced during creation", purpose, created)
+	}
+	p := &privateTempDir{path: created, dir: dirFile, info: info, dbName: dbName}
+	if parent, owner, mode, err := renamableParent(created, euid); err != nil {
+		_ = p.cleanup()
+		return nil, fmt.Errorf("failed to check where to keep %s: %w", purpose, err)
+	} else if parent != "" {
+		_ = p.cleanup()
+		return nil, fmt.Errorf("refusing to keep %s in %s: users other than uid %d can rename entries of %s above it (owner uid %d, mode %04o), and so put a directory or symbolic link of their own in its place; set TMPDIR to a directory that, like every directory above it, only root and uid %d can write, unless it has the sticky bit (as /tmp has)",
+			purpose, created, euid, parent, owner, mode, euid)
+	}
+	return p, nil
+}
+
+func (p *privateTempDir) createExclusiveDB(mode uint32) error {
+	var fd int
+	err := ignoringEINTR(func() (err error) {
+		fd, err = unix.Openat(int(p.dir.Fd()), p.dbName, unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_NOFOLLOW|unix.O_CLOEXEC, mode)
+		return err
+	})
+	if err != nil {
+		return &fs.PathError{Op: "open", Path: filepath.Join(p.path, p.dbName), Err: err}
+	}
+	return unix.Close(fd)
+}
+
+func (p *privateTempDir) sqliteDSN(params string) (string, error) {
+	if err := registerMaildirCacheVFS(); err != nil {
+		return "", fmt.Errorf("failed to open sqlite db: %w", err)
+	}
+	cachePath, err := maildirCachePath(p.dir, p.path)
+	if err != nil {
+		return "", err
+	}
+	sqlitePath := strings.TrimSuffix(cachePath, maildirCacheName) + p.dbName
+	if params == "" {
+		params = "vfs=" + maildirCacheVFS
+	} else {
+		params = params + "&vfs=" + maildirCacheVFS
+	}
+	return sqlitefile.DSN(sqlitePath, params)
+}
+
+func (p *privateTempDir) closeDir() error {
+	if p == nil || p.dir == nil {
+		return nil
+	}
+	err := p.dir.Close()
+	p.dir = nil
+	return err
+}
+
+func (p *privateTempDir) cleanup() error {
+	if p == nil || p.dir == nil {
+		return nil
+	}
+	var errs []error
+	fd := int(p.dir.Fd())
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		err := ignoringEINTR(func() error {
+			return unix.Unlinkat(fd, p.dbName+suffix, 0)
+		})
+		if err != nil && !errors.Is(err, unix.ENOENT) {
+			errs = append(errs, &fs.PathError{Op: "unlinkat", Path: filepath.Join(p.path, p.dbName+suffix), Err: err})
+		}
+	}
+	dirInfo := p.info
+	if dirInfo == nil {
+		dirInfo, _ = p.dir.Stat()
+	}
+	if err := p.dir.Close(); err != nil {
+		errs = append(errs, err)
+	}
+	p.dir = nil
+	if dirInfo != nil {
+		if lstatInfo, err := os.Lstat(p.path); err == nil && os.SameFile(dirInfo, lstatInfo) {
+			err := ignoringEINTR(func() error {
+				return unix.Rmdir(p.path)
+			})
+			if err != nil && !errors.Is(err, unix.ENOENT) {
+				errs = append(errs, &fs.PathError{Op: "rmdir", Path: p.path, Err: err})
+			}
+		}
+	}
+	return errors.Join(errs...)
+}

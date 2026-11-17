@@ -746,7 +746,7 @@ sora-admin --config config.toml verify s3 --email user@example.com --show-missin
 | `--email` | | The account (required). Its domain and local part also form the S3 prefix that is listed. Use the primary address. |
 | `--show-missing` | `false` | List every missing, orphaned and corrupt key. |
 | `--deep` | `false` | Download, decrypt and BLAKE3-hash every object. Slow: it transfers all of the account's mail. |
-| `--fix-orphaned` | `false` | Delete S3 objects under the prefix that no message uses, expunged or not. |
+| `--fix-orphaned` | `false` | Delete S3 objects under the prefix that no message (expunged or not, in any account) or pending upload uses. Requires `[s3] body_deletion_protocol = "global-hash-v1"` unless `--dry-run` is set. |
 | `--fix-missing` | `false` | Set `uploaded = false` on live messages whose object is missing. |
 | `--dry-run` | `false` | With the `--fix-*` flags, report and change nothing. |
 | `--batch-size` | `1000` | Messages per batch in the database-to-S3 pass. |
@@ -755,9 +755,9 @@ It runs two passes:
 
 1. **Database to S3.** Every live (not expunged) message's key gets a HEAD request; with
    `--deep`, the full body is also downloaded and checked.
-2. **S3 to database.** Every object under `domain/localpart/` of `--email` is looked up among all
-   message rows that reference it, expunged or not and in any account. Objects that no row uses
-   are reported as orphaned.
+2. **S3 to database.** Every object under canonical `domain/localpart/` of `--email` is looked up
+   among all message rows that reference it (expunged or not, and in any account) and all pending
+   uploads of its content hash. Objects that nothing references are reported as orphaned.
 
 Things to know before you use the fix flags:
 

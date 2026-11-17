@@ -448,9 +448,9 @@ func (db *Database) GetAllMessagesForUserVerification(ctx context.Context, accou
 // one that is merely pending two-phase cleanup, rather than misreporting it as an orphan.
 func (db *Database) GetMessagesByContentHash(ctx context.Context, accountID int64, contentHash string) ([]MessageHashInfo, error) {
 	query := `
-		SELECT m.id, m.uid, mb.name as mailbox_path, m.subject, m.uploaded, m.content_hash, (m.expunged_at IS NOT NULL) AS expunged
+		SELECT m.id, m.uid, COALESCE(mb.name, m.mailbox_path, '') as mailbox_path, m.subject, m.uploaded, m.content_hash, (m.expunged_at IS NOT NULL) AS expunged
 		FROM messages m
-		JOIN mailboxes mb ON m.mailbox_id = mb.id
+		LEFT JOIN mailboxes mb ON m.mailbox_id = mb.id
 		WHERE m.account_id = $1 AND m.content_hash = $2
 		ORDER BY m.id
 	`
