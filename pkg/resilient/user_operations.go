@@ -240,6 +240,21 @@ func (rdb *ResilientDatabase) GetMessagesByContentHashWithRetry(ctx context.Cont
 	return result.([]db.MessageHashInfo), nil
 }
 
+// GetMessagesByContentObjectWithRetry retrieves all messages referencing an exact S3 content object with retry logic
+func (rdb *ResilientDatabase) GetMessagesByContentObjectWithRetry(ctx context.Context, accountID int64, obj db.ContentObject) ([]db.MessageHashInfo, error) {
+	config := readRetryConfig
+
+	op := func(ctx context.Context) (any, error) {
+		return rdb.getOperationalDatabaseForOperation(ctx, false).GetMessagesByContentObject(ctx, accountID, obj)
+	}
+
+	result, err := rdb.executeReadWithRetry(ctx, config, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]db.MessageHashInfo), nil
+}
+
 // MarkMessagesAsNotUploadedWithRetry marks messages as not uploaded with retry logic
 func (rdb *ResilientDatabase) MarkMessagesAsNotUploadedWithRetry(ctx context.Context, s3Keys []string) (int64, error) {
 	config := writeRetryConfig
