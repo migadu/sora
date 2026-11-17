@@ -198,10 +198,12 @@ func headerIndex(t *testing.T) (name string, cols map[string]bool) {
 
 // headerIndexHeapOnlyColumns are messages.* columns the search builders may reference that
 // are deliberately NOT in the index: rare criteria with their own index (message_id,
+// message_id_raw via partial (mailbox_id, id) index idx_messages_mailbox_message_id_raw,
 // in_reply_to) or no bounded representation (recipients_json for BCC/Reply-To, the 2000-byte
-// "references"). A search on them reads the heap; everything else must not.
+// "references", unbounded unfolded message_id_raw kept out of btree tuples for TOAST safety).
+// A search on them reads the heap; everything else must not.
 var headerIndexHeapOnlyColumns = map[string]bool{
-	"recipients_json": true, `"references"`: true, "message_id": true, "in_reply_to": true,
+	"recipients_json": true, `"references"`: true, "message_id": true, "message_id_raw": true, "in_reply_to": true,
 }
 
 // TestHeaderIndexCoversLightweightSearch asserts that every messages.* column the lightweight
