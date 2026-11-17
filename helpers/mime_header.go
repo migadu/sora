@@ -25,12 +25,12 @@ func parseMIMEHeader(raw string, contentType bool) mimeHeaderValue {
 		// The repaired copy is the field with only the filename quoted, so its
 		// strict parse is exactly what the quoted form would give, trailing
 		// separators included (#1872 review).
-		if recovered := parseMIMEHeaderStrict(repaired, false); len(recovered.invalid) == 0 {
+		if recovered := parseMIMEHeaderStrict(repaired, false); !recovered.invalid["filename"] {
 			return recovered
 		}
 	}
 	// Keep independently valid parameters and RFC 2231 alternatives when a
-	// filename repair would be ambiguous or another parameter remains invalid.
+	// filename repair would be ambiguous or the filename itself remains invalid.
 	return v
 }
 
