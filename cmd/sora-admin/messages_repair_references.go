@@ -61,6 +61,11 @@ Examples:
 	}
 
 	fs.Parse(os.Args[3:])
+	if fs.NArg() > 0 {
+		fmt.Printf("Error: unexpected argument %q\n\n", fs.Arg(0))
+		fs.Usage()
+		os.Exit(1)
+	}
 	if *batchSize <= 0 {
 		fmt.Println("Error: --batch-size must be positive")
 		os.Exit(1)
