@@ -82,7 +82,7 @@ type notifySnapshotEntry struct {
 // installation it is only touched by the pump goroutine (the library
 // guarantees NotifyPoll is stopped before SetNotify runs again), except for
 // the pointer swap itself, snapshot, snapshotShared, own, ownStatus and
-// ownTree, which are guarded by IMAPSession.notifyMutex.
+// ownTree and knownSubscriptions, which are guarded by IMAPSession.notifyMutex.
 type notifyWatch struct {
 	options *imap.NotifyOptions
 
@@ -96,6 +96,11 @@ type notifyWatch struct {
 	// Mailboxes are matched to the specifiers by key (notifySnapshotEntry.key),
 	// as the database matches names.
 	nameKeys map[string]string
+
+	// The subscription names the client knows, including names without a visible
+	// mailbox. Bootstrap and own changes include those names; later snapshots
+	// update only visible names, so an unreported foreign ghost change stays visible.
+	knownSubscriptions map[string]bool
 
 	// statusMarks holds a per-mailbox high-water modseq for the STATUS fan-in:
 	// mailbox M is reported only when its highest_modseq exceeds statusMarks[M].
@@ -460,29 +465,70 @@ func (watch *notifyWatch) ownCreated(created ...db.CreatedMailbox) {
 		if _, known := watch.snapshot[m.ID]; known {
 			continue
 		}
+		watch.ensureKnownSubscriptions()
+		if m.Subscribed {
+			watch.knownSubscriptions[m.NameKey] = true
+		} else {
+			delete(watch.knownSubscriptions, m.NameKey)
+		}
 		watch.snapshot[m.ID] = notifySnapshotEntry{name: m.Name, key: m.NameKey, uidValidity: m.UIDValidity, subscribed: m.Subscribed}
 	}
 }
 func (watch *notifyWatch) ownDeleted(id int64) { delete(watch.snapshot, id) }
 func (watch *notifyWatch) ownRenamed(names []db.MailboxNameMutation) {
+	watch.ensureKnownSubscriptions()
+	// An owner rename moves name-based subscriptions, including descendants
+	// without mailbox rows. Like RenameSubscriptions, clear the destination
+	// prefix and remap the source prefix once. A non-owner's names do not move.
+	var root *db.MailboxNameMutation
+	for i := range names {
+		n := &names[i]
+		e, known := watch.snapshot[n.ID]
+		if !known || e.name != n.BeforeName || e.key != n.BeforeKey {
+			continue
+		}
+		if !n.SubscribedSet && (root == nil || len(n.BeforeKey) < len(root.BeforeKey)) {
+			root = n
+		}
+	}
+	if root != nil {
+		moved := make([]string, 0)
+		for key := range watch.knownSubscriptions {
+			source := key == root.BeforeKey || strings.HasPrefix(key, root.BeforeKey+"/")
+			if source {
+				moved = append(moved, root.AfterKey+strings.TrimPrefix(key, root.BeforeKey))
+			}
+			if source || key == root.AfterKey || strings.HasPrefix(key, root.AfterKey+"/") {
+				delete(watch.knownSubscriptions, key)
+			}
+		}
+		for _, key := range moved {
+			watch.knownSubscriptions[key] = true
+		}
+	}
 	for _, n := range names {
 		e, known := watch.snapshot[n.ID]
 		if !known || e.name != n.BeforeName || e.key != n.BeforeKey {
 			continue
 		}
 		e.name, e.key = n.AfterName, n.AfterKey
-		// For an owner rename, RenameSubscriptions moved the owner's
-		// subscriptions with the mailbox, so keep e.subscribed to leave any
-		// unnotified foreign SUBSCRIBE/UNSUBSCRIBE visible. For a non-owner
-		// rename, the caller's subscriptions stay on BeforeName and
-		// AfterSubscribed carries the caller's subscription on AfterName.
-		if n.SubscribedSet {
-			e.subscribed = n.AfterSubscribed
-		}
+		// Only subscription state already known to this watch is attributable to
+		// its own rename. A current transaction read could contain a foreign
+		// SUBSCRIBE committed since the last snapshot.
+		e.subscribed = watch.knownSubscriptions[n.AfterKey]
+
 		watch.snapshot[n.ID] = e
 	}
 }
 func (watch *notifyWatch) ownSubscribed(change db.SubscriptionMutation) {
+	if change.Changed && change.NameKey != "" {
+		watch.ensureKnownSubscriptions()
+		if change.Subscribed {
+			watch.knownSubscriptions[change.NameKey] = true
+		} else {
+			delete(watch.knownSubscriptions, change.NameKey)
+		}
+	}
 	m := change.Mailbox
 	if !change.Changed || m.ID <= 0 {
 		return
@@ -494,6 +540,21 @@ func (watch *notifyWatch) ownSubscribed(change db.SubscriptionMutation) {
 	e.subscribed = change.Subscribed
 	watch.snapshot[m.ID] = e
 }
+
+// Seed visible subscription knowledge when no name baseline is present. An
+// installed tree-event watch starts with all initial subscribed names.
+func (watch *notifyWatch) ensureKnownSubscriptions() {
+	if watch.knownSubscriptions != nil {
+		return
+	}
+	watch.knownSubscriptions = make(map[string]bool)
+	for _, e := range watch.snapshot {
+		if e.subscribed {
+			watch.knownSubscriptions[e.key] = true
+		}
+	}
+}
+
 func (watch *notifyWatch) snapshotHas(name string) bool {
 	for _, entry := range watch.snapshot {
 		if entry.name == name {
@@ -828,6 +889,16 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 			return s.internalError("failed to resolve NOTIFY watch: %v", err)
 		}
 		watch.snapshot = snapshot
+		if watch.wantsTreeEvents() {
+			names, err := s.server.rdb.GetSubscribedMailboxNamesByKeyWithRetry(readCtx, s.AccountID())
+			if err != nil {
+				return s.internalError("failed to bootstrap NOTIFY subscription names: %v", err)
+			}
+			watch.knownSubscriptions = make(map[string]bool, len(names))
+			for key := range names {
+				watch.knownSubscriptions[key] = true
+			}
+		}
 		bootstrapIDs = matchedIDs
 	}
 	if needSelectedStats {
@@ -1460,6 +1531,14 @@ func (s *IMAPSession) advanceNotifySnapshot(watch *notifyWatch, cur map[int64]no
 			return nil, false
 		}
 		events = diffNotifySnapshots(prev, cur)
+	}
+	watch.ensureKnownSubscriptions()
+	for _, e := range cur {
+		if e.subscribed {
+			watch.knownSubscriptions[e.key] = true
+		} else {
+			delete(watch.knownSubscriptions, e.key)
+		}
 	}
 	watch.snapshot, watch.snapshotShared = cur, true
 	return events, false

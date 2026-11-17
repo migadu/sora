@@ -34,6 +34,22 @@ func TestMailboxMutationResults(t *testing.T) {
 		return state
 	}
 
+	t.Run("ghost subscription mutations carry database name keys", func(t *testing.T) {
+		const name = "Absent/Key"
+		var key string
+		require.NoError(t, d.GetWritePool().QueryRow(ctx, "SELECT LOWER($1::text)", name).Scan(&key))
+		sub := changeSub(name, true)
+		require.True(t, sub.Changed)
+		require.Zero(t, sub.Mailbox.ID)
+		require.Equal(t, key, sub.NameKey)
+		noop := changeSub(name, true)
+		require.False(t, noop.Changed)
+		require.Equal(t, key, noop.NameKey)
+		unsub := changeSub(name, false)
+		require.True(t, unsub.Changed)
+		require.Zero(t, unsub.Mailbox.ID)
+		require.Equal(t, key, unsub.NameKey)
+	})
 	t.Run("creation identity and initial state do not adopt later subscription", func(t *testing.T) {
 		created := create("Original", nil)
 		require.True(t, created.Visible)
@@ -185,9 +201,12 @@ func TestMailboxMutationResults(t *testing.T) {
 		}
 		require.Len(t, byID, 2)
 		require.True(t, byID[srcParent.ID].SubscribedSet)
-		require.False(t, byID[srcParent.ID].AfterSubscribed, "viewer's subscription stayed on NonOwnerSrc")
+		var parentSubscribed, childSubscribed bool
+		require.NoError(t, d.GetWritePool().QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=$1 AND LOWER(mailbox_name)=LOWER($2::text))", viewerID, "NonOwnerDst").Scan(&parentSubscribed))
+		require.False(t, parentSubscribed, "viewer's subscription stayed on NonOwnerSrc")
 		require.True(t, byID[srcChild.ID].SubscribedSet)
-		require.True(t, byID[srcChild.ID].AfterSubscribed, "viewer already held a subscription on NonOwnerDst/GhostChild")
+		require.NoError(t, d.GetWritePool().QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM subscriptions WHERE account_id=$1 AND LOWER(mailbox_name)=LOWER($2::text))", viewerID, "NonOwnerDst/GhostChild").Scan(&childSubscribed))
+		require.True(t, childSubscribed, "viewer already held a subscription on NonOwnerDst/GhostChild")
 	})
 }
 

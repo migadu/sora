@@ -69,15 +69,14 @@ func lockNotifyMailboxForMutation(ctx context.Context, tx pgx.Tx, actorID int64,
 // MailboxNameMutation describes only this transaction's name change, never a
 // complete later snapshot entry (which could contain someone else's flags).
 // When the caller is not the mailbox owner, db.RenameMailbox does not rewrite
-// the caller's name-based subscriptions, so SubscribedSet is true and
-// AfterSubscribed records whether the caller already held a subscription on
-// AfterName inside the rename transaction.
+// the caller's name-based subscriptions, so SubscribedSet is true. The NOTIFY
+// caller resolves their destination-name subscription from its observed baseline,
+// rather than absorbing a foreign change committed before the rename.
 type MailboxNameMutation struct {
 	ID                    int64
 	BeforeName, BeforeKey string
 	AfterName, AfterKey   string
 	SubscribedSet         bool
-	AfterSubscribed       bool
 }
 
 type mailboxRenameCapture struct {
@@ -96,6 +95,8 @@ func (d *Database) RenameMailboxReturningNames(ctx context.Context, tx pgx.Tx, m
 // SubscriptionMutation is emitted only when this write changed the name-based
 // subscription. An idempotent request must not absorb a preceding foreign write.
 type SubscriptionMutation struct {
+	// NameKey is present even for a subscribed name with no visible mailbox.
+	NameKey    string
 	Mailbox    NotifyMailbox
 	Subscribed bool
 	Changed    bool
@@ -118,6 +119,9 @@ func (d *Database) UpdateSubscriptionReturningState(ctx context.Context, tx pgx.
 	result := SubscriptionMutation{Subscribed: subscribe, Changed: changed}
 	if m != nil {
 		result.Mailbox = *m
+		result.NameKey = m.NameKey
+	} else if err := tx.QueryRow(ctx, "SELECT LOWER($1::text)", name).Scan(&result.NameKey); err != nil {
+		return SubscriptionMutation{}, fmt.Errorf("read subscription name key: %w", err)
 	}
 	return result, nil
 }

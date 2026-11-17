@@ -1720,54 +1720,25 @@ func (db *Database) renameMailbox(ctx context.Context, tx pgx.Tx, mailboxID int6
 		for id := range beforeNames {
 			ids = append(ids, id)
 		}
-		if capture.viewer != 0 && capture.viewer != ownerAccountID {
-			rows, err := tx.Query(ctx, `
-				SELECT m.id, m.name, LOWER(m.name),
-				       EXISTS(SELECT 1 FROM subscriptions s WHERE s.account_id = $2 AND LOWER(s.mailbox_name) = LOWER(m.name))
-				FROM mailboxes m
-				WHERE m.id = ANY($1) AND m.deleted_at IS NULL
-				ORDER BY m.id
-			`, ids, capture.viewer)
-			if err != nil {
-				return fmt.Errorf("read transaction's renamed mailbox names: %w", err)
-			}
-			for rows.Next() {
-				var id int64
-				var name, key string
-				var subscribed bool
-				if err := rows.Scan(&id, &name, &key, &subscribed); err != nil {
-					rows.Close()
-					return err
-				}
-				n := beforeNames[id]
-				n.AfterName, n.AfterKey = name, key
-				n.SubscribedSet, n.AfterSubscribed = true, subscribed
-				capture.changes = append(capture.changes, n)
-			}
-			rows.Close()
-			if err := rows.Err(); err != nil {
+		rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE id=ANY($1) AND deleted_at IS NULL ORDER BY id`, ids)
+		if err != nil {
+			return fmt.Errorf("read transaction's renamed mailbox names: %w", err)
+		}
+		for rows.Next() {
+			var id int64
+			var name, key string
+			if err := rows.Scan(&id, &name, &key); err != nil {
+				rows.Close()
 				return err
 			}
-		} else {
-			rows, err := tx.Query(ctx, `SELECT id,name,LOWER(name) FROM mailboxes WHERE id=ANY($1) AND deleted_at IS NULL ORDER BY id`, ids)
-			if err != nil {
-				return fmt.Errorf("read transaction's renamed mailbox names: %w", err)
-			}
-			for rows.Next() {
-				var id int64
-				var name, key string
-				if err := rows.Scan(&id, &name, &key); err != nil {
-					rows.Close()
-					return err
-				}
-				n := beforeNames[id]
-				n.AfterName, n.AfterKey = name, key
-				capture.changes = append(capture.changes, n)
-			}
-			rows.Close()
-			if err := rows.Err(); err != nil {
-				return err
-			}
+			n := beforeNames[id]
+			n.AfterName, n.AfterKey = name, key
+			n.SubscribedSet = capture.viewer != 0 && capture.viewer != ownerAccountID
+			capture.changes = append(capture.changes, n)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
 		}
 	}
 

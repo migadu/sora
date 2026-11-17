@@ -18,22 +18,22 @@ func TestNotifyOwnRenamedNonOwnerSubscription(t *testing.T) {
 	}
 
 	t.Run("non-owner rename drops unmoved subscription and adopts destination ghost subscription", func(t *testing.T) {
-		watch := &notifyWatch{snapshot: base()}
+		watch := &notifyWatch{snapshot: base(), knownSubscriptions: map[string]bool{"shared/team/old": true, "shared/team/old/kid": true, "shared/team/ghostdst": true}}
 		watch.ownRenamed([]db.MailboxNameMutation{
 			{
 				ID: 1, BeforeName: "Shared/Team/Old", BeforeKey: "shared/team/old",
 				AfterName: "Shared/Team/New", AfterKey: "shared/team/new",
-				SubscribedSet: true, AfterSubscribed: false,
+				SubscribedSet: true,
 			},
 			{
 				ID: 2, BeforeName: "Shared/Team/Old/Kid", BeforeKey: "shared/team/old/kid",
 				AfterName: "Shared/Team/New/Kid", AfterKey: "shared/team/new/kid",
-				SubscribedSet: true, AfterSubscribed: false,
+				SubscribedSet: true,
 			},
 			{
 				ID: 3, BeforeName: "Shared/Team/GhostSrc", BeforeKey: "shared/team/ghostsrc",
 				AfterName: "Shared/Team/GhostDst", AfterKey: "shared/team/ghostdst",
-				SubscribedSet: true, AfterSubscribed: true,
+				SubscribedSet: true,
 			},
 		})
 		cur := testSnapshotKeys(map[int64]notifySnapshotEntry{
