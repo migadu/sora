@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -19,8 +20,11 @@ func TestMIMEHeaderFilenameSpaces(t *testing.T) {
 		{"quoted scope", `inline; description="a;b\"c(d)"; filename=monthly report.pdf`, "monthly report.pdf", true},
 		{"other quoted tab", "inline; description=\"a\tb\"; filename=monthly report.pdf", "monthly report.pdf", true},
 		{"other quoted UTF-8", `inline; description="café"; filename=monthly report.pdf`, "monthly report.pdf", true},
-		{"trailing separators", `inline; filename=monthly report.pdf;;`, "monthly report.pdf", true},
-		{"spaced trailing separators", `inline; filename=monthly report.pdf; ;`, "monthly report.pdf", true},
+		{"trailing separator", `inline; filename=monthly report.pdf;`, "monthly report.pdf", true},
+		// The quoted forms of these are recognised but incomplete, so the
+		// recovered forms are too.
+		{"trailing separators", `inline; filename=monthly report.pdf;;`, "monthly report.pdf", false},
+		{"spaced trailing separators", `inline; filename=monthly report.pdf; ;`, "monthly report.pdf", false},
 		{"quoted control", `inline; filename="monthly report.pdf"`, "monthly report.pdf", true},
 		{"quoted semicolon control", `inline; filename="monthly; report.pdf"`, "monthly; report.pdf", true},
 		{"strict comments control", `inline (part); filename=(name)report.pdf`, "report.pdf", true},
@@ -75,6 +79,27 @@ func TestMIMEHeaderFilenameSpaces(t *testing.T) {
 	}
 }
 
+// A recovered filename must read exactly as the same field with the filename
+// quoted: the repair may not make a malformed field more definitive.
+func TestMIMEHeaderFilenameSpacesMatchQuoted(t *testing.T) {
+	for _, test := range []struct{ raw, quoted string }{
+		{`inline; filename=x y.png`, `inline; filename="x y.png"`},
+		{`inline; filename=x y.png;`, `inline; filename="x y.png";`},
+		{`inline; filename=x y.png;;`, `inline; filename="x y.png";;`},
+		{`inline; filename=x y.png; ;`, `inline; filename="x y.png"; ;`},
+		{"inline; filename=x y.png;\t;", "inline; filename=\"x y.png\";\t;"},
+		{`inline; filename=x y.png; size=12;;`, `inline; filename="x y.png"; size=12;;`},
+	} {
+		t.Run(test.raw, func(t *testing.T) {
+			got, want := parseMIMEHeader(test.raw, false), parseMIMEHeaderStrict(test.quoted, false)
+			if got.value != want.value || got.complete != want.complete ||
+				fmt.Sprint(got.params) != fmt.Sprint(want.params) || fmt.Sprint(got.invalid) != fmt.Sprint(want.invalid) {
+				t.Fatalf("parseMIMEHeader(%q) = %+v; quoted form %q = %+v", test.raw, got, test.quoted, want)
+			}
+		})
+	}
+}
+
 func TestAttachmentKeywordFilenameSpaces(t *testing.T) {
 	for _, test := range []struct{ name, disposition, want string }{
 		{"reported inline image", `inline; filename=Concur _1_.png`, "$hasattachment"},
@@ -101,6 +126,9 @@ func TestAttachmentKeywordFilenameSpaces(t *testing.T) {
 		{"related malformed other parameter", `inline; filename=Concur _1_.png; broken`, ""},
 		{"related duplicate other parameter", `inline; filename=Concur _1_.png; size=1; size=2`, ""},
 		{"related interior empty parameter", `inline; filename=Concur _1_.png;; size=12`, ""},
+		{"related trailing separator", `inline; filename=Concur _1_.png;`, "$hasnoattachment"},
+		{"related trailing separators", `inline; filename=Concur _1_.png;;`, ""},
+		{"related spaced trailing separators", `inline; filename=Concur _1_.png; ;`, ""},
 		{"related unclosed quote", `inline; filename=Concur _1_.png; note="unclosed`, ""},
 		{"related trailing comment", `inline; filename=Concur _1_.png (note)`, ""},
 		{"related raw control", "inline; filename=Concur \x00_1_.png", ""},
