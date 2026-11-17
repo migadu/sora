@@ -60,6 +60,8 @@ func TestMessageIDRawMigrationPreparation(t *testing.T) {
 		require.NoError(t, conn.QueryRow(ctx, `SELECT indisvalid AND indisready
 			FROM pg_index WHERE indexrelid = 'idx_messages_mailbox_message_id_raw'::regclass`).Scan(&ready))
 		require.True(t, ready)
+		_, err = conn.Exec(ctx, string(up))
+		require.NoError(t, err, "up is idempotent")
 
 		_, err = conn.Exec(ctx, string(down))
 		require.NoError(t, err)
@@ -70,6 +72,21 @@ func TestMessageIDRawMigrationPreparation(t *testing.T) {
 		require.NoError(t, conn.QueryRow(ctx, `SELECT to_regclass('idx_messages_mailbox_message_id_raw') IS NOT NULL`).Scan(&hasIdx))
 		require.False(t, hasCol)
 		require.False(t, hasIdx)
+		_, err = conn.Exec(ctx, string(down))
+		require.NoError(t, err, "down is idempotent")
+	})
+
+	t.Run("large column-only preparation cannot bypass either guard", func(t *testing.T) {
+		conn := open(t, true)
+		_, err := conn.Exec(ctx, `ALTER TABLE messages ADD COLUMN message_id_raw TEXT`)
+		require.NoError(t, err)
+		_, err = conn.Exec(ctx, string(up))
+		require.ErrorContains(t, err, "Migration 73: messages has more than 25000 rows")
+		_, err = conn.Exec(ctx, string(down))
+		require.ErrorContains(t, err, "Migration 73 down: messages has more than 25000 rows")
+		var present bool
+		require.NoError(t, conn.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_attribute WHERE attrelid='messages'::regclass AND attname='message_id_raw' AND NOT attisdropped)`).Scan(&present))
+		require.True(t, present, "refusal must retain the prepared column")
 	})
 
 	t.Run("large unprepared database refuses up and down before blocking DDL", func(t *testing.T) {
