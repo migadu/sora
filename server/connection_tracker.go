@@ -114,9 +114,18 @@ type ConnectionTracker struct {
 	node *nodeSessions
 
 	// Kick notifications
-	kickSessions      map[int64][]chan struct{} // accountID -> channels to notify
-	kickSessionsMu    sync.RWMutex
-	sessionGeneration uint64 // guarded by kickSessionsMu; fences late authenticated registrations
+	kickSessions   map[int64][]chan struct{} // accountID -> channels to notify
+	kickSessionsMu sync.RWMutex
+	// The revocation clock, all guarded by kickSessionsMu. sessionGeneration advances on
+	// every revocation; an authentication captures it before its credential verdict, when
+	// the account is not yet known, and its registration is refused only if ITS account
+	// was revoked since: revokedAt holds the generation of the latest revocation of the
+	// accounts hashed to each slot, resetAt that of the latest node-wide reset. Constant
+	// memory; two accounts sharing a slot can fence each other's logins in flight, which
+	// errs on the safe side and is rare (#1882: one counter fenced every account's).
+	sessionGeneration uint64
+	revokedAt         [revocationSlots]uint64
+	resetAt           uint64
 
 	// Cache invalidation (optional): the lookup cache of the server this tracker serves,
 	// and the node's persistent auth cache, which a proxy falls back on when the lookup
@@ -836,11 +845,19 @@ func (ct *ConnectionTracker) EndLocalSessions(accountID int64) int {
 	return n
 }
 
-// closeSessions closes the kick channel of every session this node holds for the account.
+// revocationSlots is the size of the per-account revocation clock (8 KiB per tracker).
+// Account IDs are sequential, so any revocationSlots consecutive IDs share no slot.
+const revocationSlots = 1024
+
+func revocationSlot(accountID int64) uint64 { return uint64(accountID) % revocationSlots }
+
+// closeSessions closes the kick channel of every session this node holds for the account,
+// and fences the account's authentications in flight (RegisterSessionIfGeneration).
 func (ct *ConnectionTracker) closeSessions(accountID int64) int {
 	ct.kickSessionsMu.Lock()
 	defer ct.kickSessionsMu.Unlock()
 	ct.sessionGeneration++
+	ct.revokedAt[revocationSlot(accountID)] = ct.sessionGeneration
 
 	sessions := ct.kickSessions[accountID]
 	for _, ch := range sessions {
@@ -1553,6 +1570,7 @@ func (ct *ConnectionTracker) EndAllLocalSessions() int {
 	}
 	ct.kickSessionsMu.Lock()
 	ct.sessionGeneration++
+	ct.resetAt = ct.sessionGeneration
 	n := 0
 	for accountID, sessions := range ct.kickSessions {
 		for _, ch := range sessions {
@@ -1569,8 +1587,8 @@ func (ct *ConnectionTracker) EndAllLocalSessions() int {
 	return n
 }
 
-// SessionGeneration is captured before every credential verdict. A revocation
-// conservatively fences all in-flight authentications, using constant memory.
+// SessionGeneration is captured before every credential verdict and handed back to
+// RegisterSessionIfGeneration once the account is known.
 func (ct *ConnectionTracker) SessionGeneration() uint64 {
 	if ct == nil {
 		return 0
@@ -1581,8 +1599,11 @@ func (ct *ConnectionTracker) SessionGeneration() uint64 {
 }
 
 // RegisterSessionIfGeneration is atomic with revocation. An authentication that
-// crossed a removal/kick/reset receives an already-closed channel, so the normal
-// termination poller closes it instead of registering after the revocation passed.
+// crossed a removal/kick/credential change of its account, or a reset, receives an
+// already-closed channel, so the normal termination poller closes it instead of
+// registering after the revocation passed. A revocation of another account does not
+// fence it (#1882), save for one hashed to the same slot. A generation newer than
+// this tracker is invalid and is also refused.
 func (ct *ConnectionTracker) RegisterSessionIfGeneration(accountID int64, generation uint64) <-chan struct{} {
 	if ct == nil {
 		return ct.RegisterSession(accountID)
@@ -1590,7 +1611,7 @@ func (ct *ConnectionTracker) RegisterSessionIfGeneration(accountID int64, genera
 	ch := make(chan struct{})
 	ct.kickSessionsMu.Lock()
 	defer ct.kickSessionsMu.Unlock()
-	if generation != ct.sessionGeneration {
+	if generation > ct.sessionGeneration || ct.resetAt > generation || ct.revokedAt[revocationSlot(accountID)] > generation {
 		close(ch)
 		return ch
 	}
