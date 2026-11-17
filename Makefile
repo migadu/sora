@@ -61,9 +61,10 @@ clean:
 tests:
 	go test -v ./...
 
-# Run tests with race detector
+# Run tests with race detector. The db package alone takes ~25m under -race
+# (bcrypt cost 12 is very slow when instrumented), past go test's 10m default.
 tests-race:
-	go test -v -race ./...
+	go test -v -race -timeout=40m ./...
 
 # Helper variables for integration tests
 # Set RACE=1 to run any integration test target under the race detector,
