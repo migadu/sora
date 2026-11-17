@@ -653,32 +653,6 @@ sora-admin --config config.toml messages repair-references --apply
   Its plan and cost depend on the table statistics and batch arguments. The dry run uses the
   same read queries as `--apply`, so its elapsed time measures the read part on that database.
 
-### messages repair-state
-
-Gives live messages without a `message_state` row one with no flags and no keywords, and counts
-the unseen messages of their mailboxes again. Older builds could leave live rows without a state
-row (migration 000022 without its copy, pre-`89a559d5` restores after mailbox purges, and
-pre-#1213 copies or moves of such rows). While online flag updates (`STORE`, User API `PATCH`)
-seed a missing state row on demand, `SEARCH UNSEEN`, `STATUS UNSEEN` and `SELECT`'s first-unseen
-lookup count only `message_state` rows until this command has run.
-
-```sh
-sora-admin --config config.toml messages repair-state
-sora-admin --config config.toml messages repair-state --apply
-```
-
-| Flag | Default | Meaning |
-|---|---|---|
-| `--apply` | `false` | Write the missing state rows and recount unseen counts. Without it, only count and change nothing. |
-| `--batch-size` | `1000` | Message rows read per batch. |
-| `--start-after` | `0` | Resume after this message id. |
-
-- Rows are read in `id` order across all accounts through `messages_pkey` and `message_state_pkey`.
-  Expunged messages are skipped (`messages restore` creates a state row if restored later).
-- Uses only PostgreSQL and reads nothing from S3. Inserted rows carry `flags = 0`,
-  `custom_flags = '[]'` and `updated_modseq = NULL` (no spurious `HIGHESTMODSEQ` bump).
-- Safe to interrupt and resume with `--start-after <id>`, and idempotent if run again.
-
 ---
 
 ## 8. acl

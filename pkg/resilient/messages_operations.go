@@ -450,30 +450,3 @@ func (rd *ResilientDatabase) FillNullReferencesWithRetry(ctx context.Context, fi
 	}
 	return result.(int64), nil
 }
-
-// FindMissingMessageStateWithRetry reads one batch of messages for the message_state
-// repair (see db.FindMissingMessageState).
-func (rd *ResilientDatabase) FindMissingMessageStateWithRetry(ctx context.Context, afterID int64, limit int) (db.MissingStateBatch, error) {
-	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).FindMissingMessageState(ctx, afterID, limit)
-	}
-	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
-	if err != nil {
-		return db.MissingStateBatch{}, err
-	}
-	return result.(db.MissingStateBatch), nil
-}
-
-// AddMissingMessageStateWithRetry writes the rows one batch of the message_state repair
-// found, in a transaction of its own (see db.AddMissingMessageState). It writes only rows
-// that are still missing, so running it again after an unknown commit outcome is safe.
-func (rd *ResilientDatabase) AddMissingMessageStateWithRetry(ctx context.Context, ids []int64) (db.MessageStateRepair, error) {
-	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, true).AddMissingMessageState(ctx, tx, ids)
-	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
-	if err != nil {
-		return db.MessageStateRepair{}, err
-	}
-	return result.(db.MessageStateRepair), nil
-}

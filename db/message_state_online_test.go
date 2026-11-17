@@ -89,6 +89,32 @@ func TestFlagWritersCreateMissingMessageState(t *testing.T) {
 		require.True(t, seeded, "RemoveMessageFlagsBatch must still seed the missing message_state row")
 	})
 
+	t.Run("rejected conditional writers leave missing state untouched", func(t *testing.T) {
+		for _, mode := range []string{"add", "set", "remove"} {
+			t.Run(mode, func(t *testing.T) {
+				id, uid := insertStateless(t)
+				inTx(t, db, func(tx pgx.Tx) {
+					var results []BatchFlagUpdateResult
+					var err error
+					switch mode {
+					case "add":
+						results, err = db.AddMessageFlagsBatch(ctx, tx, []imap.UID{uid}, inbox.ID, []imap.Flag{imap.FlagSeen}, 0)
+					case "set":
+						results, err = db.SetMessageFlagsBatch(ctx, tx, []imap.UID{uid}, inbox.ID, []imap.Flag{imap.FlagSeen}, 0)
+					case "remove":
+						results, err = db.RemoveMessageFlagsBatch(ctx, tx, []imap.UID{uid}, inbox.ID, []imap.Flag{imap.FlagSeen}, 0)
+					}
+					require.NoError(t, err)
+					require.Len(t, results, 1)
+					require.True(t, results[0].PreconditionFailed)
+				})
+				var present bool
+				require.NoError(t, db.GetWritePool().QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM message_state WHERE message_id=$1)`, id).Scan(&present))
+				require.False(t, present, "UNCHANGEDSINCE rejection must not initialize historical state")
+			})
+		}
+	})
+
 	t.Run("single-message flag writers", func(t *testing.T) {
 		_, uidAdd := insertStateless(t)
 		inTx(t, db, func(tx pgx.Tx) {

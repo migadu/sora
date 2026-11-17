@@ -6,42 +6,16 @@ import (
 	"context"
 	"fmt"
 	"regexp"
-	"slices"
-	"strings"
 	"testing"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/integration_tests/common"
-	"github.com/migadu/sora/pkg/resilient"
 	"github.com/stretchr/testify/require"
 )
 
-func repairMissingMessageState(t *testing.T, rdb *resilient.ResilientDatabase, allTestIDs []int64, want ...int64) {
-	t.Helper()
-	ctx := context.Background()
-	first := slices.Min(allTestIDs)
-	last := slices.Max(allTestIDs)
-	var found []int64
-	for after := first - 1; after < last; {
-		batch, err := rdb.FindMissingMessageStateWithRetry(ctx, after, 100)
-		require.NoError(t, err)
-		require.NotZero(t, batch.Scanned, "the scan ended before reaching message %d", last)
-		for _, m := range batch.Missing {
-			if slices.Contains(allTestIDs, m.ID) {
-				found = append(found, m.ID)
-			}
-		}
-		after = batch.LastID
-	}
-	require.Equal(t, want, found, "the scan finds exactly the test messages without a state row")
-	repair, err := rdb.AddMissingMessageStateWithRetry(ctx, found)
-	require.NoError(t, err)
-	require.Equal(t, int64(len(want)), repair.Added)
-}
-
 var statusUnseenRe = regexp.MustCompile(`UNSEEN (\d+)`)
 
-func TestIMAP_RepairedMissingStateIsUnseenAndStorable(t *testing.T) {
+func TestIMAP_ExplicitFlagWritesCreateMissingStateOnlyForTargets(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	server, account := common.SetupIMAPServer(t)
 	defer server.Close()
@@ -106,28 +80,24 @@ func TestIMAP_RepairedMissingStateIsUnseenAndStorable(t *testing.T) {
 	require.Regexp(t, `FLAGS \((?:\\Recent)?\)`, fetchResponsesForSeq(lines, 3)[0])
 	require.Regexp(t, `FLAGS \((?:\\Recent)?\)`, fetchResponsesForSeq(lines, 4)[0])
 
-	// Even BEFORE running repair-state, online STORE on message 4 creates its state row!
+	// An explicit STORE creates state only for its target.
 	c.do(`STORE 4 +FLAGS (\Seen)`)
 	lines, _ = c.do("FETCH 4 (FLAGS)")
 	require.Contains(t, fetchResponsesForSeq(lines, 4)[0], `\Seen`)
 
-	// Repair remaining stateless messages 2 and 3 via messages repair-state.
-	repairMissingMessageState(t, rdb, ids, ids[1], ids[2])
-
-	require.Equal(t, 2, statusUnseen())
-	require.Equal(t, []imap.UID{2, 3}, search("UNSEEN"))
-	require.Equal(t, []imap.UID{2, 3}, search("NOT SEEN"))
-	require.Equal(t, []imap.UID{2, 3, 4}, search("UNKEYWORD Work"))
-	require.Equal(t, []imap.UID{2, 3, 4}, search("NOT KEYWORD Work"))
-	require.Equal(t, []imap.UID{1, 4}, search("SEEN"))
-
-	lines, _ = c.do("SELECT INBOX")
-	require.Contains(t, strings.Join(lines, "\n"), "[UNSEEN 2]", "%q", lines)
+	// Reads and a flag write to another message do not backfill untouched rows.
+	var untouched int
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM message_state WHERE message_id = ANY($1)`, []int64{ids[1], ids[2]}).Scan(&untouched))
+	require.Zero(t, untouched)
+	require.Equal(t, 0, statusUnseen())
+	require.Empty(t, search("UNSEEN"))
+	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM message_state WHERE message_id = ANY($1)`, []int64{ids[1], ids[2]}).Scan(&untouched))
+	require.Zero(t, untouched, "SEARCH/STATUS must leave historical missing state unchanged")
 
 	c.do(`STORE 2 +FLAGS (\Seen)`)
 	c.do(`STORE 3 +FLAGS (Work)`)
 	lines, _ = c.do("FETCH 2:3 (FLAGS)")
-	require.Regexp(t, `FLAGS \(\\Seen\)`, fetchResponsesForSeq(lines, 2)[0])
+	require.Contains(t, fetchResponsesForSeq(lines, 2)[0], `\Seen`)
 	require.Contains(t, fetchResponsesForSeq(lines, 3)[0], "FLAGS (Work)")
 	require.Equal(t, 1, statusUnseen())
 	require.Equal(t, []imap.UID{3}, search("UNSEEN"))
