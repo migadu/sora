@@ -18,6 +18,7 @@ func TestMIMEHeaderFilenameSpaces(t *testing.T) {
 		{"syntactic whitespace", "inline; filename=\t monthly report.pdf \t; size=12", "monthly report.pdf", true},
 		{"quoted scope", `inline; description="a;b\"c(d)"; filename=monthly report.pdf`, "monthly report.pdf", true},
 		{"other quoted tab", "inline; description=\"a\tb\"; filename=monthly report.pdf", "monthly report.pdf", true},
+		{"other quoted UTF-8", `inline; description="café"; filename=monthly report.pdf`, "monthly report.pdf", true},
 		{"trailing separators", `inline; filename=monthly report.pdf;;`, "monthly report.pdf", true},
 		{"spaced trailing separators", `inline; filename=monthly report.pdf; ;`, "monthly report.pdf", true},
 		{"quoted control", `inline; filename="monthly report.pdf"`, "monthly report.pdf", true},
@@ -47,6 +48,9 @@ func TestMIMEHeaderFilenameSpaces(t *testing.T) {
 		{"other quoted NUL", "inline; description=\"a\x00b\"; filename=monthly report.pdf", "", false},
 		{"other quoted DEL", "inline; description=\"a\x7fb\"; filename=monthly report.pdf", "", false},
 		{"other quoted CRLF", "inline; description=\"a\r\nb\"; filename=monthly report.pdf", "", false},
+		{"other quoted invalid UTF-8", "inline; description=\"a\xffb\"; filename=monthly report.pdf", "", false},
+		{"other escaped invalid UTF-8", "inline; description=\"a\\\xffb\"; filename=monthly report.pdf", "", false},
+		{"other quoted surrogate", "inline; description=\"a\xed\xa0\x80b\"; filename=monthly report.pdf", "", false},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			got := parseMIMEHeader(test.raw, false)
@@ -101,6 +105,7 @@ func TestAttachmentKeywordFilenameSpaces(t *testing.T) {
 		{"related trailing comment", `inline; filename=Concur _1_.png (note)`, ""},
 		{"related raw control", "inline; filename=Concur \x00_1_.png", ""},
 		{"related other quoted control", "inline; description=\"a\x00b\"; filename=Concur _1_.png", ""},
+		{"related other invalid UTF-8", "inline; description=\"a\xffb\"; filename=Concur _1_.png", ""},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			raw := previewMIMEMultipart("related", "b",
