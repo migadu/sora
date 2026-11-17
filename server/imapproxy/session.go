@@ -1368,6 +1368,7 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 					// guess during the outage would be checked against it, unseen by the
 					// auth rate limiter, until it expired.
 					s.invalidateLookupCache("password differs from cached login")
+					cacheGeneration = s.server.lookupCache.Generation()
 					// Fall through to full auth
 				} else {
 					// Entry is fresh - likely wrong password attempt
