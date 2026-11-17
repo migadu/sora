@@ -225,7 +225,7 @@ func TestVerifyHashHistoricalPrefixAndNullSubject(t *testing.T) {
 // TestVerifyS3FixMissingSlashLocalpartAndConcurrentUploadFence proves:
 //  1. verify s3 --fix-missing handles '/' in localparts without missing target rows
 //     or corrupting unrelated accounts whose localpart matches a prefix segment.
-//  2. applyFixes acquires shared S3 object locks (GetS3ObjectLockID(0, hash)),
+//  2. applyFixes acquires exclusive S3 object locks (GetS3ObjectLockID(0, hash)),
 //     rechecks ExistsContext, and guards against pending_uploads so concurrent upload
 //     completions between checkDBToS3 and applyFixes preserve uploaded = TRUE.
 func TestVerifyS3FixMissingSlashLocalpartAndConcurrentUploadFence(t *testing.T) {
@@ -310,13 +310,13 @@ func TestVerifyS3FixMissingSlashLocalpartAndConcurrentUploadFence(t *testing.T) 
 		missingKey := helpers.NewS3Key(domain, localpart, missingHash)
 		missingID := f.insert(accountID, "INBOX", domain, localpart, missingHash, missingBody, "<truly-missing-"+f.nonce+"@example.org>")
 
-		// Intercept HEAD requests during applyFixes to verify the shared S3 object lock
+		// Intercept HEAD requests during applyFixes to verify the exclusive S3 object lock
 		// on GetS3ObjectLockID(0, hash) is held while ExistsContext probes S3.
 		observerDB, err := newAdminDatabase(f.ctx, adminTestDBConfig(t))
 		require.NoError(t, err)
 		defer observerDB.Close()
 
-		var sawSharedLockOnCompleted atomic.Bool
+		var sawExclusiveLockOnCompleted atomic.Bool
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodHead && strings.HasSuffix(r.URL.Path, "/"+completedKey) {
 				lockID := uint64(db.GetS3ObjectLockID(0, completedHash))
@@ -326,7 +326,7 @@ func TestVerifyS3FixMissingSlashLocalpartAndConcurrentUploadFence(t *testing.T) 
 						SELECT 1 FROM pg_locks
 						WHERE locktype = 'advisory'
 						  AND granted
-						  AND mode = 'ShareLock'
+						  AND mode = 'ExclusiveLock'
 						  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
 						  AND classid = $1::bigint::oid
 						  AND objid = $2::bigint::oid
@@ -334,7 +334,7 @@ func TestVerifyS3FixMissingSlashLocalpartAndConcurrentUploadFence(t *testing.T) 
 					)
 				`, int64(lockID>>32), int64(lockID&0xffffffff)).Scan(&held)
 				if checkErr == nil && held {
-					sawSharedLockOnCompleted.Store(true)
+					sawExclusiveLockOnCompleted.Store(true)
 				}
 			}
 			mem.ServeHTTP(w, r)
@@ -350,7 +350,7 @@ func TestVerifyS3FixMissingSlashLocalpartAndConcurrentUploadFence(t *testing.T) 
 		assert.ElementsMatch(t, []string{completedKey, inflightKey, missingKey}, res.MissingFromS3)
 
 		// Reset head lock flag before applyFixes so only applyFixes's recheck counts.
-		sawSharedLockOnCompleted.Store(false)
+		sawExclusiveLockOnCompleted.Store(false)
 
 		// Between checkDBToS3 and applyFixes:
 		// (a) Upload worker completes completedHash: leases pending_uploads, PUTs S3 object,
@@ -374,7 +374,7 @@ func TestVerifyS3FixMissingSlashLocalpartAndConcurrentUploadFence(t *testing.T) 
 		// Run applyFixes with fixMissing=true.
 		require.NoError(t, applyFixes(f.ctx, f.rdb, s3Storage, accountID, res, false, true))
 
-		assert.True(t, sawSharedLockOnCompleted.Load(), "applyFixes must hold shared S3 object lock during ExistsContext recheck")
+		assert.True(t, sawExclusiveLockOnCompleted.Load(), "applyFixes must hold exclusive S3 object lock during ExistsContext recheck")
 		assert.True(t, isUploaded(completedID), "concurrently uploaded message must keep uploaded=TRUE")
 		assert.True(t, isUploaded(inflightID), "message with active pending_uploads row must keep uploaded=TRUE")
 		assert.False(t, isUploaded(missingID), "genuinely missing message must be marked uploaded=FALSE")

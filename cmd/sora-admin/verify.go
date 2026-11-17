@@ -498,38 +498,21 @@ func deleteOrphanedObject(ctx context.Context, rdb *resilient.ResilientDatabase,
 	return deleted, deleteErr
 }
 
-// fixMissingObject rechecks under the shared S3 object lock that no pending upload is
-// active and that the S3 key is still absent before marking its DB rows not uploaded,
-// preventing a concurrent upload completion from having its newly uploaded rows clobbered.
+// fixMissingObject uses one exclusive writable body holder through the fresh
+// pending/HEAD checks and SQL commit. It excludes new uploader admission, while an
+// already-admitted upload's pending row makes the repair skip conservatively.
 func fixMissingObject(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, key string) (int64, error) {
 	obj, ok := contentObjectFromKey(key)
 	if !ok {
 		return 0, fmt.Errorf("unexpected S3 key %q", key)
 	}
-	var rowsAffected int64
-	err := rdb.ExecuteWithSharedS3ObjectLocks(ctx, accountID, []string{obj.ContentHash}, func(guarded context.Context) error {
-		masterCtx := context.WithValue(guarded, consts.UseMasterDBKey, true)
-		pending, err := rdb.PendingUploadExistsWithRetry(masterCtx, obj.ContentHash, accountID)
-		if err != nil {
-			return fmt.Errorf("failed to check pending upload for %s: %w", key, err)
-		}
-		if pending {
-			return nil
-		}
+	return rdb.MarkMessagesAsNotUploadedIfAbsentWithRetry(ctx, obj, func(guarded context.Context) (bool, error) {
 		exists, _, err := s3Storage.ExistsContext(guarded, key)
 		if err != nil {
-			return fmt.Errorf("failed to recheck S3 key %s: %w", key, err)
+			return false, fmt.Errorf("failed to recheck S3 key %s: %w", key, err)
 		}
-		if exists {
-			return nil
-		}
-		rowsAffected, err = rdb.MarkMessagesAsNotUploadedWithRetry(guarded, []string{key})
-		return err
+		return exists, nil
 	})
-	if err != nil {
-		return 0, err
-	}
-	return rowsAffected, nil
 }
 
 func applyFixes(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, result *verificationResult, fixOrphaned, fixMissing bool) error {

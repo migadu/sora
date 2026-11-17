@@ -269,3 +269,16 @@ func (rdb *ResilientDatabase) MarkMessagesAsNotUploadedWithRetry(ctx context.Con
 	}
 	return result.(int64), nil
 }
+
+// MarkMessagesAsNotUploadedIfAbsentWithRetry keeps storage observation and repair
+// on the same exclusive writable holder. Retries repeat the complete HEAD check.
+func (rdb *ResilientDatabase) MarkMessagesAsNotUploadedIfAbsentWithRetry(ctx context.Context, obj db.ContentObject, exists func(context.Context) (bool, error)) (int64, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rdb.getOperationalDatabaseForOperation(ctx, true).MarkMessagesAsNotUploadedIfAbsent(ctx, obj, exists)
+	}
+	result, err := rdb.executeReadWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
+}

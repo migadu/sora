@@ -533,6 +533,69 @@ func (db *Database) MarkMessagesAsNotUploaded(ctx context.Context, s3Keys []stri
 		return 0, err
 	}
 
+	count, err := markMessagesAsNotUploadedInTx(ctx, tx, domains, localparts, hashes)
+	if err != nil {
+		return 0, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return 0, fmt.Errorf("failed to commit mark messages as not uploaded: %w", err)
+	}
+	return count, nil
+}
+
+// MarkMessagesAsNotUploadedIfAbsent serializes a fresh storage check and exact-key
+// repair against upload admission/finalization on one writable lock holder. A
+// shared outer lock would let an upload finish after HEAD observed absence but
+// before the UPDATE snapshot. An already-admitted upload retains its pending row
+// and causes a conservative skip, including when it belongs to another account.
+// The callback only checks existence: no body deletion or protocol activation occurs.
+func (d *Database) MarkMessagesAsNotUploadedIfAbsent(ctx context.Context, obj ContentObject, exists func(context.Context) (bool, error)) (int64, error) {
+	if obj.S3Domain == "" || obj.S3Localpart == "" || obj.ContentHash == "" || exists == nil {
+		return 0, fmt.Errorf("invalid missing-object repair request")
+	}
+	lockCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	lock, err := d.beginAdvisoryLockTx(lockCtx, pgx.ReadWrite)
+	if err != nil {
+		return 0, err
+	}
+	defer lock.Release()
+	if err := lock.Lock(lockCtx, GetS3ObjectLockID(0, obj.ContentHash)); err != nil {
+		return 0, err
+	}
+	guarded, done := lock.Guard(ctx)
+	defer done()
+	if err := lock.CheckS3BodyClaims(guarded, []string{obj.ContentHash}); err != nil {
+		return 0, err
+	}
+	var pending bool
+	if err := lock.run(guarded, func(ctx context.Context, tx pgx.Tx) error {
+		return tx.QueryRow(ctx, `SELECT EXISTS(SELECT 1 FROM pending_uploads WHERE content_hash=$1)`, obj.ContentHash).Scan(&pending)
+	}); err != nil {
+		return 0, err
+	}
+	if pending {
+		return 0, nil
+	}
+	present, err := exists(guarded)
+	if err != nil || present {
+		return 0, err
+	}
+	var count int64
+	if err := lock.run(guarded, func(ctx context.Context, tx pgx.Tx) error {
+		var err error
+		count, err = markMessagesAsNotUploadedInTx(ctx, tx, []string{obj.S3Domain}, []string{obj.S3Localpart}, []string{obj.ContentHash})
+		return err
+	}); err != nil {
+		return 0, err
+	}
+	if err := lock.commit(guarded); err != nil {
+		return 0, fmt.Errorf("failed to commit missing-object repair: %w", err)
+	}
+	return count, nil
+}
+
+func markMessagesAsNotUploadedInTx(ctx context.Context, tx pgx.Tx, domains, localparts, hashes []string) (int64, error) {
 	query := `
 		UPDATE messages m
 		SET uploaded = FALSE
@@ -550,10 +613,6 @@ func (db *Database) MarkMessagesAsNotUploaded(ctx context.Context, s3Keys []stri
 	result, err := tx.Exec(ctx, query, domains, localparts, hashes)
 	if err != nil {
 		return 0, fmt.Errorf("failed to mark messages as not uploaded: %w", err)
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("failed to commit mark messages as not uploaded: %w", err)
 	}
 
 	return result.RowsAffected(), nil
