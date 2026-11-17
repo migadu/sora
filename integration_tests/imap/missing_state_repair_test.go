@@ -98,7 +98,7 @@ func TestIMAP_ExplicitFlagWritesCreateMissingStateOnlyForTargets(t *testing.T) {
 	c.do(`STORE 3 +FLAGS (Work)`)
 	lines, _ = c.do("FETCH 2:3 (FLAGS)")
 	require.Contains(t, fetchResponsesForSeq(lines, 2)[0], `\Seen`)
-	require.Contains(t, fetchResponsesForSeq(lines, 3)[0], "FLAGS (Work)")
+	require.Regexp(t, `FLAGS \(Work(?: \\Recent)?\)`, fetchResponsesForSeq(lines, 3)[0])
 	require.Equal(t, 1, statusUnseen())
 	require.Equal(t, []imap.UID{3}, search("UNSEEN"))
 }
