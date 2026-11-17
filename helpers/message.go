@@ -98,7 +98,7 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 			// present, otherwise by the first child. Other children are
 			// resources, not alternative message bodies, even if textual.
 			if parent.relatedRootSeen || (parent.hasRelatedStart &&
-				(parent.relatedStart == "" || strings.TrimSpace(header.Get("Content-ID")) != parent.relatedStart)) {
+				(parent.relatedStart == "" || mimeContentID(header.Get("Content-ID")) != parent.relatedStart)) {
 				continue
 			}
 			parent.relatedRootSeen = true
@@ -134,7 +134,7 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 					readers = append(readers, multipartFrame{
 						reader:          mr,
 						mediaType:       mediaType,
-						relatedStart:    strings.TrimSpace(start),
+						relatedStart:    mimeContentID(start),
 						hasRelatedStart: hasStart,
 					})
 				}

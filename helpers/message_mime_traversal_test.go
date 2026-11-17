@@ -316,3 +316,35 @@ func TestExtractPlaintextBody_MultipartRelatedRoot(t *testing.T) {
 		}
 	})
 }
+
+func TestExtractPlaintextBody_RelatedContentIDCFWS(t *testing.T) {
+	for _, tc := range []struct {
+		name, start, contentID, want string
+	}{
+		{"leading comment", "<root@example.com>", "(selected) <root@example.com>", "Root words"},
+		{"trailing nested comment", "<root@example.com>", "<root@example.com> (selected (root))", "Root words"},
+		{"folded surrounding comments", "<root@example.com>", "(selected)\r\n \t<root@example.com> (root)", "Root words"},
+		{"comments in start", "(selected) <root@example.com> (root)", "<root@example.com>", "Root words"},
+		{"domain literal contains closing angle", "<root@[example>domain]>", "(selected) <root@[example>domain]> (root >)", "Root words"},
+		{"quoted local contains closing angle", `<"root>name"@example.com>`, `(selected) <"root>name"@example.com> (root >)`, "Root words"},
+		{"escaped quote in local", `<"root\">name"@example.com>`, `(selected) <"root\">name"@example.com> (root)`, "Root words"},
+		{"case remains significant", "<Root@example.com>", "(selected) <root@example.com>", ""},
+		{"multiple identifiers are not one Content-ID", "<root@example.com>", "<resource@example.com> <root@example.com>", ""},
+		{"unclosed comment remains invalid", "<root@example.com>", "<root@example.com> (unclosed", ""},
+		{"trailing garbage remains invalid", "<root@example.com>", "<root@example.com> extra", ""},
+		{"legacy exact identifier is retained", "<logo>", "<logo>", "Root words"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw := "MIME-Version: 1.0\r\n" + previewRelatedMultipart("related", "text/plain", tc.start,
+				"Content-Type: text/plain\r\nContent-ID: <resource@example.com>\r\n\r\nAuxiliary words",
+				"Content-Type: text/plain\r\nContent-ID: "+tc.contentID+"\r\n\r\nRoot words",
+				"Content-Type: text/plain\r\nContent-ID: <root@example.com>\r\n\r\nDuplicate words")
+			// A duplicate ID must not let an invalid or mismatched root select
+			// the later child in the negative cases.
+			if tc.want == "" {
+				raw = strings.Replace(raw, "Content-ID: <root@example.com>\r\n\r\nDuplicate words", "Content-ID: <duplicate@example.com>\r\n\r\nDuplicate words", 1)
+			}
+			assertExtractAndPreview(t, raw, tc.want)
+		})
+	}
+}

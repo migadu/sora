@@ -19,6 +19,15 @@ import (
 // text for full-text search, as LMTP does; it staged "", so SEARCH BODY found the
 // message only when LMTP had delivered it (#1808).
 func TestDeliverMessage_FTSKeepsTextBesideSkippedPart(t *testing.T) {
+	testDeliverMessageFTSBody(t, "", "hello words")
+}
+
+func TestDeliverMessage_FTSRelatedContentIDCFWS(t *testing.T) {
+	testDeliverMessageFTSBody(t, "Content-Type: multipart/related; boundary=related; start=\"<root@example.com>\"\r\n\r\n--related\r\nContent-Type: text/plain\r\nContent-ID: <resource@example.com>\r\n\r\nauxiliarywords\r\n--related\r\nContent-Type: text/plain\r\nContent-ID: (selected) <root@example.com> (root)\r\n\r\nrootwords\r\n--related--\r\n", "rootwords")
+}
+
+func testDeliverMessageFTSBody(t *testing.T, mimeBody, want string) {
+	t.Helper()
 	rdb := setupDeliveryTestDatabase(t)
 	ctx := context.Background()
 
@@ -51,23 +60,25 @@ func TestDeliverMessage_FTSKeepsTextBesideSkippedPart(t *testing.T) {
 	recipient.FromAddress = &fromAddr
 
 	marker := fmt.Sprintf("fts-skipped-part-%d", time.Now().UnixNano())
+	if mimeBody == "" {
+		mimeBody = "Content-Type: multipart/mixed; boundary=b1\r\n" +
+			"\r\n" +
+			"--b1\r\n" +
+			"Content-Type: image/png; name=a b.png\r\n" +
+			"Content-Disposition: inline\r\n" +
+			"\r\n" +
+			"PNG\r\n" +
+			"--b1\r\n" +
+			"Content-Type: text/plain\r\n" +
+			"\r\n" +
+			"hello words\r\n" +
+			"--b1--\r\n"
+	}
 	raw := "From: sender@example.com\r\n" +
 		"To: " + email + "\r\n" +
 		"Subject: " + marker + "\r\n" +
 		"Message-ID: <" + marker + "@example.com>\r\n" +
-		"MIME-Version: 1.0\r\n" +
-		"Content-Type: multipart/mixed; boundary=b1\r\n" +
-		"\r\n" +
-		"--b1\r\n" +
-		"Content-Type: image/png; name=a b.png\r\n" +
-		"Content-Disposition: inline\r\n" +
-		"\r\n" +
-		"PNG\r\n" +
-		"--b1\r\n" +
-		"Content-Type: text/plain\r\n" +
-		"\r\n" +
-		"hello words\r\n" +
-		"--b1--\r\n"
+		"MIME-Version: 1.0\r\n" + mimeBody
 
 	res, err := dctx.DeliverMessage(*recipient, []byte(raw))
 	require.NoError(t, err, "DeliverMessage failed: result=%+v", res)
@@ -79,12 +90,12 @@ func TestDeliverMessage_FTSKeepsTextBesideSkippedPart(t *testing.T) {
 	var textBody string
 	var indexed bool
 	err = rdb.QueryRowWithRetry(ctx, `
-		SELECT COALESCE(f.text_body, ''), COALESCE(f.text_body_tsv @@ plainto_tsquery('simple', 'hello'), false)
+		SELECT COALESCE(f.text_body, ''), COALESCE(f.text_body_tsv @@ plainto_tsquery('simple', $3), false)
 		FROM messages m
 		LEFT JOIN messages_fts_v2 f ON f.content_hash = m.content_hash AND f.account_id = m.account_id
 		WHERE m.account_id = $1 AND m.subject = $2 AND m.expunged_at IS NULL
-	`, accountID, marker).Scan(&textBody, &indexed)
+	`, accountID, marker, want).Scan(&textBody, &indexed)
 	require.NoError(t, err)
-	require.True(t, strings.Contains(textBody, "hello words") || indexed,
+	require.True(t, strings.Contains(textBody, want) || indexed,
 		"messages_fts_v2 must hold the text part's text, got text_body %q", textBody)
 }
