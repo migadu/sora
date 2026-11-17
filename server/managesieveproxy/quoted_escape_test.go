@@ -32,6 +32,8 @@ func TestManageSieveProxyRefusesInvalidQuotedEscape(t *testing.T) {
 		{"AUTHENTICATE initial response", `AUTHENTICATE "PLAIN" "` + plain[:4] + `\` + plain[4:] + "\"\r\n", false},
 		{"NOOP tag", `NOOP "ta\g"` + "\r\n", false},
 		{"AUTHENTICATE mechanism, literal response", fmt.Sprintf("AUTHENTICATE \"PL\\AIN\" {%d+}\r\n%s\r\n", len(plain), plain), true},
+		// No space is needed before the marker: "PLAIN"{5+} is a mechanism and a literal too.
+		{"AUTHENTICATE mechanism, literal response right after the quote", fmt.Sprintf("AUTHENTICATE \"PL\\AIN\"{%d+}\r\n%s\r\n", len(plain), plain), true},
 	}
 
 	for _, tc := range cases {

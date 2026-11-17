@@ -126,11 +126,12 @@ type IMAPSession struct {
 	memTracker *server.SessionMemoryTracker
 
 	// BODY or BINARY section retained for <offset.size> chunk fetches (see body_section_cache.go).
-	bodySectionCacheMu   sync.Mutex
-	bodySectionCacheKey  string
-	bodySectionCacheData []byte
-	bodySectionCacheFile *os.File
-	bodySectionCacheSize int
+	bodySectionCacheMu     sync.Mutex
+	bodySectionCacheKey    string
+	bodySectionCacheData   []byte
+	bodySectionCacheFile   *os.File
+	bodySectionCacheSize   int
+	bodySectionCacheClosed bool
 
 	// Session statistics for summary logging
 	messagesAppended atomic.Uint32
@@ -556,6 +557,7 @@ func (s *IMAPSession) Close() error {
 		s.InfoLog("unauthenticated connection dropped")
 	}
 
+	s.closeBodySectionCache()
 	s.clearSelectedMailboxStateLocked()
 
 	if s.cancel != nil {

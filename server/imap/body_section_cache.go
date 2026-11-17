@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync/atomic"
 
 	"github.com/migadu/go-imap"
 )
@@ -143,6 +144,9 @@ func (s *IMAPSession) retainBodySection(key string, data []byte) bool {
 	s.bodySectionCacheMu.Lock()
 	defer s.bodySectionCacheMu.Unlock()
 
+	if s.bodySectionCacheClosed {
+		return false
+	}
 	s.dropRetainedLocked()
 	if !s.server.reserveBodySectionCacheBytes(int64(len(data))) {
 		return false
@@ -157,6 +161,12 @@ func (s *IMAPSession) retainBodySection(key string, data []byte) bool {
 // heap bytes between commands.
 func (s *IMAPSession) spillBodySection(key string, data []byte) bool {
 	if key == "" || len(data) <= maxCachedBodySectionBytes || len(data) > maxSpilledBodySectionBytes {
+		return false
+	}
+	s.bodySectionCacheMu.Lock()
+	closed := s.bodySectionCacheClosed
+	s.bodySectionCacheMu.Unlock()
+	if closed {
 		return false
 	}
 	if !s.server.reserveSpilledBodySectionBytes(int64(len(data))) {
@@ -185,6 +195,11 @@ func (s *IMAPSession) spillBodySection(key string, data []byte) bool {
 	s.bodySectionCacheMu.Lock()
 	defer s.bodySectionCacheMu.Unlock()
 
+	if s.bodySectionCacheClosed {
+		_ = f.Close()
+		s.server.reserveSpilledBodySectionBytes(-int64(len(data)))
+		return false
+	}
 	s.dropRetainedLocked()
 	s.bodySectionCacheKey = key
 	s.bodySectionCacheFile = f
@@ -197,6 +212,16 @@ func (s *IMAPSession) spillBodySection(key string, data []byte) bool {
 func (s *IMAPSession) releaseBodySectionCache() {
 	s.bodySectionCacheMu.Lock()
 	defer s.bodySectionCacheMu.Unlock()
+	s.dropRetainedLocked()
+}
+
+// closeBodySectionCache drops any retained section and permanently disables further
+// retention or spilling so a concurrent writer finishing after Close cannot leak a
+// descriptor or node-wide reservation.
+func (s *IMAPSession) closeBodySectionCache() {
+	s.bodySectionCacheMu.Lock()
+	defer s.bodySectionCacheMu.Unlock()
+	s.bodySectionCacheClosed = true
 	s.dropRetainedLocked()
 }
 
@@ -252,19 +277,33 @@ func (s *IMAPSession) memoryAvailable(n int64) bool {
 // reserveBodySectionCacheBytes accounts n bytes (negative to give them back) against the
 // node-wide in-memory retention budget, reporting whether the reservation was granted.
 func (s *IMAPServer) reserveBodySectionCacheBytes(n int64) bool {
-	if s.bodySectionCacheBytes.Add(n) > maxServerBodySectionCacheBytes {
-		s.bodySectionCacheBytes.Add(-n)
-		return false
-	}
-	return true
+	return reserveBoundedBytes(&s.bodySectionCacheBytes, n, maxServerBodySectionCacheBytes)
 }
 
 // reserveSpilledBodySectionBytes accounts n bytes (negative to give them back) against
 // the node-wide spilled-file retention budget.
 func (s *IMAPServer) reserveSpilledBodySectionBytes(n int64) bool {
-	if s.spilledBodySectionBytes.Add(n) > maxServerSpilledBodySectionBytes {
-		s.spilledBodySectionBytes.Add(-n)
-		return false
+	return reserveBoundedBytes(&s.spilledBodySectionBytes, n, maxServerSpilledBodySectionBytes)
+}
+
+// reserveBoundedBytes atomically reserves n bytes within [0, limit] without ever writing
+// an above-limit value to counter: an optimistic Add followed by rollback transiently
+// inflates counter past limit, causing concurrent releases (n < 0) to look over-cap and
+// undo themselves while spuriously rejecting fitting smaller reservations.
+func reserveBoundedBytes(counter *atomic.Int64, n, limit int64) bool {
+	if n <= 0 {
+		if n < 0 {
+			counter.Add(n)
+		}
+		return true
 	}
-	return true
+	for {
+		cur := counter.Load()
+		if cur > limit-n {
+			return false
+		}
+		if counter.CompareAndSwap(cur, cur+n) {
+			return true
+		}
+	}
 }

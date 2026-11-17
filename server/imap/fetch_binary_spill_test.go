@@ -153,3 +153,111 @@ func safeExtractPartForTest(raw []byte, partNum int) []byte {
 	full, _ := safeExtractBodySection(raw, &imap.FetchItemBodySection{Part: []int{partNum}})
 	return full
 }
+
+// If reading a spilled BINARY section fails mid-part (e.g., after reading the
+// first <partial> slice, or on a whole-part read) and the raw-body fallback
+// returns (nil, nil), decodeBinary must not leave dirty BINARY.SIZE entries or
+// uncharged slice buffers in b.sections.
+func TestFetch_AnswerBinaryFromSpillFallbackClearsPartialState(t *testing.T) {
+	payload := bytes.Repeat([]byte("0123456789abcdef"), (maxCachedBodySectionBytes+128)/16)
+	msg := fetchTestMessage(nil)
+	key := binarySectionCacheKey(msg.ContentHash, []int{2})
+
+	t.Run("chunked mid-part spill read failure with nil body fallback", func(t *testing.T) {
+		s, tracker := newFetchTestSession(100 << 20)
+		defer s.releaseBodySectionCache()
+
+		if !s.spillBodySection(key, payload) {
+			t.Fatal("spillBodySection failed")
+		}
+		// Truncate at 64 octets so <0.64> reads cleanly from the spill file,
+		// then <64.64> hits EOF and triggers the fallback path.
+		if err := s.bodySectionCacheFile.Truncate(64); err != nil {
+			t.Fatalf("Truncate: %v", err)
+		}
+
+		var noBody []byte
+		noBodyFetched := true
+		b, err := s.decodeBinary(context.Background(), &noBody, &noBodyFetched, &imap.FetchOptions{
+			BinarySection: []*imap.FetchItemBinarySection{
+				{Part: []int{2}, Peek: true, Partial: &imap.SectionPartial{Offset: 0, Size: 64}},
+				{Part: []int{2}, Peek: true, Partial: &imap.SectionPartial{Offset: 64, Size: 64}},
+			},
+			BinarySectionSize: []*imap.FetchItemBinarySectionSize{{Part: []int{2}}},
+		}, msg)
+		if err != nil {
+			t.Fatalf("decodeBinary: %v", err)
+		}
+		if b.charged != 0 || tracker.Current() != 0 {
+			t.Errorf("charged=%d tracker=%d, want 0", b.charged, tracker.Current())
+		}
+		if b.sizes[0] != 0 {
+			t.Errorf("BINARY.SIZE[2] = %d after nil-body fallback, want 0", b.sizes[0])
+		}
+		if b.sections[0] != nil || b.sections[1] != nil {
+			t.Errorf("BINARY[2] sections = [%d bytes, %d bytes] (uncharged), want [nil, nil]",
+				len(b.sections[0]), len(b.sections[1]))
+		}
+	})
+
+	t.Run("whole-part spill read failure with nil body fallback", func(t *testing.T) {
+		s, tracker := newFetchTestSession(100 << 20)
+		defer s.releaseBodySectionCache()
+
+		if !s.spillBodySection(key, payload) {
+			t.Fatal("spillBodySection failed")
+		}
+		if err := s.bodySectionCacheFile.Truncate(64); err != nil {
+			t.Fatalf("Truncate: %v", err)
+		}
+
+		var noBody []byte
+		noBodyFetched := true
+		b, err := s.decodeBinary(context.Background(), &noBody, &noBodyFetched, &imap.FetchOptions{
+			BinarySection:     []*imap.FetchItemBinarySection{{Part: []int{2}, Peek: true}},
+			BinarySectionSize: []*imap.FetchItemBinarySectionSize{{Part: []int{2}}},
+		}, msg)
+		if err != nil {
+			t.Fatalf("decodeBinary: %v", err)
+		}
+		if b.charged != 0 || tracker.Current() != 0 {
+			t.Errorf("charged=%d tracker=%d, want 0", b.charged, tracker.Current())
+		}
+		if b.sizes[0] != 0 || b.sections[0] != nil {
+			t.Errorf("whole-part fallback left BINARY.SIZE=%d section=%d bytes, want 0 and nil",
+				b.sizes[0], len(b.sections[0]))
+		}
+	})
+
+	t.Run("chunked mid-part memory refusal clears earlier slice and size", func(t *testing.T) {
+		s, tracker := newFetchTestSession(96) // fits <0.64>, refuses <64.64>
+		defer s.releaseBodySectionCache()
+
+		if !s.spillBodySection(key, payload) {
+			t.Fatal("spillBodySection failed")
+		}
+		options := &imap.FetchOptions{
+			BinarySection: []*imap.FetchItemBinarySection{
+				{Part: []int{2}, Peek: true, Partial: &imap.SectionPartial{Offset: 0, Size: 64}},
+				{Part: []int{2}, Peek: true, Partial: &imap.SectionPartial{Offset: 64, Size: 64}},
+			},
+			BinarySectionSize: []*imap.FetchItemBinarySectionSize{{Part: []int{2}}},
+		}
+		b := &decodedBinary{
+			sections: make([][]byte, 2),
+			sizes:    make([]uint32, 1),
+		}
+		ok, err := s.answerBinaryFromSpill(b, binaryParts(options)[0], options, msg.UID, key, len(payload), true, 0)
+		requireMemoryRefusal(t, err, imap.ResponseCodeLimit)
+		if ok {
+			t.Fatal("answerBinaryFromSpill reported ok on memory refusal")
+		}
+		if tracker.Current() != 0 || b.charged != 0 {
+			t.Errorf("tracker=%d charged=%d, want 0", tracker.Current(), b.charged)
+		}
+		if b.sizes[0] != 0 || b.sections[0] != nil || b.sections[1] != nil {
+			t.Errorf("memory refusal left dirty state: sizes=%v sections=[%d, %d]",
+				b.sizes, len(b.sections[0]), len(b.sections[1]))
+		}
+	})
+}

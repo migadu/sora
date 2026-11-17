@@ -13,11 +13,13 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
+	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
+	"golang.org/x/net/idna"
 )
 
 func parseVerifyEmail(email string) (localpart, domain string, err error) {
@@ -29,7 +31,14 @@ func parseVerifyEmail(email string) (localpart, domain string, err error) {
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return "", "", fmt.Errorf("invalid email format: %s", email)
 	}
-	return strings.ToLower(parts[0]), strings.ToLower(parts[1]), nil
+	localpart = strings.ToLower(parts[0])
+	domain = strings.ToLower(parts[1])
+	if !server.IsASCII(domain) {
+		if ascii, idnaErr := idna.Lookup.ToASCII(domain); idnaErr == nil {
+			domain = ascii
+		}
+	}
+	return localpart, domain, nil
 }
 
 func handleVerifyCommand(ctx context.Context) {
@@ -176,6 +185,12 @@ type verificationResult struct {
 
 func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMissing, fixOrphaned, fixMissing, dryRun bool, batchSize int, deep bool) error {
 	startTime := time.Now()
+	localpart, domain, err := parseVerifyEmail(email)
+	if err != nil {
+		return err
+	}
+	canonicalEmail := localpart + "@" + domain
+
 	if fixOrphaned && !dryRun {
 		if err := cfg.S3.RequireBodyDeletionProtocol(); err != nil {
 			return err
@@ -219,7 +234,7 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 	fmt.Printf("Verifying S3 consistency for %s...\n\n", email)
 
 	// Get account ID
-	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
+	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, canonicalEmail)
 	if err != nil {
 		return fmt.Errorf("failed to find account: %w", err)
 	}
@@ -252,7 +267,7 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 
 	// Phase 2: Check S3 → DB (objects exist in DB)
 	fmt.Printf("[2/2] Checking S3 → DB (objects exist in DB)...\n")
-	if err := checkS3ToDB(ctx, rdb, s3Storage, email, result, batchSize); err != nil {
+	if err := checkS3ToDB(ctx, rdb, s3Storage, canonicalEmail, result, batchSize); err != nil {
 		return fmt.Errorf("S3 → DB check failed: %w", err)
 	}
 	fmt.Printf("  [OK] Found %d S3 objects\n", result.ObjectsInS3)
@@ -278,7 +293,7 @@ func verifyS3Storage(ctx context.Context, cfg AdminConfig, email string, showMis
 		if len(result.LegacySHA256) > 0 {
 			fmt.Printf("\n[WARN] %d object(s) are intact but stored under their SHA-256 digest by an older\n", len(result.LegacySHA256))
 			fmt.Printf("   'import maildir'. Move them to their BLAKE3 key with:\n")
-			fmt.Printf("   sora-admin import rekey --email %s\n", email)
+			fmt.Printf("   sora-admin import rekey --email %s\n", canonicalEmail)
 		}
 		if len(result.CorruptInS3) > 0 {
 			fmt.Printf("\n[WARN] %d object(s) exist on HEAD but their bodies are unreadable — this is provider-side\n", len(result.CorruptInS3))
@@ -483,6 +498,23 @@ func deleteOrphanedObject(ctx context.Context, rdb *resilient.ResilientDatabase,
 	return deleted, deleteErr
 }
 
+// fixMissingObject uses one exclusive writable body holder through the fresh
+// pending/HEAD checks and SQL commit. It excludes new uploader admission, while an
+// already-admitted upload's pending row makes the repair skip conservatively.
+func fixMissingObject(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, key string) (int64, error) {
+	obj, ok := contentObjectFromKey(key)
+	if !ok {
+		return 0, fmt.Errorf("unexpected S3 key %q", key)
+	}
+	return rdb.MarkMessagesAsNotUploadedIfAbsentWithRetry(ctx, obj, func(guarded context.Context) (bool, error) {
+		exists, _, err := s3Storage.ExistsContext(guarded, key)
+		if err != nil {
+			return false, fmt.Errorf("failed to recheck S3 key %s: %w", key, err)
+		}
+		return exists, nil
+	})
+}
+
 func applyFixes(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, accountID int64, result *verificationResult, fixOrphaned, fixMissing bool) error {
 	var wg sync.WaitGroup
 	errors := make(chan error, 2)
@@ -520,13 +552,17 @@ func applyFixes(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage
 			defer wg.Done()
 			fmt.Printf("  Marking %d messages as not uploaded...\n", len(result.MissingFromS3))
 
-			rowsAffected, err := rdb.MarkMessagesAsNotUploadedWithRetry(ctx, result.MissingFromS3)
-			if err != nil {
-				errors <- fmt.Errorf("failed to mark messages as not uploaded: %w", err)
-				return
+			var totalAffected int64
+			for _, key := range result.MissingFromS3 {
+				rowsAffected, err := fixMissingObject(ctx, rdb, s3Storage, accountID, key)
+				if err != nil {
+					errors <- fmt.Errorf("failed to mark messages for %s as not uploaded: %w", key, err)
+					return
+				}
+				totalAffected += rowsAffected
 			}
 
-			result.FixedMissing = int(rowsAffected)
+			result.FixedMissing = int(totalAffected)
 			fmt.Printf("  [OK] Marked %d messages as not uploaded\n", result.FixedMissing)
 		}()
 	}
@@ -799,6 +835,7 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	if err != nil {
 		return err
 	}
+	canonicalEmail := localpart + "@" + domain
 	s3Key := fmt.Sprintf("%s/%s/%s", domain, localpart, hash)
 
 	// Initialize S3 storage
@@ -895,27 +932,36 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	// unreachable, so a storage-only node can still verify object integrity.
 	if skipDB {
 		fmt.Printf("\nDatabase cross-reference skipped (--skip-db).\n")
-		printS3OnlySummary(exists, contentIntact, legacyKey, email)
+		printS3OnlySummary(exists, contentIntact, legacyKey, canonicalEmail)
 		return nil
 	}
 
 	rdb, err := newAdminDatabase(ctx, &cfg.Database)
 	if err != nil {
 		fmt.Printf("\n[WARN] Database unavailable, skipping message cross-reference: %v\n", err)
-		printS3OnlySummary(exists, contentIntact, legacyKey, email)
+		printS3OnlySummary(exists, contentIntact, legacyKey, canonicalEmail)
 		return nil
 	}
 	defer rdb.Close()
 
-	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, email)
+	var accountID int64
+	var messages []db.MessageHashInfo
+	accountID, err = rdb.GetAccountIDByEmailWithRetry(ctx, canonicalEmail)
 	if err != nil {
-		return fmt.Errorf("failed to find account: %w", err)
-	}
-
-	// Get messages with this hash from database
-	messages, err := rdb.GetMessagesByContentHashWithRetry(ctx, accountID, hash)
-	if err != nil {
-		return fmt.Errorf("failed to query messages: %w", err)
+		if !errors.Is(err, consts.ErrUserNotFound) {
+			return fmt.Errorf("failed to find account: %w", err)
+		}
+		fmt.Printf("\n[INFO] Address %s is not in credentials; checking global references only\n", canonicalEmail)
+	} else {
+		// Get messages referencing this exact S3 key from database
+		messages, err = rdb.GetMessagesByContentObjectWithRetry(ctx, accountID, db.ContentObject{
+			S3Domain:    domain,
+			S3Localpart: localpart,
+			ContentHash: hash,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to query messages: %w", err)
+		}
 	}
 
 	fmt.Printf("\nDatabase messages using this hash: %d\n", len(messages))
@@ -932,9 +978,21 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 				return fmt.Errorf("failed to check global references: %w", err)
 			}
 			if len(orphans) == 0 {
-				fmt.Printf("\n[OK] Referenced by another account or pending upload (not orphaned)\n")
+				if contentIntact && !legacyKey {
+					fmt.Printf("\n[OK] Referenced by another account or pending upload (not orphaned)\n")
+				} else {
+					fmt.Printf("\n[INFO] Referenced by another account or pending upload (not orphaned)\n")
+				}
 			} else {
 				fmt.Printf("\n[WARN] Orphaned S3 object (exists in S3 but not in DB)\n")
+			}
+			switch {
+			case !contentIntact:
+				fmt.Printf("\nSummary:\n")
+				printCorruptS3Summary()
+			case legacyKey:
+				fmt.Printf("\nSummary:\n")
+				printLegacyKeySummary(canonicalEmail)
 			}
 		}
 		return nil
@@ -996,12 +1054,9 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	fmt.Printf("\nSummary:\n")
 	switch {
 	case exists && !contentIntact:
-		fmt.Printf("[FAIL] CRITICAL: Object exists in S3 but its body is corrupt or unreadable\n")
-		fmt.Printf("  HEAD succeeds but the full body cannot be downloaded/decrypted or fails the hash check.\n")
-		fmt.Printf("  Users will get errors (e.g. \"unexpected EOF\") trying to read these messages.\n")
-		fmt.Printf("  The S3 object must be re-uploaded from the original source, or the messages deleted.\n")
+		printCorruptS3Summary()
 	case exists && legacyKey:
-		printLegacyKeySummary(email)
+		printLegacyKeySummary(canonicalEmail)
 	case liveCount == 0 && expungedCount > 0:
 		if exists {
 			fmt.Printf("[OK] Object exists in S3, referenced only by %d expunged message(s) pending cleanup\n", expungedCount)
@@ -1023,11 +1078,20 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 		fmt.Printf("  Users will get errors trying to read these messages\n")
 		fmt.Printf("  Need to either restore S3 content or delete messages\n")
 	case exists && liveNotUploaded > 0:
+		sqlQuote := func(s string) string { return "'" + strings.ReplaceAll(s, "'", "''") + "'" }
 		fmt.Printf("[WARN] Content exists in S3 but messages marked as not uploaded\n")
 		fmt.Printf("  Can fix by marking messages as uploaded:\n")
-		fmt.Printf("  UPDATE messages SET uploaded = TRUE WHERE content_hash = '%s' AND account_id = %d;\n", hash, accountID)
+		fmt.Printf("  UPDATE messages SET uploaded = TRUE WHERE account_id = %d AND s3_domain = %s AND s3_localpart = %s AND content_hash = %s;\n",
+			accountID, sqlQuote(domain), sqlQuote(localpart), sqlQuote(hash))
 	}
 	return nil
+}
+
+func printCorruptS3Summary() {
+	fmt.Printf("[FAIL] CRITICAL: Object exists in S3 but its body is corrupt or unreadable\n")
+	fmt.Printf("  HEAD succeeds but the full body cannot be downloaded/decrypted or fails the hash check.\n")
+	fmt.Printf("  Users will get errors (e.g. \"unexpected EOF\") trying to read these messages.\n")
+	fmt.Printf("  The S3 object must be re-uploaded from the original source, or the messages deleted.\n")
 }
 
 // printLegacyKeySummary is the verdict for an intact body stored under its SHA-256 digest.
@@ -1047,10 +1111,7 @@ func printS3OnlySummary(exists, contentIntact, legacyKey bool, email string) {
 	case exists && contentIntact:
 		fmt.Printf("[OK] S3 object exists and its content is intact (downloaded, decrypted, BLAKE3 verified)\n")
 	case exists && !contentIntact:
-		fmt.Printf("[FAIL] CRITICAL: Object exists in S3 but its body is corrupt or unreadable\n")
-		fmt.Printf("  HEAD succeeds but the full body cannot be downloaded/decrypted or fails the hash check.\n")
-		fmt.Printf("  Users will get errors (e.g. \"unexpected EOF\") trying to read these messages.\n")
-		fmt.Printf("  The S3 object must be re-uploaded from the original source, or the messages deleted.\n")
+		printCorruptS3Summary()
 	default:
 		fmt.Printf("[FAIL] Content MISSING from S3\n")
 	}

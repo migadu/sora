@@ -216,7 +216,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 	if importRootOpened != nil {
 		importRootOpened()
 	}
-	maildirPath = effectiveMaildirPath(maildirPath)
+	maildirPath = effectiveMaildirPath(maildirPath, root)
 	// Always create SQLite database in the maildir path to persist maildir state
 	dbPath := filepath.Join(maildirPath, maildirCacheName)
 
@@ -1966,11 +1966,16 @@ func (i *Importer) statMaildir(path string) (fs.FileInfo, error) {
 
 // maildirName returns the name of path below the maildir root. A path the cache holds
 // from a run given another spelling of the maildir (a link to it, or the directory a
-// link names) is named by its resolved directory; the root still decides what the name
-// reaches.
+// link names) is named by its resolved directory against the checked root, never by
+// re-resolving the live maildirPath; the root still decides what the name reaches.
 func (i *Importer) maildirName(path string) (string, error) {
 	if name, err := filepath.Rel(filepath.Clean(i.maildirPath), path); err == nil && filepath.IsLocal(name) {
 		return name, nil
+	}
+	if i.root != nil && i.root.Name() != "" {
+		if name, err := filepath.Rel(filepath.Clean(i.root.Name()), path); err == nil && filepath.IsLocal(name) {
+			return name, nil
+		}
 	}
 	abs, err := filepath.Abs(path)
 	if err != nil {
@@ -1980,6 +1985,22 @@ func (i *Importer) maildirName(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	resolvedPath := filepath.Join(dir, filepath.Base(abs))
+	if i.root != nil && i.root.Name() != "" {
+		if name, err := filepath.Rel(filepath.Clean(i.root.Name()), resolvedPath); err == nil && filepath.IsLocal(name) {
+			return name, nil
+		}
+		if rootInfo, err := i.root.Stat("."); err == nil {
+			if evalRoot, err := filepath.EvalSymlinks(i.root.Name()); err == nil {
+				if evalInfo, statErr := os.Stat(evalRoot); statErr == nil && sameFileID(rootInfo, evalInfo) {
+					if name, err := filepath.Rel(evalRoot, resolvedPath); err == nil && filepath.IsLocal(name) {
+						return name, nil
+					}
+				}
+			}
+		}
+		return "", fmt.Errorf("%s is not below the maildir %s", path, i.maildirPath)
+	}
 	root, err := filepath.Abs(i.maildirPath)
 	if err == nil {
 		root, err = filepath.EvalSymlinks(root)
@@ -1987,7 +2008,7 @@ func (i *Importer) maildirName(path string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if name, err := filepath.Rel(root, filepath.Join(dir, filepath.Base(abs))); err == nil && filepath.IsLocal(name) {
+	if name, err := filepath.Rel(root, resolvedPath); err == nil && filepath.IsLocal(name) {
 		return name, nil
 	}
 	return "", fmt.Errorf("%s is not below the maildir %s", path, i.maildirPath)
@@ -2704,7 +2725,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 	var preservedUID *uint32
 	var preservedUIDValidity *uint32
 	if i.options.PreserveUIDs {
-		maildirPath := filepath.Dir(filepath.Dir(path))
+		maildirPath := i.messageFolderDir(path)
 		if uidList, ok := i.dovecotUIDLists[maildirPath]; ok && uidList != nil {
 			if uid, found := uidList.GetUIDForFile(filename); found {
 				preservedUID = &uid
@@ -3874,6 +3895,15 @@ func parseKeywordsFile(path string, open func(string) (*os.File, error)) (map[in
 	return keywords, nil
 }
 
+// messageFolderDir maps a message path (including one cached under an earlier
+// spelling of the maildir) onto its folder directory under i.maildirPath.
+func (i *Importer) messageFolderDir(messagePath string) string {
+	if rel, err := i.maildirName(messagePath); err == nil {
+		return filepath.Dir(filepath.Dir(filepath.Join(filepath.Clean(i.maildirPath), rel)))
+	}
+	return filepath.Dir(filepath.Dir(messagePath))
+}
+
 // keywordsForMessagePath returns the keyword map that applies to a message file:
 // Dovecot keeps a dovecot-keywords file PER FOLDER, each with its own index → name
 // numbering, so the letters in a file under .Sent/cur/ mean whatever .Sent/dovecot-
@@ -3887,7 +3917,7 @@ func parseKeywordsFile(path string, open func(string) (*os.File, error)) (map[in
 // Results are cached per folder directory; safe for the parallel workers.
 func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 	// path is <folder>/{cur,new}/<file>
-	dir := filepath.Dir(filepath.Dir(path))
+	dir := i.messageFolderDir(path)
 	i.folderKeywordsMu.Lock()
 	defer i.folderKeywordsMu.Unlock()
 	if kws, ok := i.folderKeywords[dir]; ok {
