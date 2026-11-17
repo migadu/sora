@@ -76,6 +76,11 @@ func MessagePreview(r io.Reader) (preview string) {
 	}()
 
 	html, haveHTML := "", false
+	// Text parts whose Content-Type parameters do not parse are read without
+	// their charset, so keep them only as a fallback when no well-formed text
+	// part yields a preview.
+	lenientPlain := ""
+	lenientHTML, haveLenientHTML := "", false
 	part := entity
 	partErr := err
 	for partsRead := 0; partsRead < previewMaxMIMEParts; {
@@ -119,7 +124,7 @@ func MessagePreview(r io.Reader) (preview string) {
 			continue
 		}
 		// go-message returns a usable type alongside malformed-parameter errors.
-		mediaType, params, _ := current.Header.ContentType()
+		mediaType, params, typeErr := current.Header.ContentType()
 		if parent != nil && parent.mediaType == "multipart/digest" && current.Header.Get("Content-Type") == "" {
 			// RFC 2046 §5.1.5 changes the default for direct digest children.
 			mediaType = "message/rfc822"
@@ -156,11 +161,22 @@ func MessagePreview(r io.Reader) (preview string) {
 			if isPGPMessage(text) {
 				return ""
 			}
+			if typeErr != nil {
+				if lenientPlain == "" {
+					lenientPlain = previewFromText(text)
+				}
+				continue
+			}
 			if p := previewFromText(text); p != "" {
 				return p
 			}
 		case "text/html":
-			if !haveHTML {
+			if typeErr != nil {
+				if !haveLenientHTML {
+					b, _ := io.ReadAll(io.LimitReader(current.Body, previewMaxHTML))
+					lenientHTML, haveLenientHTML = string(b), true
+				}
+			} else if !haveHTML {
 				b, _ := io.ReadAll(io.LimitReader(current.Body, previewMaxHTML))
 				html, haveHTML = string(b), true
 			}
@@ -168,6 +184,18 @@ func MessagePreview(r io.Reader) (preview string) {
 	}
 	if haveHTML {
 		text := previewHTMLText(html)
+		if isPGPMessage(text) {
+			return ""
+		}
+		if p := previewFromText(text); p != "" {
+			return p
+		}
+	}
+	if lenientPlain != "" {
+		return lenientPlain
+	}
+	if haveLenientHTML {
+		text := previewHTMLText(lenientHTML)
 		if isPGPMessage(text) {
 			return ""
 		}

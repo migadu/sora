@@ -411,3 +411,109 @@ func TestConfigDumpShowsTheDatabaseEndpointsTheServerUses(t *testing.T) {
 		})
 	}
 }
+
+// Optional [[server]] settings carry omitempty so a TOML dump does not write proxy-only
+// booleans into every server stanza. remote_skip_forwarding_with_proxy_protocol must be
+// omitted unless explicitly enabled on a [[server]] block.
+func TestConfigDumpOmitsUnsetServerSkipForwardingPolicy(t *testing.T) {
+	t.Run("unset across server types", func(t *testing.T) {
+		content := []byte(`
+[[server]]
+type = "imap"
+name = "imap"
+addr = "127.0.0.1:143"
+
+[[server]]
+type = "pop3"
+name = "pop3"
+addr = "127.0.0.1:110"
+
+[[server]]
+type = "lmtp"
+name = "lmtp"
+addr = "127.0.0.1:24"
+
+[[server]]
+type = "managesieve"
+name = "managesieve"
+addr = "127.0.0.1:4190"
+
+[[server]]
+type = "metrics"
+name = "metrics"
+addr = "127.0.0.1:9090"
+
+[[server]]
+type = "http_admin_api"
+name = "admin-api"
+addr = "127.0.0.1:8080"
+api_key = "example-admin-key"
+
+[[server]]
+type = "http_user_api"
+name = "user-api"
+addr = "127.0.0.1:8081"
+jwt_secret = "example-jwt-secret"
+
+[[server]]
+type = "imap_proxy"
+name = "imap-proxy"
+addr = "127.0.0.1:1143"
+remote_addrs = ["192.0.2.10:143"]
+
+[[server]]
+type = "pop3_proxy"
+name = "pop3-proxy"
+addr = "127.0.0.1:1110"
+remote_addrs = ["192.0.2.10:110"]
+
+[[server]]
+type = "lmtp_proxy"
+name = "lmtp-proxy"
+addr = "127.0.0.1:2424"
+remote_addrs = ["192.0.2.10:24"]
+
+[[server]]
+type = "managesieve_proxy"
+name = "sieve-proxy"
+addr = "127.0.0.1:14190"
+remote_addrs = ["192.0.2.10:4190"]
+
+[[server]]
+type = "user_api_proxy"
+name = "user-api-proxy"
+addr = "127.0.0.1:18081"
+remote_addrs = ["192.0.2.10:8081"]
+jwt_secret = "example-jwt-secret"
+`)
+		dump := runConfigDump(t, content, "toml")
+		if strings.Contains(dump, "remote_skip_forwarding_with_proxy_protocol") {
+			t.Fatalf("dump emitted unset remote_skip_forwarding_with_proxy_protocol in [[server]] blocks:\n%s", dump)
+		}
+	})
+
+	t.Run("explicit true on server preserved without polluting sibling servers", func(t *testing.T) {
+		content := []byte(`
+[[server]]
+type = "imap"
+name = "imap"
+addr = "127.0.0.1:143"
+
+[[server]]
+type = "imap_proxy"
+name = "imap-proxy"
+addr = "127.0.0.1:1143"
+remote_addrs = ["192.0.2.10:143"]
+remote_use_proxy_protocol = true
+remote_use_id_command = true
+remote_skip_forwarding_with_proxy_protocol = true
+`)
+		dump := runConfigDump(t, content, "toml")
+		if strings.Contains(dump, "remote_skip_forwarding_with_proxy_protocol = false") {
+			t.Fatalf("dump emitted remote_skip_forwarding_with_proxy_protocol = false on sibling [[server]]:\n%s", dump)
+		}
+		if got := strings.Count(dump, "remote_skip_forwarding_with_proxy_protocol = true"); got != 1 {
+			t.Fatalf("dump count of remote_skip_forwarding_with_proxy_protocol = true = %d, want 1:\n%s", got, dump)
+		}
+	})
+}

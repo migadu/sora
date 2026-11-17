@@ -182,3 +182,101 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	c.n += n
 	return n, err
 }
+
+func TestMessagePreview_InvalidParametersWellFormedAlternativeWins(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		msg  string
+		want string
+	}{
+		{
+			name: "well-formed html alternative wins over malformed plain",
+			msg: previewMessage("Content-Type: multipart/alternative; boundary=b\n",
+				"--b\nContent-Type: text/plain; charset=iso-8859-1; format\n\ncaf\xe9 words\n"+
+					"--b\nContent-Type: text/html; charset=utf-8\n\n<p>café words</p>\n--b--\n"),
+			want: "café words",
+		},
+		{
+			name: "well-formed plain wins over earlier malformed plain",
+			msg: previewMessage("Content-Type: multipart/alternative; boundary=b\n",
+				"--b\nContent-Type: text/plain; charset=iso-8859-1; format\n\ncaf\xe9 words\n"+
+					"--b\nContent-Type: text/plain; charset=utf-8\n\ncafé words\n--b--\n"),
+			want: "café words",
+		},
+		{
+			name: "well-formed html wins over earlier malformed html",
+			msg: previewMessage("Content-Type: multipart/alternative; boundary=b\n",
+				"--b\nContent-Type: text/html; charset=iso-8859-1; format\n\n<p>caf\xe9 words</p>\n"+
+					"--b\nContent-Type: text/html; charset=utf-8\n\n<p>café words</p>\n--b--\n"),
+			want: "café words",
+		},
+		{
+			name: "well-formed html before malformed plain still wins",
+			msg: previewMessage("Content-Type: multipart/alternative; boundary=b\n",
+				"--b\nContent-Type: text/html; charset=utf-8\n\n<p>café words</p>\n"+
+					"--b\nContent-Type: text/plain; charset=iso-8859-1; format\n\ncaf\xe9 words\n--b--\n"),
+			want: "café words",
+		},
+		{
+			name: "single-part malformed plain falls back",
+			msg:  previewMessage("Content-Type: text/plain; charset=utf-8; format\n", "plain fallback\n"),
+			want: "plain fallback",
+		},
+		{
+			name: "single-part malformed html falls back",
+			msg:  previewMessage("Content-Type: text/html; charset=utf-8; format\n", "<p>html fallback</p>\n"),
+			want: "html fallback",
+		},
+		{
+			name: "no well-formed alternative prefers malformed plain over malformed html",
+			msg: previewMessage("Content-Type: multipart/alternative; boundary=b\n",
+				"--b\nContent-Type: text/plain; charset=utf-8; format\n\nplain fallback\n"+
+					"--b\nContent-Type: text/html; charset=utf-8; format\n\n<p>html fallback</p>\n--b--\n"),
+			want: "plain fallback",
+		},
+		{
+			name: "second malformed plain falls back after blank malformed plain",
+			msg: previewMessage("Content-Type: multipart/mixed; boundary=b\n",
+				"--b\nContent-Type: text/plain; charset=utf-8; format\n\n \n"+
+					"--b\nContent-Type: text/plain; charset=utf-8; format\n\nsecond plain fallback\n--b--\n"),
+			want: "second plain fallback",
+		},
+		{
+			name: "blank well-formed html falls back to malformed plain",
+			msg: previewMessage("Content-Type: multipart/alternative; boundary=b\n",
+				"--b\nContent-Type: text/plain; charset=utf-8; format\n\nplain fallback\n"+
+					"--b\nContent-Type: text/html; charset=utf-8\n\n<p>   </p>\n--b--\n"),
+			want: "plain fallback",
+		},
+		{
+			name: "blank well-formed plain falls back to malformed html",
+			msg: previewMessage("Content-Type: multipart/alternative; boundary=b\n",
+				"--b\nContent-Type: text/plain; charset=utf-8\n\n \n"+
+					"--b\nContent-Type: text/html; charset=utf-8; format\n\n<p>html fallback</p>\n--b--\n"),
+			want: "html fallback",
+		},
+		{
+			name: "malformed plain PGP message returns empty",
+			msg:  previewMessage("Content-Type: text/plain; charset=utf-8; format\n", "\n-----BEGIN PGP MESSAGE-----\n\nhQEMA...\n-----END PGP MESSAGE-----\n"),
+			want: "",
+		},
+		{
+			name: "malformed plain PGP message does not fall through to well-formed sibling",
+			msg: previewMessage("Content-Type: multipart/mixed; boundary=b\n",
+				"--b\nContent-Type: text/plain; charset=utf-8; format\n\n-----BEGIN PGP MESSAGE-----\n\nhQEMA...\n-----END PGP MESSAGE-----\n"+
+					"--b\nContent-Type: text/html; charset=utf-8\n\n<p>Wrapper notice</p>\n--b--\n"),
+			want: "",
+		},
+		{
+			name: "malformed html PGP message returns empty",
+			msg:  previewMessage("Content-Type: text/html; charset=utf-8; format\n", "<div>-----BEGIN PGP MESSAGE-----</div><div>hQEMA...</div><div>-----END PGP MESSAGE-----</div>\n"),
+			want: "",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := MessagePreview(strings.NewReader(tc.msg)); got != tc.want {
+				t.Errorf("MessagePreview() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
