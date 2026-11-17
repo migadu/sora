@@ -175,7 +175,7 @@ func TestURIConflictingVFSIsRefused(t *testing.T) {
 }
 
 func TestURIInvalidPreOpenDriverOptionsDoNotTouchFile(t *testing.T) {
-	for _, query := range []string{"_defensive=bad", "_defensive=", "_defensive=1&_defensive=1", "_error_rc=bad"} {
+	for _, query := range []string{"_defensive=bad", "_defensive=", "_defensive=1&_defensive=1", "_error_rc=bad", "_defensive=malformed", "_error_rc=malformed"} {
 		t.Run(query, func(t *testing.T) {
 			missing := filepath.Join(t.TempDir(), "missing.db")
 			c, err := openCacheForURIModeTest(t, (&url.URL{Scheme: "file", Path: missing, RawQuery: query}).String())
@@ -190,11 +190,14 @@ func TestURIInvalidPreOpenDriverOptionsDoNotTouchFile(t *testing.T) {
 			}
 
 			existing := filepath.Join(t.TempDir(), "existing.db")
-			if err := os.WriteFile(existing, []byte("existing"), 0644); err != nil {
-				t.Fatal(err)
-			}
-			if err := os.Chmod(existing, 0644); err != nil {
-				t.Fatal(err)
+			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+				path := existing + suffix
+				if err := os.WriteFile(path, []byte("existing"+suffix), 0644); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0644); err != nil {
+					t.Fatal(err)
+				}
 			}
 			c, err = openCacheForURIModeTest(t, (&url.URL{Scheme: "file", Path: existing, RawQuery: query}).String())
 			if c != nil {
@@ -203,12 +206,22 @@ func TestURIInvalidPreOpenDriverOptionsDoNotTouchFile(t *testing.T) {
 			if err == nil {
 				t.Error("invalid driver option accepted on existing file")
 			}
-			info, err := os.Stat(existing)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if got := info.Mode().Perm(); got != 0644 {
-				t.Errorf("rejected driver option %q mutated existing file mode to %04o, want 0644", query, got)
+			// An invalid value containing "malformed" must be rejected before
+			// the cache can misclassify it as corruption and recreate files.
+			for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+				path := existing + suffix
+				info, err := os.Stat(path)
+				if err != nil {
+					t.Errorf("rejected driver option %q removed %s: %v", query, path, err)
+					continue
+				}
+				if got := info.Mode().Perm(); got != 0644 {
+					t.Errorf("rejected driver option %q mutated %s mode to %04o, want 0644", query, path, got)
+				}
+				data, err := os.ReadFile(path)
+				if err != nil || string(data) != "existing"+suffix {
+					t.Errorf("rejected driver option %q changed %s contents to %q (err %v)", query, path, data, err)
+				}
 			}
 		})
 	}
