@@ -14,6 +14,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	pathpkg "path"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -36,6 +37,7 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/sieveengine"
+	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
 )
 
@@ -188,11 +190,31 @@ type Importer struct {
 	batchSize int // default: 20
 }
 
+// importRootOpened, when set, runs in NewImporter as soon as the root is open: a test
+// replaces --maildir-path there, as the maildir's owner can at any moment.
+var importRootOpened func()
+
 // NewImporter creates a new Importer instance.
 func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *resilient.ResilientDatabase, s3 objectStorage, options ImporterOptions) (*Importer, error) {
 	// The import runs on exactly this many workers: with none it would never drain its queue.
 	if jobs < 1 {
 		return nil, fmt.Errorf("jobs must be at least 1, got %d", jobs)
+	}
+	// Every message and metadata file is read through this root. It is opened first,
+	// so a directory that a link on the path may not choose is refused before the
+	// cache is created in it (openImportRoot).
+	root, err := openImportRoot(maildirPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open maildir: %w", err)
+	}
+	var importer *Importer
+	defer func() {
+		if importer == nil {
+			root.Close()
+		}
+	}()
+	if importRootOpened != nil {
+		importRootOpened()
 	}
 	maildirPath = effectiveMaildirPath(maildirPath)
 	// Always create SQLite database in the maildir path to persist maildir state
@@ -204,7 +226,9 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		logger.Info("Incremental mode disabled - will read all files (database still created for tracking)", "path", dbPath)
 	}
 
-	sqliteDB, err := openMaildirCache(maildirPath)
+	// The cache is opened in the directory openImportRoot checked, through root: the
+	// path may lead elsewhere by now.
+	sqliteDB, err := openMaildirCache(root)
 	if err != nil {
 		return nil, err
 	}
@@ -320,13 +344,7 @@ func NewImporter(ctx context.Context, maildirPath, email string, jobs int, rdb *
 		batchSize = options.BatchSize
 	}
 
-	root, err := os.OpenRoot(filepath.Clean(maildirPath))
-	if err != nil {
-		sqliteDB.Close()
-		return nil, fmt.Errorf("failed to open maildir: %w", err)
-	}
-
-	importer := &Importer{
+	importer = &Importer{
 		ctx:             ctx,
 		maildirPath:     maildirPath,
 		root:            root,
@@ -366,13 +384,23 @@ func (i *Importer) recordFailedPath(path, reason string) {
 // Close closes the importer and its resources. The maildir database file stays on
 // disk: Run removes it for --cleanup-db, and only after an import that succeeded.
 func (i *Importer) Close() error {
+	err := i.closeCache()
 	if i.root != nil {
 		i.root.Close()
+		i.root = nil
 	}
-	if i.sqliteDB != nil {
-		if err := i.sqliteDB.Close(); err != nil {
-			return fmt.Errorf("failed to close maildir database: %w", err)
-		}
+	return err
+}
+
+// closeCache closes the maildir database.
+func (i *Importer) closeCache() error {
+	if i.sqliteDB == nil {
+		return nil
+	}
+	db := i.sqliteDB
+	i.sqliteDB = nil
+	if err := db.Close(); err != nil {
+		return fmt.Errorf("failed to close maildir database: %w", err)
 	}
 	return nil
 }
@@ -382,7 +410,9 @@ func (i *Importer) Close() error {
 // a failed, partly failed or interrupted run it is kept: it is what lets the re-run
 // (--incremental) import only what is missing instead of the whole maildir again.
 func (i *Importer) finish(runErr error) {
-	if err := i.Close(); err != nil {
+	// The root is closed last: the database is removed through it.
+	defer i.Close()
+	if err := i.closeCache(); err != nil {
 		logger.Warn("Failed to close maildir database", "path", i.dbPath, "error", err)
 		return
 	}
@@ -397,7 +427,7 @@ func (i *Importer) finish(runErr error) {
 		logger.Warn("Import did not complete, keeping the import database for the next run", "path", i.dbPath, "error", runErr)
 	default:
 		logger.Info("Cleaning up import database", "path", i.dbPath)
-		if err := os.Remove(i.dbPath); err != nil {
+		if err := i.root.Remove(maildirCacheName); err != nil {
 			logger.Warn("Failed to remove import database", "path", i.dbPath, "error", err)
 		}
 	}
@@ -567,7 +597,7 @@ func (i *Importer) processSubscriptions() error {
 	subscriptionsPath := filepath.Join(i.maildirPath, "subscriptions")
 
 	// Check if subscriptions file exists
-	if _, err := os.Stat(subscriptionsPath); os.IsNotExist(err) {
+	if _, err := i.statMaildir(subscriptionsPath); errors.Is(err, fs.ErrNotExist) {
 		logger.Info("No subscriptions file found - skipping subscription processing", "path", subscriptionsPath)
 		return nil
 	}
@@ -633,17 +663,26 @@ func (i *Importer) processSubscriptions() error {
 // ~/.dovecot.sieve -> sieve/<name>.sieve; a link out of it, or an absolute one, does
 // not open. The usual --sieve file of a Dovecot migration is that link, which is the
 // user's, and the import runs with privileges the user lacks: the link must not
-// choose which file those privileges read into the user's account. Only a regular
-// file is read (openRegularFile), at most maxSieveScriptSize+1 bytes to detect an
-// oversized file without reading it whole.
+// choose which file those privileges read into the user's account. Neither may a link
+// on the way to the directory (~/sieve made a link to another user's): the root is
+// opened by openImportRoot. Only a regular file is read (openRegularFile), at most
+// maxSieveScriptSize+1 bytes to detect an oversized file without reading it whole.
 func readSieveFile(path string) ([]byte, error) {
-	path = filepath.Clean(path)
-	root, err := os.OpenRoot(filepath.Dir(path))
+	// Split without cleaning: a link followed by .. must reach the checked walk
+	// before its target determines which directory holds the script.
+	dir, name := filepath.Split(path)
+	if dir == "" {
+		dir = "."
+	}
+	if name == "" {
+		name = "." // a trailing separator still names a directory, not a script
+	}
+	root, err := openImportRoot(dir)
 	if err != nil {
 		return nil, err
 	}
 	defer root.Close()
-	file, err := openRegularFile(root, filepath.Base(path))
+	file, err := openRegularFile(root, name)
 	if err != nil {
 		return nil, err
 	}
@@ -765,7 +804,7 @@ func (i *Importer) parseDovecotKeywords() error {
 	keywordsPath := filepath.Join(i.maildirPath, "dovecot-keywords")
 
 	// Check if keywords file exists
-	if _, err := os.Stat(keywordsPath); os.IsNotExist(err) {
+	if _, err := i.statMaildir(keywordsPath); errors.Is(err, fs.ErrNotExist) {
 		logger.Info("No dovecot-keywords file found - custom keywords will not be imported", "path", keywordsPath)
 		return nil
 	}
@@ -892,7 +931,7 @@ func (i *Importer) performDryRun() error {
 		dateStr := "(unknown date)"
 
 		// Try to extract subject and date from message file
-		if info, err := os.Stat(path); err == nil {
+		if info, err := i.statMaildir(path); err == nil {
 			dateStr = info.ModTime().Format("2006-01-02 15:04")
 		}
 
@@ -1383,9 +1422,15 @@ var errNotRegularFile = errors.New("not a regular file")
 // not have been able to read (checkNamedByOwner).
 var errAnotherUsersFile = errors.New("may be another user's file")
 
-// fileUID returns the user that owns the file info describes. It is a variable so that
-// a test can make a file appear to belong to another user, which only root can arrange.
-var fileUID = func(info fs.FileInfo) uint32 { return info.Sys().(*syscall.Stat_t).Uid }
+// fileUID returns the user that owns the file info describes: one from the os package
+// or one openImportRoot's walk made (statInfo). It is a variable so that a test can
+// make a file appear to belong to another user, which only root can arrange.
+var fileUID = func(info fs.FileInfo) uint32 {
+	if st, ok := info.Sys().(*unix.Stat_t); ok {
+		return st.Uid
+	}
+	return info.Sys().(*syscall.Stat_t).Uid
+}
 
 // openRegularFile opens name below root if it is regular and passes the Unix
 // owner-directory check below. It fails with errNotRegularFile or
@@ -1442,10 +1487,10 @@ func openRegularFile(root *os.Root, name string) (*os.File, error) {
 // mode bits, not access granted through filesystem ACLs.
 //
 // The root's own owner says nothing: --maildir-path, or the --sieve file's directory,
-// may be a link the user made to a directory of root's that anyone may write into
-// (/tmp), and a maildir extracted as root into a directory root made keeps its owner's
-// files below it. Components are walked from root by descriptor (Lstat, Readlink,
-// OpenRoot), requiring the final entry to be the file opened so a directory or entry
+// may be a directory of root's that anyone may write into (/tmp), and a maildir
+// extracted as root into a directory root made keeps its owner's files below it.
+// Components are walked from root by descriptor (Lstat, Readlink, OpenRoot),
+// requiring the final entry to be the file opened so a directory or entry
 // replaced meanwhile cannot vouch for it. Any symbolic link along the path must stay
 // strictly below the directory holding that link (no absolute or .. segments), live in
 // a directory without group or other write access, and belong (together with its
@@ -1588,6 +1633,260 @@ func checkNamedByOwner(root *os.Root, name string, info fs.FileInfo) error {
 	return refuse("it was replaced while it was opened")
 }
 
+// maxImportRootLinks bounds the symbolic links openImportRoot follows, as
+// filepath.EvalSymlinks does.
+const maxImportRootLinks = 255
+
+// openImportRoot opens the directory at path, --maildir-path or the directory of the
+// --sieve file, as the root the import reads through. The import often runs as root,
+// and a user can make an entry of their home directory (~/Maildir, ~/sieve) a symbolic
+// link to any directory the import can read, such as another user's maildir, which
+// would then be read into the account named by --email. So a link on the way is
+// followed only when it belongs to root, to the user the import runs as, or to the
+// owner of the directory it leads to, as a link a user made to a directory of their
+// own does. A link of root or of that user leads only where that user could name
+// directly, as maildirCacheLinkRule trusts them. Any other link is refused, naming it,
+// so the operator can name the directory itself. The owner of a link says who made
+// it, not who gave it its name: where users may hard-link a file they do not own, a
+// link with more than one name is refused too.
+//
+// path is walked a component at a time by descriptor from the file system root (a
+// relative one from the working directory), as the system resolves it: a ".." after a
+// link goes up from the link's target. The directories on the way are opened for
+// search only (openSearchDir), so, as for an open by path, the user running the import
+// needs only search permission on them. The root is then opened by the name the walk
+// reached it by, which has no link in it, and returned only if it is the directory the
+// walk checked, so an entry replaced meanwhile cannot change what is read through it.
+func openImportRoot(path string) (*os.Root, error) {
+	return openLinkCheckedRoot(path, walkExisting)
+}
+
+// openExportRoot opens the directory at path, --maildir-path of an export, as the root
+// the export writes every message and metadata file through, under openImportRoot's
+// rule for the links on the way: an export into a user's maildir in place also often
+// runs as root, and would write the account's mail into the directory the user's link
+// chooses. The directories missing on the way are created, as os.MkdirAll creates
+// them, once every link on the way has been checked: only names of path itself are
+// created, never one that a link's target names (os.MkdirAll does not create through a
+// link that leads nowhere either). So a link that is refused leaves nothing created.
+// As for openImportRoot, the directories above need only be searchable, and one a
+// directory is created in writable, as for os.MkdirAll.
+func openExportRoot(path string) (*os.Root, error) {
+	return openLinkCheckedRoot(path, walkCreate)
+}
+
+// openExportPreviewRoot is openExportRoot for the export's dry run, which creates
+// nothing. Where openExportRoot would start creating the directories missing on the
+// way, once every link on the way is checked, it returns a nil root and no error: the
+// target does not exist, so it holds no cache and every message is new. Anything else
+// fails as it fails openExportRoot, a link the export refuses included, so a dry run
+// never reads a directory the export would not write into.
+func openExportPreviewRoot(path string) (*os.Root, error) {
+	return openLinkCheckedRoot(path, walkPreview)
+}
+
+// rootWalk is what openLinkCheckedRoot does with a name of its path that is missing.
+type rootWalk int
+
+const (
+	walkExisting rootWalk = iota // fail (openImportRoot)
+	walkCreate                   // create it, once every link is checked (openExportRoot)
+	walkPreview                  // return no root, once every link is checked (openExportPreviewRoot)
+)
+
+// openLinkCheckedRoot is openImportRoot, openExportRoot or openExportPreviewRoot, as
+// mode says.
+func openLinkCheckedRoot(path string, mode rootWalk) (*os.Root, error) {
+	sep := string(filepath.Separator)
+	euid := uint32(geteuid())
+	given := path
+	if !filepath.IsAbs(path) {
+		wd, err := os.Getwd()
+		if err != nil {
+			return nil, err
+		}
+		path = wd + sep + path
+	}
+
+	// A step is a name to walk to, which may be missing when create says so (and is
+	// then created, or ends a preview), or, after the target of a link that is not
+	// root's, the check that the directory the target reached belongs to the link's
+	// owner.
+	type step struct {
+		name    string
+		create  bool
+		link    string
+		linkUID uint32
+	}
+	split := func(p string) []step {
+		var steps []step
+		for _, name := range strings.Split(p, sep) {
+			if name != "" && name != "." {
+				steps = append(steps, step{name: name})
+			}
+		}
+		return steps
+	}
+
+	// dirs are the descriptors of the directories walked to, dirs[0] the file system
+	// root; resolved names the last of them, with no link in it.
+	var dirs []int
+	var resolved string
+	closeDirs := func() {
+		for _, dir := range dirs {
+			unix.Close(dir)
+		}
+		dirs = nil
+	}
+	defer closeDirs()
+	restart := func() error {
+		closeDirs()
+		top, err := openSearchDir(unix.AT_FDCWD, sep)
+		if err != nil {
+			return &fs.PathError{Op: "open", Path: sep, Err: err}
+		}
+		dirs, resolved = []int{top}, sep
+		return nil
+	}
+	if err := restart(); err != nil {
+		return nil, err
+	}
+
+	steps := split(path)
+	for i := range steps {
+		steps[i].create = mode != walkExisting
+	}
+	// missing are, with create, the names of path from the first one that does not
+	// exist: nothing below it exists to be checked, and a ".." after it goes back to
+	// the directory that holds it. They are created (mkdir) once the rest of path is
+	// checked, so a link the walk refuses leaves nothing created; a preview stops at
+	// the first of them that is still missing then.
+	var missing []step
+	mkdir := false
+	links := 0
+	for len(steps) > 0 || len(missing) > 0 {
+		if len(steps) == 0 {
+			steps, missing, mkdir = missing, nil, true
+		}
+		st := steps[0]
+		steps = steps[1:]
+		if len(missing) > 0 {
+			if st.name == ".." {
+				missing = missing[:len(missing)-1]
+			} else {
+				missing = append(missing, st)
+			}
+			continue
+		}
+		cur := dirs[len(dirs)-1]
+		switch {
+		case st.link != "":
+			info, err := fstatDir(cur, resolved)
+			if err != nil {
+				return nil, &fs.PathError{Op: "stat", Path: resolved, Err: err}
+			}
+			if uid := fileUID(info); uid != st.linkUID {
+				return nil, fmt.Errorf("refusing %s: %s is a symbolic link of uid %d to %s, a directory of uid %d, and a link is followed only if it belongs to root, to the user this runs as (uid %d) or to the owner of the directory it leads to; name that directory instead", given, st.link, st.linkUID, resolved, uid, euid)
+			}
+			continue
+		case st.name == "..":
+			if len(dirs) > 1 {
+				unix.Close(cur)
+				dirs = dirs[:len(dirs)-1]
+				resolved = filepath.Dir(resolved)
+			}
+			continue
+		}
+
+		name := filepath.Join(resolved, st.name)
+		info, err := lstatAt(cur, st.name)
+		if st.create && errors.Is(err, fs.ErrNotExist) {
+			if !mkdir {
+				missing = append(missing, st)
+				continue
+			}
+			if mode == walkPreview {
+				return nil, nil
+			}
+			mkdirErr := ignoringEINTR(func() error { return unix.Mkdirat(cur, st.name, 0755) })
+			if mkdirErr != nil && mkdirErr != unix.EEXIST {
+				return nil, &fs.PathError{Op: "mkdir", Path: name, Err: mkdirErr}
+			}
+			info, err = lstatAt(cur, st.name)
+		}
+		if err != nil {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: err}
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			if links++; links > maxImportRootLinks {
+				return nil, &fs.PathError{Op: "open", Path: given, Err: syscall.ELOOP}
+			}
+			target, err := readlinkAt(cur, st.name)
+			if err != nil {
+				return nil, &fs.PathError{Op: "readlink", Path: name, Err: err}
+			}
+			// The owner checked must be that of the link the target was read from.
+			again, err := lstatAt(cur, st.name)
+			if err != nil || !sameStat(info, again) {
+				return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, name)
+			}
+			// The owner says who made the link, not who gave it this name: where users
+			// may hard-link a file they do not own (hardLinksProtected), alice can name
+			// root's /var/mail/bob, or bob's own link to his maildir, ~/Maildir.
+			// Only the names the link has now are seen: one alice made earlier has
+			// a single name again once /var/mail/bob is removed, or bob replaces his
+			// link, and is then followed as its owner's. Telling it apart would need
+			// a rule on who may write the directory holding the link; the operator can
+			// name the directory itself instead (docs/IMPORT_EXPORT.md, section 3).
+			if nlink := uint64(again.st.Nlink); nlink > 1 && !hardLinksProtected() {
+				return nil, fmt.Errorf("refusing %s: %s is a symbolic link with %d names, and on this system any user may have given it this one with a hard link; name the directory it leads to instead", given, name, nlink)
+			}
+			next := split(target)
+			if uid := fileUID(again); uid != 0 && uid != euid {
+				next = append(next, step{link: name, linkUID: uid})
+			}
+			steps = append(next, steps...)
+			if filepath.IsAbs(target) {
+				if err := restart(); err != nil {
+					return nil, err
+				}
+			}
+			continue
+		}
+		if !info.IsDir() {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: syscall.ENOTDIR}
+		}
+		// The walk goes on from the directory opened here, not from the one lstatted:
+		// the open does not follow a link, and every later check looks at what it
+		// opened. The two differ at an automount point that is not mounted yet, which
+		// lstats as the directory that triggers the mount (stat does not mount, the
+		// open of a directory does), and the open reaches the directory a walk by
+		// path reaches. A directory renamed in between is walked as if renamed before.
+		dir, err := openSearchDir(cur, st.name)
+		if err != nil {
+			return nil, &fs.PathError{Op: "open", Path: name, Err: err}
+		}
+		dirs = append(dirs, dir)
+		resolved = name
+	}
+
+	// Only the root itself must be readable: it is opened by its name, and the name
+	// must still lead to the directory the walk checked, which dirs still holds open.
+	checked, err := fstatDir(dirs[len(dirs)-1], resolved)
+	if err != nil {
+		return nil, &fs.PathError{Op: "stat", Path: resolved, Err: err}
+	}
+	root, err := os.OpenRoot(resolved)
+	if err != nil {
+		return nil, err
+	}
+	if info, err := root.Stat("."); err != nil || !sameFileID(checked, info) {
+		root.Close()
+		return nil, fmt.Errorf("refusing %s: %s was replaced while it was opened", given, resolved)
+	}
+	return root, nil
+}
+
 // readMaildirDir is os.ReadDir through the maildir root (openMaildirFile). Only a
 // directory opens: with O_DIRECTORY anything else fails before it is opened, so a
 // FIFO does not wait for a writer (openRegularFile).
@@ -1596,7 +1895,20 @@ func (i *Importer) readMaildirDir(path string) ([]os.DirEntry, error) {
 	if err != nil {
 		return nil, err
 	}
-	dir, err := i.root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	return maildirFS{i.root}.ReadDir(name)
+}
+
+// maildirFS is the maildir root as an fs.FS, for the scan's fs.WalkDir. ReadDir lists
+// a directory through an O_DIRECTORY open, which fails on anything else before it is
+// opened, so a FIFO the maildir's owner swaps in does not wait for a writer.
+type maildirFS struct{ root *os.Root }
+
+func (m maildirFS) Open(name string) (fs.File, error) { return m.root.FS().Open(name) }
+
+func (m maildirFS) Stat(name string) (fs.FileInfo, error) { return m.root.Stat(name) }
+
+func (m maildirFS) ReadDir(name string) ([]fs.DirEntry, error) {
+	dir, err := m.root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -1604,6 +1916,16 @@ func (i *Importer) readMaildirDir(path string) ([]os.DirEntry, error) {
 	entries, err := dir.ReadDir(-1)
 	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
 	return entries, err
+}
+
+// statMaildir is os.Stat of path, below the maildir, through the root: once the root
+// is open, the maildir's owner may make --maildir-path lead to another directory.
+func (i *Importer) statMaildir(path string) (fs.FileInfo, error) {
+	name, err := i.maildirName(path)
+	if err != nil {
+		return nil, err
+	}
+	return i.root.Stat(name)
 }
 
 // maildirName returns the name of path below the maildir root. A path the cache holds
@@ -1635,18 +1957,18 @@ func (i *Importer) maildirName(path string) (string, error) {
 	return "", fmt.Errorf("%s is not below the maildir %s", path, i.maildirPath)
 }
 
-// isMaildirFolder checks if a directory is a valid maildir folder.
-func isMaildirFolder(path string) bool {
+// isMaildirFolder checks if the directory name in fsys is a valid maildir folder.
+func isMaildirFolder(fsys fs.FS, name string) bool {
 	// A maildir folder is one that holds messages: cur/ or new/. tmp/ is where a
 	// writer stages files and is routinely absent from copies (rsync --exclude tmp,
 	// backups); requiring it silently skipped whole folders of mail.
-	_, errCur := os.Stat(filepath.Join(path, "cur"))
-	_, errNew := os.Stat(filepath.Join(path, "new"))
-	if os.IsNotExist(errCur) && os.IsNotExist(errNew) {
+	_, errCur := fs.Stat(fsys, pathpkg.Join(name, "cur"))
+	_, errNew := fs.Stat(fsys, pathpkg.Join(name, "new"))
+	if errors.Is(errCur, fs.ErrNotExist) && errors.Is(errNew, fs.ErrNotExist) {
 		return false
 	}
-	if _, errTmp := os.Stat(filepath.Join(path, "tmp")); os.IsNotExist(errTmp) {
-		logger.Info("Maildir folder has no tmp/ directory; importing it anyway", "path", path)
+	if _, errTmp := fs.Stat(fsys, pathpkg.Join(name, "tmp")); errors.Is(errTmp, fs.ErrNotExist) {
+		logger.Info("Maildir folder has no tmp/ directory; importing it anyway", "folder", name)
 	}
 	return true
 }
@@ -1677,24 +1999,26 @@ type maildirFileKey struct {
 func (i *Importer) scanMaildir() error {
 	// Ensure path is clean and safe
 	cleanPath := filepath.Clean(i.maildirPath)
+	// Everything below is reached through the root openImportRoot checked: the path
+	// may lead to another directory by now.
+	fsys := maildirFS{i.root}
 
 	// First, validate that the root path is a valid maildir
-	if !isMaildirFolder(cleanPath) {
+	if !isMaildirFolder(fsys, ".") {
 		// Check if there's a Maildir subdirectory (common mistake)
 		possibleMaildir := filepath.Join(cleanPath, "Maildir")
-		if isMaildirFolder(possibleMaildir) {
+		if isMaildirFolder(fsys, "Maildir") {
 			return fmt.Errorf("path '%s' is not a valid maildir root.\nDid you mean to use '%s' instead?\nThe path should point directly to a maildir (containing cur/ or new/)", cleanPath, possibleMaildir)
 		}
 
 		// Check for other common maildir subdirectories
-		entries, err := os.ReadDir(cleanPath)
+		entries, err := fsys.ReadDir(".")
 		if err == nil {
 			var suggestions []string
 			for _, entry := range entries {
 				if entry.IsDir() {
-					subPath := filepath.Join(cleanPath, entry.Name())
-					if isMaildirFolder(subPath) {
-						suggestions = append(suggestions, subPath)
+					if isMaildirFolder(fsys, entry.Name()) {
+						suggestions = append(suggestions, filepath.Join(cleanPath, entry.Name()))
 					}
 				}
 			}
@@ -1706,15 +2030,9 @@ func (i *Importer) scanMaildir() error {
 		return fmt.Errorf("path '%s' is not a valid maildir root (must contain cur/ or new/)", cleanPath)
 	}
 
-	// The walk lstats its root and never follows a symbolic link, so a path that is a
-	// link to a maildir (accepted above: isMaildirFolder stats through it) was walked
-	// as a file and the run imported nothing. The walk starts at the directory the
-	// path names and reports every path below the path given, which mailbox names,
-	// keywords and uidlists are resolved against.
-	walkRoot, err := filepath.EvalSymlinks(cleanPath)
-	if err != nil {
-		return fmt.Errorf("failed to resolve maildir path %s: %w", cleanPath, err)
-	}
+	// The walk starts at the root, the directory the path named when it was checked,
+	// and never follows a symbolic link below it. It reports every path below the path
+	// given, which mailbox names, keywords and uidlists are resolved against.
 
 	// --- Parallel Processing Setup ---
 	var wg sync.WaitGroup
@@ -1786,13 +2104,13 @@ func (i *Importer) scanMaildir() error {
 	if i.options.PathsFile != "" {
 		walkErr = i.processPathsFile(cleanPath, filesToProcess)
 	} else {
-		// filepath.WalkDir lists a directory through an O_DIRECTORY open (os.ReadDir),
+		// The walk lists a directory through an O_DIRECTORY open (maildirFS.ReadDir),
 		// which fails on anything else before opening it. filepath.Walk opened a folder
 		// it had lstatted with a blocking open, and the maildir's owner can swap the
 		// folder for a FIFO in between with one rename: the open waited for a writer
 		// and the scan never returned. A folder swapped away is a scan error, as any
 		// folder that cannot be listed is.
-		walkErr = filepath.WalkDir(walkRoot, func(walked string, entry fs.DirEntry, err error) error {
+		walkErr = fs.WalkDir(fsys, ".", func(walked string, entry fs.DirEntry, err error) error {
 			select {
 			case <-i.ctx.Done():
 				return i.ctx.Err() // Stop walking if context is cancelled.
@@ -1801,29 +2119,27 @@ func (i *Importer) scanMaildir() error {
 			if err != nil {
 				return err
 			}
-			rel, err := filepath.Rel(walkRoot, walked)
-			if err != nil {
-				return fmt.Errorf("could not get relative path for %s: %w", walked, err)
-			}
-			path := filepath.Join(cleanPath, rel)
+			path := filepath.Join(cleanPath, filepath.FromSlash(walked))
 
 			// A folder below the root that is a symbolic link is not followed either: a
 			// link to a folder of the same maildir is an alias (dsync skips those too),
 			// and one pointing elsewhere would have the import read outside the path it
 			// was given. It is named, so its mail is never left out without a word; so is
-			// a link whose target cannot be read (a volume that is not mounted), which
-			// may be a folder too. cur/, new/ and tmp/ and the message files in them are
-			// not folders: they are read through the maildir root (openMaildirFile),
-			// which follows a link only within the maildir. A cur/ or new/ it does not
-			// read is named below, and a message file it does not read is refused by path.
+			// a link whose target cannot be read within the maildir (one out of it, or
+			// to a volume that is not mounted), which may be a folder too: the target
+			// is looked up through the root, not by the path. cur/, new/ and tmp/ and
+			// the message files in them are not folders: they are read through the
+			// maildir root (openMaildirFile), which follows a link only within the
+			// maildir. A cur/ or new/ it does not read is named below, and a message
+			// file it does not read is refused by path.
 			if entry.Type()&os.ModeSymlink != 0 {
-				parent := filepath.Dir(walked)
+				parent := pathpkg.Dir(walked)
 				// The root itself may be named cur, new or tmp; only a message
 				// directory below it makes this entry a message rather than a folder.
-				inMessageDir := parent != walkRoot && isMaildirMessageDir(filepath.Base(parent))
+				inMessageDir := parent != "." && isMaildirMessageDir(pathpkg.Base(parent))
 				if !isMaildirMessageDir(entry.Name()) && !inMessageDir {
-					if target, statErr := os.Stat(walked); statErr != nil {
-						logger.Warn("Skipping maildir entry: it is a symbolic link whose target cannot be read", "path", path, "error", statErr)
+					if target, statErr := fsys.Stat(walked); statErr != nil {
+						logger.Warn("Skipping maildir entry: it is a symbolic link whose target cannot be read within the maildir", "path", path, "error", statErr)
 					} else if target.IsDir() {
 						logger.Warn("Skipping maildir folder: it is a symbolic link, which the import does not follow", "path", path)
 					}
@@ -1844,7 +2160,7 @@ func (i *Importer) scanMaildir() error {
 			}
 
 			// Check if this directory is a maildir folder
-			if !isMaildirFolder(path) {
+			if !isMaildirFolder(fsys, walked) {
 				// This is not a maildir folder, continue walking.
 				return nil
 			}
@@ -2082,7 +2398,7 @@ func (i *Importer) shouldSkipMessage(path string) bool {
 		return false
 	}
 
-	info, err := os.Stat(path)
+	info, err := i.statMaildir(path)
 	if err != nil {
 		return false
 	}
@@ -2332,10 +2648,9 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		bodyStructure = fallback
 	}
 
-	extractedPlaintext, _ := helpers.ExtractPlaintextBody(messageContent)
-	var plaintextBody string
-	if extractedPlaintext != nil {
-		plaintextBody = *extractedPlaintext
+	plaintextBody, extractErr := helpers.FTSPlaintextBody(messageContent)
+	if extractErr != nil {
+		logger.Debug("Plaintext extraction encountered errors", "file", filename, "error", extractErr)
 	}
 
 	recipients := helpers.ExtractRecipients(messageContent.Header)
@@ -2374,7 +2689,7 @@ func (i *Importer) parseMessageMetadata(content []byte, filename, path string) (
 		plaintextBody:        plaintextBody,
 		sentDate:             sentDate,
 		sentDateUnknownZone:  sentDateUnknownZone,
-		internalDate:         maildirInternalDate(filename, path, sentDate),
+		internalDate:         i.maildirInternalDate(filename, path, sentDate),
 		inReplyTo:            inReplyTo,
 		references:           references,
 		bodyStructure:        &bodyStructure,
@@ -2703,8 +3018,7 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 								continue
 							}
 							if errors.Is(indErr, consts.ErrDBUniqueViolation) {
-								present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName})
-								atomic.AddInt64(&i.skippedMessages, 1)
+								present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName, path: gm.path})
 								continue
 							}
 							logger.Error("DB insert failed for message", "hash", gm.hash, "error", indErr)
@@ -2712,21 +3026,22 @@ func (i *Importer) insertBatchToDB(ctx context.Context, uploaded []uploadedMsg) 
 							atomic.AddInt64(&i.failedMessages, 1)
 							continue
 						}
-						inserted = append(inserted, markedMessage{hash: gm.hash, mailbox: mailboxName})
+						inserted = append(inserted, markedMessage{hash: gm.hash, mailbox: mailboxName, path: gm.path})
 					}
 					continue
 				}
 			}
 
-			wasInserted := make(map[string]bool, len(insertedHashesBatch))
+			remainingInserted := make(map[string]int, len(insertedHashesBatch))
 			for _, hash := range insertedHashesBatch {
-				wasInserted[hash] = true
-				inserted = append(inserted, markedMessage{hash: hash, mailbox: mailboxName})
+				remainingInserted[hash]++
 			}
 			for _, gm := range chunk {
-				if !wasInserted[gm.hash] {
-					present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName})
-					atomic.AddInt64(&i.skippedMessages, 1)
+				if remainingInserted[gm.hash] > 0 {
+					remainingInserted[gm.hash]--
+					inserted = append(inserted, markedMessage{hash: gm.hash, mailbox: mailboxName, path: gm.path})
+				} else {
+					present = append(present, markedMessage{hash: gm.hash, mailbox: mailboxName, path: gm.path})
 				}
 			}
 		}
@@ -2933,6 +3248,7 @@ func shortHash(hash string) string {
 type markedMessage struct {
 	hash    string
 	mailbox string
+	path    string
 }
 
 // sqliteMarkTimeout bounds markBatchInSQLite. Marking one batch is a short local
@@ -3132,11 +3448,18 @@ func (i *Importer) storeBatch(ctx context.Context, batch []msgInfo, read []uploa
 
 		// Phase 4: Mark successful messages in SQLite cache
 		// For safe mode, this happens AFTER individual commits
-		if err := i.markBatchInSQLite(append(append([]markedMessage(nil), successHashes...), present...)); err != nil {
+		toMark := append(append([]markedMessage(nil), successHashes...), present...)
+		if markErr := i.markBatchInSQLite(toMark); markErr != nil {
 			// FATAL: If SQLite update fails, messages will be re-imported
-			logger.Error("Failed to update SQLite cache - messages may be re-imported on retry", "error", err)
-			atomic.AddInt64(&i.failedMessages, int64(len(successHashes)))
-			return fmt.Errorf("failed to update SQLite cache: %w", err)
+			logger.Error("Failed to update SQLite cache - messages may be re-imported on retry", "error", markErr)
+			for _, m := range toMark {
+				i.recordFailedPath(m.path, fmt.Sprintf("failed to update SQLite cache: %v", markErr))
+			}
+			atomic.AddInt64(&i.failedMessages, int64(len(toMark)))
+			return fmt.Errorf("failed to update SQLite cache: %w", markErr)
+		}
+		if len(present) > 0 {
+			atomic.AddInt64(&i.skippedMessages, int64(len(present)))
 		}
 
 		logger.Info("SQLite marking complete")
@@ -3430,7 +3753,7 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 	if dir == filepath.Clean(i.maildirPath) {
 		kws = i.dovecotKeywords
 	} else if i.options.Dovecot {
-		if _, err := os.Stat(keywordsPath); err == nil {
+		if _, err := i.statMaildir(keywordsPath); err == nil {
 			parsed, perr := parseKeywordsFile(keywordsPath, i.openMaildirFile)
 			if perr != nil {
 				logger.Warn("Failed to read folder dovecot-keywords, importing its messages without keywords", "path", keywordsPath, "error", perr)
@@ -3451,14 +3774,14 @@ func (i *Importer) keywordsForMessagePath(path string) map[int]string {
 // using it as INTERNALDATE altered the arrival time of every imported message and
 // re-stamped mtimes on export. sentDate is zero for a message without a Date: header
 // that parses; it is stored with its INTERNALDATE as the sent date.
-func maildirInternalDate(filename, path string, sentDate time.Time) time.Time {
+func (i *Importer) maildirInternalDate(filename, path string, sentDate time.Time) time.Time {
 	base := filepath.Base(filename)
 	if dot := strings.IndexByte(base, '.'); dot > 0 {
 		if secs, err := strconv.ParseInt(base[:dot], 10, 64); err == nil && secs > 0 {
 			return time.Unix(secs, 0)
 		}
 	}
-	if info, err := os.Stat(path); err == nil && !info.ModTime().IsZero() {
+	if info, err := i.statMaildir(path); err == nil && !info.ModTime().IsZero() {
 		return info.ModTime()
 	}
 	if sentDate.IsZero() {

@@ -11,11 +11,11 @@ import (
 // (RFC 5234 section 2.3). strings.EqualFold matches U+017F (LATIN SMALL LETTER LONG S)
 // with "s", so "ſIZE" was read as SIZE and "ſMTPUTF8" as SMTPUTF8.
 func TestParameterLookalikesAreNotKeywords(t *testing.T) {
-	if size, reply := mailSizeParameter([]string{"FROM:<a@example.org>", "ſIZE=99999999999"}, 1024); size != "" || reply != "" {
-		t.Errorf("mailSizeParameter(ſIZE=99999999999) = %q, %q; want no SIZE parameter", size, reply)
-	}
-	if size, reply := mailSizeParameter([]string{"FROM:<a@example.org>", "ſIZE=1x"}, 1024); size != "" || reply != "" {
-		t.Errorf("mailSizeParameter(ſIZE=1x) = %q, %q; want no SIZE parameter", size, reply)
+	// Not SIZE: an unknown parameter (555), neither too large (552) nor malformed (501).
+	for _, p := range []string{"ſIZE=99999999999", "ſIZE=1x"} {
+		if size, _, reply := mailParameters([]string{p}, 1024); size != "" || !strings.HasPrefix(reply, "555 ") {
+			t.Errorf("mailParameters(%s) = %q, %q; want no SIZE parameter and 555", p, size, reply)
+		}
 	}
 	if hasSMTPUTF8Param([]string{"FROM:<a@example.org>", "ſMTPUTF8"}) {
 		t.Error("hasSMTPUTF8Param(ſMTPUTF8) = true, want false")
@@ -28,8 +28,8 @@ func TestParameterLookalikesAreNotKeywords(t *testing.T) {
 	}
 
 	// ASCII letters in any case are still the keywords.
-	if size, reply := mailSizeParameter([]string{"FROM:<a@example.org>", "size=1024"}, 1024); size != "1024" || reply != "" {
-		t.Errorf("mailSizeParameter(size=1024) = %q, %q; want 1024", size, reply)
+	if size, _, reply := mailParameters([]string{"size=1024"}, 1024); size != "1024" || reply != "" {
+		t.Errorf("mailParameters(size=1024) = %q, %q; want 1024", size, reply)
 	}
 	if !hasSMTPUTF8Param([]string{"FROM:<a@example.org>", "SmtpUtf8"}) {
 		t.Error("hasSMTPUTF8Param(SmtpUtf8) = false, want true")
