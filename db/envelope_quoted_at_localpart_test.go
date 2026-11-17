@@ -81,7 +81,7 @@ func TestBuildEnvelopeQuotedAtLocalPart(t *testing.T) {
 		}
 	})
 
-	t.Run("malformed stored addresses remain rejected", func(t *testing.T) {
+	t.Run("malformed stored addresses are rejected", func(t *testing.T) {
 		recipients := []helpers.Recipient{
 			{AddressType: "to", EmailAddress: ""},
 			{AddressType: "to", EmailAddress: "noat"},
@@ -106,6 +106,50 @@ func TestBuildEnvelopeQuotedAtLocalPart(t *testing.T) {
 			t.Errorf("To = %+v, want only %+v", env.To, wantTo)
 		}
 	})
+}
+
+// The last-@ split relies on the exact parsed-address representation that ingress
+// stores. Keep both accepted quoted local-parts and rejected domain/local forms
+// under the real parser rather than constructing their JSON representation.
+func TestBuildEnvelopeParsedAddressBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw string
+		want      []imap.Address
+	}{
+		{"at-only local", `"@"@example.com`, []imap.Address{{Mailbox: "@", Host: "example.com"}}},
+		{"space and at local", `"a @ b"@example.com`, []imap.Address{{Mailbox: "a @ b", Host: "example.com"}}},
+		{"escaped quote and at local", `"a\"@b"@example.com`, []imap.Address{{Mailbox: `a"@b`, Host: "example.com"}}},
+		{"IP literal domain", `"node@relay"@[127.0.0.1]`, []imap.Address{{Mailbox: "node@relay", Host: "[127.0.0.1]"}}},
+		{"UTF8 local and domain", `"émile@node"@münchen.example`, []imap.Address{{Mailbox: "émile@node", Host: "münchen.example"}}},
+		{"ordinary control", `ordinary@example.com`, []imap.Address{{Mailbox: "ordinary", Host: "example.com"}}},
+		{"empty quoted local rejected", `""@example.com`, nil},
+		{"at in domain literal rejected", `"node@relay"@[a@b]`, nil},
+		{"unquoted multiple at rejected", `a@b@example.com`, nil},
+		{"missing local rejected", `@example.com`, nil},
+		{"missing host rejected", `user@`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			hdr := mail.HeaderFromMap(map[string][]string{"To": {tc.raw}})
+			recipients := helpers.ExtractRecipients(hdr.Header)
+			if len(recipients) != len(tc.want) {
+				t.Fatalf("parsed recipients = %+v, want %d", recipients, len(tc.want))
+			}
+			if len(tc.want) == 1 && recipients[0].EmailAddress != tc.want[0].Mailbox+"@"+tc.want[0].Host {
+				t.Fatalf("parsed stored address = %q, want mailbox %q at host %q", recipients[0].EmailAddress, tc.want[0].Mailbox, tc.want[0].Host)
+			}
+			raw, err := json.Marshal(recipients)
+			if err != nil {
+				t.Fatal(err)
+			}
+			env, err := BuildEnvelope(&Message{UID: 4, MailboxID: 10, RecipientsJSON: raw})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !slices.Equal(env.To, tc.want) {
+				t.Fatalf("To = %+v, want %+v", env.To, tc.want)
+			}
+		})
+	}
 }
 
 func TestSortOrderClauseQuotedAtLocalPart(t *testing.T) {
