@@ -44,23 +44,34 @@ func TestMessagesRepairHeaderPresenceCommandHelper(t *testing.T) {
 
 func runRepairHeaderPresenceCLI(t *testing.T, args ...string) (string, bool) {
 	t.Helper()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestMessagesRepairHeaderPresenceCommandHelper$")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestMessagesRepairHeaderPresenceCommandHelper$")
 	cmd.Env = append(os.Environ(), repairHeaderPresenceHelperEnv+"="+strings.Join(args, "\n"))
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
+	require.NoError(t, ctx.Err(), "messages command timed out: %s", stderr.String())
 	t.Logf("messages %s (ok=%v, err=%v)\n%s", strings.Join(args, " "), err == nil, err, stdout.String())
-	return stdout.String(), err == nil
+	return stdout.String() + stderr.String(), err == nil
 }
 
-// TestMessagesRepairHeaderPresenceFixesLegacyEmptyHeaderSearch is the #661
-// scenario on legacy rows: messages whose header_presence is NULL (stored before
-// migration 000070, or copied from such rows) match UID SEARCH HEADER Cc "" even
-// without a Cc header, so NOT HEADER Cc "" finds nothing. After
-// "sora-admin messages repair-header-presence --apply" the same IMAP searches
-// must follow RFC 9051 §6.4.4 (the empty string tests header presence).
-func TestMessagesRepairHeaderPresenceFixesLegacyEmptyHeaderSearch(t *testing.T) {
+// Historical repair commands stay unavailable under the forward-only policy.
+// The helper runs the real dispatcher, including its nonzero unknown-command exit.
+func TestMessagesHistoricalRepairCommandsUnavailable(t *testing.T) {
+	for _, command := range []string{"repair-header-presence", "repair-state"} {
+		t.Run(command, func(t *testing.T) {
+			out, ok := runRepairHeaderPresenceCLI(t, command, "--apply")
+			require.False(t, ok)
+			require.Contains(t, out, "Unknown messages subcommand: "+command)
+		})
+	}
+}
+
+// New ingress records presence; historical NULL rows retain the accepted legacy
+// search behavior. Neither reads nor an attempted historical repair may fill them.
+func TestMessagesHeaderPresenceRemainsForwardOnly(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	srv, account := common.SetupIMAPServer(t)
 	defer srv.Close()
@@ -120,7 +131,7 @@ func TestMessagesRepairHeaderPresenceFixesLegacyEmptyHeaderSearch(t *testing.T) 
 	}
 
 	command(fmt.Sprintf("LOGIN %q %q", account.Email, account.Password), "")
-	// INBOX keeps the post-000070 copies (the database donors for the repair).
+	// INBOX keeps known post-000070 masks, even for the same bodies as Legacy.
 	command("APPEND INBOX", "From: a@example.com\r\nCc: c@example.com\r\nSubject: with cc\r\n\r\nbody 1\r\n")
 	command("APPEND INBOX", "From: a@example.com\r\nSubject: without cc\r\n\r\nbody 2\r\n")
 	command("CREATE Legacy", "")
@@ -143,36 +154,50 @@ func TestMessagesRepairHeaderPresenceFixesLegacyEmptyHeaderSearch(t *testing.T) 
 		SELECT min(id) FROM legacy`, accountID).Scan(&minID))
 	require.NotZero(t, minID)
 
-	command("SELECT Legacy", "")
-	// The issue's symptom on legacy rows: the message without Cc matches HEADER Cc "".
-	require.Equal(t, []int{1, 2}, search(`HEADER Cc ""`), "legacy NULL rows before repair")
-
-	out, ok := runRepairHeaderPresenceCLI(t, "repair-header-presence", "--apply",
-		"--start-after", strconv.FormatInt(minID-1, 10))
-	if !ok {
-		// Keep going: the searches below show what the failed repair left behind.
-		t.Errorf("messages repair-header-presence --apply failed:\n%s", out)
+	assertUnchangedMasks := func() {
+		t.Helper()
+		var unknown, known int
+		require.NoError(t, pool.QueryRow(ctx, `SELECT
+			count(*) FILTER (WHERE header_presence IS NULL),
+			count(*) FILTER (WHERE header_presence IS NOT NULL)
+			FROM messages WHERE account_id=$1 AND expunged_at IS NULL`, accountID).Scan(&unknown, &known))
+		require.Equal(t, 2, unknown, "historical masks must stay NULL")
+		require.Equal(t, 2, known, "new ingress masks must stay known")
 	}
-
-	command("SELECT Legacy", "")
 	cases := []struct {
 		criteria string
-		want     []int
+		known    []int
+		legacy   []int
 	}{
-		{`HEADER Cc ""`, []int{1}},
-		{`NOT HEADER Cc ""`, []int{2}},
-		{`CC ""`, []int{1}},
-		{`NOT CC ""`, []int{2}},
-		{`HEADER To ""`, []int{}},
-		{`NOT HEADER To ""`, []int{1, 2}},
-		{`TO ""`, []int{}},
-		{`NOT TO ""`, []int{1, 2}},
-		{`HEADER From ""`, []int{1, 2}},
-		{`NOT HEADER From ""`, []int{}},
+		{`HEADER Cc ""`, []int{1}, []int{1, 2}},
+		{`NOT HEADER Cc ""`, []int{2}, []int{}},
+		{`CC ""`, []int{1}, []int{1, 2}},
+		{`NOT CC ""`, []int{2}, []int{}},
+		{`HEADER To ""`, []int{}, []int{1, 2}},
+		{`NOT HEADER To ""`, []int{1, 2}, []int{}},
+		{`TO ""`, []int{}, []int{1, 2}},
+		{`NOT TO ""`, []int{1, 2}, []int{}},
+		{`HEADER From ""`, []int{1, 2}, []int{1, 2}},
+		{`NOT HEADER From ""`, []int{}, []int{}},
 	}
-	for _, tc := range cases {
-		if got := search(tc.criteria); !slices.Equal(got, tc.want) {
-			t.Errorf("UID SEARCH %s after repair = %v, want %v", tc.criteria, got, tc.want)
+	for _, apply := range []bool{false, true} {
+		args := []string{"repair-header-presence", "--start-after", strconv.FormatInt(minID-1, 10)}
+		if apply {
+			args = append(args, "--apply")
+		}
+		out, ok := runRepairHeaderPresenceCLI(t, args...)
+		require.False(t, ok)
+		require.Contains(t, out, "Unknown messages subcommand: repair-header-presence")
+		for _, mailbox := range []string{"INBOX", "Legacy"} {
+			command("SELECT "+mailbox, "")
+			for _, tc := range cases {
+				want := tc.known
+				if mailbox == "Legacy" {
+					want = tc.legacy
+				}
+				require.Equal(t, want, search(tc.criteria), "mailbox=%s apply=%v criteria=%s", mailbox, apply, tc.criteria)
+				assertUnchangedMasks()
+			}
 		}
 	}
 }
