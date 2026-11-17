@@ -169,7 +169,12 @@ func (s *IMAPSession) spillBodySection(key string, data []byte) bool {
 		return false
 	}
 	// Unlink immediately so the inode cannot outlive the process or be opened by path.
-	_ = os.Remove(f.Name())
+	// Do not write message bytes if the filesystem cannot remove the name.
+	if err := os.Remove(f.Name()); err != nil {
+		_ = f.Close()
+		s.server.reserveSpilledBodySectionBytes(-int64(len(data)))
+		return false
+	}
 
 	if n, err := f.Write(data); err != nil || n != len(data) {
 		_ = f.Close()
