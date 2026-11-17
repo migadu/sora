@@ -127,7 +127,7 @@ func TestExporterDryRunRefusesLiveSQLiteWithoutTouchingSource(t *testing.T) {
 	for _, transaction := range []bool{false, true} {
 		t.Run(fmt.Sprintf("write_transaction_%t", transaction), func(t *testing.T) {
 			dir := t.TempDir()
-			d, err := openMaildirCache(dir)
+			d, err := openMaildirCacheAt(t, dir)
 			require.NoError(t, err)
 			defer d.Close()
 			_, err = d.Exec(`CREATE TABLE messages(hash TEXT,mailbox TEXT,filename TEXT); INSERT INTO messages VALUES('live','INBOX','live.eml')`)

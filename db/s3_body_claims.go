@@ -57,29 +57,63 @@ func checkS3BodyClaimContinuity(ctx context.Context, tx pgx.Tx, hashes []string)
 	return nil
 }
 
-// lockS3SourceClaims freezes the source accounts against a rekey before reading
-// their hashes, acquires all corresponding body locks, and lets COPY/MOVE reread
-// source rows from a fresh READ COMMITTED snapshot. No changed hash can slip from
-// the first read into an uploaded copy without having its body lock held.
-func lockS3SourceClaims(ctx context.Context, tx pgx.Tx, mailboxID int64, uids *[]imap.UID) error {
+// sourceBodyClaims freezes the selected accounts against rekey before a fresh
+// source read. A cross-account operation budgets every source body, including
+// legacy rows already owned by its destination. No global body lock is taken here.
+func sourceBodyClaims(ctx context.Context, tx pgx.Tx, mailboxID, destMailboxID, destAccountID int64, uids *[]imap.UID, destObjects []string) ([]string, error) {
 	if err := lockRekeySources(ctx, tx, mailboxID, uids); err != nil {
-		return err
+		return nil, err
 	}
-	rows, err := tx.Query(ctx, `SELECT DISTINCT content_hash FROM messages WHERE mailbox_id=$1 AND uid=ANY($2) AND expunged_at IS NULL`, mailboxID, uids)
+	rows, err := tx.Query(ctx, `SELECT content_hash, bool_or(account_id IS DISTINCT FROM $3) FROM messages WHERE mailbox_id=$1 AND uid=ANY($2) AND expunged_at IS NULL GROUP BY content_hash`, mailboxID, uids, destAccountID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	var hashes []string
+	cross := false
 	for rows.Next() {
 		var h string
-		if err := rows.Scan(&h); err != nil {
+		var rekeyed bool
+		if err := rows.Scan(&h, &rekeyed); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		hashes = append(hashes, h)
+		cross = cross || rekeyed
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// A MOVE within one mailbox retains its existing account/S3 identities.
+	if cross && mailboxID != destMailboxID {
+		bodies := make(map[string]struct{}, min(len(hashes)+len(destObjects), MaxCrossAccountBodies+1))
+		for _, list := range [][]string{hashes, destObjects} {
+			for _, hash := range list {
+				bodies[hash] = struct{}{}
+				if len(bodies) > MaxCrossAccountBodies {
+					return nil, ErrCrossAccountBodyLimit
+				}
+			}
+		}
+	}
+	return hashes, nil
+}
+
+// CheckCopyMoveBodyBudget checks the complete current source under account rekey
+// guards in the actual write transaction, before any destination body lock or
+// storage callback. Caller-supplied rekey-only maps cannot establish this budget.
+// Pure same-account operations retain their existing uncapped policy.
+func (db *Database) CheckCopyMoveBodyBudget(ctx context.Context, tx pgx.Tx, srcMailboxID, destMailboxID, destAccountID int64, uids *[]imap.UID, destObjects []string) error {
+	_, err := sourceBodyClaims(ctx, tx, srcMailboxID, destMailboxID, destAccountID, uids, destObjects)
+	return err
+}
+
+// lockS3SourceClaims budgets the fresh, rekey-stable source before acquiring its
+// shared body locks. COPY/MOVE reread from a fresh READ COMMITTED snapshot while
+// the account guards and body locks remain held through commit.
+func lockS3SourceClaims(ctx context.Context, tx pgx.Tx, mailboxID, destMailboxID, destAccountID int64, uids *[]imap.UID, destObjects []string) error {
+	hashes, err := sourceBodyClaims(ctx, tx, mailboxID, destMailboxID, destAccountID, uids, destObjects)
+	if err != nil {
 		return err
 	}
 	return LockS3ObjectsSharedInTx(ctx, tx, 0, hashes)
