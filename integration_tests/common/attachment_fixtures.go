@@ -12,6 +12,17 @@ import (
 func AttachmentKeywordRegressionCases() []struct{ Name, MIME, Keyword string } {
 	msg := func(lines ...string) string { return strings.Join(lines, "\r\n") + "\r\n" }
 	return []struct{ Name, MIME, Keyword string }{
+		{"recovered filename related single separator", msg("Content-Type: multipart/related; boundary=b", "",
+			"--b", "Content-Type: text/html", "", "<p>body</p>",
+			"--b", "Content-Type: image/png", "Content-Disposition: inline; filename=monthly report.png;", "", "PNG", "--b--"), "$hasnoattachment"},
+		{"recovered filename related trailing separators", msg("Content-Type: multipart/related; boundary=b", "",
+			"--b", "Content-Type: text/html", "", "<p>body</p>",
+			"--b", "Content-Type: image/png", "Content-Disposition: inline; filename=monthly report.png;;", "", "PNG", "--b--"), ""},
+		{"recovered filename related spaced trailing separators", msg("Content-Type: multipart/related; boundary=b", "",
+			"--b", "Content-Type: text/html", "", "<p>body</p>",
+			"--b", "Content-Type: image/png", "Content-Disposition: inline; filename=monthly report.png; ;", "", "PNG", "--b--"), ""},
+		{"recovered filename outside related", msg("Content-Type: image/png",
+			"Content-Disposition: inline; filename=monthly report.png;;", "", "PNG"), "$hasattachment"},
 		{"over nested plain remains unknown", NestedAttachmentMIME(256, false), ""},
 		{"over nested hidden attachment remains unknown", NestedAttachmentMIME(256, true), ""},
 		{"shallow nested plain", NestedAttachmentMIME(4, false), "$hasnoattachment"},

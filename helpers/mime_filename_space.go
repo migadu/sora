@@ -115,7 +115,9 @@ func quoteUnquotedFilename(value string) (string, bool) {
 
 // validateRecoveredFilename follows go-message's strict media-parameter parse,
 // including its existing tolerance of trailing separators, before the raw
-// scanner may turn a recovered filename into attachment evidence.
+// scanner may turn a recovered filename into attachment evidence. It returns
+// the repaired copy untrimmed: the tolerance only gates the repair, and the
+// raw scanner then reads the separators as it would after a quoted filename.
 func validateRecoveredFilename(raw string) (string, bool) {
 	repaired, ok := quoteUnquotedFilename(raw)
 	if !ok {
@@ -127,7 +129,7 @@ func validateRecoveredFilename(raw string) (string, bool) {
 	trimmed := strings.TrimRight(strings.TrimSpace(repaired), "; \t")
 	if trimmed != repaired {
 		if _, _, err := stdmime.ParseMediaType(trimmed); err == nil {
-			return trimmed, true
+			return repaired, true
 		}
 	}
 	return "", false

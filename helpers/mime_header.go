@@ -22,7 +22,10 @@ func parseMIMEHeader(raw string, contentType bool) mimeHeaderValue {
 		return v
 	}
 	if repaired, ok := validateRecoveredFilename(raw); ok {
-		if recovered := parseMIMEHeaderStrict(repaired, false); recovered.complete {
+		// The repaired copy is the field with only the filename quoted, so its
+		// strict parse is exactly what the quoted form would give, trailing
+		// separators included (#1872 review).
+		if recovered := parseMIMEHeaderStrict(repaired, false); len(recovered.invalid) == 0 {
 			return recovered
 		}
 	}
