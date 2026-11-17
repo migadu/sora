@@ -77,6 +77,12 @@ func setupTestDatabaseWithSuffix(t testing.TB, suffix string) *Database {
 
 	database, err := NewDatabaseFromConfig(ctx, dbConfig, true)
 	require.NoError(t, err, "Failed to connect to test database. Please ensure PostgreSQL is running and %s database exists", cfg.Database.Write.Name)
+	// Close the pools when the test ends. Most callers never close the database
+	// themselves, and pgx keeps idle connections for 30 minutes, so without this the
+	// package's tests pile up open connections until PostgreSQL refuses new clients
+	// ("sorry, too many clients already"). Close is safe to call twice, so tests that
+	// also defer db.Close() are unaffected.
+	t.Cleanup(database.Close)
 
 	// Verify pg_trgm extension is available
 	var extensionExists bool
