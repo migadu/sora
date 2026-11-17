@@ -1708,9 +1708,9 @@ func openLinkCheckedRoot(path string, mode rootWalk) (*os.Root, error) {
 	}
 
 	// A step is a name to walk to, which may be missing when create says so (and is
-	// then created, or ends a preview), or, after the target of a link that is not
-	// root's, the check that the directory the target reached belongs to the link's
-	// owner.
+	// then created, or ends a preview), or, after the target of a link that is
+	// neither root's nor the running user's, the check that the directory the target
+	// reached belongs to the link's owner.
 	type step struct {
 		name    string
 		create  bool
