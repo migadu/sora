@@ -70,8 +70,13 @@ func TestGetStrandedUploadInstances(t *testing.T) {
 		t.Skip("Skipping database integration test in short mode")
 	}
 
-	db, _, accountID, _ := setupCleanerTestDatabase(t)
-	defer db.Close()
+	// GetStrandedUploadInstances reports only the top 20 instances, database-wide. On
+	// the shared test database the pending_uploads rows other tests leave behind crowd
+	// this test's small instances out of that list, so it runs on a database of its
+	// own and removes its fixtures when it ends.
+	// No defer db.Close(): it would run before the fixture cleanup below. The setup
+	// closes the pools itself, after every cleanup registered here.
+	db, _, accountID, _ := setupCleanerTestDatabaseWithSuffix(t, "_stranded")
 
 	ctx := context.Background()
 	ts := time.Now().UnixNano()
@@ -83,6 +88,14 @@ func TestGetStrandedUploadInstances(t *testing.T) {
 	unknownID := fmt.Sprintf("stranded_unknown_%d", ts)
 	aliveID := fmt.Sprintf("stranded_alive_%d", ts)
 	exhaustedID := fmt.Sprintf("stranded_exhausted_%d", ts)
+
+	t.Cleanup(func() {
+		ids := []string{goneID, unknownID, aliveID, exhaustedID}
+		_, _ = db.GetWritePool().Exec(context.Background(),
+			`DELETE FROM pending_uploads WHERE instance_id = ANY($1)`, ids)
+		_, _ = db.GetWritePool().Exec(context.Background(),
+			`DELETE FROM instance_heartbeats WHERE instance_id = ANY($1)`, ids)
+	})
 
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
