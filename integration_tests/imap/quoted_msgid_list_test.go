@@ -3,7 +3,9 @@
 package imap_test
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -12,8 +14,8 @@ import (
 	"github.com/migadu/sora/integration_tests/common"
 )
 
-// A message id whose obsolete quoted local part holds white space or angle brackets
-// (RFC 5322 §3.6.4 obs-id-left) is one id in ENVELOPE, THREAD and SEARCH (#1875).
+// Quoted local parts, UTF-8 atom text and no-fold domain literals remain one id in
+// ENVELOPE, THREAD and SEARCH (#1875).
 func TestIMAP_QuotedLocalPartMessageIDLists(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	server, account := common.SetupIMAPServer(t)
@@ -28,14 +30,25 @@ func TestIMAP_QuotedLocalPartMessageIDLists(t *testing.T) {
 		t.Fatalf("login: %v", err)
 	}
 
-	start := time.Now().Add(-4 * time.Hour)
-	for i, msg := range []string{
-		"From: a@example.com\r\nSubject: Question\r\nMessage-ID: <\"foo bar\"@example.com>\r\n\r\nAsking\r\n",
-		"From: b@example.com\r\nSubject: Answer\r\nMessage-ID: <\"<inner>\"@example.com>\r\n" +
-			"In-Reply-To: <\"foo bar\"@example.com>\r\nReferences: <\"foo bar\"@example.com>\r\n\r\nAnswering\r\n",
-		"From: c@example.com\r\nSubject: Something else\r\nMessage-ID: <r3@example.com>\r\n" +
-			"In-Reply-To: <\"<inner>\"@example.com>\r\nReferences: <\"foo bar\"@example.com> <\"<inner>\"@example.com>\r\n\r\nFollowing up\r\n",
-	} {
+	ids := []string{
+		`"foo bar"@example.com`,
+		`"<inner>"@example.com`,
+		"r3@example.com",
+		"non\u00a0breaking@example.com",
+		"em\u2003part@dom\u00a0ain.example",
+		`literal@[<inner>]`,
+		`"quoted local"@[<inner>]`,
+		"r8@example.com",
+	}
+	start := time.Now().Add(-time.Duration(len(ids)) * time.Hour)
+	var references []string
+	for i, id := range ids {
+		msg := fmt.Sprintf("From: a@example.com\r\nSubject: Chain message %d\r\nMessage-ID: <%s>\r\n", i+1, id)
+		if i > 0 {
+			msg += "In-Reply-To: <" + ids[i-1] + ">\r\nReferences: " + strings.Join(references, " ") + "\r\n"
+		}
+		msg += "\r\nBody\r\n"
+		references = append(references, "<"+id+">")
 		ac := c.Append("INBOX", int64(len(msg)), &imap.AppendOptions{Time: start.Add(time.Duration(i) * time.Hour)})
 		if _, err := ac.Write([]byte(msg)); err != nil {
 			t.Fatalf("APPEND write: %v", err)
@@ -52,14 +65,32 @@ func TestIMAP_QuotedLocalPartMessageIDLists(t *testing.T) {
 	}
 
 	t.Run("ENVELOPE", func(t *testing.T) {
-		msgs, err := c.Fetch(imap.SeqSetNum(2, 3), &imap.FetchOptions{Envelope: true}).Collect()
+		var seqs []uint32
+		for i := 2; i <= len(ids); i++ {
+			seqs = append(seqs, uint32(i))
+		}
+		msgs, err := c.Fetch(imap.SeqSetNum(seqs...), &imap.FetchOptions{Envelope: true}).Collect()
 		if err != nil {
 			t.Fatalf("FETCH: %v", err)
 		}
-		want := map[uint32][]string{2: {`"foo bar"@example.com`}, 3: {`"<inner>"@example.com`}}
+		if len(msgs) != len(seqs) {
+			t.Fatalf("FETCH returned %d messages, want %d", len(msgs), len(seqs))
+		}
+		seen := make(map[uint32]bool)
 		for _, m := range msgs {
-			if m.Envelope == nil || !slices.Equal(m.Envelope.InReplyTo, want[m.SeqNum]) {
-				t.Errorf("message %d ENVELOPE In-Reply-To = %q, want %q", m.SeqNum, m.Envelope.InReplyTo, want[m.SeqNum])
+			if m.SeqNum < 2 || m.SeqNum > uint32(len(ids)) || seen[m.SeqNum] {
+				t.Fatalf("unexpected or duplicate FETCH sequence number %d", m.SeqNum)
+			}
+			seen[m.SeqNum] = true
+			if m.Envelope == nil {
+				t.Fatalf("message %d has no ENVELOPE", m.SeqNum)
+			}
+			want := []string{ids[m.SeqNum-2]}
+			if !slices.Equal(m.Envelope.InReplyTo, want) {
+				t.Errorf("message %d ENVELOPE In-Reply-To = %q, want %q", m.SeqNum, m.Envelope.InReplyTo, want)
+			}
+			if m.Envelope.MessageID != ids[m.SeqNum-1] {
+				t.Errorf("message %d ENVELOPE Message-ID = %q, want %q", m.SeqNum, m.Envelope.MessageID, ids[m.SeqNum-1])
 			}
 		}
 	})
@@ -70,8 +101,8 @@ func TestIMAP_QuotedLocalPartMessageIDLists(t *testing.T) {
 			if err != nil {
 				t.Fatalf("UID THREAD: %v", err)
 			}
-			if len(res) != 1 || !slices.Equal(res[0].Chain, []uint32{1, 2, 3}) {
-				t.Fatalf("UID THREAD %s = %+v, want one thread [1 2 3]", alg, res)
+			if len(res) != 1 || !slices.Equal(res[0].Chain, []uint32{1, 2, 3, 4, 5, 6, 7, 8}) {
+				t.Fatalf("UID THREAD %s = %+v, want one thread [1 2 3 4 5 6 7 8]", alg, res)
 			}
 		})
 	}
@@ -86,9 +117,17 @@ func TestIMAP_QuotedLocalPartMessageIDLists(t *testing.T) {
 	}{
 		{"In-Reply-To whole quoted id", header("In-Reply-To", `<"foo bar"@example.com>`), []imap.UID{2}},
 		{"In-Reply-To quoted id with brackets", header("In-Reply-To", `<"<inner>"@example.com>`), []imap.UID{3}},
-		{"References two quoted ids", header("References", `<"foo bar"@example.com> <"<inner>"@example.com>`), []imap.UID{3}},
-		{"References substring inside quotes", header("References", `"foo bar"@`), []imap.UID{2, 3}},
+		{"References two quoted ids", header("References", `<"foo bar"@example.com> <"<inner>"@example.com>`), []imap.UID{3, 4, 5, 6, 7, 8}},
+		{"References substring inside quotes", header("References", `"foo bar"@`), []imap.UID{2, 3, 4, 5, 6, 7, 8}},
 		{"Message-ID whole quoted id", header("Message-ID", `<"foo bar"@example.com>`), []imap.UID{1}},
+		{"In-Reply-To nonbreaking space atom", header("In-Reply-To", "<"+ids[3]+">"), []imap.UID{5}},
+		{"In-Reply-To Unicode atom and domain", header("In-Reply-To", "<"+ids[4]+">"), []imap.UID{6}},
+		{"In-Reply-To literal angles", header("In-Reply-To", "<"+ids[5]+">"), []imap.UID{7}},
+		{"In-Reply-To quoted local and literal angles", header("In-Reply-To", "<"+ids[6]+">"), []imap.UID{8}},
+		{"References Unicode atom and domain", header("References", "<"+ids[4]+">"), []imap.UID{6, 7, 8}},
+		{"References literal angles", header("References", "<"+ids[5]+">"), []imap.UID{7, 8}},
+		{"Message-ID literal angles", header("Message-ID", "<"+ids[5]+">"), []imap.UID{6}},
+		{"Message-ID quoted local and literal angles", header("Message-ID", "<"+ids[6]+">"), []imap.UID{7}},
 	} {
 		data, err := c.UIDSearch(tc.criteria, nil).Wait()
 		if err != nil {
