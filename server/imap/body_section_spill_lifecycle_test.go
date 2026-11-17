@@ -4,7 +4,11 @@ import (
 	"bytes"
 	"math"
 	"os"
+	"runtime"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/migadu/go-imap"
 )
@@ -94,4 +98,201 @@ func TestSpilledSectionPartialBoundsMatchMemory(t *testing.T) {
 			t.Fatalf("partial %v differs between disk and memory", p)
 		}
 	}
+}
+
+// Over-budget reservation attempts must never transiently push the atomic counter
+// above its cap: doing so makes concurrent negative releases look "over cap" and
+// undo themselves (permanently leaking node budget) while spuriously rejecting
+// concurrent smaller reservations that fit within the remaining headroom.
+func TestReserveBodySectionBudgets_ConcurrentOverCapDoesNotLeakOrReject(t *testing.T) {
+	if runtime.GOMAXPROCS(0) < 4 {
+		defer runtime.GOMAXPROCS(runtime.GOMAXPROCS(4))
+	}
+
+	srv := &IMAPServer{}
+	cases := []struct {
+		name    string
+		limit   int64
+		counter *atomic.Int64
+		reserve func(int64) bool
+	}{
+		{
+			name:    "spilled budget",
+			limit:   maxServerSpilledBodySectionBytes,
+			counter: &srv.spilledBodySectionBytes,
+			reserve: srv.reserveSpilledBodySectionBytes,
+		},
+		{
+			name:    "in-memory budget",
+			limit:   maxServerBodySectionCacheBytes,
+			counter: &srv.bodySectionCacheBytes,
+			reserve: srv.reserveBodySectionCacheBytes,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.counter.Store(0)
+			defer tc.counter.Store(0)
+
+			const (
+				workers     = 4
+				overCallers = 4
+				iters       = 20000
+			)
+			unit := tc.limit / 64
+			pinned := 58 * unit // 6*unit headroom: 4 workers of 1*unit always fit, 10*unit never fits.
+			over := 10 * unit
+
+			if !tc.reserve(pinned) {
+				t.Fatalf("pinned reservation of %d failed", pinned)
+			}
+
+			var (
+				start           = make(chan struct{})
+				wg              sync.WaitGroup
+				overGranted     atomic.Int64
+				spuriousRejects atomic.Int64
+			)
+
+			for range overCallers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					for range iters {
+						if tc.reserve(over) {
+							overGranted.Add(1)
+							tc.reserve(-over)
+						}
+					}
+				}()
+			}
+
+			for range workers {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					for range iters {
+						if !tc.reserve(unit) {
+							spuriousRejects.Add(1)
+							continue
+						}
+						tc.reserve(-unit)
+					}
+				}()
+			}
+
+			close(start)
+			wg.Wait()
+			tc.reserve(-pinned)
+
+			if got := overGranted.Load(); got != 0 {
+				t.Errorf("granted %d over-budget reservations, want 0", got)
+			}
+			if got := spuriousRejects.Load(); got != 0 {
+				t.Errorf("spuriously rejected %d fitting reservations while over-budget attempts raced", got)
+			}
+			if got := tc.counter.Load(); got != 0 {
+				t.Errorf("node budget after releasing all reservations = %d bytes, want 0 (leaked)", got)
+			}
+		})
+	}
+}
+
+// Once IMAPSession.Close has run, late or concurrent retainBodySection and
+// spillBodySection calls must not store an unclosed file descriptor or leak
+// node-wide / session memory reservations.
+func TestBodySectionCache_ClosePreventsLateRetainAndSpillLeak(t *testing.T) {
+	spillData := bytes.Repeat([]byte("z"), maxCachedBodySectionBytes+1)
+	smallData := []byte("small-section")
+
+	t.Run("after Close", func(t *testing.T) {
+		s, tracker := newFetchTestSession(0)
+		s.server.sessions.Add()
+		t.Cleanup(func() {
+			if s.bodySectionCacheFile != nil {
+				_ = s.bodySectionCacheFile.Close()
+			}
+			s.server.spilledBodySectionBytes.Store(0)
+			s.server.bodySectionCacheBytes.Store(0)
+		})
+
+		if !s.spillBodySection("initial", spillData) {
+			t.Fatal("initial spill failed")
+		}
+		initialFile := s.bodySectionCacheFile
+		if err := s.Close(); err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+		if _, err := initialFile.Stat(); err == nil {
+			t.Fatal("Close left initial spill descriptor open")
+		}
+
+		if err := tracker.Allocate(int64(len(smallData))); err != nil {
+			t.Fatal(err)
+		}
+		if s.retainBodySection("late-mem", smallData) {
+			t.Error("retainBodySection succeeded after Close")
+		} else {
+			tracker.Free(int64(len(smallData)))
+		}
+
+		if s.spillBodySection("late-spill", spillData) {
+			t.Error("spillBodySection succeeded after Close")
+		}
+
+		if s.bodySectionCacheFile != nil || s.bodySectionCacheData != nil || s.bodySectionCacheKey != "" {
+			t.Errorf("cache populated after Close: key=%q data=%d file=%v",
+				s.bodySectionCacheKey, len(s.bodySectionCacheData), s.bodySectionCacheFile)
+		}
+		if got := s.server.bodySectionCacheBytes.Load(); got != 0 {
+			t.Errorf("bodySectionCacheBytes after Close = %d, want 0", got)
+		}
+		if got := s.server.spilledBodySectionBytes.Load(); got != 0 {
+			t.Errorf("spilledBodySectionBytes after Close = %d, want 0", got)
+		}
+		if got := tracker.Current(); got != 0 {
+			t.Errorf("session memory tracker after Close = %d, want 0", got)
+		}
+	})
+
+	t.Run("Close during unlocked spill write", func(t *testing.T) {
+		largeSpill := bytes.Repeat([]byte("w"), 16<<20)
+		for iter := range 8 {
+			s, _ := newFetchTestSession(0)
+			s.server.sessions.Add()
+
+			done := make(chan bool, 1)
+			go func() {
+				done <- s.spillBodySection("inflight", largeSpill)
+			}()
+
+			deadline := time.Now().Add(5 * time.Second)
+			for s.server.spilledBodySectionBytes.Load() == 0 && len(done) == 0 {
+				if time.Now().After(deadline) {
+					t.Fatal("timed out waiting for spillBodySection to reserve bytes")
+				}
+				runtime.Gosched()
+			}
+
+			if err := s.Close(); err != nil {
+				t.Fatalf("iter %d Close: %v", iter, err)
+			}
+			<-done
+
+			leakedFile := s.bodySectionCacheFile
+			leakedBytes := s.server.spilledBodySectionBytes.Load()
+			if leakedFile != nil {
+				_ = leakedFile.Close()
+			}
+			s.server.spilledBodySectionBytes.Store(0)
+
+			if leakedFile != nil || s.bodySectionCacheKey != "" || leakedBytes != 0 {
+				t.Fatalf("iter %d: concurrent Close + spill leaked file=%v key=%q spilledBytes=%d",
+					iter, leakedFile, s.bodySectionCacheKey, leakedBytes)
+			}
+		}
+	})
 }
