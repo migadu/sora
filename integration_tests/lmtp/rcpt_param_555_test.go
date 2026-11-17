@@ -13,9 +13,8 @@ import (
 // RFC 5321 section 4.1.1.11: "If the server SMTP does not recognize or cannot implement
 // one or more of the parameters associated with a particular MAIL FROM or RCPT TO
 // command, it will return code 555." The backend enables go-smtp's RCPT extensions for
-// XRCPTFORWARD, so go-smtp hands it every RCPT parameter it does not know itself: one the
-// backend does not implement is refused with 555 for an existing recipient too, while
-// XRCPTFORWARD keeps working (#1562).
+// XRCPTFORWARD alone, so go-smtp refuses every other RCPT parameter with 555, for an
+// existing recipient too, while XRCPTFORWARD keeps working (#1562).
 func TestLMTP_UnknownRcptParameterGets555(t *testing.T) {
 	server, account := common.SetupLMTPServer(t)
 	defer server.Close()

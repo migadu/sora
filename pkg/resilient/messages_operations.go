@@ -184,8 +184,15 @@ var destObjectKeepalive = 30 * time.Second
 // move with a *DestObjectError, which the write circuit breaker does not count and the
 // retry does not repeat (the S3 calls retry on their own). A statement keeps the
 // transaction alive at least every destObjectKeepalive.
+//
+// A fresh complete-source preflight under account-rekey guards refuses an
+// oversized cross-account command before destination locks or storage callbacks.
+// This also counts legacy rows already owned by the destination.
 func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]imap.UID, srcMailboxID, destMailboxID int64, destAccountID int64, destS3Domain string, destS3Localpart string, instanceID string, sourceHashes map[imap.UID]string, destObjects []string, ensureDestObject func(ctx context.Context, contentHash string) error) (map[imap.UID]imap.UID, error) {
 	op := func(opCtx context.Context, tx pgx.Tx) (any, error) {
+		if err := rd.getOperationalDatabaseForOperation(opCtx, true).CheckCopyMoveBodyBudget(opCtx, tx, srcMailboxID, destMailboxID, destAccountID, ids, destObjects); err != nil {
+			return nil, err
+		}
 		if len(destObjects) > 0 {
 			if err := db.LockS3ObjectsSharedInTx(opCtx, tx, destAccountID, destObjects); err != nil {
 				return nil, err
@@ -199,7 +206,7 @@ func (rd *ResilientDatabase) MoveMessagesWithRetry(ctx context.Context, ids *[]i
 		}
 		return rd.getOperationalDatabaseForOperation(opCtx, true).MoveMessages(opCtx, tx, ids, srcMailboxID, destMailboxID, destAccountID, destS3Domain, destS3Localpart, instanceID, sourceHashes, destObjects)
 	}
-	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	result, err := rd.executeWriteInTxWithRetry(ctx, writeRetryConfig, timeoutWrite, op, db.ErrCrossAccountBodyLimit)
 	if err != nil {
 		return nil, err
 	}
@@ -415,4 +422,31 @@ func (rd *ResilientDatabase) restoreMessagesChunked(ctx context.Context, params 
 			"email", params.Email, "processed", end, "total", len(ids), "restored", restored)
 	}
 	return restored, nil
+}
+
+// FindNullReferencesWithRetry reads one batch of messages for the References repair
+// (see db.FindNullReferences).
+func (rd *ResilientDatabase) FindNullReferencesWithRetry(ctx context.Context, afterID int64, limit int) (db.NullReferencesBatch, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).FindNullReferences(ctx, afterID, limit)
+	}
+	result, err := rd.executeReadWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return db.NullReferencesBatch{}, err
+	}
+	return result.(db.NullReferencesBatch), nil
+}
+
+// FillNullReferencesWithRetry writes the values one batch of the References repair found,
+// in a transaction of its own (see db.FillNullReferences). A fill writes only rows that
+// are still NULL, so running it again after an unknown commit outcome is safe.
+func (rd *ResilientDatabase) FillNullReferencesWithRetry(ctx context.Context, fills []db.ReferencesFill) (int64, error) {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).FillNullReferences(ctx, tx, fills)
+	}
+	result, err := rd.executeWriteInTxWithRetry(ctx, adminRetryConfig, timeoutAdmin, op)
+	if err != nil {
+		return 0, err
+	}
+	return result.(int64), nil
 }

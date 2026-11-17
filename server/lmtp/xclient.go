@@ -167,21 +167,6 @@ func (s *LMTPSession) xclientTrustedProxies() []string {
 	return trustedProxies
 }
 
-// unsupportedRcptParameter returns the keyword of an RCPT parameter in opts.Extensions
-// that the backend does not implement, or "" if there is none. XRCPTFORWARD is the only
-// one it takes; go-smtp upper-cases the keywords.
-func unsupportedRcptParameter(opts *smtp.RcptOptions) string {
-	if opts == nil {
-		return ""
-	}
-	for keyword := range opts.Extensions {
-		if keyword != "XRCPTFORWARD" {
-			return keyword
-		}
-	}
-	return ""
-}
-
 // ParseRCPTForward processes XRCPTFORWARD parameters from RCPT TO command
 // This is used for per-recipient forwarding parameters
 func (s *LMTPSession) ParseRCPTForward(rcptOptions *smtp.RcptOptions) {
