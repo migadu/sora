@@ -3,6 +3,7 @@ package helpers
 import (
 	stdmime "mime"
 	"strings"
+	"unicode/utf8"
 )
 
 // quoteUnquotedFilename repairs the narrow, common defect of an unquoted
@@ -15,6 +16,9 @@ import (
 // wins. Comments outside quoted strings and incomplete quote/escape scopes
 // also prevent recovery. Already-valid headers bypass this helper entirely.
 func quoteUnquotedFilename(value string) (string, bool) {
+	if !utf8.ValidString(value) {
+		return "", false
+	}
 	filenameSeen := false
 	filenameStart, filenameEnd := -1, -1
 	parameterStart := -1
