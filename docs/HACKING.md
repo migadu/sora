@@ -106,7 +106,7 @@ Sora is one Go module, `github.com/migadu/sora`. It builds two programs: `sora`,
 
 ### 2.1 Requirements
 
-You need Go 1.25 or newer. `go.mod` says `go 1.25.0`. Every dependency is pure Go, so you do not
+You need Go 1.26 or newer. `go.mod` says `go 1.26.0`. Every dependency is pure Go, so you do not
 need a C compiler. The SQLite driver is `modernc.org/sqlite`, which needs no cgo.
 
 ### 2.2 Make targets

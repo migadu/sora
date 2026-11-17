@@ -46,7 +46,7 @@ Sora ships as two programs:
 
 `make build` builds both programs in the repository root. `make build-linux-musl` builds static
 Linux binaries (`sora-linux-amd64`, `sora-admin-linux-amd64`) and `make build-freebsd` builds FreeBSD
-ones (`sora-freebsd-amd64`, `sora-admin-freebsd-amd64`). The module needs Go 1.25.0 or later
+ones (`sora-freebsd-amd64`, `sora-admin-freebsd-amd64`). The module needs Go 1.26.0 or later
 (`go.mod`). The Makefile stamps the version, commit and build date into the binary from git.
 
 ### Command-line flags

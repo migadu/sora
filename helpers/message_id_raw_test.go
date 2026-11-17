@@ -52,9 +52,18 @@ func TestExtractMessageIDRaw(t *testing.T) {
 			want: strPtr("<outer@[<inner@example.com>]>"),
 		},
 		{
-			name: "obsolete quoted local-part retained",
+			// go-message keeps quoting the local part needs, so "<" + message_id + ">"
+			// reproduces the field and the search loses nothing.
+			name: "required local-part quoting omitted",
 			raw:  "From: a@example.com\r\nMessage-ID: <\"<inner\"@example.com>\r\n\r\nbody\r\n",
-			want: strPtr("<\"<inner\"@example.com>"),
+			want: nil,
+		},
+		{
+			// go-message drops quoting the local part does not need (RFC 5256
+			// section 2.2.2), so the field text differs from message_id.
+			name: "unnecessary local-part quoting retained",
+			raw:  "From: a@example.com\r\nMessage-ID: <\"quoted\"@example.com>\r\n\r\nbody\r\n",
+			want: strPtr("<\"quoted\"@example.com>"),
 		},
 		{
 			name: "multiple Message-ID fields joined by newline",

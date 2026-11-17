@@ -31,7 +31,7 @@ single server to many.
 
 ## Requirements
 
-- Go 1.25.0 or later, to build (`go 1.25.0` in `go.mod`).
+- Go 1.26.0 or later, to build (`go 1.26.0` in `go.mod`).
 - PostgreSQL 14 or later, with the `pg_trgm` and `btree_gin` extensions. Both ship with
   PostgreSQL's contrib package. Sora applies its own database migrations when it starts.
 - An S3-compatible object store for message bodies, such as MinIO.
