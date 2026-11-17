@@ -43,7 +43,7 @@ var lookupTableKeysReadBy = func() map[string]map[string]struct {
 			"remote_port":               {`remote_port = 1143`, proxies},
 			"remote_use_proxy_protocol": {`remote_use_proxy_protocol = true`, lineProxies},
 			"remote_use_id_command":     {`remote_use_id_command = true`, []string{"imap_proxy"}},
-			"remote_skip_forwarding_with_proxy_protocol": {`remote_skip_forwarding_with_proxy_protocol = true`, []string{"imap_proxy", "pop3_proxy"}},
+			"remote_skip_forwarding_with_proxy_protocol": {"remote_use_proxy_protocol = true\nremote_use_id_command = true\nremote_use_xclient = true\nremote_skip_forwarding_with_proxy_protocol = true", []string{"imap_proxy", "pop3_proxy"}},
 			"remote_use_xclient":                         {`remote_use_xclient = true`, []string{"pop3_proxy", "lmtp_proxy"}},
 			"remote_use_utf8":                            {`remote_use_utf8 = true`, []string{"pop3_proxy"}},
 			"restrict_to_pool":                           {`restrict_to_pool = true`, proxies},

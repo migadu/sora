@@ -46,6 +46,33 @@ func (p *PoolConfig) GetRemoteTLSVerify() bool {
 	return p.RemoteTLSVerify == nil || *p.RemoteTLSVerify
 }
 
+// WarnUnusedConfigOptions logs warnings for [[pool]] options that have no effect.
+func (p *PoolConfig) WarnUnusedConfigOptions(logger func(format string, args ...any)) {
+	if !p.RemoteSkipForwardingWithProxyProtocol {
+		return
+	}
+	var missing []string
+	if !p.RemoteUseProxyProtocol {
+		missing = append(missing, "'remote_use_proxy_protocol'")
+	}
+	if !p.RemoteUseIDCommand && !p.RemoteUseXCLIENT {
+		missing = append(missing, "'remote_use_id_command' or 'remote_use_xclient'")
+	}
+	if len(missing) > 0 {
+		logger("WARNING: [[pool]] %q has 'remote_skip_forwarding_with_proxy_protocol' configured without %s, so it has no effect", p.Name, strings.Join(missing, " and "))
+	}
+}
+
+func (c *Config) poolWarnings() []string {
+	var warnings []string
+	for i := range c.Pools {
+		c.Pools[i].WarnUnusedConfigOptions(func(format string, args ...any) {
+			warnings = append(warnings, fmt.Sprintf(format, args...))
+		})
+	}
+	return warnings
+}
+
 // HasPools reports whether the file declares named backend pools.
 func (c *Config) HasPools() bool {
 	return len(c.Pools) > 0

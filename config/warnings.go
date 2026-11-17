@@ -18,7 +18,8 @@ import (
 // that `sora-admin config validate` can print them before the file is deployed. Each is
 // about a setting start-up accepts but that does not do on this node what it says:
 //
-//   - a [[server]] key the server type does not apply (ServerConfig.WarnUnusedConfigOptions);
+//   - a [[server]] or [[pool]] key that does not apply as configured
+//     (ServerConfig.WarnUnusedConfigOptions, PoolConfig.WarnUnusedConfigOptions);
 //   - an imap or pop3 session_memory_limit below an lmtp max_message_size
 //     (SessionMemoryShortfalls);
 //   - a feature without the part of the node that serves it: enable_affinity without
@@ -58,6 +59,11 @@ func (c *Config) Warnings() []string {
 
 	var proxy, userAPI bool
 	servers := c.GetAllServers()
+	if len(servers) == 0 && c.HasPools() {
+		for _, w := range c.poolWarnings() {
+			warn("%s", strings.TrimPrefix(w, "WARNING: "))
+		}
+	}
 	for i := range servers {
 		s := &servers[i]
 		s.WarnUnusedConfigOptions(func(format string, args ...any) {

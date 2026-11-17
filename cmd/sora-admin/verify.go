@@ -16,8 +16,21 @@ import (
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/storage"
 )
+
+func parseVerifyEmail(email string) (localpart, domain string, err error) {
+	addr, addrErr := server.NewAddress(email)
+	if addrErr == nil && !addr.HasSuffix() {
+		return addr.LocalPart(), addr.Domain(), nil
+	}
+	parts := strings.Split(strings.TrimSpace(email), "@")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return "", "", fmt.Errorf("invalid email format: %s", email)
+	}
+	return strings.ToLower(parts[0]), strings.ToLower(parts[1]), nil
+}
 
 func handleVerifyCommand(ctx context.Context) {
 	if len(os.Args) < 3 {
@@ -365,13 +378,10 @@ func hashFromS3Key(s3Key string) string {
 // its body is pending (db.UnreferencedContentObjects). References are read after each
 // object was listed, so an upload that lands meanwhile is seen with the row it is for.
 func checkS3ToDB(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storage *storage.S3Storage, email string, result *verificationResult, batchSize int) error {
-	// Parse email to get domain and localpart
-	parts := strings.Split(email, "@")
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid email format: %s", email)
+	localpart, domain, err := parseVerifyEmail(email)
+	if err != nil {
+		return err
 	}
-	localpart := parts[0]
-	domain := parts[1]
 
 	// Construct S3 prefix for the user
 	prefix := fmt.Sprintf("%s/%s/", domain, localpart)
@@ -385,6 +395,7 @@ func checkS3ToDB(ctx context.Context, rdb *resilient.ResilientDatabase, s3Storag
 		if err != nil {
 			return fmt.Errorf("failed to check references: %w", err)
 		}
+		result.CheckedS3ToDB += len(batch)
 		for _, o := range orphans {
 			result.OrphanedInS3 = append(result.OrphanedInS3, o.Key())
 		}
@@ -781,15 +792,13 @@ Examples:
 }
 
 func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string, showDetails, skipDB bool, downloadPath, downloadDecryptedPath string) error {
-	// Parse email to get domain and localpart. The S3 key is derived entirely
-	// from this and the hash — no database lookup is required to verify the
-	// object itself.
-	parts := strings.Split(email, "@")
-	if len(parts) != 2 {
-		return fmt.Errorf("invalid email format: %s", email)
+	// Parse email to get canonical domain and localpart. The S3 key is derived
+	// entirely from this and the hash — no database lookup is required to verify
+	// the object itself.
+	localpart, domain, err := parseVerifyEmail(email)
+	if err != nil {
+		return err
 	}
-	localpart := parts[0]
-	domain := parts[1]
 	s3Key := fmt.Sprintf("%s/%s/%s", domain, localpart, hash)
 
 	// Initialize S3 storage
@@ -914,7 +923,19 @@ func verifyContentHash(ctx context.Context, cfg AdminConfig, hash, email string,
 	if len(messages) == 0 {
 		fmt.Printf("  (No messages found in database)\n")
 		if exists {
-			fmt.Printf("\n[WARN] Orphaned S3 object (exists in S3 but not in DB)\n")
+			orphans, err := rdb.UnreferencedContentObjectsWithRetry(ctx, []db.ContentObject{{
+				S3Domain:    domain,
+				S3Localpart: localpart,
+				ContentHash: hash,
+			}})
+			if err != nil {
+				return fmt.Errorf("failed to check global references: %w", err)
+			}
+			if len(orphans) == 0 {
+				fmt.Printf("\n[OK] Referenced by another account or pending upload (not orphaned)\n")
+			} else {
+				fmt.Printf("\n[WARN] Orphaned S3 object (exists in S3 but not in DB)\n")
+			}
 		}
 		return nil
 	}
