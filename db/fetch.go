@@ -45,12 +45,14 @@ func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 		name = recipient.Name
 		emailAddress = recipient.EmailAddress
 
-		parts := strings.Split(emailAddress, "@")
-		if len(parts) != 2 {
+		// net/mail unquotes quoted local-parts and rejects '@' in the domain, so the
+		// addr-mailbox / addr-host separator is always the last '@'.
+		at := strings.LastIndexByte(emailAddress, '@')
+		if at <= 0 || at == len(emailAddress)-1 {
 			logger.Warn("Database: malformed email address for recipient", "email", emailAddress, "type", addressType, "uid", msg.UID, "mailbox_id", msg.MailboxID)
 			continue
 		}
-		mailboxPart, hostNamePart := parts[0], parts[1]
+		mailboxPart, hostNamePart := emailAddress[:at], emailAddress[at+1:]
 
 		address := imap.Address{
 			Name:    name,
