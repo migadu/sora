@@ -43,6 +43,10 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 	}()
 
 	var plaintextBody, htmlBody *string
+	// Text parts whose Content-Type parameters do not parse, read without
+	// their charset: the text of last resort, used only without any
+	// well-formed text part.
+	var lenientPlain, lenientHTML *string
 	var skippedParts []string // Track reasons for skipped parts (for debugging)
 
 	next := msg
@@ -71,14 +75,8 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 			} else if message.IsUnknownCharset(err) {
 				// The part comes with its body not converted from the charset, which
 				// is still its best text: it is read as the single-part form is, and
-				// as PREVIEW reads it. go-message reports only the charset when the
-				// transfer encoding is unknown too, so check that it was decoded.
-				switch transferEncodingMechanism(part.Header.Get("Content-Transfer-Encoding")) {
-				case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
-				default:
-					skippedParts = append(skippedParts, fmt.Sprintf("NextPart error: %v", err))
-					continue
-				}
+				// as PREVIEW reads it. Its transfer encoding is checked below along
+				// with single-part messages.
 			} else if err != nil {
 				// A broken multipart (malformed part header, missing boundary or
 				// missing close delimiter) cannot yield more parts of its own, but
@@ -101,17 +99,30 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 			}
 			continue
 		}
+		// A single-part entity arrives without a NextPart error, and go-message
+		// reports only the charset error when both charset and encoding are
+		// unknown. Check every leaf so undecoded bytes are never indexed.
+		switch transferEncodingMechanism(header.Get("Content-Transfer-Encoding")) {
+		case "", "7bit", "8bit", "binary", "quoted-printable", "base64":
+		default:
+			skippedParts = append(skippedParts, fmt.Sprintf("unsupported Content-Transfer-Encoding: %q", header.Get("Content-Transfer-Encoding")))
+			continue
+		}
+
 		if disp, _, _ := header.ContentDisposition(); disp != "inline" && (disp == "attachment" || !strings.HasPrefix(partType, "text/")) {
 			continue
 		}
 
-		mediaType, _, err := header.ContentType()
-		if err != nil {
-			// Malformed Content-Type header (e.g., invalid media parameters).
-			// Skip this part and continue - plaintext extraction is best-effort for FTS.
-			skippedParts = append(skippedParts, fmt.Sprintf("invalid Content-Type: %v", err))
-			continue
-		} else if mediaType != "text/plain" && mediaType != "text/html" {
+		// go-message keeps the media type when only the parameters are
+		// malformed. Such a text part is still text (RFC 2045 §5.2 even
+		// recommends assuming text/plain for an invalid field), so it is
+		// not dropped, but it is read without its charset: a well-formed
+		// alternative, if there is one, is the better text.
+		mediaType, _, typeErr := header.ContentType()
+		if mediaType != "text/plain" && mediaType != "text/html" {
+			if typeErr != nil {
+				skippedParts = append(skippedParts, fmt.Sprintf("invalid Content-Type: %v", typeErr))
+			}
 			continue
 		}
 
@@ -124,14 +135,23 @@ func ExtractPlaintextBody(msg *message.Entity) (*string, error) {
 		}
 		s := string(b)
 
-		switch mediaType {
-		case "text/plain":
-			plaintextBody = &s
-		case "text/html":
-			if htmlBody == nil {
-				htmlBody = &s
+		switch {
+		case typeErr != nil && mediaType == "text/plain":
+			if lenientPlain == nil {
+				lenientPlain = &s
 			}
+		case typeErr != nil:
+			if lenientHTML == nil {
+				lenientHTML = &s
+			}
+		case mediaType == "text/plain":
+			plaintextBody = &s
+		case htmlBody == nil:
+			htmlBody = &s
 		}
+	}
+	if plaintextBody == nil && htmlBody == nil {
+		plaintextBody, htmlBody = lenientPlain, lenientHTML
 	}
 
 	// If we don't have a plaintext body but we have an HTML body, convert it to plaintext
