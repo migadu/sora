@@ -21,6 +21,7 @@ func TestMsgIDListExprMatchesSplitMessageIDs(t *testing.T) {
 		`"foo bar"@x`, `"foo bar"@x b@x`, `a@x "Foo Bar"@X c@x`,
 		`"<inner>"@x`, `"a\" b"@x c@x`, `"a\\" b@x`, `a@["] b@x`,
 		`"unterminated b@x`, `b"@x "c d"@x`, `"a" b"@x`, `"x y"z@x`,
+		`a@[x>y] z@x`, `a@[<x>] z@x`, `a@[>"] "x y"@x`, "a\u00a0b@x z@x", "\"q r\"@x a\u3000b@x",
 	} {
 		var got *string
 		require.NoError(t, db.GetWritePool().QueryRow(ctx,
