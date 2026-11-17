@@ -317,6 +317,16 @@ func TestExtractIDs(t *testing.T) {
 		"  a@x \t b@x\r\n ": {"a@x", "b@x"},
 		"<a@x> <b@x>":       {"a@x", "b@x"},
 		"<a@x><b@x>":        {"a@x", "b@x"},
+		// go-message keeps the quoting a local part needs (RFC 5322 §3.6.4
+		// obs-id-left), so white space, '<' and '>' inside quotes belong to the id.
+		`"foo bar"@x b@x`:     {`"foo bar"@x`, "b@x"},
+		`"<inner>"@x`:         {`"<inner>"@x`},
+		`"a\" b"@x c@x`:       {`"a\" b"@x`, "c@x"},
+		`<"foo bar"@x> <b@x>`: {`"foo bar"@x`, "b@x"},
+		`a@["] b@x`:           {`a@["]`, "b@x"},
+		// A quote or bracket that never closes is no quoted string or literal.
+		`"unterminated b@x`: {`"unterminated`, "b@x"},
+		`a@[x b@x`:          {"a@[x", "b@x"},
 	}
 	for in, want := range cases {
 		assert.Equal(t, want, extractIDs(in), "extractIDs(%q)", in)
