@@ -160,9 +160,9 @@ func (o *VacationOracle) CountRedirectsSince(ctx context.Context, accountID int6
 	return o.RDB.CountRedirectsSinceWithRetry(ctx, accountID, window)
 }
 
-// RecordRedirect records that a redirect action was performed under the given window.
-func (o *VacationOracle) RecordRedirect(ctx context.Context, accountID int64, window time.Duration) error {
-	return o.RDB.RecordRedirectWithRetry(ctx, accountID, window)
+// RecordRedirect records that a redirect action was performed under the given window and limit.
+func (o *VacationOracle) RecordRedirect(ctx context.Context, accountID int64, window time.Duration, limit int) error {
+	return o.RDB.RecordRedirectWithRetry(ctx, accountID, window, limit)
 }
 
 // RelayQueue interface defines operations for queuing relay messages

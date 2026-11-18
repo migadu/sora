@@ -88,7 +88,7 @@ func TestSievePolicyReadsHonorPrimaryPinAndAccount(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, accountID := range []int64{aID, bID, bID} {
-		if err := rdb.RecordRedirectWithRetry(ctx, accountID, time.Hour); err != nil {
+		if err := rdb.RecordRedirectWithRetry(ctx, accountID, time.Hour, 100); err != nil {
 			t.Fatal(err)
 		}
 	}

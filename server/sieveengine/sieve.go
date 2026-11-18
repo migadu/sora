@@ -239,9 +239,10 @@ type VacationOracle interface {
 // persistent storage for redirect tracking.
 type RedirectOracle interface {
 	CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error)
-	// RecordRedirect charges one redirect against a limit of the given window. The record
-	// is kept until that window has passed, whichever node's cleaner prunes it.
-	RecordRedirect(ctx context.Context, accountID int64, window time.Duration) error
+	// RecordRedirect charges one redirect against a limit of the given window and size. The
+	// record is kept until that window has passed, whichever node's cleaner prunes it, and
+	// keeps both, so a node can tell redirects another node charged under other settings.
+	RecordRedirect(ctx context.Context, accountID int64, window time.Duration, limit int) error
 }
 
 type Executor interface {
@@ -598,9 +599,9 @@ func (p *SievePolicy) redirectRecorder() func(context.Context) error {
 	if oracle == nil || p.redirectRateLimit <= 0 {
 		return nil
 	}
-	accountID, window := p.AccountID, p.redirectRateWindow
+	accountID, window, limit := p.AccountID, p.redirectRateWindow, p.redirectRateLimit
 	return func(ctx context.Context) error {
-		return oracle.RecordRedirect(ctx, accountID, window)
+		return oracle.RecordRedirect(ctx, accountID, window, limit)
 	}
 }
 
