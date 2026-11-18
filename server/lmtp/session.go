@@ -354,6 +354,10 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 				Message:      "No such user here",
 			}
 		}
+		if reply := s.rcptContextError(ctx, err, "user lookup"); reply != nil {
+			recordMetrics("failure")
+			return reply
+		}
 		// Database error (connection failure, timeout, etc.) - temporary failure
 		s.WarnLog("database error during user lookup", "address", lookupAddress, "error", err)
 		recordMetrics("failure")
@@ -368,24 +372,9 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	// (master-DB pinning) value. Ensure default mailboxes exist.
 	err = s.backend.rdb.CreateDefaultMailboxesWithRetry(ctx, AccountID)
 	if err != nil {
-		// Context error: distinguish the RCPT execution cap firing on a
-		// healthy-but-slow server from client disconnect / server shutdown.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if reply := s.rcptContextError(ctx, err, "mailbox creation"); reply != nil {
 			recordMetrics("failure")
-			if commandTimedOut(ctx) {
-				s.WarnLog("mailbox creation timed out", "cap", "rcpt")
-				return &smtp.SMTPError{
-					Code:         451,
-					EnhancedCode: smtp.EnhancedCode{4, 4, 3},
-					Message:      "Recipient validation timed out, please try again later",
-				}
-			}
-			s.InfoLog("mailbox creation cancelled due to server shutdown")
-			return &smtp.SMTPError{
-				Code:         421,
-				EnhancedCode: smtp.EnhancedCode{4, 2, 1},
-				Message:      "service shutting down",
-			}
+			return reply
 		}
 		recordMetrics("failure")
 		// The reply text reaches the sender in a delay or bounce notice: the database
@@ -398,23 +387,9 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	// User.Address should always be the primary address (not the recipient with +alias)
 	primaryAddr, err := s.backend.rdb.GetPrimaryEmailForAccountWithRetry(readCtx, AccountID)
 	if err != nil {
-		// Context error: RCPT cap timeout vs disconnect/shutdown (see above).
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if reply := s.rcptContextError(ctx, err, "primary email fetch"); reply != nil {
 			recordMetrics("failure")
-			if commandTimedOut(ctx) {
-				s.WarnLog("primary email fetch timed out", "cap", "rcpt")
-				return &smtp.SMTPError{
-					Code:         451,
-					EnhancedCode: smtp.EnhancedCode{4, 4, 3},
-					Message:      "Recipient validation timed out, please try again later",
-				}
-			}
-			s.InfoLog("primary email fetch cancelled due to server shutdown")
-			return &smtp.SMTPError{
-				Code:         421,
-				EnhancedCode: smtp.EnhancedCode{4, 2, 1},
-				Message:      "service shutting down",
-			}
+			return reply
 		}
 		s.WarnLog("failed to get primary email", "recipient_account_id", AccountID, "error", err)
 		recordMetrics("failure")
@@ -477,6 +452,32 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	}
 	recordMetrics("success")
 	return nil
+}
+
+// rcptContextError answers an RCPT step that failed because the command's context
+// ended: the RCPT timeout ran out on a healthy but slow server (451, the MTA retries),
+// or the session is ending by server shutdown or client disconnect (421). It returns
+// nil for any other error, including a context error of the database layer's own
+// per-query timeout while the command's context is still live: that is a database
+// failure for the caller's own reply.
+func (s *LMTPSession) rcptContextError(ctx context.Context, err error, step string) error {
+	if ctx.Err() == nil || !(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return nil
+	}
+	if commandTimedOut(ctx) {
+		s.WarnLog(step+" timed out", "cap", "rcpt")
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 3},
+			Message:      "Recipient validation timed out, please try again later",
+		}
+	}
+	s.InfoLog(step + " cancelled due to server shutdown")
+	return &smtp.SMTPError{
+		Code:         421,
+		EnhancedCode: smtp.EnhancedCode{4, 2, 1},
+		Message:      "service shutting down",
+	}
 }
 
 func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
