@@ -7,11 +7,13 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/integration_tests/common"
+	"github.com/migadu/sora/server/pop3"
 )
 
 // TestPOP3UTF8ModeChangesNothing pins that the UTF8 command (RFC 6856) does
@@ -107,6 +109,125 @@ func TestPOP3UTF8ModeChangesNothing(t *testing.T) {
 			if got := readEntireMultilineResponse(t, r); got != headers+".\r\n" {
 				t.Errorf("TOP 1 0 changed the headers:\n got %q\nwant %q", got, headers+".\r\n")
 			}
+			mustOK("QUIT")
+		})
+	}
+}
+
+// strictUTF8Content turns on the pop3 strict_utf8_content setting.
+func strictUTF8Content(o *pop3.POP3ServerOptions) {
+	// Set by name so this test compiles before the option exists: a missing
+	// option is ignored, as an unknown config key is.
+	if f := reflect.ValueOf(o).Elem().FieldByName("StrictUTF8Content"); f.IsValid() {
+		f.SetBool(true)
+	}
+}
+
+// TestPOP3StrictUTF8Content pins the opt-in RFC 6856 section 2.1 refusal
+// (issue #1933). With strict_utf8_content set, a session that has not issued
+// UTF8 gets -ERR [UTF8] (section 5) for RETR and TOP of a message with raw
+// UTF-8 in its header section, and the message itself once it has issued UTF8,
+// before login or after. A message with ASCII headers is always sent, 8bit
+// body included. The default (setting off) is TestPOP3UTF8ModeChangesNothing.
+func TestPOP3StrictUTF8Content(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := SetupPOP3ServerWithUploader(t, strictUTF8Content)
+	defer server.Close()
+
+	const utf8Headers = "From: José Müller <jose@example.com>\r\n" +
+		"To: bob@example.com\r\n" +
+		"Subject: Grüße aus Zürich, 日本語\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"\r\n"
+	const utf8Msg = utf8Headers + "Hello.\r\n"
+	const asciiHeaders = "From: alice@example.com\r\n" +
+		"To: bob@example.com\r\n" +
+		"Subject: Hello\r\n" +
+		"MIME-Version: 1.0\r\n" +
+		"Content-Type: text/plain; charset=utf-8\r\n" +
+		"Content-Transfer-Encoding: 8bit\r\n" +
+		"\r\n"
+	const asciiMsg = asciiHeaders + "Schöne Grüße.\r\n"
+	tddAppendMessage(t, server, account.Email, utf8Msg)  // message 1
+	tddAppendMessage(t, server, account.Email, asciiMsg) // message 2
+
+	cases := []struct {
+		name       string
+		utf8Before bool // send UTF8 in the AUTHORIZATION state
+		utf8After  bool // refused first, then send UTF8 after login (classic Outlook's order) and retry
+	}{
+		{name: "without UTF8"},
+		{name: "UTF8 before login", utf8Before: true},
+		{name: "UTF8 after login", utf8After: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conn, err := net.Dial("tcp", server.TestServer.Address)
+			if err != nil {
+				t.Fatalf("Failed to connect: %v", err)
+			}
+			defer conn.Close()
+			r := bufio.NewReader(conn)
+
+			cmd := func(line string) string {
+				t.Helper()
+				if _, err := fmt.Fprintf(conn, "%s\r\n", line); err != nil {
+					t.Fatalf("Failed to send %q: %v", line, err)
+				}
+				resp, err := r.ReadString('\n')
+				if err != nil {
+					t.Fatalf("Failed to read reply to %q: %v", line, err)
+				}
+				return resp
+			}
+			mustOK := func(line string) {
+				t.Helper()
+				if resp := cmd(line); !strings.HasPrefix(resp, "+OK") {
+					t.Fatalf("%s: got %q, want +OK", line, resp)
+				}
+			}
+			mustRefuse := func(line string) {
+				t.Helper()
+				resp := cmd(line)
+				if !strings.HasPrefix(resp, "-ERR [UTF8] ") {
+					if strings.HasPrefix(resp, "+OK") {
+						readEntireMultilineResponse(t, r)
+					}
+					t.Errorf("%s: got %q, want -ERR [UTF8]", line, resp)
+				}
+			}
+			mustSend := func(line, want string) {
+				t.Helper()
+				mustOK(line)
+				if got := readEntireMultilineResponse(t, r); got != want+".\r\n" {
+					t.Errorf("%s changed the message:\n got %q\nwant %q", line, got, want+".\r\n")
+				}
+			}
+
+			if greeting, err := r.ReadString('\n'); err != nil || !strings.HasPrefix(greeting, "+OK") {
+				t.Fatalf("Bad greeting %q: %v", greeting, err)
+			}
+			if tc.utf8Before {
+				mustOK("UTF8")
+			}
+			mustOK("USER " + account.Email)
+			mustOK("PASS " + account.Password)
+
+			if !tc.utf8Before {
+				mustRefuse("RETR 1")
+				mustRefuse("TOP 1 0")
+			}
+			if tc.utf8After {
+				mustOK("UTF8")
+			}
+			if tc.utf8Before || tc.utf8After {
+				mustSend("RETR 1", utf8Msg)
+				mustSend("TOP 1 0", utf8Headers)
+			}
+			mustSend("RETR 2", asciiMsg)
+			mustSend("TOP 2 0", asciiHeaders)
 			mustOK("QUIT")
 		})
 	}
