@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -85,21 +86,49 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 			}
 		}
 	}
-	joined := make([]string, len(sections))
+	var joined [3]string
+	var lengths [3]int
 	for i, values := range sections {
 		joined[i] = strings.Join(values, extraAddressesValueSep)
+		lengths[i] = len(joined[i])
 	}
+	// The sections share what the sort columns leave of the budget, less the two section
+	// separators. Each is cut to its share (extraAddressesShares), never the whole value at
+	// the end, so a long From or To list cannot crowd the Cc addresses out.
 	budget := helpers.MaxAddressColumnsBytes - len(fromNameSort) - len(fromEmailSort) - len(toNameSort) - len(toEmailSort) - len(ccEmailSort)
-	extraAddresses = helpers.TruncateUTF8Safe(
-		strings.TrimRight(strings.Join(joined, extraAddressesSectionSep), extraAddressesSectionSep), max(budget, 0))
+	shares := extraAddressesShares(lengths, budget-2*len(extraAddressesSectionSep))
+	for i := range joined {
+		joined[i] = helpers.TruncateUTF8Safe(joined[i], shares[i])
+	}
+	extraAddresses = strings.TrimRight(strings.Join(joined[:], extraAddressesSectionSep), extraAddressesSectionSep)
 	return
+}
+
+// extraAddressesShares splits budget bytes between the three extra_addresses sections of
+// the given lengths, smallest first: each gets all of itself or an equal share of what is
+// left, whichever is less, so a section that needs less than a third leaves the rest to the
+// others and none can take another's third (#2113). Ties go in section order. The integer
+// arithmetic is mirrored by sora_extra_addresses_shares in
+// scripts/backfill_extra_addresses.sql (TestExtraAddressesBackfillMatchesWriter).
+func extraAddressesShares(lengths [3]int, budget int) (shares [3]int) {
+	order := []int{0, 1, 2}
+	slices.SortStableFunc(order, func(a, b int) int { return lengths[a] - lengths[b] })
+	left := max(budget, 0)
+	for k, i := range order {
+		shares[i] = min(lengths[i], left/(len(order)-k))
+		left -= shares[i]
+	}
+	return shares
 }
 
 // Layout of messages.extra_addresses: three sections, From, To and Cc in that order,
 // separated by a newline, and inside a section the names and addresses in header order,
 // separated by a tab. A tab or newline inside a name is stored as a space, so a value can
 // never leak into another section (the search splits on the newline, see
-// addressHeaderCond). Trailing empty sections are left out, and a message with nothing to
+// addressHeaderCond). Each section is cut to its share of the byte budget
+// (extraAddressesShares), so a long list in one header does not cut off another's
+// addresses (#2113; rows written before keep the whole value cut at the end). Trailing
+// empty sections are left out, and a message with nothing to
 // add stores the empty string. NULL means the row was written before the column existed, or
 // by a binary that does not write it; the search reads it as empty, so such rows are matched
 // on their first addresses only until scripts/backfill_extra_addresses.sql fills them.

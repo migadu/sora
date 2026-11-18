@@ -118,8 +118,11 @@ Stored values are cut to fixed lengths, so only the start of a very long value i
 | `extra_addresses` | what the five columns above leave of 1300 bytes, lowercased |
 | `in_reply_to`, `references` | first 2000 bytes |
 
-So in a message with very many recipients, the addresses past about 1300 bytes are not
-searchable.
+So in a message with very many recipients, not every address is searchable. The From, To
+and Cc parts of `extra_addresses` share its length: each keeps all of itself or an equal share,
+whichever is less, and what a short part leaves goes to the others. A long To list therefore
+cuts only the end of the To list, never the Cc addresses (or a leading Cc group's name, the
+`CC` sort key). Messages stored before this rule keep the value cut at the end.
 
 ### The covering index
 
