@@ -29,7 +29,7 @@ func handleHealthCommand(ctx context.Context) {
 	switch subcommand {
 	case "status":
 		handleHealthStatus(ctx)
-	case "--help", "-h":
+	case "help", "--help", "-h":
 		printHealthUsage()
 	default:
 		fmt.Printf("Unknown health subcommand: %s\n\n", subcommand)
