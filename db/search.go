@@ -326,8 +326,8 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		case "bcc", "reply-to", "sender":
 			// No dedicated columns: recipients_json holds every address of these
 			// headers, typed by header name and in its original case. The term is a
-			// substring of one address or display name of that header, compared
-			// case-insensitively. JSONB containment compared the whole address,
+			// substring of one address, display name or group name of that header,
+			// compared case-insensitively. JSONB containment compared the whole address,
 			// case-sensitively. These are rare searches; like References they are
 			// filtered from the mailbox's rows (recipients_json is deliberately
 			// not in idx_messages_mailbox_headers_v2).
@@ -336,10 +336,11 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			param := nextParam()
 			args[param] = lowerValue
 			conditions = append(conditions, fmt.Sprintf(
-				"EXISTS (SELECT 1 FROM jsonb_array_elements(%srecipients_json) r WHERE r->>'type' = @%s AND (%s OR %s))",
+				"EXISTS (SELECT 1 FROM jsonb_array_elements(%srecipients_json) r WHERE r->>'type' = @%s AND (%s OR %s OR %s))",
 				datePrefix, typeParam,
 				substringCond("LOWER(r->>'email')", "@"+param),
-				substringCond("LOWER(r->>'name')", "@"+param)))
+				substringCond("LOWER(r->>'name')", "@"+param),
+				substringCond("LOWER(r->>'group')", "@"+param)))
 		default:
 			// HEADER search on a header without a dedicated, indexed column
 			// (e.g. List-ID, X-*). Sora stores no raw-header representation to
@@ -535,17 +536,19 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 			// FROM: sort by addr-mailbox (the local part) per RFC 5256 §3, not the
 			// full local@domain address. The stored column keeps the full email
 			// (DISPLAYFROM needs it); take the local part before the last '@' at sort time.
-			orderField = addressCasemapKey(addrMailboxExpr(colPrefix+"from_email_sort")) + octetCollation
+			orderField = addressCasemapKey(groupAwareAddrMailboxExpr(colPrefix+"from_email_sort", colPrefix+"from_name_sort")) + octetCollation
 		case imap.SortKeyDisplayTo:
 			// DISPLAYTO: as DISPLAYFROM. to_name_sort is also NULL on rows written before
 			// migration 000006.
 			orderField = addressCasemapKey(fmt.Sprintf("COALESCE(NULLIF(%sto_name_sort, ''), %sto_email_sort)", colPrefix, colPrefix)) + octetCollation
 		case imap.SortKeyTo:
 			// TO: sort by addr-mailbox (local part) per RFC 5256 §3.
-			orderField = addressCasemapKey(addrMailboxExpr(colPrefix+"to_email_sort")) + octetCollation
+			orderField = addressCasemapKey(groupAwareAddrMailboxExpr(colPrefix+"to_email_sort", colPrefix+"to_name_sort")) + octetCollation
 		case imap.SortKeyCc:
 			// CC: sort by addr-mailbox (local part) per RFC 5256 §3.
-			orderField = addressCasemapKey(addrMailboxExpr(colPrefix+"cc_email_sort")) + octetCollation
+			// A Cc group's name heads the Cc section of extra_addresses (sortColumnsFor).
+			ccGroup := fmt.Sprintf(`split_part(split_part(%sextra_addresses, E'\n', %d), E'\t', 1)`, colPrefix, addressHeaderSection["cc"])
+			orderField = addressCasemapKey(groupAwareAddrMailboxExpr(colPrefix+"cc_email_sort", ccGroup)) + octetCollation
 		default:
 			// If the sort key is not supported, default to uid
 			orderField = fmt.Sprintf("%suid", colPrefix)
@@ -565,6 +568,17 @@ func (db *Database) buildSortOrderClauseWithPrefix(sortCriteria []imap.SortCrite
 // from a stored email sort column so quoted local-parts containing '@' stay intact.
 func addrMailboxExpr(col string) string {
 	return fmt.Sprintf("CASE WHEN strpos(%[1]s, '@') > 0 THEN left(%[1]s, length(%[1]s) - strpos(reverse(%[1]s), '@')) ELSE %[1]s END", col)
+}
+
+// groupAwareAddrMailboxExpr is the RFC 5256 §3 FROM/TO/CC sort key of a header's first
+// address: addrMailboxExpr of its email column, or, when that column is empty, the group
+// name a leading group start leaves in groupName (see sortColumnsFor; RFC 3501 §7.4.2
+// makes the whole name the group start's addr-mailbox). An address always has a non-empty
+// email column, and a header without addresses has an empty groupName too, so its key is
+// still the empty string. groupName is NULL on rows written before its column existed,
+// hence the COALESCE: such rows never stored a group.
+func groupAwareAddrMailboxExpr(emailCol, groupName string) string {
+	return fmt.Sprintf("CASE WHEN %[1]s = '' THEN COALESCE(%[2]s, '') ELSE %[3]s END", emailCol, groupName, addrMailboxExpr(emailCol))
 }
 
 func buildNumSetCondition(numSet imap.NumSet, columnName string, paramPrefix string, paramCounter *int) (string, pgx.NamedArgs, error) {
@@ -916,7 +930,7 @@ func addressHeaderCond(prefix, header, placeholder string) string {
 // them. They are not returned to the caller. The lightweight projection omits the
 // non-name columns from its data set, so it must carry them here too. Each must appear
 // EXACTLY ONCE across (branchSelect + sortColumns) or the CTE gets a duplicate column.
-const textUnionSortColumnsLight = "m.internal_date, m.sent_date, m.size, m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort"
+const textUnionSortColumnsLight = "m.internal_date, m.sent_date, m.size, m.subject_sort, m.from_name_sort, m.from_email_sort, m.to_name_sort, m.to_email_sort, m.cc_email_sort, m.extra_addresses"
 
 // buildTextUnionQuery builds the validated TEXT UNION query for an eligible search
 // (see canUseTextUnion). branchSelect is the per-branch data projection from messages m
