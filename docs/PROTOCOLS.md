@@ -893,6 +893,9 @@ The list is the same before and after login.
   trusted peers (section 7.5).
 - After login: `CAPA`, `STAT`, `LIST`, `UIDL`, `RETR`, `TOP`, `DELE`, `RSET`, `NOOP`, `LANG`, `UTF8`
   and `QUIT`. `UTF8` is also accepted after login, because some clients send it then.
+- `UTF8` (RFC 6856) changes nothing. Addresses and passwords may contain UTF-8 with or without it,
+  and `RETR` and `TOP` send messages as stored either way, also to a client that never sent `UTF8`
+  (no surrogate, no `-ERR [UTF8]`).
 - `APOP` is not supported: `-ERR Unknown command: APOP`. `LAST` gets `-ERR LAST is obsolete (RFC 1939)`.
 - `AUTH` supports only `PLAIN`, with or without an initial response.
 
