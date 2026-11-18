@@ -310,7 +310,7 @@ var (
 // mailbox and is kept: MAIL FROM:<"\"x\""@example.com> arrives as `"x"@example.com`,
 // which is not the mailbox x@example.com. The null reverse-path ("") is the caller's to
 // handle; it is refused here. A mailbox still in its written form (an Admin API "from")
-// must be decoded by its caller first: decoding it here would decode the go-smtp form
+// goes through NewSerializedReversePath: decoding it here would decode the go-smtp form
 // a second time.
 //
 // The suffix (user@domain@SUFFIX) belongs to login names, not to envelope addresses: a
@@ -396,4 +396,65 @@ func parseReversePath(input string) (Address, error) {
 		domain:      domain,
 		detail:      detail,
 	}, nil
+}
+
+// NewSerializedReversePath parses a reverse-path in its written form, RFC 5321 §4.1.2
+// Mailbox syntax as a caller writes it (the Admin API "from"), not as go-smtp hands it
+// over. It decodes the mailbox the way go-smtp decodes MAIL FROM and hands the result
+// to NewReversePath, so the two agree on every mailbox both can carry:
+// `"John Doe"@example.com` here is "John Doe@example.com" there.
+//
+// The input must be valid UTF-8 before anything is unescaped, so that a "\" cannot
+// splice a valid character out of invalid bytes. A local part is then either a
+// Quoted-string, DQUOTE *(qtextSMTP / quoted-pairSMTP) DQUOTE with quoted-pairSMTP =
+// "\" %d32-126 (plus UTF-8 in qtext, RFC 6531 §3.3), followed by "@" and a domain
+// without one; or unquoted, where a `"`, "\", space or other special cannot stand. An
+// unquoted local part is a lenient dot-string, as NewReversePath reads one; a second
+// "@" is read as LMTP reads it (#1938), so "a@b.example@example.com" is still the
+// sender `"a@b.example"@example.com`.
+func NewSerializedReversePath(input string) (Address, error) {
+	decoded, err := decodeSerializedMailbox(input)
+	if err != nil {
+		return Address{}, addressError{err}
+	}
+	return NewReversePath(decoded)
+}
+
+// decodeSerializedMailbox returns the mailbox in input with its local part decoded.
+func decodeSerializedMailbox(input string) (string, error) {
+	if !utf8.ValidString(input) {
+		return "", fmt.Errorf("address is not valid UTF-8: %q", input)
+	}
+	if !strings.HasPrefix(input, `"`) {
+		at := strings.LastIndexByte(input, '@')
+		if at <= 0 {
+			return "", fmt.Errorf("invalid email format: %q", input)
+		}
+		for _, part := range strings.Split(input[:at], "@") {
+			if !lenientDotStringRe.MatchString(part) {
+				return "", fmt.Errorf("local part is neither a dot-string nor a quoted string: %q", input)
+			}
+		}
+		return input, nil
+	}
+	var local strings.Builder
+	for i := 1; i < len(input); i++ {
+		switch c := input[i]; c {
+		case '"':
+			rest := input[i+1:]
+			if !strings.HasPrefix(rest, "@") || strings.Contains(rest[1:], "@") {
+				return "", fmt.Errorf("quoted local part is not followed by @ and a domain: %q", input)
+			}
+			return local.String() + rest, nil
+		case '\\':
+			i++
+			if i == len(input) || input[i] < 0x20 || input[i] > 0x7e {
+				return "", fmt.Errorf("\\ in a quoted local part must quote a printable ASCII character: %q", input)
+			}
+			local.WriteByte(input[i])
+		default:
+			local.WriteByte(c)
+		}
+	}
+	return "", fmt.Errorf("quoted local part does not end: %q", input)
 }

@@ -14,7 +14,6 @@ import (
 
 	"github.com/migadu/sora/logger"
 
-	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/server"
@@ -198,10 +197,18 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract sender address if not provided
-	if req.From == "" {
+	// The envelope sender (#1970). A "from" the caller named is in its written form and
+	// is decoded once; one that does not parse is ignored. Without one, the first From:
+	// address is the sender: net/mail has already decoded it, so it is neither trimmed
+	// nor decoded again.
+	var sender *server.Address
+	if req.From != "" {
+		sender, _ = explicitSender(req.From)
+	} else {
 		if fromAddrs, err := helpers.ParseAddressList(messageEntity.Header.Get("From")); err == nil && len(fromAddrs) > 0 {
-			req.From = fromAddrs[0].Address
+			if addr, err := server.NewReversePath(fromAddrs[0].Address); err == nil {
+				sender = &addr
+			}
 		}
 	}
 
@@ -230,7 +237,7 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, recipient := range req.Recipients {
-		status := s.deliverToRecipient(ctx, &req, recipient, messageBytes, messageEntity)
+		status := s.deliverToRecipient(ctx, &req, recipient, messageBytes, sender)
 		response.Recipients = append(response.Recipients, status)
 
 		if !status.Accepted {
@@ -280,8 +287,24 @@ func (s *Server) notifyRelayWorker() {
 	}
 }
 
+// explicitSender reads the sender a caller named in "from" (JSON, form, query or X-From).
+// It is in its written form, RFC 5321 §4.1.2 syntax, so it is decoded here, once, by
+// server.NewSerializedReversePath. Whitespace around it is the client's: none can stand
+// outside a quoted local part. An empty value and "<>" are the null sender (nil).
+func explicitSender(from string) (*server.Address, error) {
+	from = strings.TrimSpace(from)
+	if from == "" || from == "<>" {
+		return nil, nil
+	}
+	addr, err := server.NewSerializedReversePath(from)
+	if err != nil {
+		return nil, err
+	}
+	return &addr, nil
+}
+
 // deliverToRecipient delivers a message to a single recipient using the delivery package
-func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest, recipient string, messageBytes []byte, _ *message.Entity) RecipientStatus {
+func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest, recipient string, messageBytes []byte, sender *server.Address) RecipientStatus {
 	status := RecipientStatus{
 		Email:    recipient,
 		Accepted: false,
@@ -329,7 +352,11 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 
 	deliveryCtx.SieveExecutor = sieveExecutor
 
-	logger.Log("starting delivery from=%s size=%d uid=%v", req.From, len(messageBytes), req.UID)
+	from := ""
+	if sender != nil {
+		from = sender.FullAddress()
+	}
+	logger.Log("starting delivery from=%s size=%d uid=%v", from, len(messageBytes), req.UID)
 
 	// Lookup recipient
 	recipientInfo, err := deliveryCtx.LookupRecipient(ctx, recipient)
@@ -344,13 +371,8 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 
 	logger.Log("recipient found AccountID=%d", recipientInfo.AccountID)
 
-	// Set from address if provided. It is the envelope sender, read as LMTP reads
-	// MAIL FROM (#1970); surrounding whitespace is a client's, not a quoted local part's.
-	if req.From != "" {
-		if addr, parseErr := server.NewReversePath(strings.TrimSpace(req.From)); parseErr == nil {
-			recipientInfo.FromAddress = &addr
-		}
-	}
+	// The envelope sender, parsed once for every recipient by handleDeliverMail.
+	recipientInfo.FromAddress = sender
 
 	// Set preserved UID fields for migration
 	recipientInfo.PreservedUID = req.UID
