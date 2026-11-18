@@ -23,6 +23,16 @@ func SetDefaultSieveScriptForTest(t *testing.T, script string) {
 // RcptForTest answers RCPT TO:<to> on a session without a connection, against rdb, with
 // the given RCPT timeout. ctx is the command's context, as go-smtp passes it.
 func RcptForTest(ctx context.Context, rdb *resilient.ResilientDatabase, rcptTimeout time.Duration, to string) error {
+	return rcptForTest(ctx, rdb, rcptTimeout, to, false)
+}
+
+// RcptWhileLockedForTest is RcptForTest while another holder keeps the session lock past
+// server.MutexTimeout.
+func RcptWhileLockedForTest(rdb *resilient.ResilientDatabase, to string) error {
+	return rcptForTest(context.Background(), rdb, 0, to, true)
+}
+
+func rcptForTest(ctx context.Context, rdb *resilient.ResilientDatabase, rcptTimeout time.Duration, to string, locked bool) error {
 	sessionCtx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	s := &LMTPSession{
@@ -41,5 +51,9 @@ func RcptForTest(ctx context.Context, rdb *resilient.ResilientDatabase, rcptTime
 	s.ServerName = "test"
 	s.RemoteIP = "127.0.0.1"
 	s.mutexHelper = server.NewMutexTimeoutHelper(&s.mutex, sessionCtx, "LMTP", nil)
+	if locked {
+		s.mutex.Lock()
+		defer s.mutex.Unlock()
+	}
 	return s.Rcpt(ctx, to, nil)
 }
