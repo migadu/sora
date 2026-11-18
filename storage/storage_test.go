@@ -288,9 +288,9 @@ func TestListObjects_ErrorHandling(t *testing.T) {
 // stops and closes its channels, even if the caller no longer reads objects (the callers
 // in cmd/sora-admin verify.go and tls.go return on ctx.Done() without draining).
 func TestListObjects_ContextCancellation(t *testing.T) {
-	// TODO(#1992): see report. The lister sends on the unbuffered objects channel without
+	// TODO(#2053): the lister sends on the unbuffered objects channel without
 	// watching ctx, so once the caller stops reading its goroutine blocks forever.
-	t.Skip("ListObjects ignores cancellation while sending an object; see report on #1992")
+	t.Skip("ListObjects ignores cancellation while sending an object; see #2053")
 
 	_, s := newListingS3(t, listingFixture...)
 

@@ -33,7 +33,7 @@ import (
 func TestIMAP_StatusRecent_ReflectsRecentMessages(t *testing.T) {
 	t.Skip("H3: STATUS (RECENT) always 0 — accepted rev1-compat limitation " +
 		"(RECENT removed in IMAP4rev2; Sora is rev2-first). See memory " +
-		"imap-command-correctness-audit-2026-07 (H3).")
+		"imap-command-correctness-audit-2026-07 (H3); see #2015.")
 
 	common.SkipIfDatabaseUnavailable(t)
 
