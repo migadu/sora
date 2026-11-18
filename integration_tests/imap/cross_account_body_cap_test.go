@@ -370,4 +370,3 @@ func TestIMAP_SameMailboxMixedOwnershipCopyMoveSkipsCrossAccountStaging(t *testi
 		require.Empty(t, fake.Keys(ownerPrefix), "same-mailbox MOVE after rekey must not touch owner S3 keys")
 	})
 }
-

@@ -111,12 +111,12 @@ type serverDependencies struct {
 	connectionTrackersMux sync.Mutex                           // protects connectionTrackers map
 	authCacheInstance     *authcache.Cache                     // persistent auth cache
 	credChanges           atomic.Pointer[credchanges.Watcher]
-	proxyServers          map[string]adminapi.ProxyServer      // proxy name -> proxy server interface (for backend health)
-	proxyServersMux       sync.Mutex                           // protects proxyServers map
-	maintenance           *proxy.Maintenance                   // backends in maintenance, honored by every proxy (nil without proxies or DB)
-	maintenanceGate       *server.MaintenanceGate              // refuses new sessions while this backend is in maintenance (nil on a node that does not report its sessions)
-	runningServers        map[string]ConfigReloader            // server name -> reloadable server
-	runningServersMux     sync.Mutex                           // protects runningServers, registering and registered
+	proxyServers          map[string]adminapi.ProxyServer // proxy name -> proxy server interface (for backend health)
+	proxyServersMux       sync.Mutex                      // protects proxyServers map
+	maintenance           *proxy.Maintenance              // backends in maintenance, honored by every proxy (nil without proxies or DB)
+	maintenanceGate       *server.MaintenanceGate         // refuses new sessions while this backend is in maintenance (nil on a node that does not report its sessions)
+	runningServers        map[string]ConfigReloader       // server name -> reloadable server
+	runningServersMux     sync.Mutex                      // protects runningServers, registering and registered
 	// registering are the servers startServers started that take a reload and have
 	// neither registered for one nor stopped starting; registered is closed when none
 	// is left (see expectRegistrations).

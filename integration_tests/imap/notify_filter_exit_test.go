@@ -21,12 +21,12 @@ func TestNotifyRenameOutOfMailboxesAndSubtreeIsReported(t *testing.T) {
 	// "Archived" is used for the top-level rename while "Archive/Alpha" moves a
 	// child under the existing "Archive" folder.
 	tests := []struct {
-		name      string
-		setup     []string
-		item      imap.NotifyItem
-		from, to  string
-		wantName  string
-		wantOld   string
+		name     string
+		setup    []string
+		item     imap.NotifyItem
+		from, to string
+		wantName string
+		wantOld  string
 	}{
 		{
 			name:  "mailboxes",
