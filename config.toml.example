@@ -1469,7 +1469,7 @@ limits.redirect_rate_window = "1h"       # Time window for redirect rate limitin
                                          # longer, and each record until the window of the server that charged it
                                          # has passed. Cluster-wide: use the same window (and redirect_rate_limit)
                                          # on every lmtp and http_admin_api server of every node, or an account's
-                                         # limit depends on the node that delivers; sora warns when windows differ.
+                                         # limit depends on the node that delivers; sora warns when windows or limits differ.
 limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
                                          # backstop, counted via the X-Sora-Loop header (default: 2; 1 = allow a
                                          # single redirect then stop; 0 = unlimited). Delivered-To loop detection

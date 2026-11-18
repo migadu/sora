@@ -34,8 +34,9 @@ import (
 //     ([database] timeouts are parsed by every query, not once); a [spam_training] value
 //     start-up cannot parse leaves spam training out;
 //   - a max_message_size above the largest message Sora can store, which start-up caps;
-//   - lmtp and http_admin_api servers with different limits.redirect_rate_window values
-//     (RedirectRateWindows), which give an account more than one redirect limit;
+//   - lmtp and http_admin_api servers with different limits.redirect_rate_window or
+//     limits.redirect_rate_limit values (RedirectRateWindows, RedirectRateLimits),
+//     which give an account more than one redirect limit;
 //   - what the servers, the cluster manager, the TLS manager and the cleaner log about
 //     their settings as they start: master SASL without master_sasl_allowed_networks;
 //     an imap append_limit above the largest message Sora can store or above
@@ -171,11 +172,16 @@ func (c *Config) Warnings() []string {
 
 	// An account's redirect limit counts its redirects within the window of the server
 	// that delivers, and the cleaner may prune a shorter window's records before a longer
-	// window stops counting them. Start-up logs this, with the windows other nodes use
+	// window stops counting them; with different limits, the limit too depends on the
+	// server. Start-up logs this, with the windows and limits other nodes use
 	// (delivery.WatchRedirectRateWindows).
 	if windows := c.RedirectRateWindows(); len(windows) > 1 {
 		warn("The lmtp and http_admin_api servers apply the Sieve redirect rate limit with different limits.redirect_rate_window values %v: "+
 			"an account's limit then depends on the server that delivers; use one window on every lmtp and http_admin_api server of every node", windows)
+	}
+	if limits := c.RedirectRateLimits(); len(limits) > 1 {
+		warn("The lmtp and http_admin_api servers apply the Sieve redirect rate limit with different limits.redirect_rate_limit values %v: "+
+			"an account's limit then depends on the server that delivers; use one limit on every lmtp and http_admin_api server of every node", limits)
 	}
 
 	// The User API reads message bodies from S3, which a node without a mail backend
