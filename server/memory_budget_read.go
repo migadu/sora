@@ -72,30 +72,3 @@ func (t *SessionMemoryTracker) Reserver(charged *int64) func(size int64) error {
 		return nil
 	}
 }
-
-// ChargedReader charges Budget for every octet it reads from R, for a body that a
-// decoder (JSON, multipart) buffers in its own way, so its buffer cannot be
-// reserved ahead. Once a charge is refused, Read fails with an error wrapping
-// ErrMemoryBudgetExhausted, and Refused reports it whatever the decoder makes of
-// that error. The caller frees Charged once the decoded body is no longer needed.
-type ChargedReader struct {
-	R       io.Reader
-	Budget  *SessionMemoryTracker
-	Charged int64
-	Refused bool
-}
-
-func (c *ChargedReader) Read(p []byte) (int, error) {
-	if c.Refused {
-		return 0, ErrMemoryBudgetExhausted
-	}
-	n, err := c.R.Read(p)
-	if n > 0 && c.Budget != nil {
-		if allocErr := c.Budget.Allocate(int64(n)); allocErr != nil {
-			c.Refused = true
-			return 0, fmt.Errorf("%w: %v", ErrMemoryBudgetExhausted, allocErr)
-		}
-		c.Charged += int64(n)
-	}
-	return n, err
-}

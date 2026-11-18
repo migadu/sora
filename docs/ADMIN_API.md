@@ -814,8 +814,11 @@ curl -X POST "http://127.0.0.1:8080/admin/mail/deliver?recipients=alice@example.
 ```
 
 **`multipart/form-data`**: the field `message` holds the message, as a value or a file
-upload; `recipients` may repeat; `from` is a single value. `mailbox`, `uid` and
-`uid_validity` are available only in the JSON form.
+upload; `recipients` may repeat, one address in each; `from` is a single value. `mailbox`, `uid`
+and `uid_validity` are available only in the JSON form. The fields may come in any order. When
+`message` is given more than once, a value counts before a file upload, and the first of each.
+A `recipients` or `from` value is at most 1024 bytes, and a form has at most 1000 parts; parts
+with other names are ignored and not read into memory.
 
 Any other `Content-Type` gives `400 Unsupported Content-Type. Use application/json,
 message/rfc822, or multipart/form-data`.
@@ -861,7 +864,7 @@ Status codes:
 |---|---|
 | 200 | Every recipient accepted. |
 | 207 | Two or more recipients, and at least one failed (also when all failed). |
-| 400 | One recipient, and it failed for a reason in the request (unknown or invalid address, or a message too large to store); or the request itself is bad: no message, an unparseable message, no recipients, a `from` that does not parse, a body over the size limit, a bad form. |
+| 400 | One recipient, and it failed for a reason in the request (unknown or invalid address, or a message too large to store); or the request itself is bad: no message, an unparseable message, no recipients, a `from` that does not parse, a body over the size limit, a bad form (`Failed to parse multipart form`: malformed, cut short, or more than 1000 parts; `Form field "recipients" is longer than 1024 bytes`, likewise `from`). |
 | 503 | One recipient, and it failed on the server side. `Retry-After: 30`. |
 | 503 | This node has no upload worker: `{"error":"Mail delivery not available on this node: no upload worker"}` with `Retry-After: 60`. Send the request to a node that runs an `imap`, `pop3` or `lmtp` server. |
 | 503 | This backend is in maintenance: `{"error":"Server in maintenance, try again later"}` with `Retry-After: 60`. See [PROXY.md](PROXY.md) for maintenance mode. |
