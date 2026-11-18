@@ -171,8 +171,7 @@ Options:
   --domain string        Domain to list accounts for (e.g., example.com) (required)
 
 Examples:
-  sora-admin accounts list --domain example.com
-  sora-admin accounts list --domain example.com --config /path/to/config.toml
+  sora-admin accounts list --domain example.com --config config.toml
 `)
 	}
 
@@ -218,9 +217,8 @@ Options:
   --json             Output in JSON format instead of human-readable format
 
 Examples:
-  sora-admin accounts show --email user@example.com
-  sora-admin accounts show --email user@example.com --json
-  sora-admin accounts show --email user@example.com --config /path/to/config.toml
+  sora-admin accounts show --email user@example.com --config config.toml
+  sora-admin accounts show --email user@example.com --json --config config.toml
 `)
 	}
 
@@ -420,7 +418,7 @@ Options:
   --config string        Path to TOML configuration file (required)
 
 Examples:
-  sora-admin accounts restore --email user@example.com
+  sora-admin accounts restore --email user@example.com --config config.toml
 `)
 	}
 

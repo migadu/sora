@@ -68,10 +68,9 @@ This command shows:
   - Details of failed uploads including content hashes and attempt counts
 
 Examples:
-  sora-admin uploader status
-  sora-admin uploader status --config /path/to/config.toml
-  sora-admin uploader status --failed-limit 20
-  sora-admin uploader status --show-failed=false
+  sora-admin uploader status --config config.toml
+  sora-admin uploader status --failed-limit 20 --config config.toml
+  sora-admin uploader status --show-failed=false --config config.toml
 `)
 	}
 
@@ -122,9 +121,9 @@ Actions taken per upload:
   whose objects exist but leaves the pending record to the upload in flight.
 
 Examples:
-  sora-admin uploader resolve --dry-run
-  sora-admin uploader resolve
-  sora-admin uploader resolve --limit 50
+  sora-admin uploader resolve --dry-run --config config.toml
+  sora-admin uploader resolve --config config.toml
+  sora-admin uploader resolve --limit 50 --config config.toml
 `)
 	}
 

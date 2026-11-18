@@ -81,8 +81,8 @@ This command shows:
 
 Examples:
   sora-admin tls list --config config.toml
-  sora-admin tls list --details
-  sora-admin tls list --cache-dir /custom/path
+  sora-admin tls list --details --config config.toml
+  sora-admin tls list --cache-dir /custom/path --config config.toml
 `)
 	}
 

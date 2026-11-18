@@ -74,10 +74,10 @@ Other Options:
   --config string        Path to TOML configuration file (required)
 
 Examples:
-  sora-admin messages list-deleted --email user@example.com
-  sora-admin messages list-deleted --email user@example.com --mailbox INBOX
-  sora-admin messages list-deleted --email user@example.com --since 2024-01-01
-  sora-admin messages list-deleted --email user@example.com --limit 50
+  sora-admin messages list-deleted --email user@example.com --config config.toml
+  sora-admin messages list-deleted --email user@example.com --mailbox INBOX --config config.toml
+  sora-admin messages list-deleted --email user@example.com --since 2024-01-01 --config config.toml
+  sora-admin messages list-deleted --email user@example.com --limit 50 --config config.toml
 `)
 	}
 
@@ -167,13 +167,13 @@ Other Options:
 
 Examples:
   # Restore specific messages by ID
-  sora-admin messages restore --email user@example.com --ids 123,456,789 --confirm
+  sora-admin messages restore --email user@example.com --ids 123,456,789 --confirm --config config.toml
 
   # Restore all deleted messages from INBOX
-  sora-admin messages restore --email user@example.com --mailbox INBOX --confirm
+  sora-admin messages restore --email user@example.com --mailbox INBOX --confirm --config config.toml
 
   # Restore messages deleted in the last 24 hours
-  sora-admin messages restore --email user@example.com --since $(date -u -d '1 day ago' '+%%Y-%%m-%%d') --confirm
+  sora-admin messages restore --email user@example.com --since $(date -u -d '1 day ago' '+%%Y-%%m-%%d') --confirm --config config.toml
 `)
 	}
 

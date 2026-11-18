@@ -193,9 +193,8 @@ Options:
   --json             Output in JSON format instead of human-readable format
 
 Examples:
-  sora-admin credentials show --email user@example.com
-  sora-admin credentials show --email alias@example.com --json
-  sora-admin credentials show --email user@example.com --config /path/to/config.toml
+  sora-admin credentials show --email user@example.com --config config.toml
+  sora-admin credentials show --email alias@example.com --json --config config.toml
 `)
 	}
 
