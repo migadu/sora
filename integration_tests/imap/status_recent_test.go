@@ -16,26 +16,11 @@ import (
 	"github.com/migadu/sora/integration_tests/common"
 )
 
-// TestIMAP_StatusRecent_ReflectsRecentMessages documents a KNOWN, ACCEPTED
-// LIMITATION (audit finding H3, 2026-07-01): STATUS (RECENT) always reports 0.
-//
-// db/mailbox.go GetMailboxSummary never populates MailboxSummary.RecentCount.
-// \Recent and the RECENT status item are OBSOLETE — removed in IMAP4rev2
-// (RFC 9051) — and Sora is rev2-first. RECENT is meaningful only to legacy rev1
-// clients, and Sora's per-session in-memory recent model has no well-defined
-// cross-session value for STATUS on a (possibly non-selected) mailbox. We
-// deliberately do NOT fix the value; this test is skipped and kept as executable
-// documentation of the intended rev1 behavior should the decision change.
-//
-// (SELECT's NumRecent is computed on a separate path and IS correct; only the
-// STATUS/LIST-STATUS RECENT item returns 0.)
-//
-// Expected if ever implemented (RFC 3501 §6.3.10): RECENT == 2 here.
+// TestIMAP_StatusRecent_ReflectsRecentMessages: STATUS (RECENT) of a mailbox
+// that no session has selected read-write counts every message (RFC 3501
+// §6.3.10, §2.3.2). RECENT is an IMAP4rev1 item (removed in IMAP4rev2, RFC 9051
+// Appendix E), so the request is driven over the wire.
 func TestIMAP_StatusRecent_ReflectsRecentMessages(t *testing.T) {
-	t.Skip("H3: STATUS (RECENT) always 0 — accepted rev1-compat limitation " +
-		"(RECENT removed in IMAP4rev2; Sora is rev2-first). See memory " +
-		"imap-command-correctness-audit-2026-07 (H3).")
-
 	common.SkipIfDatabaseUnavailable(t)
 
 	server, account := common.SetupIMAPServer(t)
@@ -96,9 +81,8 @@ func TestIMAP_StatusRecent_ReflectsRecentMessages(t *testing.T) {
 		t.Fatalf("sanity: expected MESSAGES 2, got %d", messages)
 	}
 	if recent != messages {
-		t.Errorf("REGRESSION: STATUS reported RECENT %d for a mailbox with %d never-SELECTed "+
-			"messages; expected RECENT %d. MailboxSummary.RecentCount is never populated "+
-			"(db/mailbox.go GetMailboxSummary).", recent, messages, messages)
+		t.Errorf("STATUS reported RECENT %d for a mailbox with %d never-SELECTed "+
+			"messages; expected RECENT %d", recent, messages, messages)
 	}
 }
 
@@ -206,5 +190,35 @@ func TestIMAP_StatusRecent_AfterExamineAndClose(t *testing.T) {
 	}
 	if got := listStatusRecent("l2"); got != 1 {
 		t.Errorf("LIST RETURN (STATUS (RECENT)) after a new delivery: RECENT %d, want 1", got)
+	}
+}
+
+// TestIMAP_StatusRecent_SelectedMailboxMatchesSelect: STATUS of the selected
+// mailbox (which RFC 3501 §6.3.10 discourages but allows) reports this
+// session's \Recent messages, the count SELECT announced, while another
+// connection, opening after the read-write SELECT, sees none.
+func TestIMAP_StatusRecent_SelectedMailboxMatchesSelect(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	conn, r := esearchDialLogin(t, server, account.Email, account.Password)
+	defer conn.Close()
+	esearchCreate(t, conn, r, "c1", "Box")
+	esearchAppend(t, conn, r, "a1", "Box", "one")
+	esearchAppend(t, conn, r, "a2", "Box", "two")
+	if lines := esearchCmdOK(t, conn, r, "w1", "SELECT Box"); !slices.Contains(lines, "* 2 RECENT") {
+		t.Fatalf("SELECT: want * 2 RECENT, got %q", lines)
+	}
+	resp := strings.Join(esearchCmdOK(t, conn, r, "s1", "STATUS Box (RECENT)"), "\n")
+	if got := h3ParseStatusItem(t, resp, "RECENT"); got != 2 {
+		t.Errorf("STATUS of the selected mailbox: RECENT %d, want 2 as SELECT said", got)
+	}
+
+	other, r2 := esearchDialLogin(t, server, account.Email, account.Password)
+	defer other.Close()
+	resp = strings.Join(esearchCmdOK(t, other, r2, "s2", "STATUS Box (RECENT)"), "\n")
+	if got := h3ParseStatusItem(t, resp, "RECENT"); got != 0 {
+		t.Errorf("STATUS from another connection after the read-write SELECT: RECENT %d, want 0", got)
 	}
 }

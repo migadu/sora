@@ -1048,7 +1048,6 @@ type MailboxSummary struct {
 	NumMessages       int
 	TotalSize         int64
 	HighestModSeq     uint64
-	RecentCount       int
 	UnseenCount       int
 	FirstUnseenSeqNum uint32 // Sequence number of the first unseen message
 }
