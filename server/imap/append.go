@@ -347,8 +347,8 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 
 	// User.Address is always the primary address (set during LOGIN)
 	// No need to query - it's already cached in the session
-	// Sanitize flags to remove invalid values (e.g., NIL, NULL, empty strings)
-	// This prevents protocol errors like "Keyword used without being in FLAGS: NIL"
+	// Sanitize flags to remove values no IMAP response can encode (empty
+	// strings, non-atom keywords; see helpers.SanitizeFlags)
 	sanitizedFlags := helpers.SanitizeFlags(options.Flags)
 
 	// RFC 3501 §2.3.2: \Recent is a session flag — it must NOT be stored

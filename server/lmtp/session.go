@@ -937,7 +937,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Flags set by the Sieve script via imap4flags (RFC 5232) belong to one stored
 	// copy, the one its keep or fileinto stores (Destination.Flags). storedFlags
 	// turns them into the flags that copy is stored with, next to the attachment
-	// keyword classified above. Sanitize to drop NIL/empty values and anything
+	// keyword classified above. Sanitize to drop empty values and anything
 	// that is not a valid IMAP flag-keyword -- a Sieve script is the one flag
 	// source that never passes an IMAP parser, so this is where an unencodable
 	// keyword would otherwise enter the system.

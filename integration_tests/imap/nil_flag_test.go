@@ -11,15 +11,10 @@ import (
 	"github.com/migadu/sora/integration_tests/common"
 )
 
-// TestIMAP_NILNotAFlag tests that NIL never appears as a flag
-// This is a regression test for imaptest error:
-// "Keyword used without being in FLAGS: NIL: * 1 FETCH (FLAGS (\Recent NIL) UID 1 MODSEQ (116))"
-//
-// NIL is not a valid flag and should never appear in FLAGS responses.
-// This could happen if:
-// 1. Malformed input is stored (literal string "NIL" as a flag)
-// 2. NULL values in database are incorrectly serialized as "NIL"
-// 3. Empty/null flag handling bug
+// TestIMAP_NILNotAFlag tests that a message nobody gave the keyword NIL never
+// shows one: no flags, an empty flag list or clearing all flags must not be
+// serialized as a NIL keyword. (A client storing the keyword NIL gets it back;
+// see TestIMAP_StoreNILKeyword.)
 func TestIMAP_NILNotAFlag(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -214,8 +209,8 @@ func TestIMAP_NILNotAFlag(t *testing.T) {
 	t.Log("✅ All NIL flag tests passed - NIL never appears as a flag")
 }
 
-// TestIMAP_NILCustomFlagAttempt tests that attempting to use "NIL" as a custom flag
-// is rejected or sanitized
+// TestIMAP_NILCustomFlagAttempt tests that "$NIL", a valid keyword atom, is
+// stored on APPEND like any other keyword (#2013).
 func TestIMAP_NILCustomFlagAttempt(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -238,11 +233,6 @@ func TestIMAP_NILCustomFlagAttempt(t *testing.T) {
 
 	testMessage := "From: test@example.com\r\nTo: user@example.com\r\nSubject: Test\r\n\r\nBody\r\n"
 
-	// Try to append with "NIL" as a custom flag
-	// The go-imap client might reject this, but let's see what happens
-	t.Log("=== Attempting to use NIL-like strings as flags ===")
-
-	// Test with "$NIL" which is technically a valid custom flag format
 	appendCmd := c.Append("INBOX", int64(len(testMessage)), &imap.AppendOptions{
 		Flags: []imap.Flag{"$NIL", "$Valid"},
 	})
@@ -254,12 +244,9 @@ func TestIMAP_NILCustomFlagAttempt(t *testing.T) {
 	}
 	appendData, err := appendCmd.Wait()
 	if err != nil {
-		t.Logf("APPEND with $NIL flag rejected (expected): %v", err)
-		// This is acceptable - server can reject NIL-like flags
-		return
+		t.Fatalf("APPEND with keyword $NIL failed: %v", err)
 	}
 
-	// If APPEND succeeded, verify the flags
 	fetchResults, err := c.Fetch(imap.UIDSetNum(appendData.UID), &imap.FetchOptions{
 		UID:   true,
 		Flags: true,
@@ -288,12 +275,10 @@ func TestIMAP_NILCustomFlagAttempt(t *testing.T) {
 		}
 	}
 
-	if hasNILFlag {
-		t.Errorf("⚠️  Server accepted and stored $NIL flag (should ideally reject or sanitize)")
-		t.Logf("   This could lead to the imaptest error: 'Keyword used without being in FLAGS: NIL'")
+	if !hasNILFlag {
+		t.Errorf("keyword $NIL was dropped on APPEND: %v", flags)
 	}
-
-	if hasValidFlag {
-		t.Logf("✅ Valid flag $Valid was stored correctly")
+	if !hasValidFlag {
+		t.Errorf("keyword $Valid was dropped on APPEND: %v", flags)
 	}
 }
