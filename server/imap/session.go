@@ -47,9 +47,12 @@ type IMAPSession struct {
 	selectedMailbox *db.DBMailbox
 	mailboxTracker  *imapserver.MailboxTracker
 	sessionTracker  *imapserver.SessionTracker
-	// announcedFlags is the mailbox FLAGS list last given to the client, by
-	// SELECT/EXAMINE or by a later Poll announcing new keywords (#2042).
-	announcedFlags []imap.Flag
+	// announcedFlags is the FLAGS list of mailbox announcedMailboxID last
+	// written to the client, by SELECT/EXAMINE or later by announceNewKeywords
+	// (#2042). Both are guarded by announcedMu, which is taken after s.mutex.
+	announcedMu        sync.Mutex
+	announcedFlags     []imap.Flag
+	announcedMailboxID int64
 
 	// Client identification and capability filtering
 	clientID       *imap.IDData
@@ -583,7 +586,9 @@ func (s *IMAPSession) clearSelectedMailboxStateLocked() {
 	s.selectedExamined.Store(false)
 	s.mailboxTracker = nil
 	s.sessionTracker = nil
-	s.announcedFlags = nil
+	s.announcedMu.Lock()
+	s.announcedFlags, s.announcedMailboxID = nil, 0
+	s.announcedMu.Unlock()
 	s.currentHighestModSeq.Store(0)
 	s.reportedHighestModSeq.Store(0)
 	s.reportedModSeqGap.Store(false)

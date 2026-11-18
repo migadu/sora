@@ -507,6 +507,15 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 		}
 	}
 
+	// A keyword the client has not been told the mailbox uses, such as one
+	// another session added since this session's last poll, is announced
+	// before the response showing it (#2091).
+	if options.Flags {
+		if err := s.announceNewKeywords(selectedMailboxID, msg.CustomFlags, w.WriteMailboxFlags); err != nil {
+			return err
+		}
+	}
+
 	m := w.CreateMessage(seqNum)
 	if m == nil {
 		// This indicates an issue with the imapserver library or FetchWriter.
