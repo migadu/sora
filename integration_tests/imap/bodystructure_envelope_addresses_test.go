@@ -3,7 +3,6 @@
 package imap_test
 
 import (
-	"strings"
 	"testing"
 
 	"github.com/migadu/sora/integration_tests/common"
@@ -49,10 +48,9 @@ func TestIMAP_BodyStructureAttachedEnvelopeAddresses(t *testing.T) {
 	untagged, tagged := rc.cmd("f", "FETCH 1 (BODYSTRUCTURE)")
 	require.Contains(t, tagged, "OK")
 	require.Len(t, untagged, 1, "one FETCH response: %v", untagged)
-	// RFC 3501's env-to is "(" 1*address ")", with no SP between addresses. go-imap up to
-	// the pinned #372 head writes one; migadu/go-imap#378 (#377) removes it. Compare without
-	// it so the assertions hold on both sides of that pin bump.
-	resp := strings.ReplaceAll(untagged[0], ") (NIL ", ")(NIL ")
+	// RFC 3501's env-to is "(" 1*address ")", with no SP between addresses; go-imap writes
+	// them unspaced since migadu/go-imap#378, so the response is compared as sent.
+	resp := untagged[0]
 	require.Contains(t, resp, `"attached"`, "embedded envelope present: %s", resp)
 
 	t.Run("groups", func(t *testing.T) {
