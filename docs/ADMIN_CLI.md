@@ -57,9 +57,10 @@ go build -o sora-admin ./cmd/sora-admin
 sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
 ```
 
-- `--config PATH` is **required** for every command except `help` and `version`. There is no
-  default path. The flag may appear anywhere on the line, and `--config=PATH` works too. Use two
-  dashes: `-config` is not recognised and the tool stops with `--config flag is required`.
+- `--config PATH` is **required** for every command except `help`, `version` and `--help` (see
+  below). There is no default path. The flag may appear anywhere on the line, and `--config=PATH`
+  works too. Use two dashes: `-config` is not recognised and the tool stops with `--config flag is
+  required`.
 - `sora-admin` reads the same TOML file as the server. It loads it with the server's loader, so
   unknown keys and duplicate keys produce the same warnings, and a file the server cannot load
   stops the tool. Settings the file leaves out take the server's defaults, so a command that
@@ -69,17 +70,17 @@ sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
   `[shared_mailboxes]`, `[tls]`, `[admin_cli]`, `[relay]`, `[sieve]`, the `[[server]]` blocks and
   the top-level `bcrypt_cost`. The tool stops at once if `[s3] body_deletion_protocol`,
   `[shared_mailboxes]`, `[cleanup]` or `[uploader]` holds a value the server would refuse.
-- The config file is loaded before anything else, so even `sora-admin --config PATH accounts
-  --help` needs a file that loads. Only `sora-admin help`, `sora-admin --help`, `sora-admin -h`,
-  `sora-admin version`, `sora-admin -v`, `sora-admin --version` and `sora-admin config --help`
-  work without one.
 - Flags of a subcommand come **after** the subcommand. They are parsed with Go's `flag` package,
   so `--flag value`, `--flag=value` and `-flag value` all work. A boolean flag that defaults to
   `true` is turned off with `--flag=false`.
 - Worker counts (`--jobs`, `--workers`) must be at least `1`. So must the batch sizes and limits
   this document marks "at least 1"; a smaller value stops the command with an error.
 - `sora-admin <command> --help` lists the subcommands. `sora-admin <command> <subcommand> --help`
-  prints the subcommand's flags.
+  prints the subcommand's flags. `-h` and `-help` do the same. Help needs no config file: without
+  `--config`, or with a file that does not load, a line with a help flag prints the usage of the
+  command and subcommand named before the first flag, exits `0` and runs nothing, whatever else
+  the line holds. With a file that loads, the line is parsed as written, so `--help` given as a
+  flag's value (`--email --help`) is that value.
 
 ### Output, logs and exit status
 
