@@ -202,10 +202,10 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 
 	// The caller is responsible for beginning and committing/rolling back the transaction.
 
-	// Lock the destination's mailbox row before any message row, the order MOVE, EXPUNGE
-	// and STORE take them in (see lockMailboxStats): the source rows are locked next, and
-	// a MOVE into this mailbox holds this row while it waits for them.
-	if err := lockMailboxStats(ctx, tx, destMailboxID); err != nil {
+	// Lock both mailboxes rows before any message row, the order MOVE, EXPUNGE, STORE and
+	// the failed-upload cleanup take them in: the source rows are locked next, and each of
+	// those holds its mailbox row while it waits for them (see lockCopyMailboxes).
+	if err := lockCopyMailboxes(ctx, tx, srcMailboxID, destMailboxID); err != nil {
 		return nil, nil, err
 	}
 

@@ -152,6 +152,11 @@ func (db *Database) CheckCopyMoveBodyBudget(ctx context.Context, tx pgx.Tx, srcM
 // Row locks are kept in the rows and take no lock-table entry. A rekey is held off by
 // the account guard; a deleter working for another account that shares the key counts
 // rows in any state, and the source row exists throughout.
+//
+// What such a command no longer does is make an exclusive holder of the body lock wait
+// for it. The deleters do not need that (above). The missing-object repair, which
+// changes the rows it finds under that lock, reads them again until it has them all
+// (MarkMessagesAsNotUploadedIfAbsent).
 func lockS3SourceClaims(ctx context.Context, tx pgx.Tx, mailboxID, destMailboxID, destAccountID int64, uids *[]imap.UID, destObjects []string) error {
 	hashes, budgeted, err := sourceBodyClaims(ctx, tx, mailboxID, destMailboxID, destAccountID, uids, destObjects)
 	if err != nil {

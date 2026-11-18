@@ -581,11 +581,32 @@ func (d *Database) MarkMessagesAsNotUploadedIfAbsent(ctx context.Context, obj Co
 	if err != nil || present {
 		return 0, err
 	}
+	// A COPY or MOVE within one account holds no body lock (lockS3SourceClaims), so one
+	// can be open now. The UPDATE waits for its source row, but with the snapshot it
+	// started with: it cannot see the row that command commits meanwhile, which stays
+	// marked uploaded, and a moved source is expunged by then and matches nothing. So
+	// read again after each pass, until a fresh snapshot shows no uploaded row of the
+	// key. That is final: a command still open then either locked its source before
+	// this transaction marked it, and has therefore committed, or waits for this
+	// transaction's row lock and will copy the row as marked.
+	domains, localparts, hashes := []string{obj.S3Domain}, []string{obj.S3Localpart}, []string{obj.ContentHash}
 	var count int64
 	if err := lock.run(guarded, func(ctx context.Context, tx pgx.Tx) error {
-		var err error
-		count, err = markMessagesAsNotUploadedInTx(ctx, tx, []string{obj.S3Domain}, []string{obj.S3Localpart}, []string{obj.ContentHash})
-		return err
+		for pass := 0; pass < missingObjectRepairPasses; pass++ {
+			n, err := markMessagesAsNotUploadedInTx(ctx, tx, domains, localparts, hashes)
+			if err != nil {
+				return err
+			}
+			count += n
+			var left bool
+			if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages m WHERE `+markedUploadedForKeys+`)`, domains, localparts, hashes).Scan(&left); err != nil {
+				return fmt.Errorf("failed to re-check messages marked uploaded: %w", err)
+			}
+			if !left {
+				return nil
+			}
+		}
+		return fmt.Errorf("messages of %s/%s/%s kept being copied or moved during the repair; run it again", obj.S3Domain, obj.S3Localpart, obj.ContentHash)
 	}); err != nil {
 		return 0, err
 	}
@@ -595,11 +616,15 @@ func (d *Database) MarkMessagesAsNotUploadedIfAbsent(ctx context.Context, obj Co
 	return count, nil
 }
 
-func markMessagesAsNotUploadedInTx(ctx context.Context, tx pgx.Tx, domains, localparts, hashes []string) (int64, error) {
-	query := `
-		UPDATE messages m
-		SET uploaded = FALSE
-		WHERE (m.s3_domain, m.s3_localpart, m.content_hash) IN (
+// missingObjectRepairPasses bounds the passes of MarkMessagesAsNotUploadedIfAbsent. Each
+// pass after the first needs a COPY or MOVE of the body that was open during the one
+// before it.
+const missingObjectRepairPasses = 16
+
+// markedUploadedForKeys selects the live rows m of the S3 keys ($1, $2, $3: domains,
+// local parts, hashes) that are marked uploaded and have no upload pending.
+const markedUploadedForKeys = `
+		(m.s3_domain, m.s3_localpart, m.content_hash) IN (
 			SELECT * FROM unnest($1::text[], $2::text[], $3::text[])
 		)
 		AND m.uploaded = TRUE
@@ -607,7 +632,13 @@ func markMessagesAsNotUploadedInTx(ctx context.Context, tx pgx.Tx, domains, loca
 		AND NOT EXISTS (
 			SELECT 1 FROM pending_uploads pu
 			WHERE pu.account_id = m.account_id AND pu.content_hash = m.content_hash
-		)
+		)`
+
+func markMessagesAsNotUploadedInTx(ctx context.Context, tx pgx.Tx, domains, localparts, hashes []string) (int64, error) {
+	query := `
+		UPDATE messages m
+		SET uploaded = FALSE
+		WHERE ` + markedUploadedForKeys + `
 	`
 
 	result, err := tx.Exec(ctx, query, domains, localparts, hashes)
