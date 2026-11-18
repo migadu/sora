@@ -260,6 +260,65 @@ func TestThreadReferences_DummyThreadSubject(t *testing.T) {
 	}
 }
 
+// TestThreadReferences_SentDateOrder pins the ordering of RFC 5256 REFERENCES
+// steps 4 and 6: threads and siblings sort by a message's own sent date, and a
+// dummy by its first child's ("use the first child for the top-level sort"),
+// not by the earliest date anywhere below them. The cases differ from that only
+// when a reply is dated before the message it answers.
+func TestThreadReferences_SentDateOrder(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+	at := func(hoursAgo int) time.Time { return now.Add(-time.Duration(hoursAgo) * time.Hour) }
+
+	tests := []struct {
+		name     string
+		messages []db.ThreadMessageResult
+		want     []imap.ThreadData
+	}{
+		{
+			// UID 2 answers UID 1 but is dated earlier than both 1 and 3.
+			name: "threads by their root's date",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "ALPHA", SentDate: at(3)},
+				{UID: 2, MessageID: "b@b", References: "a@b", SubjectSort: "ALPHA", ReplyOrForward: true, SentDate: at(5)},
+				{UID: 3, MessageID: "c@b", SubjectSort: "BETA", SentDate: at(4)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{3}}, {Chain: []uint32{1, 2}}},
+		},
+		{
+			// UID 4 answers UID 2 and is dated before everything else.
+			name: "siblings by their own date",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "p@b", SentDate: at(6)},
+				{UID: 2, MessageID: "c1@b", References: "p@b", SentDate: at(1)},
+				{UID: 3, MessageID: "c2@b", References: "p@b", SentDate: at(2)},
+				{UID: 4, MessageID: "g@b", References: "p@b c1@b", SentDate: at(10)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{1}, SubThreads: []imap.ThreadData{{Chain: []uint32{3}}, {Chain: []uint32{2, 4}}}}},
+		},
+		{
+			// UIDs 1 and 2 answer a message not in the mailbox; the dummy sorts by
+			// UID 1, its first child, though UID 3 below UID 2 is the oldest.
+			name: "dummy by its first child's date",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "x@b", References: "gone@b", SentDate: at(2)},
+				{UID: 2, MessageID: "y@b", References: "gone@b", SentDate: at(1)},
+				{UID: 3, MessageID: "z@b", References: "gone@b y@b", SentDate: at(9)},
+				{UID: 4, MessageID: "w@b", SubjectSort: "W", SentDate: at(5)},
+			},
+			want: []imap.ThreadData{
+				{Chain: []uint32{4}},
+				{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2, 3}}}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, session.threadReferences(imapserver.NumKindUID, tt.messages, false))
+		})
+	}
+}
+
 // The ids below are written the way the messages table holds them: without angle
 // brackets, several ids joined by a space (db.InsertMessage).
 
