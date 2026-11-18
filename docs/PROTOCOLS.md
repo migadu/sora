@@ -880,7 +880,7 @@ this order:
 | `STLS` | On a STARTTLS listener, before the upgrade. |
 | `SASL PLAIN` | When login is allowed on this connection. |
 | `LANG` | Always. |
-| `UTF8` | Always. |
+| `UTF8 USER` | Always. `USER` says that user names and passwords may be UTF-8 (RFC 6856 §2.2). |
 | `EXPIRE NEVER` or `EXPIRE <days>` | `<days>` is `[cleanup] max_age_restriction` in whole days, rounded down, and at least 1 (RFC 2449 reads `EXPIRE 0` as "do not leave mail on the server"). |
 | `AUTH-RESP-CODE` | Always. |
 | `IMPLEMENTATION Sora-POP3-Server` | Always. |
@@ -929,6 +929,7 @@ at the moment, gets `-ERR [SYS/TEMP] Session memory limit reached, please try ag
 | Situation | Reply |
 |---|---|
 | Wrong address or password, an address that does not parse, or rate-limited | `-ERR [AUTH] Authentication failed` |
+| `USER`/`PASS` with a user name or password that is not valid UTF-8 | `-ERR [AUTH] Authentication failed` |
 | Login before TLS on a STARTTLS port with `insecure_auth = false` | `-ERR Authentication requires TLS. Use STLS first` |
 | Too many logins waiting in the delay queue | `-ERR [SYS/TEMP] Too many concurrent authentication attempts. Please try again later.` |
 | The database cannot be reached | `-ERR [SYS/TEMP] Service temporarily unavailable, please try again later` |
@@ -940,6 +941,13 @@ at the moment, gets `-ERR [SYS/TEMP] Session memory limit reached, please try ag
 
 An address that does not parse is answered and counted like a wrong password, so the reply does
 not tell a guessed name from a real one.
+
+User names and passwords are UTF-8, as `UTF8 USER` says, and a client may use them without sending
+`UTF8` first. They are compared as sent: Sora does not apply SASLprep (RFC 4013), which RFC 6856
+§2.2 recommends, because the stored password hashes were made from the passwords as typed. A
+user name or password that is not valid UTF-8 (RFC 3629) is refused, as RFC 6856 §2.2 requires,
+before its credentials are looked up; no stored password can match it, so the attempt is not
+counted by the rate limiter.
 
 The library closes a session after 4 errors (failed logins included), with
 `-ERR Too many errors, closing connection`. Each error adds a delay of 3 seconds times the error

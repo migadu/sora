@@ -14,6 +14,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
@@ -603,6 +604,14 @@ func (s *POP3Session) refuseLikeWrongPassword(ctx context.Context, username, pas
 }
 
 func (s *POP3Session) Login(ctx context.Context, username, password string) error {
+	// RFC 6856 section 2.2: "The server MUST reject UTF-8 usernames or passwords
+	// that fail to comply with the formal syntax in UTF-8". No stored credential
+	// can match them, so they are refused before the credential check, like a
+	// wrong password. Valid UTF-8 is checked as sent, without SASLprep.
+	if !utf8.ValidString(username) || !utf8.ValidString(password) {
+		s.InfoLog("login refused: user name or password is not valid UTF-8")
+		return errAuthFailed
+	}
 	_, err := s.authenticateUser(ctx, "", username, password, false)
 	return err
 }
