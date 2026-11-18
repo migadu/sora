@@ -753,8 +753,18 @@ func TestGetMailboxSummariesBatch(t *testing.T) {
 	t.Logf("Successfully tested GetMailboxSummariesBatch with %d mailboxes", len(mailboxIDs))
 }
 
-// TestMailboxNameValidation tests mailbox name validation scenarios
+// TestMailboxNameValidation: CreateMailbox refuses a name that is not a storable mailbox
+// name (helpers.MailboxNameValid) with consts.ErrMailboxInvalidName, whatever its caller
+// checked first, and creates any other.
 func TestMailboxNameValidation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, accountID := setupMailboxTestDatabase(t)
+	defer db.Close()
+	ctx := context.Background()
+
 	tests := []struct {
 		name    string
 		mailbox string
@@ -763,26 +773,31 @@ func TestMailboxNameValidation(t *testing.T) {
 		{"valid simple name", "Sent", true},
 		{"valid hierarchical name", "INBOX/Sent", true},
 		{"valid with spaces", "My Folder", true},
+		{"unicode name", "📧 Mail", true},
+		{"dots inside a level", "Foo.Bar/..baz", true},
 		{"empty name", "", false},
 		{"just delimiter", "/", false},
 		{"leading delimiter", "/Folder", false},
 		{"trailing delimiter", "Folder/", false},
 		{"double delimiter", "INBOX//Sent", false},
-		{"unicode name", "📧 Mail", true},
-		{"very long name", string(make([]byte, 300)), false},
+		{"parent level", "a/../b", false},
+		{"tab", "a\tb", false},
+		{"invalid UTF-8", "caf\xe9", false},
+		{"NUL bytes", string(make([]byte, 300)), false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// This would test mailbox name validation logic
-			// Since there's no explicit validation function visible,
-			// this demonstrates the test structure for when one is added
+			tx, err := db.GetWritePool().Begin(ctx)
+			require.NoError(t, err)
+			defer tx.Rollback(ctx) // nothing created here outlives the subtest
 
-			t.Skip("Mailbox name validation not yet implemented")
-
-			// Example test:
-			// valid := validateMailboxName(tt.mailbox)
-			// assert.Equal(t, tt.valid, valid)
+			err = db.CreateMailbox(ctx, tx, accountID, tt.mailbox, nil)
+			if tt.valid {
+				assert.NoError(t, err)
+			} else {
+				assert.ErrorIs(t, err, consts.ErrMailboxInvalidName)
+			}
 		})
 	}
 }
