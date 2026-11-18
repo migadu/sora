@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"syscall"
 	"time"
 
 	"github.com/emersion/go-message"
@@ -110,7 +109,7 @@ var errStageOwnerCopy = errors.New("failed to stage message body")
 // spool. The error names spool files, which must not reach the client: the caller logs
 // the returned error, and ErrorMessage gives the cause only.
 func stagingFailure(result *DeliveryResult, what string, err error) error {
-	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
+	if helpers.IsInsufficientStorage(err) {
 		result.ErrorMessage = "Insufficient system storage (spool disk full or read-only)"
 		return fmt.Errorf("%w: %w", ErrInsufficientStorage, err)
 	}

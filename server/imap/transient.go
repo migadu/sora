@@ -3,9 +3,9 @@ package imap
 import (
 	"context"
 	"errors"
-	"syscall"
 
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/circuitbreaker"
 	"github.com/migadu/sora/pkg/retry"
 	"github.com/migadu/sora/server"
@@ -26,7 +26,7 @@ import (
 func isTransientError(err error) bool {
 	// A full or read-only spool disk is a condition the operator will clear; the
 	// client should retry later ([UNAVAILABLE]), not be told the server is broken.
-	if err != nil && (errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS)) {
+	if helpers.IsInsufficientStorage(err) {
 		return true
 	}
 	if err == nil {

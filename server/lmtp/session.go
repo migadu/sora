@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/emersion/go-message"
@@ -1267,7 +1266,7 @@ func (s *LMTPSession) fixedFieldsLog(logFn func(msg string, keysAndValues ...any
 // read-only: RFC 3463 4.3.1 "mail system full" is the reply MTAs understand as "back off,
 // storage", not a server error. It is nil for any other error.
 func spoolFullReply(err error) *smtp.SMTPError {
-	if !errors.Is(err, syscall.ENOSPC) && !errors.Is(err, syscall.EROFS) {
+	if !helpers.IsInsufficientStorage(err) {
 		return nil
 	}
 	return &smtp.SMTPError{
