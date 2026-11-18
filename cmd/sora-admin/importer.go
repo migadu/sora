@@ -1091,6 +1091,11 @@ func (i *Importer) hashMaildirFile(path string) (string, int64, error) {
 // it fails with errMessageTooLarge without reading the rest: a compressed file of a
 // few hundred bytes can expand to gigabytes, and hashing all of it only to refuse it
 // afterwards keeps a scan worker busy for as long as that takes.
+//
+// A message holding a NUL is the exception: the import stores it with its
+// NUL-bearing parts re-encoded (storedMessage), so it is read again in full and
+// its hash is that of the stored message. The size stays the message's as read,
+// which the limit applies to.
 func hashMessageFile(file *os.File, maxSize int64) (string, int64, error) {
 	reader, compressed, err := maildirContentReader(file)
 	if err != nil {
@@ -1102,15 +1107,44 @@ func hashMessageFile(file *os.File, maxSize int64) (string, int64, error) {
 	src := io.LimitReader(reader, limit+1)
 
 	hasher := helpers.NewContentHasher()
-	size, err := io.Copy(hasher, src)
+	var nul nulDetector
+	size, err := io.Copy(io.MultiWriter(hasher, &nul), src)
 	if err != nil {
 		return "", 0, fmt.Errorf("failed to hash file: %w", err)
 	}
 	if size > limit {
 		return "", 0, fmt.Errorf("%w: more than %d bytes", errMessageTooLarge, limit)
 	}
+	if nul {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return "", 0, fmt.Errorf("failed to hash file: %w", err)
+		}
+		content, err := readMessageFile(file, maxSize)
+		if err != nil {
+			return "", 0, err
+		}
+		return helpers.HashContent(storedMessage(content)), int64(len(content)), nil
+	}
 
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
+}
+
+// storedMessage is the message the import stores for content as read: a part
+// holding NUL base64 encoded, as APPEND and delivery store it, since FETCH BODY
+// sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3).
+func storedMessage(content []byte) []byte {
+	stored, _ := helpers.EncodeNULParts(content)
+	return stored
+}
+
+// nulDetector is an io.Writer that records whether a NUL octet passed through it.
+type nulDetector bool
+
+func (d *nulDetector) Write(p []byte) (int, error) {
+	if !*d && bytes.IndexByte(p, 0) >= 0 {
+		*d = true
+	}
+	return len(p), nil
 }
 
 // messageHead returns up to n bytes from the start of the message in a maildir file
@@ -2843,6 +2877,10 @@ func (i *Importer) readBatch(batch []msgInfo) []uploadedMsg {
 				atomic.AddInt64(&i.failedMessages, 1)
 				return
 			}
+			// The limit is on the message as read, the size the scan caches; what is
+			// stored and hashed may be larger by its re-encoded NUL-bearing parts.
+			readSize := len(content)
+			content = storedMessage(content)
 
 			// The hash in the SQLite cache was computed at scan time — possibly by an
 			// earlier run, since the scan keeps the first row for a (filename, mailbox).
@@ -2868,14 +2906,14 @@ func (i *Importer) readBatch(batch []msgInfo) []uploadedMsg {
 					logger.Warn("File content changed since the scan; using its current hash",
 						"path", msg.path, "scanned_hash", msg.hash, "current_hash", got)
 					if _, uerr := i.sqliteDB.Exec("UPDATE messages SET hash = ?, size = ?, s3_uploaded = 0 WHERE path = ? AND mailbox = ?",
-						got, len(content), msg.path, msg.mailbox); uerr != nil {
+						got, readSize, msg.path, msg.mailbox); uerr != nil {
 						logger.Warn("Failed to update the cached hash", "path", msg.path, "error", uerr)
 						i.recordFailedPath(msg.path, fmt.Sprintf("content changed since scan and the cache could not be updated: %v", uerr))
 						atomic.AddInt64(&i.failedMessages, 1)
 						return
 					}
 					msg.hash = got
-					msg.size = int64(len(content))
+					msg.size = int64(readSize)
 				}
 			}
 

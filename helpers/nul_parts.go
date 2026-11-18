@@ -63,6 +63,9 @@ func encodeNULEntity(out *bytes.Buffer, entity []byte, defaultType string, depth
 	case strings.HasPrefix(contentType.value, "multipart/"):
 		boundary, ok := contentType.boundary()
 		if !ok {
+			// Left as it is. Base64 is not a CTE a multipart may have (RFC
+			// 2045 §6.4), and making it a leaf would change its Content-Type,
+			// which RFC 3516 §4.4 does not allow: only the CTE.
 			break
 		}
 		childType := "text/plain"

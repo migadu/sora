@@ -261,6 +261,10 @@ file's first bytes, never by its name; a file that starts with none of these is 
 | xz | `fd 37 7a 58 5a 00` | Refused: `xz-compressed maildir file is not supported; decompress it first`. |
 | LZ4 frame format | `04 22 4d 18` | Refused: `lz4-compressed maildir file is not supported; decompress it first`. |
 
+A body part that holds a NUL octet under an identity Content-Transfer-Encoding is stored
+base64-encoded, as IMAP APPEND stores it ([PROTOCOLS.md](PROTOCOLS.md#54-messages-and-flags)); the
+content hash and size are those of the stored message.
+
 Decompression stops at 256 MiB of output. A refused file, a corrupt one, and one that
 decompresses to more than 256 MiB count as failed
 ([section 11](#11-failures-retries-and-exit-status)).

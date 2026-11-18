@@ -622,6 +622,13 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		s.WarnLog("could not find header/body separator in message")
 	}
 
+	// A part holding NUL is stored base64 encoded, as APPEND stores it: FETCH
+	// BODY sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3).
+	if encoded, ok := helpers.EncodeNULParts(fullMessageBytes); ok {
+		s.DebugLog("re-encoded NUL-bearing body parts as base64", "size", len(fullMessageBytes), "encoded_size", len(encoded))
+		fullMessageBytes = encoded
+	}
+
 	messageContent, err := server.ParseMessage(bytes.NewReader(fullMessageBytes))
 	if err != nil {
 		recordMetrics("failure")

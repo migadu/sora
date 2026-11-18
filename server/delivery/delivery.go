@@ -139,6 +139,10 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		MailboxName: consts.MailboxInbox,
 	}
 
+	// A part holding NUL is stored base64 encoded, as APPEND stores it: FETCH
+	// BODY sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3).
+	messageBytes, _ = helpers.EncodeNULParts(messageBytes)
+
 	// Parse message
 	messageEntity, err := server.ParseMessage(bytes.NewReader(messageBytes))
 	if err != nil {

@@ -440,10 +440,12 @@ start a cache warm-up that copies the newest INBOX messages from S3 to the local
 - An APPEND without a date-time gets the current time as its INTERNALDATE (RFC 9051 §6.3.12).
 - A body part that holds a NUL octet under an identity Content-Transfer-Encoding (none, `7bit`,
   `8bit` or `binary`), as a `~{n}` (literal8, RFC 3516) APPEND may send, is stored base64-encoded
-  with its `Content-Transfer-Encoding` field changed to match. `BODY[...]` and `BODYSTRUCTURE`
-  then describe the base64 form, which an ordinary literal can carry, and `BINARY[...]` returns
-  the original octets (RFC 3516 §4.4 allows a lossless CTE change). Every other part, and every
-  message without such a part, is stored exactly as sent. `RFC822.SIZE` is the stored size.
+  with its `Content-Transfer-Encoding` field changed to match. LMTP delivery
+  ([section 8.5](#85-delivery)), Admin API delivery and `sora-admin import maildir` store such a
+  part the same way. `BODY[...]` and `BODYSTRUCTURE` then describe the base64 form, which an
+  ordinary literal can carry, and `BINARY[...]` returns the original octets (RFC 3516 §4.4 allows
+  a lossless CTE change). Every other part, and every message without such a part, is stored
+  exactly as sent. `RFC822.SIZE` is the stored size.
 - When the session memory limit cannot hold the message:
   `NO [UNAVAILABLE] Session memory limit reached, please try again later`.
 - When this node's upload spool is over its size limit:
@@ -1144,15 +1146,17 @@ After `DATA` and the last `BDAT`, each reply carries the recipient, for example
 
 For each accepted message, Sora:
 
-1. checks for a delivery loop (an `X-Sora-Loop` header together with a `Delivered-To` equal to the
+1. re-encodes as base64 any body part that holds a NUL octet, as APPEND does
+   ([section 5.4](#54-messages-and-flags)), so that `FETCH BODY` never has to send one;
+2. checks for a delivery loop (an `X-Sora-Loop` header together with a `Delivered-To` equal to the
    account's primary address), answering `550 5.4.6 routing loop detected (Delivered-To)`;
-2. adds a `Received:` header and a `Delivered-To:` header naming the account's primary address;
-3. checks that this node's upload spool has room for the message;
-4. runs the built-in default Sieve script, then the user's active script (see
+3. adds a `Received:` header and a `Delivered-To:` header naming the account's primary address;
+4. checks that this node's upload spool has room for the message;
+5. runs the built-in default Sieve script, then the user's active script (see
    [SIEVE.md](SIEVE.md));
-5. writes the message to the local spool (with fsync), stores its metadata in PostgreSQL and queues
+6. writes the message to the local spool (with fsync), stores its metadata in PostgreSQL and queues
    the body for upload to S3 (see [STORAGE.md](STORAGE.md));
-6. answers `250 2.0.0 <recipient> OK: queued`.
+7. answers `250 2.0.0 <recipient> OK: queued`.
 
 The `Received:` header has this form:
 
