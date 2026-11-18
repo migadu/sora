@@ -130,6 +130,14 @@ func CheckStorableSize(size int) error {
 	return nil
 }
 
+// ReserveStorable is CheckStorableSize as the reserve callback of
+// helpers.EncodeNULParts on the paths without a session memory budget (LMTP and
+// Admin API delivery): a message whose re-encoded form sora cannot store is
+// refused before that form is allocated.
+func ReserveStorable(size int64) error {
+	return CheckStorableSize(int(size))
+}
+
 // DeliverMessage is the main entry point for message delivery.
 // It handles the complete delivery flow: parsing, Sieve execution, and storage.
 func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes []byte) (*DeliveryResult, error) {
@@ -137,6 +145,24 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		Success:     false,
 		Discarded:   false,
 		MailboxName: consts.MailboxInbox,
+	}
+
+	// Identity of the upstream submission, used to absorb a retry of a delivery whose
+	// acknowledgement was lost. MUST be taken over the bytes exactly as received: before
+	// the NUL-part re-encoding below (distinct submissions can be stored alike) and
+	// before the trace stamped further down, which carries a per-attempt id and
+	// timestamp, so anything hashed after it (content_hash included) differs on every
+	// attempt. Only the Sieve path (no TargetMailbox) uses it.
+	if recipient.Address != nil && recipient.TargetMailbox == "" {
+		recipient.DeliveryHash = helpers.HashContent(messageBytes)
+	}
+
+	// A part holding NUL is stored base64 encoded, as APPEND stores it: FETCH
+	// BODY sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3).
+	messageBytes, _, err := helpers.EncodeNULParts(messageBytes, ReserveStorable)
+	if err != nil {
+		result.ErrorMessage = err.Error()
+		return result, err
 	}
 
 	// Parse message
@@ -162,12 +188,6 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			result.ErrorMessage = "routing loop detected (Delivered-To)"
 			return result, fmt.Errorf("mail loop detected for %s", deliveredTo)
 		}
-		// Identity of the upstream submission, used to absorb a retry of a delivery whose
-		// acknowledgement was lost. MUST be taken over the bytes exactly as received: the
-		// trace stamped below carries a per-attempt id and timestamp, so anything hashed
-		// after it (content_hash included) differs on every attempt.
-		recipient.DeliveryHash = helpers.HashContent(messageBytes)
-
 		// Add our Received: trace for this delivery hop, then Delivered-To on top.
 		received := helpers.BuildReceivedHeader("", d.Hostname, "HTTP", deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
 		messageBytes = helpers.PrependRawHeader(messageBytes, received)

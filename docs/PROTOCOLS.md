@@ -444,7 +444,9 @@ start a cache warm-up that copies the newest INBOX messages from S3 to the local
   match. A message that cannot be converted safely gets `NO [UNKNOWN-CTE]`.
 - Any other APPEND (an ordinary literal, or the `UTF8 (~{n})` literal8 of RFC 6855) has only its
   leaf parts that hold a NUL octet under an identity Content-Transfer-Encoding (none, `7bit`,
-  `8bit` or `binary`) stored base64-encoded. A part it cannot locate is kept as sent.
+  `8bit` or `binary`) stored base64-encoded. A part it cannot locate is kept as sent. LMTP
+  delivery ([section 8.5](#85-delivery)), Admin API delivery and `sora-admin import maildir` store
+  such a part the same way.
 - In both cases `BODY[...]` and `BODYSTRUCTURE` describe the stored form, which an ordinary
   literal can carry, and `BINARY[...]` returns the original octets (RFC 3516 §4.4 allows a
   lossless CTE change). Every other byte, and every message that needs no conversion, is stored
@@ -1185,15 +1187,21 @@ After `DATA` and the last `BDAT`, each reply carries the recipient, for example
 
 For each accepted message, Sora:
 
-1. checks for a delivery loop (an `X-Sora-Loop` header together with a `Delivered-To` equal to the
+1. takes the retry identity (the delivery hash a lost `250` is recognised by) from the message
+   exactly as received, then re-encodes as base64 any body part that holds a NUL octet, as APPEND
+   does ([section 5.4](#54-messages-and-flags)), so that `FETCH BODY` never has to send one.
+   `max_message_size` applies to the message as received; a re-encoded form larger than
+   2147483647 octets is refused, before it is built, with
+   `552 5.3.4 message size exceeds maximum allowed size of 2147483647 bytes`;
+2. checks for a delivery loop (an `X-Sora-Loop` header together with a `Delivered-To` equal to the
    account's primary address), answering `550 5.4.6 routing loop detected (Delivered-To)`;
-2. adds a `Received:` header and a `Delivered-To:` header naming the account's primary address;
-3. checks that this node's upload spool has room for the message;
-4. runs the built-in default Sieve script, then the user's active script (see
+3. adds a `Received:` header and a `Delivered-To:` header naming the account's primary address;
+4. checks that this node's upload spool has room for the message;
+5. runs the built-in default Sieve script, then the user's active script (see
    [SIEVE.md](SIEVE.md));
-5. writes the message to the local spool (with fsync), stores its metadata in PostgreSQL and queues
+6. writes the message to the local spool (with fsync), stores its metadata in PostgreSQL and queues
    the body for upload to S3 (see [STORAGE.md](STORAGE.md));
-6. answers `250 2.0.0 <recipient> OK: queued`.
+7. answers `250 2.0.0 <recipient> OK: queued`.
 
 The `Received:` header has this form:
 
