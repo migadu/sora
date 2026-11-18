@@ -17,8 +17,9 @@ func TestNewReversePathNoMasterSuffix(t *testing.T) {
 		{"a@b@example.com", `"a@b"@example.com`, `"a@b"`, "example.com"},
 		// `"a@b.example"@example.com`
 		{"a@b.example@example.com", `"a@b.example"@example.com`, `"a@b.example"`, "example.com"},
-		// `"User+Tag@Example.org"@Example.com`: a quoted local part has no detail.
-		{"User+Tag@Example.org@Example.com", `"user+tag@example.org"@example.com`, `"user+tag@example.org"`, "example.com"},
+		// `"User+Tag@Example.org"@Example.com`: a quoted local part has no detail, and
+		// keeps its case (#2101).
+		{"User+Tag@Example.org@Example.com", `"User+Tag@Example.org"@example.com`, `"User+Tag@Example.org"`, "example.com"},
 		// `"user@example.com"@SUFFIX`: the last "@" starts the domain.
 		{"user@example.com@SUFFIX", `"user@example.com"@suffix`, `"user@example.com"`, "suffix"},
 	} {

@@ -8,7 +8,8 @@ import (
 
 // NewReversePath reads a MAIL FROM mailbox as go-smtp hands it over (a quoted local
 // part already unquoted) as leniently as go-smtp parses it, and returns it in a form
-// that is safe to write into MAIL FROM, RCPT TO or a To: field (#1907).
+// that is safe to write into MAIL FROM, RCPT TO or a To: field (#1907), its local part
+// in the case it was sent with (#2101).
 func TestNewReversePathLenient(t *testing.T) {
 	for _, tt := range []struct {
 		in, full, local, domain, detail string
@@ -17,7 +18,7 @@ func TestNewReversePathLenient(t *testing.T) {
 		{"first..last@example.com", "first..last@example.com", "first..last", "example.com", ""},
 		{".lead@example.com", ".lead@example.com", ".lead", "example.com", ""},
 		{"trail.@example.com", "trail.@example.com", "trail.", "example.com", ""},
-		{"Trail..+Tag@Example.COM", "trail..+tag@example.com", "trail..+tag", "example.com", "tag"},
+		{"Trail..+Tag@Example.COM", "Trail..+Tag@example.com", "Trail..+Tag", "example.com", "Tag"},
 		// A dotless domain and address literals.
 		{"user@localhost", "user@localhost", "user", "localhost", ""},
 		{"user@[192.0.2.1]", "user@[192.0.2.1]", "user", "[192.0.2.1]", ""},
@@ -52,15 +53,16 @@ func TestNewReversePathLenient(t *testing.T) {
 	}
 }
 
-// Every sender NewAddress accepts comes back from NewReversePath exactly as from
-// NewAddress, so nothing changes for the senders accepted before #1907. A sender with
-// a master-token suffix is not one of them (TestNewReversePathNoMasterSuffix, #1938).
+// Every sender NewAddress accepts comes back from NewReversePath as from NewAddress,
+// except that the local part keeps its case (#2101), so nothing else changes for the
+// senders accepted before #1907. A sender with a master-token suffix is not one of them
+// (TestNewReversePathNoMasterSuffix, #1938).
 func TestNewReversePathMatchesNewAddress(t *testing.T) {
 	for _, in := range []string{
 		"user@example.com",
 		"User+Tag@Example.com",
 		"a/b=c@example.com",
-		"josé@bücher.example",
+		"José@bücher.example",
 	} {
 		want, err := NewAddress(in)
 		if err != nil {
@@ -70,8 +72,11 @@ func TestNewReversePathMatchesNewAddress(t *testing.T) {
 		if err != nil {
 			t.Fatalf("NewReversePath(%q): %v", in, err)
 		}
-		if got != want {
-			t.Errorf("NewReversePath(%q) = %+v, want %+v", in, got, want)
+		local := in[:strings.IndexByte(in, '@')]
+		if got.LocalPart() != local || got.FullAddress() != local+"@"+want.Domain() || got.Domain() != want.Domain() ||
+			!strings.EqualFold(got.Detail(), want.Detail()) || got.HasSuffix() ||
+			strings.ToLower(got.FullAddress()) != want.FullAddress() {
+			t.Errorf("NewReversePath(%q) = %+v, want %+v with the local part %q", in, got, want, local)
 		}
 	}
 }
