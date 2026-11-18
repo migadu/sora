@@ -158,6 +158,83 @@ func TestThreadReferences_SubjectGrouping(t *testing.T) {
 	assert.Len(t, resultRefs, 4, "REFS should not group by subject, leaving 4 isolated root nodes")
 }
 
+// TestThreadReferences_SubjectMergeRules pins RFC 5256 REFERENCES step 5: the
+// subject table prefers a dummy, then a message that is not a reply or forward
+// (5.B); a reply or forward merges under a non-reply, and anything else gets a new
+// dummy over both (5.C).
+func TestThreadReferences_SubjectMergeRules(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		messages []db.ThreadMessageResult
+		want     []imap.ThreadData
+	}{
+		{
+			// Dovecot imaptest thread3/thread4.
+			name: "reply under the original",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "FOO", SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "b@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{1, 2}}},
+		},
+		{
+			// 5.B replaces the earlier reply with the original in the table.
+			name: "reply sent before the original",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "b@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "a@b", SubjectSort: "FOO", SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{2, 1}}},
+		},
+		{
+			name: "two replies",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "b@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}}}},
+		},
+		{
+			// 2 and 3 answer a message not in the mailbox, so they stay under its
+			// dummy, which the table prefers: the original joins them there.
+			name: "dummy thread takes the original",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "FOO", SentDate: now.Add(-3 * time.Hour)},
+				{UID: 2, MessageID: "b@b", References: "gone@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 3, MessageID: "c@b", References: "gone@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}, {Chain: []uint32{3}}}}},
+		},
+		{
+			// A third message lands under the dummy the first two got.
+			name: "three originals",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "FOO", SentDate: now.Add(-3 * time.Hour)},
+				{UID: 2, MessageID: "b@b", SubjectSort: "FOO", SentDate: now.Add(-2 * time.Hour)},
+				{UID: 3, MessageID: "c@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}, {Chain: []uint32{3}}}}},
+		},
+		{
+			// An empty thread subject is never merged (5.B.ii, 5.C.ii).
+			name: "empty subjects",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "b@b", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, session.threadReferences(imapserver.NumKindUID, tt.messages, false))
+		})
+	}
+}
+
 // The ids below are written the way the messages table holds them: without angle
 // brackets, several ids joined by a space (db.InsertMessage).
 

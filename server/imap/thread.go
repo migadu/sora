@@ -292,82 +292,11 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 		sortByEarliest(rootNodes)
 	}
 
-	// 5. Subject Grouping (RFC 5256 JWZ algorithm phase 5); REFS ignores Subject.
+	// 5. Merge the threads that share a base subject; REFS ignores Subject.
 	if !refs {
-		subjectTable := make(map[string]*jwzNode)
+		rootNodes = mergeBySubject(rootNodes)
 
-		for _, root := range rootNodes {
-			// Only consider nodes that are still roots (might have been merged in this loop)
-			if root.parent != nil {
-				continue
-			}
-
-			subj := getSubject(root)
-			if subj == "" {
-				continue
-			}
-
-			existing, ok := subjectTable[subj]
-			if !ok || existing == root {
-				subjectTable[subj] = root
-				continue
-			}
-
-			// Merge root and existing
-			if existing.msg == nil && root.msg == nil {
-				// Both are dummies: merge root's children into existing
-				for _, child := range root.children {
-					child.parent = existing
-					existing.children = append(existing.children, child)
-				}
-				root.children = nil // effectively discarded
-			} else if existing.msg == nil || root.msg == nil {
-				// One is dummy: make it the parent of the real one
-				var dummy, real *jwzNode
-				if existing.msg == nil {
-					dummy, real = existing, root
-				} else {
-					dummy, real = root, existing
-					subjectTable[subj] = dummy
-				}
-				real.parent = dummy
-				dummy.children = append(dummy.children, real)
-			} else {
-				// Neither is dummy: create new dummy to parent both
-				newDummy := &jwzNode{}
-				existing.parent = newDummy
-				root.parent = newDummy
-				newDummy.children = append(newDummy.children, existing, root)
-				subjectTable[subj] = newDummy
-			}
-		}
-
-		// Rebuild rootNodes to include any newly created dummies and exclude merged nodes
-		var newRoots []*jwzNode
-		seen := make(map[*jwzNode]bool)
-
-		for _, root := range rootNodes {
-			if root.parent == nil {
-				if root.msg == nil && len(root.children) == 0 {
-					continue // Discarded dummy
-				}
-				if !seen[root] {
-					newRoots = append(newRoots, root)
-					seen[root] = true
-				}
-			}
-		}
-		for _, node := range subjectTable {
-			if node.parent == nil {
-				if !seen[node] {
-					newRoots = append(newRoots, node)
-					seen[node] = true
-				}
-			}
-		}
-		rootNodes = newRoots
-
-		// 6. Grouping made new roots: order them again.
+		// 6. Merging made new roots: order them again.
 		sortByEarliest(rootNodes)
 	}
 
@@ -380,6 +309,61 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 	}
 
 	return result
+}
+
+// mergeBySubject is step 5 of REFERENCES (RFC 5256 section 3): of the threads
+// in roots, in their step 4 order, it merges those with the same thread subject
+// and returns the threads left.
+func mergeBySubject(roots []*jwzNode) []*jwzNode {
+	// 5.B: the subject table holds one thread per subject: a dummy if there is
+	// one, else a message that is not a reply or forward, else the first reply.
+	table := make(map[string]*jwzNode)
+	for _, root := range roots {
+		subj := getSubject(root)
+		if subj == "" {
+			continue
+		}
+		held, ok := table[subj]
+		if !ok || held.msg != nil && (root.msg == nil || held.msg.ReplyOrForward && !root.msg.ReplyOrForward) {
+			table[subj] = root
+		}
+	}
+
+	// 5.C: merge every other thread into the one in the table. A dummy thread is
+	// in the table whenever there is one, so the current thread is a dummy only
+	// when the one in the table is too.
+	merged := make([]*jwzNode, 0, len(roots))
+	for _, root := range roots {
+		subj := getSubject(root)
+		held := table[subj]
+		if subj == "" || held == root {
+			merged = append(merged, root)
+			continue
+		}
+		switch {
+		case held.msg == nil && root.msg == nil:
+			// "append the current message's children to the children of the
+			// message in the subject table ... and then delete the current message"
+			for _, child := range root.children {
+				linkChild(held, child)
+			}
+			root.children = nil
+		case held.msg == nil, root.msg.ReplyOrForward && !held.msg.ReplyOrForward:
+			// "make the current message a child of the message in the subject table"
+			linkChild(held, root)
+		default:
+			// "create a new dummy message and make both the current message and the
+			// message in the subject table children of the dummy. Then replace the
+			// message in the subject table with the dummy message." The thread in
+			// the table comes earlier in roots, so it is already in merged.
+			dummy := &jwzNode{}
+			merged[slices.Index(merged, held)] = dummy
+			linkChild(dummy, held)
+			linkChild(dummy, root)
+			table[subj] = dummy
+		}
+	}
+	return merged
 }
 
 func (s *IMAPSession) getMessageID(numKind imapserver.NumKind, msg db.ThreadMessageResult) uint32 {

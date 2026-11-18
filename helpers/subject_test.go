@@ -114,3 +114,35 @@ func TestBaseSubjectGroupsThreadVariants(t *testing.T) {
 		}
 	}
 }
+
+// TestSubjectIsReplyOrForward: a subject is a reply or forward when base-subject
+// extraction removes a subj-refwd, a "(fwd)" trailer, or a "[fwd: ...]" wrapper
+// (RFC 5256 section 3), and not when it removes only blobs or whitespace.
+func TestSubjectIsReplyOrForward(t *testing.T) {
+	tests := []struct {
+		subject string
+		want    bool
+	}{
+		{"Re: foo", true},
+		{"re:foo", true},
+		{"Fwd: foo", true},
+		{"FW: foo", true},
+		{"Re [2]: foo", true},
+		{"[list] Re: foo", true},
+		{"foo (fwd)", true},
+		{"[fwd: foo]", true},
+		{"foo", false},
+		{"", false},
+		{"  foo  ", false},
+		{"[list] foo", false},
+		{"[xyz]", false},
+		{"Re foo", false},
+		{"Ad: Re foo", false},
+		{"foo (fwd) bar", false},
+	}
+	for _, tt := range tests {
+		if got := SubjectIsReplyOrForward(tt.subject); got != tt.want {
+			t.Errorf("SubjectIsReplyOrForward(%q) = %v, want %v", tt.subject, got, tt.want)
+		}
+	}
+}
