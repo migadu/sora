@@ -468,9 +468,9 @@ func (rd *ResilientDatabase) GetMessagesByFlagWithRetry(ctx context.Context, mai
 	return result.([]db.Message), nil
 }
 
-func (rd *ResilientDatabase) GetDeletedMessageUIDsAndSeqsWithRetry(ctx context.Context, mailboxID int64) ([]db.MessageUIDSeq, error) {
+func (rd *ResilientDatabase) GetDeletedMessageUIDsAndSeqsWithRetry(ctx context.Context, mailboxID int64, uidSets ...imap.UIDSet) ([]db.MessageUIDSeq, error) {
 	op := func(ctx context.Context) (any, error) {
-		return rd.getOperationalDatabaseForOperation(ctx, false).GetDeletedMessageUIDsAndSeqs(ctx, mailboxID)
+		return rd.getOperationalDatabaseForOperation(ctx, false).GetDeletedMessageUIDsAndSeqs(ctx, mailboxID, uidSets...)
 	}
 	result, err := rd.executeReadWithRetry(ctx, readRetryConfig, timeoutRead, op)
 	if err != nil {
