@@ -299,28 +299,3 @@ func TestReadDeadlineDetectsStaleConnection(t *testing.T) {
 		}
 	}
 }
-
-// TestTCPKeepaliveDetectsDeadConnection tests that TCP keepalive
-// can detect a truly dead connection (network partition scenario)
-func TestTCPKeepaliveDetectsDeadConnection(t *testing.T) {
-	t.Skip("This test requires actual network partition simulation - run manually if needed")
-
-	// This would require:
-	// 1. Setting up a connection
-	// 2. Enabling TCP keepalive with very short period (e.g., 1 second)
-	// 3. Using iptables/pf to drop packets (simulate network partition)
-	// 4. Verifying Read() eventually returns error after keepalive probes fail
-	//
-	// TCP keepalive parameters on FreeBSD:
-	// - net.inet.tcp.keepidle: time before first keepalive probe (default 7200s)
-	// - net.inet.tcp.keepintvl: interval between probes (default 75s)
-	// - net.inet.tcp.keepcnt: number of probes before declaring dead (default 8)
-	//
-	// So even with SetKeepAlivePeriod(2 * time.Minute), it takes:
-	// - 2 minutes idle before first probe
-	// - Then 8 probes * 75 seconds = 10 minutes
-	// - Total: ~12 minutes to detect dead connection
-	//
-	// For production, we should consider shorter keepalive settings or
-	// rely on absolute session timeout as the primary safeguard.
-}
