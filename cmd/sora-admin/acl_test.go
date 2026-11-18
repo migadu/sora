@@ -27,10 +27,13 @@ func TestACLCommands(t *testing.T) {
 	rdb := setupACLTestDatabase(t)
 	defer rdb.Close()
 
-	// Create test accounts with unique emails to avoid conflicts
+	// Create test accounts with unique emails to avoid conflicts, on a domain of their
+	// own: "anyone" reaches every account in the owner's domain, and a grant left behind
+	// on example.com would list this mailbox to every later test's account.
 	timestamp := time.Now().UnixNano()
-	owner := createACLTestAccount(t, rdb, fmt.Sprintf("owner-%d@example.com", timestamp), "password123")
-	user1 := createACLTestAccount(t, rdb, fmt.Sprintf("user1-%d@example.com", timestamp), "password123")
+	domain := fmt.Sprintf("t%d.example.com", timestamp)
+	owner := createACLTestAccount(t, rdb, fmt.Sprintf("owner-%d@%s", timestamp, domain), "password123")
+	user1 := createACLTestAccount(t, rdb, fmt.Sprintf("user1-%d@%s", timestamp, domain), "password123")
 
 	// Create a shared mailbox with unique name to avoid conflicts with previous test runs
 	ctx := context.Background()
