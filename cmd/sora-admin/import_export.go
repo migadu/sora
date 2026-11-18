@@ -66,7 +66,7 @@ func handleImportMaildir(ctx context.Context) {
 		fmt.Printf(`Import maildir from a given path
 
 Usage:
-  sora-admin import maildir [options]
+  sora-admin --config PATH import maildir [options]
 
 Options:
   --email string          Email address for the account to import mail to (required)
@@ -284,7 +284,7 @@ func handleImportS3(ctx context.Context) {
 		fmt.Printf(`Import messages from S3 objects that have no database row (recovery)
 
 Usage:
-  sora-admin import s3 [options]
+  sora-admin --config PATH import s3 [options]
 
 Options:
   --email string               Email address to import messages for (required)
@@ -414,7 +414,7 @@ func handleExportMaildir(ctx context.Context) {
 		fmt.Printf(`Export messages to maildir format
 
 Usage:
-  sora-admin export maildir [options]
+  sora-admin --config PATH export maildir [options]
 
 Options:
   --email string          Email address for the account to export mail from (required)
@@ -558,7 +558,7 @@ func printImportUsage() {
 	fmt.Printf(`Import Management
 
 Usage:
-  sora-admin import <subcommand> [options]
+  sora-admin --config PATH import <subcommand> [options]
 
 Subcommands:
   maildir        Import maildir data
@@ -581,7 +581,7 @@ func printExportUsage() {
 	fmt.Printf(`Export Management
 
 Usage:
-  sora-admin export <subcommand> [options]
+  sora-admin --config PATH export <subcommand> [options]
 
 Subcommands:
   maildir  Export messages to maildir format

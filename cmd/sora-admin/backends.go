@@ -493,9 +493,9 @@ grace period it refuses new sessions itself. The backend keeps running, so it fi
 the uploads only it can do (its spool is node-local), and is then safe to stop.
 
 Usage:
-  sora-admin backends maintenance on  --host HOST [--instance ID] [--reason TEXT] [--wait]
-  sora-admin backends maintenance off --host HOST
-  sora-admin backends status [--host HOST] [--wait]
+  sora-admin --config PATH backends maintenance on  --host HOST [--instance ID] [--reason TEXT] [--wait]
+  sora-admin --config PATH backends maintenance off --host HOST
+  sora-admin --config PATH backends status [--host HOST] [--wait]
 
 Options:
   --host string       Backend host as the proxies know it: a name or an IP, without a

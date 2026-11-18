@@ -1211,7 +1211,7 @@ func renamedDescendantName(name, oldName, newName string) string {
 
 // printMailboxUsage prints usage information for the 'mailbox' command
 func printMailboxUsage() {
-	fmt.Println(`Usage: sora-admin mailbox <subcommand> [options]
+	fmt.Println(`Usage: sora-admin --config PATH mailbox <subcommand> [options]
 
 Subcommands:
   create        Create a new mailbox

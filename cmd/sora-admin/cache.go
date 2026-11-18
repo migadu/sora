@@ -50,7 +50,7 @@ func handleCacheStats(ctx context.Context) {
 		fmt.Printf(`Show local cache size and object count
 
 Usage:
-  sora-admin cache stats [options]
+  sora-admin --config PATH cache stats [options]
 
 Options:
   --config string        Path to TOML configuration file (required)
@@ -89,7 +89,7 @@ func handleCachePurge(ctx context.Context) {
 		fmt.Printf(`Clear all cached objects
 
 Usage:
-  sora-admin cache purge [options]
+  sora-admin --config PATH cache purge [options]
 
 Options:
   --config string        Path to TOML configuration file (required)
@@ -131,7 +131,7 @@ func handleCacheMetrics(ctx context.Context) {
 		fmt.Printf(`Show cache hit/miss ratios and performance metrics
 
 Usage:
-  sora-admin cache metrics [options]
+  sora-admin --config PATH cache metrics [options]
 
 Options:
   --instance string    Show metrics for specific instance ID
@@ -177,7 +177,7 @@ func printCacheUsage() {
 	fmt.Printf(`Cache Management
 
 Usage:
-  sora-admin cache <subcommand> [options]
+  sora-admin --config PATH cache <subcommand> [options]
 
 Subcommands:
   stats    Show local cache size and object count

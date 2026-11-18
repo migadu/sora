@@ -49,7 +49,7 @@ func handleBlockedCommand(ctx context.Context) {
 		fmt.Printf(`Show blocked IPs and rate-limited addresses
 
 Usage:
-  sora-admin stats blocked [options]
+  sora-admin --config PATH stats blocked [options]
 
 Options:
   --config string     Path to TOML configuration file (required)
@@ -90,7 +90,7 @@ func handleConnectionStats(ctx context.Context) {
 		fmt.Printf(`Show active connections and statistics
 
 Usage:
-  sora-admin stats connection [options]
+  sora-admin --config PATH stats connection [options]
 
 Options:
   --user string         Show connections for specific user email
@@ -130,7 +130,7 @@ func printStatsUsage() {
 	fmt.Printf(`System Statistics
 
 Usage:
-  sora-admin stats <subcommand> [options]
+  sora-admin --config PATH stats <subcommand> [options]
 
 Subcommands:
   blocked     Show blocked IPs and rate-limited addresses

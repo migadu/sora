@@ -41,6 +41,9 @@ Usage:
 
 Asks the Admin API ([admin_cli] addr and api_key) for the affinity cache's entries and
 broadcast queue.
+
+Examples:
+  sora-admin --config config.toml affinity-cache status
 `)
 	}
 	if err := fs.Parse(os.Args[3:]); err != nil {
@@ -137,7 +140,7 @@ func printAffinityCacheUsage() {
 	fmt.Printf(`Affinity Cache Management
 
 Usage:
-  sora-admin affinity-cache <subcommand> [options]
+  sora-admin --config PATH affinity-cache <subcommand> [options]
 
 Subcommands:
   status      Show affinity cache statistics (entries, queue status, etc.)

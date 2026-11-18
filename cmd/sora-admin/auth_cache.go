@@ -40,6 +40,9 @@ Usage:
   sora-admin --config PATH auth-cache status
 
 Asks the Admin API ([admin_cli] addr and api_key) for the auth cache's entries and hit rate.
+
+Examples:
+  sora-admin --config config.toml auth-cache status
 `)
 	}
 	if err := fs.Parse(os.Args[3:]); err != nil {
@@ -116,7 +119,7 @@ func printAuthCacheUsage() {
 	fmt.Printf(`Auth Cache Management
 
 Usage:
-  sora-admin auth-cache <subcommand> [options]
+  sora-admin --config PATH auth-cache <subcommand> [options]
 
 Subcommands:
   status      Show auth cache statistics (entries, hit rate, etc.)

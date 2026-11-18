@@ -59,7 +59,7 @@ permanently removed by the cleanup worker. Messages in the grace period
 can be restored using the 'restore' subcommand.
 
 Usage:
-  sora-admin messages list-deleted --email <email> [options]
+  sora-admin --config PATH messages list-deleted --email <email> [options]
 
 Required Options:
   --email string        Email address of the account
@@ -150,7 +150,7 @@ You can restore messages by:
   - Messages deleted within a time range (--since/--until)
 
 Usage:
-  sora-admin messages restore --email <email> [options]
+  sora-admin --config PATH messages restore --email <email> [options]
 
 Required Options:
   --email string        Email address of the account
@@ -240,7 +240,7 @@ func printMessagesUsage() {
 	fmt.Printf(`Message Management
 
 Usage:
-  sora-admin messages <subcommand> [options]
+  sora-admin --config PATH messages <subcommand> [options]
 
 Subcommands:
   list-deleted       List deleted (expunged) messages for an account

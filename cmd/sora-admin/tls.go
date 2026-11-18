@@ -63,7 +63,7 @@ func handleTLSList(ctx context.Context) {
 		fmt.Printf(`List TLS certificates from S3 and local cache
 
 Usage:
-  sora-admin tls list [options]
+  sora-admin --config PATH tls list [options]
 
 Options:
   --cache-dir string    Local autocert cache directory (default: [tls.letsencrypt] fallback_dir,
@@ -117,7 +117,7 @@ func handleTLSDelete(ctx context.Context) {
 		fmt.Printf(`Delete a specific TLS certificate
 
 Usage:
-  sora-admin tls delete [options]
+  sora-admin --config PATH tls delete [options]
 
 Options:
   --domain string       Domain name (deletes both ECDSA and RSA variants)
@@ -190,7 +190,7 @@ func handleTLSClean(ctx context.Context) {
 		fmt.Printf(`Clean up expired TLS certificates
 
 Usage:
-  sora-admin tls clean [options]
+  sora-admin --config PATH tls clean [options]
 
 Options:
   --cache-dir string    Local autocert cache directory (default: from config)
@@ -249,7 +249,7 @@ func handleTLSCache(ctx context.Context) {
 		fmt.Printf(`Sync certificates from S3 to local cache
 
 Usage:
-  sora-admin tls cache [options]
+  sora-admin --config PATH tls cache [options]
 
 Options:
   --cache-dir string    Local autocert cache directory (default: from config)
@@ -295,7 +295,7 @@ func printTLSUsage() {
 	fmt.Printf(`TLS Certificate Management
 
 Usage:
-  sora-admin tls <subcommand> [options]
+  sora-admin --config PATH tls <subcommand> [options]
 
 Subcommands:
   list     List certificates from S3 and local cache status

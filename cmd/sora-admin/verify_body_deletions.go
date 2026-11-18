@@ -20,12 +20,20 @@ func handleVerifyBodyDeletions(ctx context.Context) {
 		fmt.Print(`List unresolved S3 message-body deletion intents (read-only by default).
 
 Usage:
-  sora-admin verify body-deletions
-  sora-admin verify body-deletions --reconcile --content-hash HASH --operation-id UUID --storage-drained
+  sora-admin --config PATH verify body-deletions
+  sora-admin --config PATH verify body-deletions --reconcile --content-hash HASH --operation-id UUID --storage-drained
 
 Reconciliation requires [s3] body_deletion_protocol = "global-hash-v1" and a
 completed operational drain. Protected referenced bodies are downloaded and
 verified; orphan-only keys are deleted. An uncertain request keeps the fence.
+
+Examples:
+  # List the unresolved deletion intents
+  sora-admin --config config.toml verify body-deletions
+
+  # Reconcile one intent from the listing, after draining storage operations
+  sora-admin --config config.toml verify body-deletions --reconcile \
+    --content-hash HASH --operation-id UUID --storage-drained
 `)
 	}
 	if err := fs.Parse(os.Args[3:]); err != nil {
