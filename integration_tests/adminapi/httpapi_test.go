@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1949,15 +1950,13 @@ This message has no recipients.
 	})
 
 	t.Run("DeliverMail_RecipientsFromToCcBccOnly", func(t *testing.T) {
-		// TODO(#1992): see report. Without a recipients field the handler delivers to
-		// every address helpers.ExtractRecipients finds, which includes From, Sender and
-		// Reply-To; docs/ADMIN_API.md says To, Cc and Bcc.
-		t.Skip("/admin/mail/deliver also delivers to the From/Sender/Reply-To addresses; see report on #1992")
-
-		// A local sender: the message must reach testEmail only, not come back to it.
+		// Without a recipients field the message goes to its To, Cc and Bcc addresses,
+		// each once (docs/ADMIN_API.md). A local sender, also named in Reply-To and Cc,
+		// gets the one copy Cc asks for, not one per header.
+		external := fmt.Sprintf("recipient-%d@example.org", time.Now().UnixNano())
 		resp, body := server.makeRequest(t, "POST", "/admin/mail/deliver", map[string]any{
-			"message": fmt.Sprintf("From: %s\r\nReply-To: %s\r\nTo: recipient-%d@example.org\r\nCc: %s\r\nSubject: Header recipients\r\n\r\nbody\r\n",
-				testEmail, testEmail, time.Now().UnixNano(), testEmail),
+			"message": fmt.Sprintf("From: %s\r\nSender: %s\r\nReply-To: %s\r\nTo: %s\r\nCc: %s\r\nBcc: %s\r\nSubject: Header recipients\r\n\r\nbody\r\n",
+				testEmail, testEmail, testEmail, external, testEmail, testEmail),
 		})
 		var deliveryResp map[string]any
 		server.expectJSON(t, body, &deliveryResp)
@@ -1967,8 +1966,8 @@ This message has no recipients.
 			got = append(got, r.(map[string]any)["email"].(string))
 		}
 		t.Logf("status %d, recipients %v", resp.StatusCode, got)
-		if len(got) != 2 {
-			t.Errorf("expected the To and Cc addresses only (2 recipients), got %v", got)
+		if want := []string{external, testEmail}; !slices.Equal(got, want) {
+			t.Errorf("expected the To, Cc and Bcc addresses once each %v, got %v", want, got)
 		}
 	})
 
