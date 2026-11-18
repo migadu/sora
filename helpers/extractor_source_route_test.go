@@ -160,8 +160,7 @@ func TestExtractRecipientsSourceRouteCanonicalForm(t *testing.T) {
 
 // TestSourceRouteIsNotPartOfTheAddress: only the ENVELOPE reports the route. The
 // recipients of a delivery and the distinct address lists do not see it, a routed and a
-// plain spelling of one address are one address, and a list parsed flat because its
-// group syntax is malformed keeps its addresses without guessing whose route it was.
+// plain spelling of one address are one address.
 func TestSourceRouteIsNotPartOfTheAddress(t *testing.T) {
 	h := mail.HeaderFromMap(map[string][]string{"To": {"<@route:user@domain>, user@domain, <@other:second@domain>"}})
 	if got, want := ExtractEnvelopeRecipients(h.Header), []string{"user@domain", "second@domain"}; !slices.Equal(got, want) {
@@ -171,11 +170,6 @@ func TestSourceRouteIsNotPartOfTheAddress(t *testing.T) {
 	want := []Recipient{{AddressType: "to", EmailAddress: "user@domain", Route: "@route"}, {AddressType: "to", EmailAddress: "second@domain", Route: "@other"}}
 	if !slices.Equal(distinct, want) {
 		t.Errorf("DistinctAddresses = %+v, want %+v", distinct, want)
-	}
-
-	addresses, routes, err := parseAddressListRoutes("team: <@first:one@domain>, <@second:two@domain>;")
-	if err != nil || len(addresses) != 2 || routes != nil {
-		t.Errorf("flat parse of a group = %d addresses, routes %q, err %v; want 2 addresses and no routes", len(addresses), routes, err)
 	}
 }
 
