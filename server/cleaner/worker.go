@@ -522,8 +522,9 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// one row per relayed SIEVE redirect, so it must be pruned or it grows unbounded.
 	// The rate limit counts the rows within redirect_rate_window, so they are kept for
 	// the longest window or grace_period, whichever is longer (see New). The same call
-	// prunes redirect_deliveries, which stops an MTA retry of a delivery from being
-	// redirected again; a retry after that retention is redirected again.
+	// prunes redirect_deliveries, which stops a retry of a delivery (an MTA's on LMTP, a
+	// caller's on the Admin API) from being redirected again; a retry after that
+	// retention is redirected again.
 	redirectCount, err = w.rdb.CleanupOldRedirectsWithRetry(ctx, w.redirectLogRetention)
 	if err != nil {
 		logger.Error("Cleanup: Failed to clean up old redirect log entries", "error", err)
