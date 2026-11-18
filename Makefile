@@ -1,4 +1,4 @@
-.PHONY: all clean build sora sora-admin install tests tests-race reset-test-db build-test-sora-admin \
+.PHONY: all clean build sora sora-admin sora-imaptest tests-imaptest install tests tests-race reset-test-db build-test-sora-admin \
 	integration-tests integration-tests-sora integration-tests-imap integration-tests-imap-slowloris integration-tests-lmtp integration-tests-pop3 \
 	integration-tests-managesieve integration-tests-imapproxy integration-tests-lmtpproxy \
 	integration-tests-pop3proxy integration-tests-managesieveproxy integration-tests-userapiproxy \
@@ -13,6 +13,7 @@
 # Binary names - can be overridden by environment variables
 SORA_BINARY ?= sora
 SORA_ADMIN_BINARY ?= sora-admin
+SORA_IMAPTEST_BINARY ?= sora-imaptest
 SORA_LINUX_BINARY ?= sora-linux-amd64
 SORA_ADMIN_LINUX_BINARY ?= sora-admin-linux-amd64
 SORA_FREEBSD_BINARY ?= sora-freebsd-amd64
@@ -44,6 +45,13 @@ sora:
 sora-admin:
 	go build $(LDFLAGS) -o $(SORA_ADMIN_BINARY) ./cmd/sora-admin
 
+# Standalone blackbox client; does not start a server or reset a database.
+sora-imaptest:
+	go build -o $(SORA_IMAPTEST_BINARY) ./cmd/sora-imaptest
+
+tests-imaptest:
+	go test ./internal/imaptest ./cmd/sora-imaptest
+
 # Install both executables to GOPATH/bin
 install:
 	go install ./cmd/sora
@@ -55,7 +63,7 @@ build-test-sora-admin:
 
 # Clean build artifacts
 clean:
-	rm -f $(SORA_BINARY) $(SORA_ADMIN_BINARY) $(SORA_LINUX_BINARY) $(SORA_ADMIN_LINUX_BINARY) $(SORA_FREEBSD_BINARY) $(SORA_ADMIN_FREEBSD_BINARY) integration_tests/sora-admin
+	rm -f $(SORA_BINARY) $(SORA_ADMIN_BINARY) $(SORA_IMAPTEST_BINARY) $(SORA_LINUX_BINARY) $(SORA_ADMIN_LINUX_BINARY) $(SORA_FREEBSD_BINARY) $(SORA_ADMIN_FREEBSD_BINARY) integration_tests/sora-admin
 
 # Run tests with verbose output
 tests:
@@ -286,6 +294,8 @@ help:
 	@echo "  build        - Build both executables"
 	@echo "  sora         - Build only the main sora server"
 	@echo "  sora-admin   - Build only the sora-admin tool"
+	@echo "  sora-imaptest - Build the standalone IMAP conformance runner"
+	@echo "  tests-imaptest - Test the standalone runner without a Sora instance"
 	@echo "  install      - Install both executables to GOPATH/bin"
 	@echo "  clean        - Remove build artifacts"
 	@echo ""

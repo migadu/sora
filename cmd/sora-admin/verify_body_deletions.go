@@ -17,7 +17,7 @@ func handleVerifyBodyDeletions(ctx context.Context) {
 	reconcile := fs.Bool("reconcile", false, "Reconcile one intent after storage operations have been drained")
 	drained := fs.Bool("storage-drained", false, "Acknowledge that old requests/writers cannot resume; this is not automatic detection")
 	fs.Usage = func() {
-		fmt.Fprint(os.Stderr, `List unresolved S3 message-body deletion intents (read-only by default).
+		fmt.Print(`List unresolved S3 message-body deletion intents (read-only by default).
 
 Usage:
   sora-admin verify body-deletions

@@ -1065,22 +1065,15 @@ func (s *ManageSieveSession) closeWithoutLock() error {
 }
 
 func (s *ManageSieveSession) Close() error {
-	// Check if context is already canceled (during shutdown)
-	select {
-	case <-s.ctx.Done():
-		// Context is canceled, skip lock acquisition during shutdown
-		return s.closeWithoutLock()
-	default:
-		// Acquire write lock for cleanup
-		acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-		if !acquired {
-			s.InfoLog("failed to acquire write lock within timeout", "operation", "close")
-			// Continue with close even if we can't get the lock
-			return s.closeWithoutLock()
-		}
-		defer release()
+	// Not on s.ctx: Server.Close cancels it before the library closes the sessions.
+	acquired, release := s.mutexHelper.AcquireWriteLockForClose()
+	if !acquired {
+		s.WarnLog("failed to acquire write lock within timeout", "operation", "close")
+		// Still close the connection even if we can't acquire the lock
 		return s.closeWithoutLock()
 	}
+	defer release()
+	return s.closeWithoutLock()
 }
 
 // registerConnection takes a slot for the logging-in account in the connection

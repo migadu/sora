@@ -96,6 +96,27 @@ type RecipientInfo struct {
 // the largest message sora can store.
 var ErrMessageTooLarge = errors.New("message too large to store")
 
+// ErrInsufficientStorage is wrapped into the error DeliverMessage returns when this
+// node has no room to stage the message: its staging limit is reached, or the spool
+// disk is full or read-only. It is temporary, the condition LMTP answers with 452 4.3.1.
+var ErrInsufficientStorage = errors.New("insufficient system storage")
+
+// errStageOwnerCopy is wrapped into the error for a body that could not be staged
+// under the owner of a shared mailbox (resolveOwnedTarget).
+var errStageOwnerCopy = errors.New("failed to stage message body")
+
+// stagingFailure reports err, a failure (what) to stage the message body on the local
+// spool. The error names spool files, which must not reach the client: the caller logs
+// the returned error, and ErrorMessage gives the cause only.
+func stagingFailure(result *DeliveryResult, what string, err error) error {
+	if helpers.IsInsufficientStorage(err) {
+		result.ErrorMessage = "Insufficient system storage (spool disk full or read-only)"
+		return fmt.Errorf("%w: %w", ErrInsufficientStorage, err)
+	}
+	result.ErrorMessage = fmt.Sprintf("%s: %v", what, helpers.FileErrorCause(err))
+	return err
+}
+
 // CheckStorableSize refuses a message of size octets that sora cannot store. A
 // delivery's max_message_size is capped at consts.MaxStoredMessageSize, but what it
 // stores is larger than what it read: the Received and Delivered-To trace headers and
@@ -162,7 +183,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	if d.Uploader.IsStagingLimitExceeded(int64(len(messageBytes))) {
 		d.Logger.Log("Rejecting delivery due to upload staging size limit exceeded")
 		result.ErrorMessage = "Insufficient system storage (staging limit reached)"
-		return result, fmt.Errorf("staging limit exceeded")
+		return result, fmt.Errorf("%w: staging limit exceeded", ErrInsufficientStorage)
 	}
 
 	// Determine target mailbox. Sieve runs BEFORE the message is hashed and stored, as it
@@ -282,8 +303,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		// finished): (re)write it atomically.
 		filePath, err = d.Uploader.StoreLocally(contentHash, recipient.AccountID, messageBytes)
 		if err != nil {
-			result.ErrorMessage = fmt.Sprintf("Failed to save message to disk: %v", err)
-			return result, err
+			return result, stagingFailure(result, "Failed to save message to disk", err)
 		}
 		d.Logger.Log("Message accepted locally, file written: %s", *filePath)
 	} else if err == nil {
@@ -298,8 +318,7 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		d.Logger.Log("Message file already exists, skipping write (concurrent delivery): %s", expectedPath)
 	} else {
 		// Stat error (permission issue, etc.)
-		result.ErrorMessage = fmt.Sprintf("Failed to check file existence: %v", err)
-		return result, fmt.Errorf("failed to check file existence: %w", err)
+		return result, stagingFailure(result, "Failed to check file existence", fmt.Errorf("failed to check file existence: %w", err))
 	}
 
 	if resolveDestinations != nil {
@@ -337,6 +356,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		// A duplicate copy is an accepted delivery, as it is in LMTP: the copy is
 		// already in the mailbox, so a resubmission must not fail the delivery.
 		if err != nil && !errors.Is(err, consts.ErrMessageExists) && !errors.Is(err, consts.ErrDBUniqueViolation) {
+			if errors.Is(err, errStageOwnerCopy) {
+				return result, stagingFailure(result, fmt.Sprintf("Failed to save Sieve copy to %s", c.Mailbox), err)
+			}
 			result.ErrorMessage = fmt.Sprintf("Failed to save Sieve copy to %s: %v", c.Mailbox, err)
 			return result, err
 		}
@@ -348,6 +370,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 	// under recipient.AccountID above.
 	mailbox, destAccountID, destS3Domain, destS3Localpart, err := d.resolveOwnedTarget(ctx, recipient, mailboxName, contentHash, messageBytes, resolvedTarget)
 	if err != nil {
+		if errors.Is(err, errStageOwnerCopy) {
+			return result, stagingFailure(result, "Failed to save message to disk", err)
+		}
 		result.ErrorMessage = fmt.Sprintf("Failed to resolve destination mailbox: %v", err)
 		return result, err
 	}
@@ -468,8 +493,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 // LookupRecipient looks up a recipient's user ID by email address.
 func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string) (*RecipientInfo, error) {
-	// Parse recipient address
-	toAddress, err := server.NewAddress(recipient)
+	// A recipient is an envelope address, parsed as LMTP RCPT parses it: a master-token
+	// suffix (user@domain@SUFFIX) is not delivered to the address before it (#1961).
+	toAddress, err := server.NewForwardPath(recipient)
 	if err != nil {
 		return nil, fmt.Errorf("invalid recipient address: %w", err)
 	}
@@ -621,7 +647,7 @@ func (d *DeliveryContext) resolveOwnedTarget(ctx context.Context, recipient Reci
 	// message stored without it has no body: a staging failure fails the delivery.
 	if destAccountID != recipient.AccountID {
 		if err = d.Uploader.LinkStagedOrStore(contentHash, recipient.AccountID, destAccountID, messageBytes); err != nil {
-			return nil, 0, "", "", fmt.Errorf("failed to stage message body for the owner of mailbox '%s': %w", mailbox.Name, err)
+			return nil, 0, "", "", fmt.Errorf("%w for the owner of mailbox '%s': %w", errStageOwnerCopy, mailbox.Name, err)
 		}
 	}
 

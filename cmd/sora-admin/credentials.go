@@ -193,9 +193,8 @@ Options:
   --json             Output in JSON format instead of human-readable format
 
 Examples:
-  sora-admin credentials show --email user@example.com
-  sora-admin credentials show --email alias@example.com --json
-  sora-admin credentials show --email user@example.com --config /path/to/config.toml
+  sora-admin credentials show --email user@example.com --config config.toml
+  sora-admin credentials show --email alias@example.com --json --config config.toml
 `)
 	}
 
@@ -279,10 +278,10 @@ Subcommands:
   delete   Delete a specific credential from an account
 
 Examples:
-  sora-admin credentials add --primary admin@example.com --email alias@example.com --password mypassword
-  sora-admin credentials list --email user@example.com
-  sora-admin credentials show --email user@example.com
-  sora-admin credentials delete --email alias@example.com
+  sora-admin credentials add --primary admin@example.com --email alias@example.com --password mypassword --config config.toml
+  sora-admin credentials list --email user@example.com --config config.toml
+  sora-admin credentials show --email user@example.com --config config.toml
+  sora-admin credentials delete --email alias@example.com --config config.toml
 
 Use 'sora-admin credentials <subcommand> --help' for detailed help.
 `)

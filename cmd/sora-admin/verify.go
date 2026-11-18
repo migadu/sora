@@ -77,8 +77,9 @@ Subcommands:
 
 Examples:
   sora-admin verify s3 --email user@example.com --config config.toml
-  sora-admin verify s3 --email user@example.com --show-missing
-  sora-admin verify s3 --email user@example.com --fix-orphaned --dry-run
+  sora-admin verify s3 --email user@example.com --show-missing --config config.toml
+  sora-admin verify s3 --email user@example.com --fix-orphaned --dry-run --config config.toml
+  sora-admin verify body-deletions --config config.toml
   sora-admin verify hash --hash 31feeacf... --email user@example.com --config config.toml
 
 Use 'sora-admin verify <subcommand> --help' for detailed help.

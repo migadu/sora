@@ -134,12 +134,16 @@ func (s *IMAPSession) threadOrderedSubject(numKind imapserver.NumKind, messages 
 		return messages[i].UID < messages[j].UID
 	})
 
-	// Split the sorted messages into threads of the same base subject.
+	// Split the sorted messages into threads of the same base subject. The empty
+	// base subject is one too (RFC 5256 section 3: "each thread containing
+	// messages with the same base subject text"): a message without a Subject
+	// threads with one whose Subject reduces to nothing (Dovecot imaptest,
+	// thread-orderedsubject).
 	var threads [][]uint32
 	var currentSubject string
 	for _, msg := range messages {
 		id := s.getMessageID(numKind, msg)
-		if len(threads) == 0 || msg.SubjectSort != currentSubject || msg.SubjectSort == "" {
+		if len(threads) == 0 || msg.SubjectSort != currentSubject {
 			threads = append(threads, []uint32{id})
 			currentSubject = msg.SubjectSort
 		} else {
