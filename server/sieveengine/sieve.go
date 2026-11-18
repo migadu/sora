@@ -483,6 +483,13 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// to time.Duration, which would overflow for large Sieve numbers.
 		days := max(1, min(vacation.Days, consts.MaxVacationDays))
 		duration := time.Duration(days) * 24 * time.Hour
+		// go-sieve skips a sender that is one of the :addresses only when the two are
+		// equal byte for byte (migadu/go-sieve#61). The envelope sender keeps the case
+		// it was sent with (#2101), so compare without case here: Me@example.com is
+		// still the user's own me@example.com, and gets no reply.
+		if slices.ContainsFunc(vacation.Addresses, func(own string) bool { return strings.EqualFold(own, sender) }) {
+			break
+		}
 		// The envelope sender keeps the case of its local part (#2101), but the :days
 		// window (RFC 5230 §4.2) is kept per sender compared in lower case, the key
 		// every window was stored under while the sender was lower-cased on the way in.
