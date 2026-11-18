@@ -202,8 +202,19 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 
 	// The caller is responsible for beginning and committing/rolling back the transaction.
 
-	// Get the source message IDs and UIDs
-	rows, err := tx.Query(ctx, `SELECT id, uid, account_id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
+	// Lock the destination's mailbox row before any message row, the order MOVE, EXPUNGE
+	// and STORE take them in (see lockMailboxStats): the source rows are locked next, and
+	// a MOVE into this mailbox holds this row while it waits for them.
+	if err := lockMailboxStats(ctx, tx, destMailboxID); err != nil {
+		return nil, nil, err
+	}
+
+	// Get the source message IDs and UIDs, and hold the rows live until the commit. A
+	// copy within one account takes no S3 body lock (lockS3SourceClaims): its bodies stand
+	// because the source rows it copies from stay live, and FOR SHARE keeps an expunge or
+	// a delete of one from committing before the copies do. Locked in UID order, as MOVE
+	// locks them.
+	rows, err := tx.Query(ctx, `SELECT id, uid, account_id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid FOR SHARE`, srcMailboxID, uids)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
@@ -239,7 +250,6 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
-	// The highest_uid UPDATE holds the destination's row lock from here on.
 	window := modSeqWindowFor(ctx, destMailboxID)
 	if err := window.begin(ctx, tx); err != nil {
 		return nil, nil, err

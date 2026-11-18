@@ -58,45 +58,63 @@ func checkS3BodyClaimContinuity(ctx context.Context, tx pgx.Tx, hashes []string)
 }
 
 // sourceBodyClaims freezes the selected accounts against rekey before a fresh
-// source read. A cross-account operation budgets every source body, including
-// legacy rows already owned by its destination. No global body lock is taken here.
-func sourceBodyClaims(ctx context.Context, tx pgx.Tx, mailboxID, destMailboxID, destAccountID int64, uids *[]imap.UID, destObjects []string) ([]string, error) {
+// source read, and tells the two kinds of COPY/MOVE apart.
+//
+// A command is budgeted when it re-keys a row to another account or carries
+// destObjects. It is limited to MaxCrossAccountBodies distinct bodies, counting every
+// source body, including legacy rows already owned by its destination, and its
+// distinct source hashes are returned for the caller to lock. No global body lock is
+// taken here.
+//
+// Every other command copies rows within their own accounts (all sources belong to
+// destAccountID, or it is a MOVE within one mailbox, which keeps each row's account and
+// S3 key). It is not limited, so no hashes are returned for it: it must never take a
+// lock per body (see lockS3SourceClaims).
+func sourceBodyClaims(ctx context.Context, tx pgx.Tx, mailboxID, destMailboxID, destAccountID int64, uids *[]imap.UID, destObjects []string) (hashes []string, budgeted bool, err error) {
 	if err := lockRekeySources(ctx, tx, mailboxID, uids); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	rows, err := tx.Query(ctx, `SELECT content_hash, bool_or(account_id IS DISTINCT FROM $3) FROM messages WHERE mailbox_id=$1 AND uid=ANY($2) AND expunged_at IS NULL GROUP BY content_hash`, mailboxID, uids, destAccountID)
+	// A MOVE within one mailbox retains its existing account/S3 identities.
+	if mailboxID == destMailboxID {
+		return nil, false, nil
+	}
+	if len(destObjects) == 0 {
+		// A row's account never changes (a rekey renames its hash only), so this answer
+		// holds for the rows the caller reads afterwards.
+		var cross bool
+		if err := tx.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM messages WHERE mailbox_id=$1 AND uid=ANY($2) AND expunged_at IS NULL AND account_id IS DISTINCT FROM $3)`, mailboxID, uids, destAccountID).Scan(&cross); err != nil {
+			return nil, false, err
+		}
+		if !cross {
+			return nil, false, nil
+		}
+	}
+	rows, err := tx.Query(ctx, `SELECT DISTINCT content_hash FROM messages WHERE mailbox_id=$1 AND uid=ANY($2) AND expunged_at IS NULL`, mailboxID, uids)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	var hashes []string
-	cross := false
 	for rows.Next() {
 		var h string
-		var rekeyed bool
-		if err := rows.Scan(&h, &rekeyed); err != nil {
+		if err := rows.Scan(&h); err != nil {
 			rows.Close()
-			return nil, err
+			return nil, false, err
 		}
 		hashes = append(hashes, h)
-		cross = cross || rekeyed
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	// A MOVE within one mailbox retains its existing account/S3 identities.
-	if mailboxID != destMailboxID && (cross || len(destObjects) > 0) {
-		bodies := make(map[string]struct{}, min(len(hashes)+len(destObjects), MaxCrossAccountBodies+1))
-		for _, list := range [][]string{hashes, destObjects} {
-			for _, hash := range list {
-				bodies[hash] = struct{}{}
-				if len(bodies) > MaxCrossAccountBodies {
-					return nil, ErrCrossAccountBodyLimit
-				}
+	bodies := make(map[string]struct{}, min(len(hashes)+len(destObjects), MaxCrossAccountBodies+1))
+	for _, list := range [][]string{hashes, destObjects} {
+		for _, hash := range list {
+			bodies[hash] = struct{}{}
+			if len(bodies) > MaxCrossAccountBodies {
+				return nil, false, ErrCrossAccountBodyLimit
 			}
 		}
 	}
-	return hashes, nil
+	return hashes, true, nil
 }
 
 // CheckCopyMoveBodyBudget checks the complete current source under account rekey
@@ -104,17 +122,67 @@ func sourceBodyClaims(ctx context.Context, tx pgx.Tx, mailboxID, destMailboxID, 
 // storage callback. Caller-supplied rekey-only maps cannot establish this budget.
 // Pure same-account operations retain their existing uncapped policy.
 func (db *Database) CheckCopyMoveBodyBudget(ctx context.Context, tx pgx.Tx, srcMailboxID, destMailboxID, destAccountID int64, uids *[]imap.UID, destObjects []string) error {
-	_, err := sourceBodyClaims(ctx, tx, srcMailboxID, destMailboxID, destAccountID, uids, destObjects)
+	_, _, err := sourceBodyClaims(ctx, tx, srcMailboxID, destMailboxID, destAccountID, uids, destObjects)
 	return err
 }
 
-// lockS3SourceClaims budgets the fresh, rekey-stable source before acquiring its
-// shared body locks. COPY/MOVE reread from a fresh READ COMMITTED snapshot while
-// the account guards and body locks remain held through commit.
+// lockS3SourceClaims protects the bodies of a COPY/MOVE's source rows until the new
+// rows commit, and refuses a body with an open deletion intent.
+//
+// A budgeted command (sourceBodyClaims) takes the shared body lock of every distinct
+// source hash, at most MaxCrossAccountBodies of them, and rereads its sources from a
+// fresh READ COMMITTED snapshot while the account guards and body locks remain held
+// through commit.
+//
+// A command within one account takes NO body lock. It is not limited and not batched,
+// and each advisory lock is an entry in PostgreSQL's server-wide lock table until the
+// transaction ends: one lock per body would let a single "move this folder" fill the
+// table and fail every session with "out of shared memory" (SQLSTATE 53200). Its
+// bodies are protected by its source rows instead. A new row has the account, S3 key
+// and hash of the source row it is copied from, and no deleter retires a body while
+// its account has a live row of that hash (filterS3Orphans), so the body stands as
+// long as that reference never lapses between the command's read and its commit:
+//
+//   - MoveMessages locks its source rows FOR UPDATE, then expunges them and inserts
+//     their replacements in the same transaction: the source is live until the commit
+//     and the new row from it.
+//   - CopyMessages locks its source rows FOR SHARE until the commit, so no expunge or
+//     delete of a source can commit in between.
+//
+// Row locks are kept in the rows and take no lock-table entry. A rekey is held off by
+// the account guard; a deleter working for another account that shares the key counts
+// rows in any state, and the source row exists throughout.
 func lockS3SourceClaims(ctx context.Context, tx pgx.Tx, mailboxID, destMailboxID, destAccountID int64, uids *[]imap.UID, destObjects []string) error {
-	hashes, err := sourceBodyClaims(ctx, tx, mailboxID, destMailboxID, destAccountID, uids, destObjects)
+	hashes, budgeted, err := sourceBodyClaims(ctx, tx, mailboxID, destMailboxID, destAccountID, uids, destObjects)
 	if err != nil {
 		return err
 	}
-	return LockS3ObjectsSharedInTx(ctx, tx, 0, hashes)
+	if budgeted {
+		return LockS3ObjectsSharedInTx(ctx, tx, 0, hashes)
+	}
+	return checkS3SourceBodyIntents(ctx, tx, mailboxID, uids)
+}
+
+// checkS3SourceBodyIntents is the deletion-intent check of CheckS3BodyClaims for a
+// COPY/MOVE within one account, made on the source rows themselves: such a command may
+// name any number of bodies, so their hashes are neither read into memory nor sent back
+// as a parameter. A body with an open intent is refused, as for every other admission.
+func checkS3SourceBodyIntents(ctx context.Context, tx pgx.Tx, mailboxID int64, uids *[]imap.UID) error {
+	var isolation string
+	var quarantined bool
+	if err := tx.QueryRow(ctx, `
+		SELECT current_setting('transaction_isolation'), EXISTS (
+			SELECT 1 FROM s3_body_delete_intents di
+			JOIN messages m ON m.content_hash = di.content_hash
+			WHERE m.mailbox_id = $1 AND m.uid = ANY($2) AND m.expunged_at IS NULL)`,
+		mailboxID, uids).Scan(&isolation, &quarantined); err != nil {
+		return fmt.Errorf("check S3 body deletion intents: %w", err)
+	}
+	if isolation != "read committed" {
+		return fmt.Errorf("S3 body admission requires READ COMMITTED: %w", ErrS3BodyQuarantined)
+	}
+	if quarantined {
+		return ErrS3BodyQuarantined
+	}
+	return nil
 }

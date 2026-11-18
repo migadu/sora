@@ -961,8 +961,8 @@ func (d *Database) GetUnusedFTSKeys(ctx context.Context, after FTSKey, limit int
 // NOTE ON LOCK TABLE CAPACITY: The sweep holds up to len(keys) (capped at BATCH_PURGE_SIZE=1000)
 // exclusive advisory locks in this short transaction. The shared lock table holds
 // max_locks_per_transaction x (max_connections + max_prepared_transactions) entries for the
-// whole server (about 25,600 on production), and running out fails unrelated queries with
-// "out of shared memory", so do not raise this batch size without checking that budget.
+// whole server, and running out fails unrelated queries with "out of shared memory", so do
+// not raise this batch size without checking that budget.
 func (d *Database) DeleteMessagesFTSByKeyBatch(ctx context.Context, tx pgx.Tx, keys []FTSKey) (int64, error) {
 	if len(keys) == 0 {
 		return 0, nil
