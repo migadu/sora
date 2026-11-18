@@ -36,7 +36,7 @@ func handleCacheCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printCacheUsage()
 	default:
-		fmt.Printf("Unknown cache subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown cache subcommand: %s\n\n", subcommand)
 		printCacheUsage()
 		os.Exit(1)
 	}

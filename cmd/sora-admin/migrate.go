@@ -39,7 +39,7 @@ func handleMigrateCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printMigrateUsage()
 	default:
-		fmt.Printf("Unknown migrate subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown migrate subcommand: %s\n\n", subcommand)
 		printMigrateUsage()
 		os.Exit(1)
 	}

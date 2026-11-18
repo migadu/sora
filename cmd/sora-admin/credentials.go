@@ -34,7 +34,7 @@ func handleCredentialsCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printCredentialsUsage()
 	default:
-		fmt.Printf("Unknown credentials subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown credentials subcommand: %s\n\n", subcommand)
 		printCredentialsUsage()
 		os.Exit(1)
 	}
@@ -81,25 +81,25 @@ Examples:
 
 	// Validate required arguments
 	if *primaryIdentity == "" {
-		fmt.Printf("Error: --primary is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --primary is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *password == "" && *passwordHash == "" {
-		fmt.Printf("Error: either --password or --password-hash is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: either --password or --password-hash is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *password != "" && *passwordHash != "" {
-		fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
+		fmt.Fprintf(os.Stderr, "Error: cannot specify both --password and --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -114,7 +114,7 @@ Examples:
 		}
 	}
 	if !hashTypeValid {
-		fmt.Printf("Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
+		fmt.Fprintf(os.Stderr, "Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -157,7 +157,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -205,7 +205,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -252,7 +252,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}

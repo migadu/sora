@@ -25,7 +25,7 @@ func handleAffinityCacheCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printAffinityCacheUsage()
 	default:
-		fmt.Printf("Unknown affinity-cache subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown affinity-cache subcommand: %s\n\n", subcommand)
 		printAffinityCacheUsage()
 		os.Exit(1)
 	}
@@ -86,7 +86,7 @@ broadcast queue.
 
 	stats, ok := result["stats"].(map[string]any)
 	if !ok {
-		fmt.Println("Error: Invalid response format")
+		fmt.Fprintln(os.Stderr, "Error: Invalid response format")
 		return
 	}
 

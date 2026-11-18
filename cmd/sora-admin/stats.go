@@ -34,7 +34,7 @@ func handleStatsCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printStatsUsage()
 	default:
-		fmt.Printf("Unknown stats subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown stats subcommand: %s\n\n", subcommand)
 		printStatsUsage()
 		os.Exit(1)
 	}

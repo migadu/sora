@@ -560,19 +560,19 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 	if *batchSize <= 0 || *jobs <= 0 {
-		fmt.Printf("Error: --batch-size and --jobs must be positive\n")
+		fmt.Fprintf(os.Stderr, "Error: --batch-size and --jobs must be positive\n")
 		os.Exit(1)
 	}
 	var cursor db.ContentObject
 	if *startAfter != "" {
 		var err error
 		if cursor, err = parseRekeyCursor(*startAfter); err != nil {
-			fmt.Printf("Error: --start-after: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Error: --start-after: %v\n", err)
 			os.Exit(1)
 		}
 	}

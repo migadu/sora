@@ -50,7 +50,7 @@ func handleBackendsCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printBackendsUsage()
 	default:
-		fmt.Printf("Unknown backends subcommand: %s\n\n", os.Args[2])
+		fmt.Fprintf(os.Stderr, "Unknown backends subcommand: %s\n\n", os.Args[2])
 		printBackendsUsage()
 		os.Exit(1)
 	}
@@ -82,7 +82,7 @@ func handleBackendsMaintenance(ctx context.Context) {
 
 	h, err := normalizeBackendHost(*host)
 	if err != nil {
-		fmt.Printf("Error: %v\n\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
 		printBackendsUsage()
 		os.Exit(1)
 	}
@@ -232,7 +232,7 @@ func handleBackendsStatus(ctx context.Context) {
 	if *host != "" || *wait {
 		h, err := normalizeBackendHost(*host)
 		if err != nil {
-			fmt.Printf("Error: %v\n\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
 			printBackendsUsage()
 			os.Exit(1)
 		}

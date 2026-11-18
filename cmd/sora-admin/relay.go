@@ -36,7 +36,7 @@ func handleRelayCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printRelayUsage()
 	default:
-		fmt.Printf("Unknown relay subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown relay subcommand: %s\n\n", subcommand)
 		printRelayUsage()
 		os.Exit(1)
 	}
@@ -81,7 +81,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -147,7 +147,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -263,7 +263,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -365,7 +365,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -463,7 +463,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 

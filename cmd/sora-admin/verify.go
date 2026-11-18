@@ -58,7 +58,7 @@ func handleVerifyCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printVerifyUsage()
 	default:
-		fmt.Printf("Unknown verify subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown verify subcommand: %s\n\n", subcommand)
 		printVerifyUsage()
 		os.Exit(1)
 	}
@@ -155,12 +155,12 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 	if *batchSize < 1 {
-		fmt.Printf("Error: --batch-size must be at least 1\n")
+		fmt.Fprintf(os.Stderr, "Error: --batch-size must be at least 1\n")
 		os.Exit(1)
 	}
 
@@ -812,12 +812,12 @@ Examples:
 
 	// Validate required arguments
 	if *hash == "" {
-		fmt.Printf("Error: --hash is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --hash is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}

@@ -32,7 +32,7 @@ func handleHealthCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printHealthUsage()
 	default:
-		fmt.Printf("Unknown health subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown health subcommand: %s\n\n", subcommand)
 		printHealthUsage()
 		os.Exit(1)
 	}
