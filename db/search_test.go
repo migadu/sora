@@ -519,51 +519,80 @@ func setupSearchTestDatabase(t testing.TB) (*Database, int64, int64) {
 	return db, accountID, mailbox.ID
 }
 
-// TestBuildNumSetCondition tests the number set condition building (placeholder)
+// TestBuildNumSetCondition: each range of a sequence or UID set becomes one condition on
+// the column, single numbers an equality and ranges a BETWEEN, OR-ed together, with
+// parameter names numbered on from the caller's counter. A UID range ending in * reaches
+// the highest UID; an empty set matches nothing.
 func TestBuildNumSetCondition(t *testing.T) {
 	tests := []struct {
-		name        string
-		numSet      imap.NumSet
-		columnName  string
-		expectError bool
+		name       string
+		numSet     imap.NumSet
+		columnName string
+		counter    int
+		wantCond   string
+		wantArgs   pgx.NamedArgs
 	}{
 		{
-			name:        "simple UID range",
-			numSet:      imap.UIDSet{imap.UIDRange{Start: 1, Stop: 5}},
-			columnName:  "uid",
-			expectError: false,
+			name:       "UID range",
+			numSet:     imap.UIDSet{imap.UIDRange{Start: 1, Stop: 5}},
+			columnName: "uid",
+			wantCond:   "uid BETWEEN @p1 AND @p2",
+			wantArgs:   pgx.NamedArgs{"p1": imap.UID(1), "p2": imap.UID(5)},
 		},
 		{
-			name:        "sequence set",
-			numSet:      imap.SeqSet{imap.SeqRange{Start: 1, Stop: 10}},
-			columnName:  "seqnum",
-			expectError: false,
+			name:       "single UID",
+			numSet:     imap.UIDSet{imap.UIDRange{Start: 7, Stop: 7}},
+			columnName: "uid",
+			wantCond:   "uid = @p1",
+			wantArgs:   pgx.NamedArgs{"p1": imap.UID(7)},
 		},
 		{
-			name:        "empty column name",
-			numSet:      imap.UIDSet{imap.UIDRange{Start: 1, Stop: 5}},
-			columnName:  "",
-			expectError: true,
+			name:       "UID range to *",
+			numSet:     imap.UIDSet{imap.UIDRange{Start: 3, Stop: 0}},
+			columnName: "uid",
+			wantCond:   "uid BETWEEN @p1 AND @p2",
+			wantArgs:   pgx.NamedArgs{"p1": imap.UID(3), "p2": imap.UID(4294967295)},
+		},
+		{
+			name:       "sequence set of a number and a range",
+			numSet:     imap.SeqSet{imap.SeqRange{Start: 2, Stop: 2}, imap.SeqRange{Start: 4, Stop: 10}},
+			columnName: "seqnum",
+			wantCond:   "(seqnum = @p1 OR seqnum BETWEEN @p2 AND @p3)",
+			wantArgs:   pgx.NamedArgs{"p1": uint32(2), "p2": uint32(4), "p3": uint32(10)},
+		},
+		{
+			name:       "numbering continues from the counter",
+			numSet:     imap.SeqSet{imap.SeqRange{Start: 1, Stop: 1}},
+			columnName: "seqnum",
+			counter:    4,
+			wantCond:   "seqnum = @p5",
+			wantArgs:   pgx.NamedArgs{"p5": uint32(1)},
+		},
+		{
+			name:       "empty set",
+			numSet:     imap.UIDSet{},
+			columnName: "uid",
+			wantCond:   "1=0",
+			wantArgs:   pgx.NamedArgs{},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			// This would test the buildNumSetCondition function
-			t.Skip("buildNumSetCondition is internal function")
-
-			// Example test structure:
-			// paramCounter := 0
-			// condition, args, err := buildNumSetCondition(tt.numSet, tt.columnName, "p", &paramCounter)
-			// if tt.expectError {
-			//     assert.Error(t, err)
-			// } else {
-			//     assert.NoError(t, err)
-			//     assert.NotEmpty(t, condition)
-			//     assert.NotNil(t, args)
-			// }
+			counter := tt.counter
+			cond, args, err := buildNumSetCondition(tt.numSet, tt.columnName, "p", &counter)
+			require.NoError(t, err)
+			assert.Equal(t, tt.wantCond, cond)
+			assert.Equal(t, tt.wantArgs, args)
+			assert.Equal(t, tt.counter+len(tt.wantArgs), counter, "parameter counter")
 		})
 	}
+
+	t.Run("unsupported set type", func(t *testing.T) {
+		counter := 0
+		_, _, err := buildNumSetCondition(nil, "uid", "p", &counter)
+		assert.Error(t, err)
+	})
 }
 
 // TestBuildSearchCriteria tests search criteria building

@@ -46,7 +46,7 @@ func handleTLSCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printTLSUsage()
 	default:
-		fmt.Printf("Unknown tls subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown tls subcommand: %s\n\n", subcommand)
 		printTLSUsage()
 		os.Exit(1)
 	}
@@ -63,7 +63,7 @@ func handleTLSList(ctx context.Context) {
 		fmt.Printf(`List TLS certificates from S3 and local cache
 
 Usage:
-  sora-admin tls list [options]
+  sora-admin --config PATH tls list [options]
 
 Options:
   --cache-dir string    Local autocert cache directory (default: [tls.letsencrypt] fallback_dir,
@@ -81,8 +81,8 @@ This command shows:
 
 Examples:
   sora-admin tls list --config config.toml
-  sora-admin tls list --details
-  sora-admin tls list --cache-dir /custom/path
+  sora-admin tls list --details --config config.toml
+  sora-admin tls list --cache-dir /custom/path --config config.toml
 `)
 	}
 
@@ -117,7 +117,7 @@ func handleTLSDelete(ctx context.Context) {
 		fmt.Printf(`Delete a specific TLS certificate
 
 Usage:
-  sora-admin tls delete [options]
+  sora-admin --config PATH tls delete [options]
 
 Options:
   --domain string       Domain name (deletes both ECDSA and RSA variants)
@@ -153,13 +153,13 @@ certificate for the name.
 	}
 
 	if *domain == "" && *s3Key == "" {
-		fmt.Println("Error: Either --domain or --key must be specified")
+		fmt.Fprintln(os.Stderr, "Error: Either --domain or --key must be specified")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *domain != "" && *s3Key != "" {
-		fmt.Println("Error: Cannot specify both --domain and --key")
+		fmt.Fprintln(os.Stderr, "Error: Cannot specify both --domain and --key")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -190,7 +190,7 @@ func handleTLSClean(ctx context.Context) {
 		fmt.Printf(`Clean up expired TLS certificates
 
 Usage:
-  sora-admin tls clean [options]
+  sora-admin --config PATH tls clean [options]
 
 Options:
   --cache-dir string    Local autocert cache directory (default: from config)
@@ -249,7 +249,7 @@ func handleTLSCache(ctx context.Context) {
 		fmt.Printf(`Sync certificates from S3 to local cache
 
 Usage:
-  sora-admin tls cache [options]
+  sora-admin --config PATH tls cache [options]
 
 Options:
   --cache-dir string    Local autocert cache directory (default: from config)
@@ -295,7 +295,7 @@ func printTLSUsage() {
 	fmt.Printf(`TLS Certificate Management
 
 Usage:
-  sora-admin tls <subcommand> [options]
+  sora-admin --config PATH tls <subcommand> [options]
 
 Subcommands:
   list     List certificates from S3 and local cache status

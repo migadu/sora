@@ -29,10 +29,10 @@ func handleHealthCommand(ctx context.Context) {
 	switch subcommand {
 	case "status":
 		handleHealthStatus(ctx)
-	case "--help", "-h":
+	case "help", "--help", "-h":
 		printHealthUsage()
 	default:
-		fmt.Printf("Unknown health subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown health subcommand: %s\n\n", subcommand)
 		printHealthUsage()
 		os.Exit(1)
 	}
@@ -54,7 +54,7 @@ func handleHealthStatus(ctx context.Context) {
 		fmt.Printf(`Show system health status and component monitoring
 
 Usage:
-  sora-admin health status [options]
+  sora-admin --config PATH health status [options]
 
 Options:
   --hostname string     Show health status for specific hostname
@@ -72,11 +72,11 @@ This command shows:
   - Proxy backend health status (with --backends flag)
 
 Examples:
-  sora-admin health status
-  sora-admin health status --hostname server1.example.com
-  sora-admin health status --component database --detailed
-  sora-admin health status --backends
-  sora-admin health status --json
+  sora-admin health status --config config.toml
+  sora-admin health status --hostname server1.example.com --config config.toml
+  sora-admin health status --component database --detailed --config config.toml
+  sora-admin health status --backends --config config.toml
+  sora-admin health status --json --config config.toml
 `)
 	}
 
@@ -122,16 +122,16 @@ func printHealthUsage() {
 	fmt.Printf(`System Health Management
 
 Usage:
-  sora-admin health <subcommand> [options]
+  sora-admin --config PATH health <subcommand> [options]
 
 Subcommands:
   status   Show system health status and component monitoring
 
 Examples:
-  sora-admin health status
-  sora-admin health status --hostname server1.example.com
-  sora-admin health status --component database
-  sora-admin health status --detailed --json
+  sora-admin health status --config config.toml
+  sora-admin health status --hostname server1.example.com --config config.toml
+  sora-admin health status --component database --config config.toml
+  sora-admin health status --detailed --json --config config.toml
 
 Use 'sora-admin health <subcommand> --help' for detailed help.
 `)

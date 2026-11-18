@@ -2,6 +2,8 @@ package helpers
 
 import (
 	"bytes"
+	"errors"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -70,7 +72,7 @@ func TestEncodeNULParts(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, changed := EncodeNULParts([]byte(tc.msg))
+			got, changed := encodeNULPartsChecked(t, []byte(tc.msg))
 			if !changed {
 				t.Fatal("EncodeNULParts reported no change")
 			}
@@ -100,7 +102,7 @@ func TestEncodeNULParts(t *testing.T) {
 			"preamble\r\n--b1\r\nContent-Type: text/plain\r\n\r\nhello\r\n" +
 			"--b1 \r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\nX-A: 1\r\n\r\n"
 		after := "\r\n--b1--\r\nepilogue\r\n"
-		got, _ := EncodeNULParts([]byte(before + nulBody + after))
+		got, _ := encodeNULPartsChecked(t, []byte(before+nulBody+after))
 		want := strings.Replace(before, "Content-Transfer-Encoding: binary", "Content-Transfer-Encoding: base64", 1) +
 			"AC3kCg0KCg==" + after
 		if string(got) != want {
@@ -116,10 +118,66 @@ func TestEncodeNULParts(t *testing.T) {
 		{"no body", "From: a@example.com\r\nX-A: \x00"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, changed := EncodeNULParts([]byte(tc.msg))
+			got, changed := encodeNULPartsChecked(t, []byte(tc.msg))
 			if changed || string(got) != tc.msg {
 				t.Fatalf("changed=%v, got %q", changed, got)
 			}
 		})
+	}
+}
+
+// encodeNULPartsChecked runs EncodeNULParts and checks its reservation contract:
+// reserve is called only when the message changes, with exactly the size of the
+// buffer then allocated, and an unchanged message is returned without a copy.
+func encodeNULPartsChecked(t *testing.T, msg []byte) ([]byte, bool) {
+	t.Helper()
+	reserved, calls := int64(0), 0
+	got, changed, err := EncodeNULParts(msg, func(size int64) error {
+		reserved, calls = size, calls+1
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("EncodeNULParts: %v", err)
+	}
+	if !changed {
+		if calls != 0 {
+			t.Fatalf("reserve called %d times for an unchanged message", calls)
+		}
+		if len(msg) > 0 && &got[0] != &msg[0] {
+			t.Fatal("unchanged message was copied")
+		}
+		return got, changed
+	}
+	if calls != 1 || reserved != int64(len(got)) || int64(cap(got)) != reserved {
+		t.Fatalf("reserve called %d times for %d bytes; output is %d bytes in a %d-byte buffer", calls, reserved, len(got), cap(got))
+	}
+	return got, changed
+}
+
+// A refused reservation allocates nothing the size of the message and returns
+// the reserve error as it is.
+func TestEncodeNULPartsReserveRefused(t *testing.T) {
+	msg := []byte("Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n\r\n" +
+		strings.Repeat("\x00\xff\r\n", 100000))
+	want, _ := encodeNULPartsChecked(t, msg)
+	refused := errors.New("over budget")
+	var asked int64
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	got, changed, err := EncodeNULParts(msg, func(size int64) error {
+		asked = size
+		return refused
+	})
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, refused) || got != nil || changed {
+		t.Fatalf("got %d bytes, changed=%v, err=%v; want the reserve error and no output", len(got), changed, err)
+	}
+	if asked != int64(len(want)) {
+		t.Fatalf("reserve asked for %d bytes, the encoded message is %d", asked, len(want))
+	}
+	// The size pass parses the header (a bufio.Reader and the fields) and
+	// nothing else: far less than the %d-byte output it refused.
+	if allocated := after.TotalAlloc - before.TotalAlloc; allocated > 64<<10 {
+		t.Fatalf("refused reservation allocated %d bytes (encoded size %d)", allocated, len(want))
 	}
 }

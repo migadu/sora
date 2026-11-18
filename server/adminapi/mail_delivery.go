@@ -183,12 +183,9 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract recipients from message if not provided
+	// Without recipients, deliver to the message's To, Cc and Bcc addresses, each once
 	if len(req.Recipients) == 0 {
-		recipients := helpers.ExtractRecipients(messageEntity.Header)
-		for _, r := range recipients {
-			req.Recipients = append(req.Recipients, r.EmailAddress)
-		}
+		req.Recipients = helpers.ExtractEnvelopeRecipients(messageEntity.Header)
 	}
 
 	// Trim and validate recipients
@@ -203,8 +200,7 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 
 	// Extract sender address if not provided
 	if req.From == "" {
-		mailHeader := mail.Header{Header: messageEntity.Header}
-		if fromAddrs, err := mailHeader.AddressList("From"); err == nil && len(fromAddrs) > 0 {
+		if fromAddrs, err := helpers.ParseAddressList(messageEntity.Header.Get("From")); err == nil && len(fromAddrs) > 0 {
 			req.From = fromAddrs[0].Address
 		}
 	}

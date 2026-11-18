@@ -131,6 +131,13 @@ bad-credentials reply (section 6), and the attempt counts as a failed login for 
 reply does not say that the name was malformed, so it cannot be used to probe which names Sora
 accepts.
 
+The same holds for every credential no account can have: a name that does not parse, an empty
+password, and a name or password that is not valid UTF-8 (on POP3, and in a SASL PLAIN message on
+every listener, section 9). They are refused without a lookup, but after the progressive delay and
+the rate-limit check, and recorded as a failed login, so a client sending such credentials is
+slowed and blocked like one guessing passwords. They cannot be any master password, so counting
+them reveals nothing about one.
+
 A suffix that is not the configured `master_username`, and the `master_username` suffix with any
 password other than `master_password` (section 8.1):
 
@@ -247,7 +254,8 @@ This is the order on an IMAP, POP3 or ManageSieve backend. The code is in `serve
    ([SECURITY.md](SECURITY.md#4-connection-limits), section 10.7 below).
 2. **Plaintext gate.** On a connection without TLS, a login is accepted only if the listener allows
    plaintext logins ([SECURITY.md](SECURITY.md#2-tls-and-plaintext-logins)).
-3. **Empty password.** IMAP refuses an empty password at once.
+3. **Empty password.** Refused after the rate-limit check (step 6), without a lookup, as a failed
+   login (section 3).
 4. **Rate-limit key.** Sora derives the key for this attempt (section 10.2).
 5. **Progressive delay.** If rate limiting is on and the client's IP has recent failures, Sora waits
    before going on (section 10.3).
@@ -331,7 +339,9 @@ The IMAP, POP3 and ManageSieve proxies check the password before they choose a b
 proxy the order is ([server/imapproxy/session.go](../server/imapproxy/session.go); the POP3 and
 ManageSieve proxies follow the same plan):
 
-1. Plaintext gate and empty-password check, as on a backend.
+1. Plaintext gate, as on a backend. An empty password, and on the POP3 proxy a name or password
+   that is not valid UTF-8, is refused after the rate-limit check (step 3), without a lookup, as a
+   failed login (section 3).
 2. Progressive delay for the client's IP (section 10.3).
 3. Rate-limit check. A blocked attempt ends the connection (section 10.7), whether or not the login
    is cached.
@@ -507,6 +517,12 @@ No other SASL mechanism is offered (no `LOGIN`, `CRAM-MD5`, `SCRAM-*`, `XOAUTH2`
 Because PLAIN carries the password in clear, Sora refuses these commands on an unencrypted
 connection unless plaintext logins are allowed on that listener
 ([SECURITY.md](SECURITY.md#2-tls-and-plaintext-logins)).
+
+RFC 4616 defines every field of a PLAIN message (authorization identity, authentication identity,
+password) as UTF-8. On every listener above, a PLAIN message with a field that is not valid UTF-8
+names no account: it gets the bad-credentials reply (section 6) before anything is looked up, and
+counts as a failed login, like a name that does not parse (section 3). The POP3 proxy refuses any
+authorization identity other than the authentication identity before the lookup anyway.
 
 On the IMAP backend, `AUTH=PLAIN` cannot be removed with `disabled_caps` or a `client_filters` entry.
 Sora logs a warning for such an entry and keeps advertising the mechanism wherever logins are

@@ -797,14 +797,14 @@ The `Content-Type` header picks the format.
 | Field | Meaning |
 |---|---|
 | `message` | The whole RFC 5322 message. Required. |
-| `recipients` | Addresses to deliver to. When empty, the `To`, `Cc` and `Bcc` header addresses are used. |
+| `recipients` | Addresses to deliver to. When empty, the `To`, `Cc` and `Bcc` header addresses are used, each once (`From`, `Sender` and `Reply-To` are not recipients). |
 | `from` | Envelope sender, as Sieve and vacation see it. When empty, the first `From` header address. An address that does not parse is ignored. |
 | `mailbox` | Deliver straight into this mailbox. Sieve does not run, and no `Received:` or `Delivered-To:` header is added. A mailbox that does not exist means `INBOX`. |
 | `uid`, `uid_validity` | Keep these IMAP values, for migrations. |
 
 **`message/rfc822` or `text/plain`**: the body is the message. Recipients come from the
 `recipients` query parameter or the `X-Recipients` header (comma-separated), else from the
-message headers. The sender comes from the `from` query parameter or the `X-From` header.
+`To`, `Cc` and `Bcc` headers as above. The sender comes from the `from` query parameter or the `X-From` header.
 
 ```bash
 curl -X POST "http://127.0.0.1:8080/admin/mail/deliver?recipients=alice@example.com" \

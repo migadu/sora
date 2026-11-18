@@ -19,7 +19,7 @@ func TestImportNULPartStoredEncoded(t *testing.T) {
 	message := []byte("From: user@example.org\r\nMime-Version: 1.0\r\n" +
 		"Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n\r\n" +
 		"\x00-\xe4\n\r\n\n")
-	stored, changed := helpers.EncodeNULParts(message)
+	stored, changed, _ := helpers.EncodeNULParts(message, nil)
 	require.True(t, changed, "EncodeNULParts left the fixture unchanged")
 
 	for _, tt := range []struct {

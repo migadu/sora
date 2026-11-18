@@ -13,8 +13,10 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
@@ -121,16 +123,32 @@ func (s *Session) handleConnection() {
 		if s.clientConn != nil {
 			s.clientConn.Close()
 		}
+		backend := s.backendConn
 		s.mu.Unlock()
+		// The backend too: closing the client does not unblock a read on the backend
+		// (a greeting or login reply that never comes), which would hold the session
+		// until the connect timeout. Raw socket first, outside the mutex: a TLS
+		// close_notify can wait for its peer. connectToBackend refuses to install a
+		// connection once the context has ended, so none is missed here.
+		closeMaintenanceTransport(backend)
 	}()
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
 	if s.settings.absoluteSessionTimeout > 0 {
+		// The timer goroutine only cancels: logging there read the session's
+		// username/account fields while the session goroutine wrote them. The
+		// session goroutine logs it on the way out instead.
+		var timedOut atomic.Bool
 		timeout := time.AfterFunc(s.settings.absoluteSessionTimeout, func() {
-			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.settings.absoluteSessionTimeout)
+			timedOut.Store(true)
 			s.cancel() // Force cancel context to unblock any stuck I/O
 		})
-		defer timeout.Stop()
+		defer func() {
+			if timeout.Stop() || !timedOut.Load() {
+				return // ended before the timeout
+			}
+			s.InfoLog("Absolute session timeout reached - force closed", "duration", s.settings.absoluteSessionTimeout)
+		}()
 	}
 
 	s.InfoLog("connected")
@@ -423,13 +441,8 @@ func (s *Session) handleConnection() {
 
 			// A missing argument above is BAD ("arguments invalid", RFC 9051
 			// §6.2.3); an empty user name or password given as a string is a
-			// well-formed LOGIN whose credentials are rejected: NO.
-			if username == "" || password == "" {
-				if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
-					return
-				}
-				continue
-			}
+			// well-formed LOGIN whose credentials no account has: refused by
+			// authenticateUser like any other failed login, same reply and count.
 
 			if err := s.authenticateUser(username, password); err != nil {
 				s.DebugLog("authentication failed", "error", err)
@@ -1153,12 +1166,19 @@ func (s *Session) authorizeIdentity(authzID, username, resolvedEmail, method str
 	return nil
 }
 
-// authenticateUser authenticates the user against the database.
+// authenticateUser authenticates a LOGIN.
 func (s *Session) authenticateUser(username, password string) error {
-	return s.authenticateUserWithAuthzID("", username, password)
+	return s.authenticateCredentials("", username, password, false)
 }
 
-func (s *Session) authenticateUserWithAuthzID(authzID, username, password string) (retErr error) {
+// authenticateUserWithAuthzID authenticates an AUTHENTICATE PLAIN message.
+func (s *Session) authenticateUserWithAuthzID(authzID, username, password string) error {
+	return s.authenticateCredentials(authzID, username, password, true)
+}
+
+// authenticateCredentials checks the credentials of a login; saslPlain says they
+// came in a SASL PLAIN message, whose fields RFC 4616 defines as UTF-8.
+func (s *Session) authenticateCredentials(authzID, username, password string, saslPlain bool) (retErr error) {
 	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 	cacheGeneration := s.server.lookupCache.Generation()
 
@@ -1183,12 +1203,6 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 		s.username = addr.BaseAddress()
 	} else {
 		s.username = username // Fallback to raw username if parsing fails
-	}
-
-	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
-	// Empty passwords are never valid under any condition
-	if password == "" {
-		return consts.ErrAuthenticationFailed
 	}
 
 	// Rate-limit key for this attempt. Canonicalised from the submitted username so
@@ -1264,6 +1278,17 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 		// Unknown rate limiting error (shouldn't happen, but handle gracefully)
 		metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
 		return err
+	}
+
+	// Credentials no account can have: an empty password, or a SASL PLAIN field that
+	// is not UTF-8 (RFC 4616 section 2: "SAFE = ... any UTF-8 encoded Unicode
+	// character except NUL"). Refused without a lookup, but as a failed login,
+	// recorded and counted like a name that does not parse.
+	if password == "" || (saslPlain && (!utf8.ValidString(authzID) || !utf8.ValidString(username) || !utf8.ValidString(password))) {
+		s.InfoLog("authentication refused: empty password, or SASL PLAIN field not valid UTF-8")
+		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+		metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
+		return consts.ErrAuthenticationFailed
 	}
 
 	// Check cache
@@ -1819,6 +1844,13 @@ func (s *Session) connectToBackend() error {
 	metrics.ProxyBackendConnections.WithLabelValues("imap", "success").Inc()
 
 	s.mu.Lock()
+	if err := s.ctx.Err(); err != nil {
+		// The context watchdog has already run (it takes mu after ctx.Done) and
+		// would not close a connection installed now.
+		s.mu.Unlock()
+		backendConn.Close()
+		return fmt.Errorf("session ended while connecting to the backend: %w", err)
+	}
 	s.backendConn = backendConn
 	s.backendReader = bufio.NewReader(backendConn)
 	s.backendWriter = bufio.NewWriter(backendConn)

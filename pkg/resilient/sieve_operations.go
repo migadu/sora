@@ -267,14 +267,45 @@ func (rd *ResilientDatabase) CountRedirectsSinceWithRetry(ctx context.Context, A
 	return result.(int), nil
 }
 
-// RecordRedirectWithRetry records that a redirect action was performed with retry logic
-func (rd *ResilientDatabase) RecordRedirectWithRetry(ctx context.Context, AccountID int64) error {
+// RecordRedirectWithRetry records that a redirect action was performed, charged against a
+// redirect rate limit of the given window and limit, with retry logic
+func (rd *ResilientDatabase) RecordRedirectWithRetry(ctx context.Context, AccountID int64, window time.Duration, limit int) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordRedirect(ctx, tx, AccountID)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordRedirect(ctx, tx, AccountID, window, limit)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
 	return err
+}
+
+// RedirectRateWindowsOtherThanWithRetry returns the redirect rate windows other than windows
+// that running redirect_log rows were charged under, with retry logic
+func (rd *ResilientDatabase) RedirectRateWindowsOtherThanWithRetry(ctx context.Context, windows []time.Duration) ([]time.Duration, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).RedirectRateWindowsOtherThan(ctx, windows)
+	}
+
+	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+
+	return result.([]time.Duration), nil
+}
+
+// RedirectRateLimitsOtherThanWithRetry returns the redirect rate limits other than limits
+// that running redirect_log rows were charged under, with retry logic
+func (rd *ResilientDatabase) RedirectRateLimitsOtherThanWithRetry(ctx context.Context, limits []int) ([]int, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).RedirectRateLimitsOtherThan(ctx, limits)
+	}
+
+	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+
+	return result.([]int), nil
 }
 
 // RedirectedTargetsWithRetry returns the redirect targets already queued for the

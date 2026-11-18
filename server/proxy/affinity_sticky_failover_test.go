@@ -74,9 +74,17 @@ func TestAffinityStickyFailover(t *testing.T) {
 	affinity.UpdateBackend(username, "backend2:143", failoverBackend, protocol)
 	t.Logf("Step 4: Affinity updated to failover backend: %s", failoverBackend)
 
-	// Step 5: Wait for 1-minute auto-recovery window
-	t.Logf("Step 5: Waiting 61 seconds for auto-recovery window...")
-	time.Sleep(61 * time.Second)
+	// Step 5: Let the quarantine pass. Backdate the last failure past
+	// backendRecoveryInterval instead of sleeping through it.
+	connMgr.healthMu.Lock()
+	health, ok := connMgr.backendHealth["backend2:143"]
+	if !ok {
+		connMgr.healthMu.Unlock()
+		t.Fatal("no health entry for backend2:143")
+	}
+	health.LastFailure = time.Now().Add(-backendRecoveryInterval - time.Second)
+	connMgr.healthMu.Unlock()
+	t.Logf("Step 5: backend2:143 quarantine expired (last failure backdated)")
 
 	// Step 6: Check IsBackendHealthyForAffinity FIRST (before auto-recovery mutates state)
 	// IMPORTANT: Must check affinity health BEFORE calling IsBackendHealthy() which triggers auto-recovery

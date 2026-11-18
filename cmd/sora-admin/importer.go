@@ -1133,7 +1133,7 @@ func hashMessageFile(file *os.File, maxSize int64) (string, int64, error) {
 // holding NUL base64 encoded, as APPEND and delivery store it, since FETCH BODY
 // sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3).
 func storedMessage(content []byte) []byte {
-	stored, _ := helpers.EncodeNULParts(content)
+	stored, _, _ := helpers.EncodeNULParts(content, nil)
 	return stored
 }
 

@@ -629,7 +629,9 @@ type S3Object struct {
 	ETag         string
 }
 
-// ListObjects lists objects in S3 with the given prefix
+// ListObjects lists objects in S3 with the given prefix. Both channels are closed when
+// the listing ends, errCh first; a failure, or the cancellation of ctx, is sent on errCh
+// before that. A caller may stop reading objects once ctx is cancelled.
 func (s *S3Storage) ListObjects(ctx context.Context, prefix string, recursive bool) (<-chan S3Object, <-chan error) {
 	objectCh := make(chan S3Object)
 	errCh := make(chan error, 1)
@@ -657,11 +659,17 @@ func (s *S3Storage) ListObjects(ctx context.Context, prefix string, recursive bo
 			}
 
 			for _, object := range page.Contents {
-				objectCh <- S3Object{
+				obj := S3Object{
 					Key:          aws.ToString(object.Key),
 					Size:         aws.ToInt64(object.Size),
 					LastModified: aws.ToTime(object.LastModified),
 					ETag:         strings.Trim(aws.ToString(object.ETag), "\""),
+				}
+				select {
+				case objectCh <- obj:
+				case <-ctx.Done():
+					errCh <- ctx.Err()
+					return
 				}
 			}
 		}

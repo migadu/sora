@@ -29,7 +29,7 @@ func handleACLCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printACLUsage()
 	default:
-		fmt.Printf("Unknown acl subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown acl subcommand: %s\n\n", subcommand)
 		printACLUsage()
 		os.Exit(1)
 	}
@@ -43,18 +43,36 @@ func handleACLGrant(ctx context.Context) {
 	identifier := fs.String("identifier", "", "Email address or 'anyone' (required, can also use --user)")
 	user := fs.String("user", "", "Alias for --identifier")
 	rights := fs.String("rights", "", "ACL rights string, e.g., 'lrs' (required)")
+	fs.Usage = func() {
+		fmt.Printf(`Grant ACL rights to a user or identifier on a mailbox
+
+Usage:
+  sora-admin --config PATH acl grant [options]
+
+Options:
+  --email string       Email address of the mailbox owner (required)
+  --mailbox string     Mailbox name, e.g. 'Shared/Sales' (required)
+  --identifier string  Email address or 'anyone' (required, can also use --user)
+  --user string        Alias for --identifier
+  --rights string      ACL rights string, e.g. 'lrs' (required); replaces any rights the identifier had
+
+Examples:
+  sora-admin --config config.toml acl grant --email owner@example.com --mailbox "Shared/Sales" --user bob@example.com --rights lrs
+  sora-admin --config config.toml acl grant --email owner@example.com --mailbox "Shared/Sales" --identifier anyone --rights lr
+`)
+	}
 
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
@@ -64,21 +82,21 @@ func handleACLGrant(ctx context.Context) {
 		targetIdentifier = *user
 	}
 	if targetIdentifier == "" {
-		fmt.Println("Error: --identifier or --user is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --identifier or --user is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *rights == "" {
-		fmt.Println("Error: --rights is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --rights is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -95,7 +113,7 @@ func handleACLGrant(ctx context.Context) {
 	// Grant ACL (use context with config)
 	err = aclSvc.Grant(ctxWithConfig, *email, *mailbox, targetIdentifier, *rights)
 	if err != nil {
-		fmt.Printf("Failed to grant ACL: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to grant ACL: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -110,18 +128,34 @@ func handleACLRevoke(ctx context.Context) {
 	mailbox := fs.String("mailbox", "", "Mailbox name, e.g., 'Shared/Sales' (required)")
 	identifier := fs.String("identifier", "", "Email address or 'anyone' (required, can also use --user)")
 	user := fs.String("user", "", "Alias for --identifier")
+	fs.Usage = func() {
+		fmt.Printf(`Revoke ACL rights from a user or identifier on a mailbox
+
+Usage:
+  sora-admin --config PATH acl revoke [options]
+
+Options:
+  --email string       Email address of the mailbox owner (required)
+  --mailbox string     Mailbox name, e.g. 'Shared/Sales' (required)
+  --identifier string  Email address or 'anyone' (required, can also use --user)
+  --user string        Alias for --identifier
+
+Examples:
+  sora-admin --config config.toml acl revoke --email owner@example.com --mailbox "Shared/Sales" --user bob@example.com
+`)
+	}
 
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
@@ -131,15 +165,15 @@ func handleACLRevoke(ctx context.Context) {
 		targetIdentifier = *user
 	}
 	if targetIdentifier == "" {
-		fmt.Println("Error: --identifier or --user is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --identifier or --user is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -156,7 +190,7 @@ func handleACLRevoke(ctx context.Context) {
 	// Revoke ACL (use context with config)
 	err = aclSvc.Revoke(ctxWithConfig, *email, *mailbox, targetIdentifier)
 	if err != nil {
-		fmt.Printf("Failed to revoke ACL: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to revoke ACL: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -169,25 +203,39 @@ func handleACLList(ctx context.Context) {
 	fs := flag.NewFlagSet("acl list", flag.ExitOnError)
 	email := fs.String("email", "", "Email address of the mailbox owner (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name, e.g., 'Shared/Sales' (required)")
+	fs.Usage = func() {
+		fmt.Printf(`List all ACL entries for a mailbox
+
+Usage:
+  sora-admin --config PATH acl list [options]
+
+Options:
+  --email string    Email address of the mailbox owner (required)
+  --mailbox string  Mailbox name, e.g. 'Shared/Sales' (required)
+
+Examples:
+  sora-admin --config config.toml acl list --email owner@example.com --mailbox "Shared/Sales"
+`)
+	}
 
 	fs.Parse(os.Args[3:])
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -204,7 +252,7 @@ func handleACLList(ctx context.Context) {
 	// List ACLs (use context with config)
 	acls, err := aclSvc.List(ctxWithConfig, *email, *mailbox)
 	if err != nil {
-		fmt.Printf("Failed to list ACLs: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to list ACLs: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -223,7 +271,7 @@ func handleACLList(ctx context.Context) {
 
 // printACLUsage prints usage information for the 'acl' command
 func printACLUsage() {
-	fmt.Println(`Usage: sora-admin acl <subcommand> [options]
+	fmt.Println(`Usage: sora-admin --config PATH acl <subcommand> [options]
 
 Subcommands:
   grant   Grant ACL rights to a user or identifier on a mailbox

@@ -413,24 +413,6 @@ func TestIMAP_BinaryPartialFetchQuotedPrintable(t *testing.T) {
 	t.Log("✅ BINARY QP partial fetch test passed")
 }
 
-// TestIMAP_BinaryPartialFetchResponseFormat tests that BINARY partial responses
-// include the correct offset marker in the response
-func TestIMAP_BinaryPartialFetchResponseFormat(t *testing.T) {
-	t.Skip("This test requires raw protocol inspection to verify response format")
-
-	// This test would need to check that:
-	// - Response includes BINARY[5]<0> not just BINARY[5]
-	// - Response uses literal format {7}\nabcdefg not quoted "abcdefg"
-	//
-	// The go-imap client library may parse this differently, so we'd need
-	// to inspect the raw IMAP protocol responses to verify correctness.
-	//
-	// The imaptest failures suggest the server is sending:
-	//   BINARY[5] "abcdefg"
-	// But should send:
-	//   BINARY[5]<0> {7}\nabcdefg
-}
-
 func min(a, b int) int {
 	if a < b {
 		return a

@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"time"
+	"unicode/utf8"
 
 	"github.com/emersion/go-sasl"
 	"github.com/migadu/go-imap"
@@ -87,6 +88,20 @@ func (s *IMAPSession) Authenticate(mechanism string) (sasl.Server, error) {
 					// rate-limit state isn't an observable oracle. (security-audit M14)
 					return authFailedError()
 				}
+			}
+
+			// RFC 4616 section 2: every field of a PLAIN message is UTF-8 ("SAFE = ...
+			// any UTF-8 encoded Unicode character except NUL"). A field that is not names
+			// no account: refused before anything is looked up, but as a failed login,
+			// recorded and counted like a name that does not parse. None of them can be
+			// a master credential, so this answers nothing about one.
+			if !utf8.ValidString(identity) || !utf8.ValidString(username) || !utf8.ValidString(password) {
+				s.InfoLog("authentication refused: SASL PLAIN field not valid UTF-8")
+				if s.server.authLimiter != nil {
+					s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, netConn, proxyInfo, authKey, false)
+				}
+				metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+				return authFailedError()
 			}
 
 			s.DebugLog("SASL PLAIN", "authorization_id", identity, "authentication_id", username)
