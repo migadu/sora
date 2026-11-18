@@ -1069,6 +1069,8 @@ Other replies before a transaction:
   copies carry it as `MAIL FROM` with the local part in its own case (RFC 5321 section 2.4); only
   the domain is lower-cased. A quoted local part is quoted once, and only when it needs quotes:
   `"John Doe"@example.com` stays as it is, `"John.Doe"@example.com` becomes `John.Doe@example.com`.
+  The quoted string is decoded once: quote characters that are part of the local part stay in it,
+  so `"\"Sender\""@example.com` stays as it is and is not read as `Sender@example.com`.
   Vacation's `:days` window compares senders in lower case.
 - A recipient that is not a valid address gets `553 5.1.3 Invalid recipient address syntax`, or
   `501 5.1.3 Was expecting RCPT arg syntax of TO:<address>` when the command does not parse. A

@@ -303,14 +303,15 @@ var (
 	addressLiteralRe   = regexp.MustCompile(`^\[[\x21-\x5a\x5e-\x7e]+\]$`)
 )
 
-// NewReversePath parses the reverse-path of MAIL FROM: the mailbox between the angle
-// brackets. The null reverse-path ("") is the caller's to handle; it is refused here.
-//
-// A quoted local part is read in either of its forms: as go-smtp hands it to a session,
-// already unquoted ("john doe@example.com"), or as written (`"john doe"@example.com`,
-// which is how the Admin API passes it on). A local part that is one whole Quoted-string
-// is read as one, the way go-smtp reads it; the rare go-smtp mailbox whose unquoted
-// local part is itself such a string is read the same way.
+// NewReversePath parses the reverse-path of MAIL FROM as go-smtp hands it to a session:
+// the mailbox between the angle brackets, decoded. go-smtp has already unquoted a quoted
+// local part (`"John Doe"@example.com` arrives as "John Doe@example.com"), and net/mail
+// does the same with a From: field. Whatever quote or backslash is left is part of the
+// mailbox and is kept: MAIL FROM:<"\"x\""@example.com> arrives as `"x"@example.com`,
+// which is not the mailbox x@example.com. The null reverse-path ("") is the caller's to
+// handle; it is refused here. A mailbox still in its written form (an Admin API "from")
+// must be decoded by its caller first: decoding it here would decode the go-smtp form
+// a second time.
 //
 // The suffix (user@domain@SUFFIX) belongs to login names, not to envelope addresses: a
 // second "@" can only come from a quoted local part, so "a@b.example@example.com" is
@@ -354,9 +355,6 @@ func parseReversePath(input string) (Address, error) {
 		return Address{}, fmt.Errorf("invalid email format: %q", input)
 	}
 	localPart := input[:at]
-	if unquoted, ok := unquoteLocalPart(localPart); ok {
-		localPart = unquoted
-	}
 	domain := strings.ToLower(input[at+1:])
 
 	detail := ""
@@ -398,31 +396,4 @@ func parseReversePath(input string) (Address, error) {
 		domain:      domain,
 		detail:      detail,
 	}, nil
-}
-
-// unquoteLocalPart returns the content of s when s is one non-empty quoted string as
-// go-smtp reads a quoted local part: between the double quotes, "\" quotes the next
-// character and a bare `"` cannot stand (RFC 5321 §4.1.2 Quoted-string).
-func unquoteLocalPart(s string) (string, bool) {
-	if len(s) < 3 || s[0] != '"' || s[len(s)-1] != '"' {
-		return "", false
-	}
-	inner := s[1 : len(s)-1]
-	var b strings.Builder
-	for i := 0; i < len(inner); i++ {
-		c := inner[i]
-		switch c {
-		case '"':
-			return "", false
-		case '\\':
-			i++
-			if i == len(inner) {
-				// The closing quote is escaped: the string does not end.
-				return "", false
-			}
-			c = inner[i]
-		}
-		b.WriteByte(c)
-	}
-	return b.String(), true
 }
