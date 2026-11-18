@@ -594,11 +594,13 @@ fails; `MANUAL` and `REPORT` lines do not change it.
 
 ### mailbox repair-unseen
 
-Finds mailboxes whose cached unseen count (served by STATUS, LIST and NOTIFY) is higher than
-the number of unseen messages they hold, and with `--apply` recomputes it. Older builds left
-such counts when the failed-upload cleanup, `uploader resolve` or an importer rollback
-hard-deleted an unseen message. A count that has gone negative is repaired by the server
-itself.
+Finds mailboxes whose cached unseen count (served by STATUS, LIST, NOTIFY and the User API
+mailbox list) differs from the number of unseen messages they hold, and with `--apply`
+recomputes it. Older builds left counts too high when the failed-upload cleanup,
+`uploader resolve` or an importer rollback hard-deleted an unseen message, and counts too low
+in mailboxes holding messages without a flag state row: such a message has no flags, so it is
+unseen, but builds before migration 000076 did not count it. A count that has gone negative is
+repaired by the server itself.
 
 ```sh
 sora-admin --config config.toml mailbox repair-unseen

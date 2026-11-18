@@ -67,7 +67,7 @@ func TestMailboxRepairUnseen(t *testing.T) {
 	require.Contains(t, out, wouldRepair)
 	require.NotContains(t, out, fmt.Sprintf("mailbox_id=%d ", right.ID), "Right is counted right")
 	require.Contains(t, out, fmt.Sprintf("resume with --start-after %d", drifted.ID), "each batch prints where to resume")
-	require.Contains(t, out, "1 mailbox(es) with unseen_count too high, by 2 in total")
+	require.Contains(t, out, "2 mailbox(es) with a wrong unseen_count, off by 3 in total")
 	require.Contains(t, out, fmt.Sprintf(`WOULD REPAIR mailbox_id=%d account_id=%d "Stateless" unseen_count 0 -> 1`, stateless.ID, accountID))
 	require.Equal(t, int64(3), cached(drifted.ID), "a dry run changes nothing")
 	require.Equal(t, int64(0), cached(stateless.ID), "a dry run changes nothing")
@@ -80,7 +80,7 @@ func TestMailboxRepairUnseen(t *testing.T) {
 	require.Equal(t, int64(1), cached(stateless.ID))
 
 	out = runMailboxRepairUnseen(t, ctx, account.Email)
-	require.Contains(t, out, "0 mailbox(es) with unseen_count too high")
+	require.Contains(t, out, "0 mailbox(es) with a wrong unseen_count")
 }
 
 // runMailboxRepairUnseen runs "sora-admin mailbox repair-unseen" for one account against
