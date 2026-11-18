@@ -49,8 +49,9 @@ func TestIMAP_BodyStructureAttachedEnvelopeAddresses(t *testing.T) {
 	untagged, tagged := rc.cmd("f", "FETCH 1 (BODYSTRUCTURE)")
 	require.Contains(t, tagged, "OK")
 	require.Len(t, untagged, 1, "one FETCH response: %v", untagged)
-	// go-imap writes a space between the addresses of a list; RFC 3501's grammar has none
-	// ("(" 1*address ")"). Compare without it so the assertions hold either way.
+	// RFC 3501's env-to is "(" 1*address ")", with no SP between addresses. go-imap up to
+	// the pinned #372 head writes one; migadu/go-imap#378 (#377) removes it. Compare without
+	// it so the assertions hold on both sides of that pin bump.
 	resp := strings.ReplaceAll(untagged[0], ") (NIL ", ")(NIL ")
 	require.Contains(t, resp, `"attached"`, "embedded envelope present: %s", resp)
 
