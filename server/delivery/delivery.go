@@ -494,8 +494,9 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 // LookupRecipient looks up a recipient's user ID by email address.
 func (d *DeliveryContext) LookupRecipient(ctx context.Context, recipient string) (*RecipientInfo, error) {
-	// Parse recipient address
-	toAddress, err := server.NewAddress(recipient)
+	// A recipient is an envelope address, parsed as LMTP RCPT parses it: a master-token
+	// suffix (user@domain@SUFFIX) is not delivered to the address before it (#1961).
+	toAddress, err := server.NewForwardPath(recipient)
 	if err != nil {
 		return nil, fmt.Errorf("invalid recipient address: %w", err)
 	}
