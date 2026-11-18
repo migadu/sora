@@ -59,6 +59,9 @@ func handleBackendsCommand(ctx context.Context) {
 func handleBackendsMaintenance(ctx context.Context) {
 	if len(os.Args) < 4 || (os.Args[3] != "on" && os.Args[3] != "off") {
 		printBackendsUsage()
+		if len(os.Args) >= 4 && helpRequested(os.Args[3:4]) {
+			os.Exit(0)
+		}
 		os.Exit(1)
 	}
 	action := os.Args[3]
