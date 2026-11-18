@@ -263,7 +263,10 @@ file's first bytes, never by its name; a file that starts with none of these is 
 
 A body part that holds a NUL octet under an identity Content-Transfer-Encoding is stored
 base64-encoded, as IMAP APPEND stores it ([PROTOCOLS.md](PROTOCOLS.md#54-messages-and-flags)); the
-content hash and size are those of the stored message.
+content hash and size are those of the stored message. The message size limit applies to the
+message as read from the file; the re-encoded form must still fit the largest message sora can
+store (2147483647 octets). A file whose re-encoded form does not is refused, by the scan and by
+the upload, as `invalid message: message too large`, before anything of it is cached or uploaded.
 
 Decompression stops at 256 MiB of output. A refused file, a corrupt one, and one that
 decompresses to more than 256 MiB count as failed

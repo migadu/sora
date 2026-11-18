@@ -36,6 +36,7 @@ import (
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
+	"github.com/migadu/sora/server/delivery"
 	"github.com/migadu/sora/server/sieveengine"
 	"golang.org/x/sys/unix"
 	_ "modernc.org/sqlite"
@@ -1123,18 +1124,33 @@ func hashMessageFile(file *os.File, maxSize int64) (string, int64, error) {
 		if err != nil {
 			return "", 0, err
 		}
-		return helpers.HashContent(storedMessage(content)), int64(len(content)), nil
+		stored, err := storedMessage(content)
+		if err != nil {
+			return "", 0, err
+		}
+		return helpers.HashContent(stored), int64(len(content)), nil
 	}
 
 	return hex.EncodeToString(hasher.Sum(nil)), size, nil
 }
 
+// checkStoredImportSize refuses a message, as the import would store it, that
+// sora cannot store. A variable so that a test can lower the bound.
+var checkStoredImportSize = delivery.CheckStorableSize
+
 // storedMessage is the message the import stores for content as read: a part
 // holding NUL base64 encoded, as APPEND and delivery store it, since FETCH BODY
-// sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3).
-func storedMessage(content []byte) []byte {
-	stored, _, _ := helpers.EncodeNULParts(content, nil)
-	return stored
+// sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3). The size
+// limits apply to content; the re-encoded form must still be storable, which is
+// checked before it is allocated (errMessageTooLarge).
+func storedMessage(content []byte) ([]byte, error) {
+	stored, _, err := helpers.EncodeNULParts(content, func(size int64) error {
+		return checkStoredImportSize(int(size))
+	})
+	if err != nil {
+		return nil, fmt.Errorf("%w: re-encoded: %w", errMessageTooLarge, err)
+	}
+	return stored, nil
 }
 
 // nulDetector is an io.Writer that records whether a NUL octet passed through it.
@@ -2880,7 +2896,12 @@ func (i *Importer) readBatch(batch []msgInfo) []uploadedMsg {
 			// The limit is on the message as read, the size the scan caches; what is
 			// stored and hashed may be larger by its re-encoded NUL-bearing parts.
 			readSize := len(content)
-			content = storedMessage(content)
+			if content, err = storedMessage(content); err != nil {
+				logger.Warn("Invalid message", "path", msg.path, "error", err)
+				i.recordFailedPath(msg.path, fmt.Sprintf("invalid message: %v", err))
+				atomic.AddInt64(&i.failedMessages, 1)
+				return
+			}
 
 			// The hash in the SQLite cache was computed at scan time — possibly by an
 			// earlier run, since the scan keeps the first row for a (filename, mailbox).

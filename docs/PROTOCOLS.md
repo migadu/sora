@@ -1180,8 +1180,12 @@ After `DATA` and the last `BDAT`, each reply carries the recipient, for example
 
 For each accepted message, Sora:
 
-1. re-encodes as base64 any body part that holds a NUL octet, as APPEND does
-   ([section 5.4](#54-messages-and-flags)), so that `FETCH BODY` never has to send one;
+1. takes the retry identity (the delivery hash a lost `250` is recognised by) from the message
+   exactly as received, then re-encodes as base64 any body part that holds a NUL octet, as APPEND
+   does ([section 5.4](#54-messages-and-flags)), so that `FETCH BODY` never has to send one.
+   `max_message_size` applies to the message as received; a re-encoded form larger than
+   2147483647 octets is refused, before it is built, with
+   `552 5.3.4 message size exceeds maximum allowed size of 2147483647 bytes`;
 2. checks for a delivery loop (an `X-Sora-Loop` header together with a `Delivered-To` equal to the
    account's primary address), answering `550 5.4.6 routing loop detected (Delivered-To)`;
 3. adds a `Received:` header and a `Delivered-To:` header naming the account's primary address;

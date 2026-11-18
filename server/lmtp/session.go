@@ -526,9 +526,28 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		s.WarnLog("could not find header/body separator in message")
 	}
 
+	// Identity of the upstream queue entry, used to absorb an MTA retry of a delivery
+	// whose 250 was lost. MUST be taken over the bytes exactly as received: before the
+	// NUL-part re-encoding below (distinct submissions can be stored alike) and before
+	// the trace headers stamped further down, which carry a per-attempt id and
+	// timestamp, so anything hashed after them (content_hash included) differs on
+	// every attempt.
+	deliveryHash := helpers.HashContent(fullMessageBytes)
+
 	// A part holding NUL is stored base64 encoded, as APPEND stores it: FETCH
-	// BODY sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3).
-	if encoded, ok, _ := helpers.EncodeNULParts(fullMessageBytes, nil); ok {
+	// BODY sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3). A
+	// re-encoded form too large to store is refused before it is allocated.
+	encoded, changed, err := helpers.EncodeNULParts(fullMessageBytes, delivery.ReserveStorable)
+	if err != nil {
+		s.WarnLog("re-encoded message too large to store", "size", len(fullMessageBytes), "error", err, "limit", consts.MaxStoredMessageSize)
+		recordMetrics("failure")
+		return &smtp.SMTPError{
+			Code:         552,
+			EnhancedCode: smtp.EnhancedCode{5, 3, 4},
+			Message:      fmt.Sprintf("message size exceeds maximum allowed size of %d bytes", consts.MaxStoredMessageSize),
+		}
+	}
+	if changed {
 		s.DebugLog("re-encoded NUL-bearing body parts as base64", "size", len(fullMessageBytes), "encoded_size", len(encoded))
 		fullMessageBytes = encoded
 	}
@@ -542,12 +561,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Header.Get returns the first occurrence: mizu prepends its headers, so
 	// that is the most recent mizu hop's id.
 	s.traceID = traceIDFromHeader(messageContent.Header.Get(mizuTraceIDHeader))
-
-	// Identity of the upstream queue entry, used to absorb an MTA retry of a delivery
-	// whose 250 was lost. MUST be taken over the bytes exactly as received: the trace
-	// headers stamped below carry a per-attempt id and timestamp, so anything hashed
-	// after them (content_hash included) differs on every attempt.
-	deliveryHash := helpers.HashContent(fullMessageBytes)
 
 	// Mail-loop detection + Delivered-To stamping (Postfix-style). If this message is in
 	// a Sora redirect loop (our X-Sora-Loop marker present AND a Delivered-To for this
