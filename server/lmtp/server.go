@@ -227,6 +227,12 @@ type LMTPServerBackend struct {
 	// Per-command hard execution timeouts (nil = use defaults)
 	commandTimeouts *CommandTimeouts
 
+	// deliveryMemory is limits.delivery_memory_limit: the message bytes all
+	// transactions of this server may hold at once (the DATA buffer and the
+	// re-encoded copy of NUL-bearing parts). A limit of 0 means none. nil in
+	// backends built without New.
+	deliveryMemory *server.SessionMemoryTracker
+
 	// Connection counters
 	totalConnections  atomic.Int64
 	activeConnections atomic.Int64
@@ -363,6 +369,7 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 		maxRedirectHops:    options.MaxRedirectHops,
 		sharedMailboxes:    options.SharedMailboxes,
 		commandTimeouts:    defaultCommandTimeouts(),
+		deliveryMemory:     server.NewSessionMemoryTracker(options.DeliveryMemoryLimit),
 	}
 	backend.settings.Store(&reloadableSettings{
 		maxMessageSize: options.MaxMessageSize,

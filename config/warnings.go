@@ -99,6 +99,10 @@ func (c *Config) Warnings() []string {
 			}
 		}
 
+		if s.Type == "lmtp" || s.Type == "http_admin_api" {
+			s.WarnDeliveryMemoryLimit(warn)
+		}
+
 		switch s.Type {
 		case "imap_proxy", "pop3_proxy", "managesieve_proxy":
 			// Only the cluster connection tracker counts a user's connections through
@@ -307,6 +311,7 @@ var serverValues = []struct {
 }{
 	{"limits.search_rate_limit_window", []string{"imap"}, func(s *ServerConfig) error { _, err := s.GetSearchRateLimitWindow(); return err }},
 	{"limits.session_memory_limit", []string{"imap", "pop3"}, func(s *ServerConfig) error { _, err := s.GetSessionMemoryLimit(); return err }},
+	{"limits.delivery_memory_limit", []string{"lmtp", "http_admin_api"}, func(s *ServerConfig) error { _, err := s.GetDeliveryMemoryLimit(); return err }},
 	// The default is the cache's max_object_size, which does not change whether it parses.
 	{"limits.preview_s3_max_size", []string{"imap"}, func(s *ServerConfig) error { _, err := s.GetPreviewS3MaxSize(0); return err }},
 	{"limits.redirect_rate_window", []string{"lmtp", "http_admin_api"}, func(s *ServerConfig) error { _, err := s.GetRedirectRateWindow(); return err }},
@@ -393,6 +398,21 @@ func positiveDuration(value string) error {
 		err = errors.New("must be positive")
 	}
 	return err
+}
+
+// WarnDeliveryMemoryLimit warns when an lmtp or http_admin_api server's
+// delivery_memory_limit is below its max_message_size: a message larger than the
+// budget is refused as temporary on every attempt, until the sender gives up.
+func (s *ServerConfig) WarnDeliveryMemoryLimit(warn func(format string, args ...any)) {
+	limit, err := s.GetDeliveryMemoryLimit()
+	if err != nil || limit <= 0 {
+		return
+	}
+	if maxSize := s.GetMaxMessageSizeWithDefault(); limit < maxSize {
+		warn("Server %s (type: %s) has delivery_memory_limit %d bytes, below its max_message_size %d bytes: "+
+			"a message larger than delivery_memory_limit is refused as temporary on every attempt until the sender gives up",
+			s.Name, s.Type, limit, maxSize)
+	}
 }
 
 // imapWarnings are the warnings an IMAP server logs about its settings as it is built

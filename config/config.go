@@ -1588,6 +1588,7 @@ type ServerLimitsConfig struct {
 	RedirectRateWindow    string `toml:"redirect_rate_window,omitempty"`      // Redirect rate limit time window (must be positive, default: 1h)
 	MaxRedirectHops       *int   `toml:"max_redirect_hops,omitempty"`         // Max times one message may be redirected before suppression (mail-loop backstop, 0=unlimited, default: 2)
 	SessionMemoryLimit    string `toml:"session_memory_limit,omitempty"`      // Per-session memory limit (default: 100mb, 0=unlimited)
+	DeliveryMemoryLimit   string `toml:"delivery_memory_limit,omitempty"`     // Message bytes all deliveries of an lmtp or http_admin_api server may hold at once (default: 0=unlimited)
 	MaxAuthErrors         int    `toml:"max_auth_errors,omitempty"`           // Maximum authentication errors before disconnection (default: 2)
 	PreviewS3PerMin       *int   `toml:"preview_s3_per_min,omitempty"`        // S3 downloads per account per minute to answer FETCH PREVIEW without LAZY (IMAP backend only, 0=unlimited, default: 300)
 	PreviewS3Burst        *int   `toml:"preview_s3_burst,omitempty"`          // Of those, how many may run back to back (default: min(200, positive per-minute limit))
@@ -2514,6 +2515,16 @@ func (s *ServerConfig) GetSessionMemoryLimit() (int64, error) {
 		return helpers.ParseSize(s.Limits.SessionMemoryLimit)
 	}
 	return defaultSessionMemoryLimit, nil
+}
+
+// GetDeliveryMemoryLimit parses limits.delivery_memory_limit: the message bytes all
+// deliveries under way on an lmtp or http_admin_api server may hold at once. Unset is
+// 0, no limit.
+func (s *ServerConfig) GetDeliveryMemoryLimit() (int64, error) {
+	if s.Limits != nil && s.Limits.DeliveryMemoryLimit != "" {
+		return helpers.ParseSize(s.Limits.DeliveryMemoryLimit)
+	}
+	return 0, nil
 }
 
 // SessionMemoryShortfall is an imap or pop3 server whose session_memory_limit is below
@@ -3630,6 +3641,8 @@ var serverLimitKeys = []struct {
 	{"preview_s3_max_size", func(l *ServerLimitsConfig) bool { return l.PreviewS3MaxSize != "" }, []string{"imap"}},
 	// The session memory tracker.
 	{"session_memory_limit", func(l *ServerLimitsConfig) bool { return l.SessionMemoryLimit != "" }, []string{"imap", "pop3"}},
+	// The delivery memory budget: LMTP DATA and the Admin API's /admin/mail/deliver.
+	{"delivery_memory_limit", func(l *ServerLimitsConfig) bool { return l.DeliveryMemoryLimit != "" }, []string{"lmtp", "http_admin_api"}},
 	// The login proxies' cap on protocol errors before authentication (wrong passwords do not count).
 	{"max_auth_errors", func(l *ServerLimitsConfig) bool { return l.MaxAuthErrors != 0 }, []string{"imap_proxy", "pop3_proxy", "managesieve_proxy"}},
 	// Sieve on delivery: LMTP and the Admin API's /admin/mail/deliver.

@@ -17,6 +17,7 @@ import (
 	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/migadu/sora/helpers"
+	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/server"
 	"github.com/migadu/sora/server/delivery"
 )
@@ -84,7 +85,31 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	if maxBody <= 0 {
 		maxBody = defaultMaxMessageSize
 	}
-	r.Body = http.MaxBytesReader(w, r.Body, maxBody)
+	limitedBody := http.MaxBytesReader(w, r.Body, maxBody)
+
+	// The delivery memory budget (limits.delivery_memory_limit) is charged for the
+	// request body as it is read, for the message copy delivered from, and (in
+	// DeliverMessage) for the re-encoded copy of NUL-bearing parts. Everything charged
+	// here is held until the request ends, on every path.
+	chargedBody := &server.ChargedReader{R: limitedBody, Budget: s.deliveryMemory}
+	r.Body = struct {
+		io.Reader
+		io.Closer
+	}{chargedBody, limitedBody}
+	var held int64
+	defer func() { s.freeDeliveryMemory(chargedBody.Charged + held) }()
+	// holdCopy charges the message copy of n bytes before it is made.
+	holdCopy := func(n int) bool {
+		if s.deliveryMemory == nil {
+			return true
+		}
+		if err := s.deliveryMemory.Allocate(int64(n)); err != nil {
+			s.refuseDeliveryMemory(w, err)
+			return false
+		}
+		held += int64(n)
+		return true
+	}
 
 	// Parse request based on Content-Type
 	var req DeliverMailRequest
@@ -98,6 +123,10 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	case strings.HasPrefix(mediaType, "multipart/form-data"):
 		// Parse multipart form
 		err = r.ParseMultipartForm(32 << 20) // 32MB max
+		if chargedBody.Refused {
+			s.refuseDeliveryMemory(w, err)
+			return
+		}
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, "Failed to parse multipart form")
 			return
@@ -131,11 +160,20 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 			req.From = r.MultipartForm.Value["from"][0]
 		}
 
+		if !holdCopy(len(req.Message)) {
+			return
+		}
 		messageBytes = []byte(req.Message)
 
 	case mediaType == "message/rfc822" || mediaType == "text/plain":
-		// Raw RFC822 message
-		messageBytes, err = io.ReadAll(r.Body)
+		// Raw RFC822 message, read into a buffer charged before it grows.
+		var charged int64
+		messageBytes, charged, err = server.ReadAllCharged(limitedBody, s.deliveryMemory)
+		held += charged
+		if errors.Is(err, server.ErrMemoryBudgetExhausted) {
+			s.refuseDeliveryMemory(w, err)
+			return
+		}
 		if err != nil {
 			s.writeError(w, http.StatusBadRequest, "Failed to read message body")
 			return
@@ -160,7 +198,14 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	case mediaType == "application/json":
 		// JSON request
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			if chargedBody.Refused {
+				s.refuseDeliveryMemory(w, err)
+				return
+			}
 			s.writeError(w, http.StatusBadRequest, "Invalid JSON")
+			return
+		}
+		if !holdCopy(len(req.Message)) {
 			return
 		}
 		messageBytes = []byte(req.Message)
@@ -313,6 +358,7 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		MetricsLabel:    "http_delivery",
 		Logger:          logger,
 		SharedMailboxes: s.sharedMailboxes,
+		Memory:          s.deliveryMemory,
 	}
 
 	sieveExecutor := &delivery.StandardSieveExecutor{
@@ -386,4 +432,21 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 
 	status.Accepted = result.Success
 	return status
+}
+
+// freeDeliveryMemory gives back n bytes charged to the delivery memory budget.
+func (s *Server) freeDeliveryMemory(n int64) {
+	if s.deliveryMemory != nil && n > 0 {
+		s.deliveryMemory.Free(n)
+	}
+}
+
+// refuseDeliveryMemory answers a delivery the delivery memory budget
+// (limits.delivery_memory_limit) cannot hold: 503 with Retry-After, so the injector
+// retries once the deliveries holding the budget have ended.
+func (s *Server) refuseDeliveryMemory(w http.ResponseWriter, err error) {
+	logger.Warn("Mail delivery refused: delivery memory limit reached", "name", s.name, "error", err)
+	metrics.SessionMemoryLimitExceeded.WithLabelValues("http_delivery", s.name, s.hostname).Inc()
+	w.Header().Set("Retry-After", "30")
+	s.writeError(w, http.StatusServiceUnavailable, "Delivery memory limit reached, try again later")
 }

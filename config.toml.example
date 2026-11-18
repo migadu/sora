@@ -1454,6 +1454,10 @@ proxy_protocol_timeout = "5s"
 # (IMAP NO [LIMIT], POP3 -ERR [SYS/PERM]); startup and reload warn about an imap or pop3
 # server whose limit is below this.
 max_message_size = "50mb"     # Maximum message size (default: 50MB; 0 also means 50MB, there is no unlimited)
+# limits.delivery_memory_limit = "1gb"  # Message bytes all transactions of this server may hold at once: the DATA
+                                        # buffer and the base64 copy of NUL-bearing parts (default: "0" = no limit).
+                                        # A transaction that does not fit gets 452 4.3.1 and the MTA retries it.
+                                        # Keep it well above max_message_size; not reloaded.
 
 # --- SIEVE REDIRECT LIMITS ---
 # Applied when a delivery runs the recipient's Sieve script: by lmtp servers and by
@@ -2417,6 +2421,9 @@ proxy_protocol_timeout = "5s"
 # limits.redirect_rate_limit = 100      # (default: 100, 0 = unlimited)
 # limits.redirect_rate_window = "1h"    # (default: "1h", must be positive, the same as the LMTP servers')
 # limits.max_redirect_hops = 2          # (default: 2, 0 = unlimited)
+# Message bytes all /admin/mail/deliver requests may hold at once (default: "0" = no limit);
+# a request that does not fit gets 503 with Retry-After. Keep it well above max_message_size.
+# limits.delivery_memory_limit = "1gb"
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint
 # NOTE: /admin/mail/deliver stages bodies through this node's upload worker, which runs only when the

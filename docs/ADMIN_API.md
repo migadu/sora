@@ -865,6 +865,7 @@ Status codes:
 | 503 | One recipient, and it failed on the server side. `Retry-After: 30`. |
 | 503 | This node has no upload worker: `{"error":"Mail delivery not available on this node: no upload worker"}` with `Retry-After: 60`. Send the request to a node that runs an `imap`, `pop3` or `lmtp` server. |
 | 503 | This backend is in maintenance: `{"error":"Server in maintenance, try again later"}` with `Retry-After: 60`. See [PROXY.md](PROXY.md) for maintenance mode. |
+| 503 | The server's `limits.delivery_memory_limit` cannot hold the request now: `{"error":"Delivery memory limit reached, try again later"}` with `Retry-After: 30` (for the re-encoded copy of a NUL-bearing part, the recipient's `error` says so). See [CONFIGURATION.md](CONFIGURATION.md#95-limits-serverlimits). |
 
 In-flight deliveries count as this server's sessions while a backend drains for maintenance.
 

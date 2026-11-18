@@ -50,6 +50,9 @@ type DeliveryContext struct {
 	// Sieve mailboxexists resolves its root (FileintoTarget). Left zero, sharing
 	// counts as disabled.
 	SharedMailboxes config.SharedMailboxesConfig
+	// Memory is the server's delivery memory budget (limits.delivery_memory_limit),
+	// charged for the re-encoded copy of NUL-bearing parts. nil: no budget.
+	Memory *server.SessionMemoryTracker
 }
 
 // uploadInstanceID is the identity this delivery stamps on the pending_uploads row it
@@ -131,11 +134,32 @@ func CheckStorableSize(size int) error {
 }
 
 // ReserveStorable is CheckStorableSize as the reserve callback of
-// helpers.EncodeNULParts on the paths without a session memory budget (LMTP and
-// Admin API delivery): a message whose re-encoded form sora cannot store is
+// helpers.EncodeNULParts: a message whose re-encoded form sora cannot store is
 // refused before that form is allocated.
 func ReserveStorable(size int64) error {
 	return CheckStorableSize(int(size))
+}
+
+// EncodeNULPartsCharged is helpers.EncodeNULParts for a delivery (LMTP, Admin API):
+// before the encoded copy is allocated it must be storable (ReserveStorable) and is
+// charged to budget, the delivery memory budget (nil: none), on top of the message it
+// is made from. A refused charge is an error wrapping server.ErrMemoryBudgetExhausted.
+// It returns the bytes charged, which the caller frees once done with the copy.
+func EncodeNULPartsCharged(data []byte, budget *server.SessionMemoryTracker) ([]byte, bool, int64, error) {
+	var charged int64
+	encoded, changed, err := helpers.EncodeNULParts(data, func(size int64) error {
+		if err := ReserveStorable(size); err != nil {
+			return err
+		}
+		if budget != nil {
+			if err := budget.Allocate(size); err != nil {
+				return fmt.Errorf("%w: %v", server.ErrMemoryBudgetExhausted, err)
+			}
+			charged = size
+		}
+		return nil
+	})
+	return encoded, changed, charged, err
 }
 
 // DeliverMessage is the main entry point for message delivery.
@@ -159,9 +183,15 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	// A part holding NUL is stored base64 encoded, as APPEND stores it: FETCH
 	// BODY sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3).
-	messageBytes, _, err := helpers.EncodeNULParts(messageBytes, ReserveStorable)
+	messageBytes, _, charged, err := EncodeNULPartsCharged(messageBytes, d.Memory)
+	if charged > 0 {
+		defer d.Memory.Free(charged)
+	}
 	if err != nil {
 		result.ErrorMessage = err.Error()
+		if errors.Is(err, server.ErrMemoryBudgetExhausted) {
+			result.ErrorMessage = "Delivery memory limit reached, try again later"
+		}
 		return result, err
 	}
 
