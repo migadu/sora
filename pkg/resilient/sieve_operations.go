@@ -278,6 +278,21 @@ func (rd *ResilientDatabase) RecordRedirectWithRetry(ctx context.Context, Accoun
 	return err
 }
 
+// RedirectRateWindowsOtherThanWithRetry returns the redirect rate windows other than windows
+// that running redirect_log rows were charged under, with retry logic
+func (rd *ResilientDatabase) RedirectRateWindowsOtherThanWithRetry(ctx context.Context, windows []time.Duration) ([]time.Duration, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, false).RedirectRateWindowsOtherThan(ctx, windows)
+	}
+
+	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+
+	return result.([]time.Duration), nil
+}
+
 // RedirectedTargetsWithRetry returns the redirect targets already queued for the
 // account's delivery of the message identified by deliveryHash, read from the primary.
 func (rd *ResilientDatabase) RedirectedTargetsWithRetry(ctx context.Context, accountID int64, deliveryHash string) ([]string, error) {

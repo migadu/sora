@@ -40,6 +40,39 @@ func (db *Database) CountRedirectsSince(ctx context.Context, accountID int64, wi
 	return count, err
 }
 
+// RedirectRateWindowsOtherThan returns the redirect rate windows, shortest first and to the
+// second, that redirect_log rows still inside their window were charged under
+// (expires_at - redirect_date, see RecordRedirect) and that are none of windows. A node passes
+// its own windows: what comes back was charged by a server whose redirect_rate_window differs,
+// on which an account's limit is a different one (#1994). Rows written before migration 75
+// have no window and are not looked at.
+func (db *Database) RedirectRateWindowsOtherThan(ctx context.Context, windows []time.Duration) ([]time.Duration, error) {
+	seconds := make([]int64, len(windows))
+	for i, w := range windows {
+		seconds[i] = int64(w.Round(time.Second) / time.Second)
+	}
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
+		SELECT DISTINCT round(EXTRACT(EPOCH FROM expires_at - redirect_date))::bigint AS window_seconds
+		FROM redirect_log
+		WHERE expires_at > now()
+		AND round(EXTRACT(EPOCH FROM expires_at - redirect_date))::bigint <> ALL($1::bigint[])
+		ORDER BY window_seconds
+		LIMIT 10
+	`, seconds)
+	if err != nil {
+		return nil, err
+	}
+	other, err := pgx.CollectRows(rows, pgx.RowTo[int64])
+	if err != nil {
+		return nil, err
+	}
+	result := make([]time.Duration, len(other))
+	for i, s := range other {
+		result[i] = time.Duration(s) * time.Second
+	}
+	return result, nil
+}
+
 // RedirectedTargets returns the redirect targets the account's delivery of the message
 // identified by deliveryHash (see InsertMessageOptions.DeliveryHash) has already handed to
 // the relay, on LMTP or the Admin API. It reads the primary: the retry of a delivery can
