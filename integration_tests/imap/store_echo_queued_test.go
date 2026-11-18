@@ -210,7 +210,9 @@ func TestIMAP_StoreNotOvertakenByInFlightNotifyFetch(t *testing.T) {
 		require.NoError(t, err)
 		line = strings.TrimRight(line, "\r\n")
 		lines = append(lines, line)
-		if seenFlagsRe.MatchString(line) {
+		// The STORE's FETCH answer, not the mailbox FLAGS update announcing
+		// the new message's keyword, which also lists \Seen.
+		if strings.Contains(line, " FETCH ") && seenFlagsRe.MatchString(line) {
 			break
 		}
 	}

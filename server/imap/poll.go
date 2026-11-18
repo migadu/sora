@@ -145,6 +145,24 @@ func (s *IMAPSession) Poll(ctx context.Context, w *imapserver.UpdateWriter, allo
 		s.currentHighestModSeq.Store(next)
 	}
 
+	// A keyword the client has not been told the mailbox uses is announced in a
+	// FLAGS response (RFC 3501 §5.2, §7.2.6), queued ahead of the EXPUNGE, EXISTS
+	// and FETCH updates of this poll so that it precedes the unsolicited FETCH
+	// showing the keyword, and is delivered even by a FETCH/STORE/SEARCH poll
+	// that has to hold an EXPUNGE back: FLAGS carries no sequence numbers. A
+	// STORE's own FETCH answer is written by the command, before this poll.
+	// PERMANENTFLAGS lists no keywords (at most \*), so it does not change
+	// with them (#2042).
+	if s.announcedFlags != nil {
+		if flags := mailboxFlagsWithNewKeywords(s.announcedFlags, poll.Updates); flags != nil {
+			if err := s.mailboxTracker.QueueMailboxFlags(flags); err != nil {
+				s.WarnLog("failed to queue mailbox FLAGS update", "mailbox_id", mailboxID, "error", err)
+			} else {
+				s.announcedFlags = flags
+			}
+		}
+	}
+
 	// A count increase is deliberately NOT queued here: it is queued by the final
 	// reconciliation below, after the expunges. Ordering is load-bearing twice over.
 	//
