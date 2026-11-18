@@ -1949,10 +1949,10 @@ This message has no recipients.
 	})
 
 	t.Run("DeliverMail_RecipientsFromToCcBccOnly", func(t *testing.T) {
-		// TODO(#1992): see report. Without a recipients field the handler delivers to
+		// TODO(#2052): without a recipients field the handler delivers to
 		// every address helpers.ExtractRecipients finds, which includes From, Sender and
 		// Reply-To; docs/ADMIN_API.md says To, Cc and Bcc.
-		t.Skip("/admin/mail/deliver also delivers to the From/Sender/Reply-To addresses; see report on #1992")
+		t.Skip("/admin/mail/deliver also delivers to the From/Sender/Reply-To addresses; see #2052")
 
 		// A local sender: the message must reach testEmail only, not come back to it.
 		resp, body := server.makeRequest(t, "POST", "/admin/mail/deliver", map[string]any{
