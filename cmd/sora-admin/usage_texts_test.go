@@ -314,7 +314,7 @@ func TestUsageTextsMatchTheCode(t *testing.T) {
 
 	t.Run("connections kick --all is not offered", func(t *testing.T) {
 		check(t, help("connections", "--help"), nil, []string{"--all"})
-		err := kickConnections(context.Background(), AdminConfig{}, "", "IMAP", "", "", false, true)
+		err := kickConnections(context.Background(), AdminConfig{}, "", "IMAP", true)
 		if err == nil {
 			t.Fatal("kick without --user succeeded")
 		}
