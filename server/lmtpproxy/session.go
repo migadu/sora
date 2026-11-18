@@ -329,11 +329,10 @@ func (s *Session) handleConnection() {
 				continue
 			}
 			// Only "<>" is the null reverse-path (RFC 5321 section 4.1.2). One the proxy
-			// cannot read (among them a quoted local part with a space, which the
-			// space-split arguments cut short) is refused with a sora backend's reply,
-			// before the parameters as there, and starts no transaction. Sent on as
-			// "MAIL FROM:<>", it would have the message delivered as a bounce.
-			sender, ok := s.extractAddress(fromParam)
+			// cannot read is refused with a sora backend's reply, before the parameters
+			// as there, and starts no transaction. Sent on as "MAIL FROM:<>", it would
+			// have the message delivered as a bounce.
+			sender, ok := extractReversePath(fromParam)
 			if !ok {
 				s.InfoLog("MAIL refused for an unreadable reverse-path", "from", fromParam)
 				s.sendResponse("501 5.5.2 Was expecting MAIL arg syntax of FROM:<address>")
@@ -1146,6 +1145,42 @@ func extractAddressString(param string) (address string, ok bool) {
 	}
 
 	return candidate, true
+}
+
+// extractReversePath is extractAddress for the reverse-path of MAIL. It also reads a
+// path in angle brackets whose quoted local part holds a space, `<"john doe"@example.org>`,
+// which go-smtp reads and a sora backend accepts (server.NewReversePath, #1907); forwarded
+// between its angle brackets, go-smtp on the backend reads the quoted string to its
+// closing quote. A space anywhere else, an angle bracket inside the path, and every other
+// refusal of extractAddress stand. A forward-path is read by extractAddress alone.
+func extractReversePath(param string) (address string, ok bool) {
+	if address, ok := extractAddressString(param); ok {
+		return address, true
+	}
+	param = strings.TrimSpace(param)
+	if len(param) < 4 || param[0] != '<' || param[len(param)-1] != '>' || hasASCIIControl(param) {
+		return "", false
+	}
+	address = param[1 : len(param)-1]
+	if address[0] != '"' || strings.ContainsAny(address, "<>") {
+		return "", false
+	}
+	escaped := false
+	for i := 1; i < len(address); i++ {
+		switch {
+		case escaped:
+			escaped = false
+		case address[i] == '\\':
+			escaped = true
+		case address[i] == '"':
+			domain, found := strings.CutPrefix(address[i+1:], "@")
+			if !found || domain == "" || strings.ContainsAny(domain, ` "`) {
+				return "", false
+			}
+			return address, true
+		}
+	}
+	return "", false
 }
 
 func unquoteWholeString(str string) (string, bool) {

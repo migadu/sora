@@ -17,7 +17,11 @@ func TestUnreadableReversePathRefused(t *testing.T) {
 	for _, tt := range []struct{ name, from string }{
 		{"no closing bracket", "<foo"},
 		{"one character", "x"},
-		{"quoted local part with space", `<"john doe"@example.org>`},
+		// A space inside a quoted local part is read (TestLenientReversePathForwarded),
+		// one outside it is not.
+		{"space after quoted local part", `<"john doe" @example.org>`},
+		{"space in domain after quoted local part", `<"john doe"@exa mple.org>`},
+		{"quoted local part without domain", `<"john doe">`},
 		{"spaces inside brackets", "< a@example.org >"},
 		// Not "<>": a quoted string is a local part (section 4.1.2), and this one has
 		// no domain. A sora backend answers it as the other cases here.
