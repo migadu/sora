@@ -239,9 +239,10 @@ type VacationOracle interface {
 // persistent storage for redirect tracking.
 type RedirectOracle interface {
 	CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error)
-	// RecordRedirect charges one redirect against a limit of the given window. The record
-	// is kept until that window has passed, whichever node's cleaner prunes it.
-	RecordRedirect(ctx context.Context, accountID int64, window time.Duration) error
+	// RecordRedirect charges one redirect against a limit of the given window and size. The
+	// record is kept until that window has passed, whichever node's cleaner prunes it, and
+	// keeps both, so a node can tell redirects another node charged under other settings.
+	RecordRedirect(ctx context.Context, accountID int64, window time.Duration, limit int) error
 }
 
 type Executor interface {
@@ -482,6 +483,17 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// to time.Duration, which would overflow for large Sieve numbers.
 		days := max(1, min(vacation.Days, consts.MaxVacationDays))
 		duration := time.Duration(days) * 24 * time.Hour
+		// go-sieve skips a sender that is one of the :addresses only when the two are
+		// equal byte for byte (migadu/go-sieve#61). The envelope sender keeps the case
+		// it was sent with (#2101), so compare without case here: Me@example.com is
+		// still the user's own me@example.com, and gets no reply.
+		if slices.ContainsFunc(vacation.Addresses, func(own string) bool { return strings.EqualFold(own, sender) }) {
+			break
+		}
+		// The envelope sender keeps the case of its local part (#2101), but the :days
+		// window (RFC 5230 §4.2) is kept per sender compared in lower case, the key
+		// every window was stored under while the sender was lower-cased on the way in.
+		sender = strings.ToLower(sender)
 		allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.ResponseIdentity, duration)
 		if err != nil || !allowed {
 			// An oracle error must not fail the delivery; it costs this one reply.
@@ -598,9 +610,9 @@ func (p *SievePolicy) redirectRecorder() func(context.Context) error {
 	if oracle == nil || p.redirectRateLimit <= 0 {
 		return nil
 	}
-	accountID, window := p.AccountID, p.redirectRateWindow
+	accountID, window, limit := p.AccountID, p.redirectRateWindow, p.redirectRateLimit
 	return func(ctx context.Context) error {
-		return oracle.RecordRedirect(ctx, accountID, window)
+		return oracle.RecordRedirect(ctx, accountID, window, limit)
 	}
 }
 

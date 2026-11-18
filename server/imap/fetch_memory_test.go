@@ -105,7 +105,7 @@ func bodySectionsBeforeResponse(s *IMAPSession, bodyData *[]byte, bodyFetched *b
 	}
 	return func(w bodySectionWriter) error {
 		defer s.freeSectionCopies(sections.charged)
-		return writeBodySections(w, options, sections)
+		return writeBodySections(w, options, sections, nil)
 	}, nil
 }
 

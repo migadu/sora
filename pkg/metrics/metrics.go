@@ -397,6 +397,14 @@ var (
 		[]string{"reason"},
 	)
 
+	IMAPBodyNULReplaced = promauto.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "sora_body_section_nul_replaced_total",
+			Help: "Total FETCH BODY sections sent with their NUL octets replaced by 0x80",
+		},
+		[]string{"protocol"},
+	)
+
 	IMAPPreviewTotal = promauto.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "sora_imap_preview_total",

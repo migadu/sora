@@ -36,7 +36,7 @@ func handleConnectionsCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printConnectionsUsage()
 	default:
-		fmt.Printf("Unknown connections subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown connections subcommand: %s\n\n", subcommand)
 		printConnectionsUsage()
 		os.Exit(1)
 	}
@@ -55,7 +55,7 @@ func handleListConnections(ctx context.Context) {
 		fmt.Printf(`List active proxy connections
 
 Usage:
-  sora-admin connections list [options]
+  sora-admin --config PATH connections list [options]
 
 Options:
   --user string         Filter connections by user email
@@ -104,7 +104,7 @@ func handleKickConnections(ctx context.Context) {
 		fmt.Printf(`Force disconnect proxy connections via gossip protocol
 
 Usage:
-  sora-admin connections kick [options]
+  sora-admin --config PATH connections kick [options]
 
 Options:
   --user string         Kick all connections for specific user email (REQUIRED)
@@ -134,7 +134,7 @@ Examples:
 
 	// The kick is per account: the gossip broadcast carries the account, so --user is required
 	if *userEmail == "" {
-		fmt.Printf("Error: --user is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --user is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -151,7 +151,7 @@ Examples:
 			}
 		}
 		if !valid {
-			fmt.Printf("Error: Invalid protocol. Must be one of: %s\n\n", strings.Join(validProtocols, ", "))
+			fmt.Fprintf(os.Stderr, "Error: Invalid protocol. Must be one of: %s\n\n", strings.Join(validProtocols, ", "))
 			fs.Usage()
 			os.Exit(1)
 		}
@@ -183,7 +183,7 @@ func handleAffinityCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printAffinityUsage()
 	default:
-		fmt.Printf("Unknown affinity subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown affinity subcommand: %s\n\n", subcommand)
 		printAffinityUsage()
 		os.Exit(1)
 	}
@@ -200,7 +200,7 @@ func handleSetAffinity(ctx context.Context) {
 		fmt.Printf(`Set backend server affinity for a user
 
 Usage:
-  sora-admin affinity set [options]
+  sora-admin --config PATH affinity set [options]
 
 Options:
   --config string    Path to TOML configuration file (required)
@@ -222,7 +222,7 @@ Examples:
 
 	// Validate required arguments
 	if *userEmail == "" || *protocol == "" || *backendAddr == "" {
-		fmt.Printf("Error: --user, --protocol, and --backend are required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --user, --protocol, and --backend are required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -231,7 +231,7 @@ Examples:
 	validProtocols := map[string]bool{"imap": true, "pop3": true, "managesieve": true}
 	*protocol = strings.ToLower(*protocol)
 	if !validProtocols[*protocol] {
-		fmt.Printf("Error: protocol must be one of: imap, pop3, managesieve\n\n")
+		fmt.Fprintf(os.Stderr, "Error: protocol must be one of: imap, pop3, managesieve\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -269,7 +269,7 @@ func handleGetAffinity(ctx context.Context) {
 		fmt.Printf(`Get backend server affinity for a user
 
 Usage:
-  sora-admin affinity get [options]
+  sora-admin --config PATH affinity get [options]
 
 Options:
   --config string    Path to TOML configuration file (required)
@@ -287,7 +287,7 @@ Examples:
 
 	// Validate required arguments
 	if *userEmail == "" || *protocol == "" {
-		fmt.Printf("Error: --user, and --protocol are required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --user, and --protocol are required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -323,7 +323,7 @@ func handleListAffinity(ctx context.Context) {
 		fmt.Printf(`List backend server affinities
 
 Usage:
-  sora-admin affinity list [options]
+  sora-admin --config PATH affinity list [options]
 
 Options:
   --config string    Path to TOML configuration file (required)
@@ -389,7 +389,7 @@ func handleDeleteAffinity(ctx context.Context) {
 		fmt.Printf(`Delete backend server affinity for a user
 
 Usage:
-  sora-admin affinity delete [options]
+  sora-admin --config PATH affinity delete [options]
 
 Options:
   --config string    Path to TOML configuration file (required)
@@ -410,7 +410,7 @@ Examples:
 
 	// Validate required arguments
 	if *userEmail == "" || *protocol == "" {
-		fmt.Printf("Error: --user, and --protocol are required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --user, and --protocol are required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -437,7 +437,7 @@ func printConnectionsUsage() {
 	fmt.Printf(`Connection Management
 
 Usage:
-  sora-admin connections <subcommand> [options]
+  sora-admin --config PATH connections <subcommand> [options]
 
 Subcommands:
   list   List active proxy connections
@@ -456,7 +456,7 @@ func printAffinityUsage() {
 	fmt.Printf(`Manage user-to-backend affinity mappings (via gossip)
 
 Usage:
-  sora-admin affinity <subcommand> [options]
+  sora-admin --config PATH affinity <subcommand> [options]
 
 Subcommands:
   set      Set backend affinity for a user (gossiped to all nodes)

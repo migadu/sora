@@ -52,17 +52,17 @@ Examples:
 
 	fs.Parse(os.Args[3:])
 	if *batchSize <= 0 {
-		fmt.Println("Error: --batch-size must be positive")
+		fmt.Fprintln(os.Stderr, "Error: --batch-size must be positive")
 		os.Exit(1)
 	}
 	if *startAfter < 0 {
-		fmt.Println("Error: --start-after must not be negative")
+		fmt.Fprintln(os.Stderr, "Error: --start-after must not be negative")
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -70,13 +70,13 @@ Examples:
 	var accountID int64
 	if *email != "" {
 		if accountID, err = rdb.GetAccountIDByEmailWithRetry(ctx, *email); err != nil {
-			fmt.Printf("Failed to find account: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
 	if err := repairDriftedUnseen(ctx, rdb, accountID, *startAfter, *batchSize, *apply); err != nil {
-		fmt.Printf("Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }

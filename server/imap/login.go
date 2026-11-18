@@ -109,16 +109,6 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 	}
 	authStart := time.Now()
 
-	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
-	// Empty passwords are never valid under any condition
-	if password == "" {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeNo,
-			Code: imap.ResponseCodeAuthenticationFailed,
-			Text: "Authentication failed",
-		}
-	}
-
 	// Get the underlying net.Conn for proxy-aware rate limiting
 	netConn := s.conn.NetConn()
 
@@ -192,6 +182,20 @@ func (s *IMAPSession) login(ctx context.Context, address, password, authzid stri
 				return authFailedError()
 			}
 		}
+	}
+
+	// An empty password is a credential no account can have. Refused without a
+	// lookup, but, like an address that does not parse (below), as a failed login:
+	// recorded and counted, so a client sending it is slowed and blocked like one
+	// guessing passwords. No master password is empty, so this answers nothing
+	// about one.
+	if password == "" {
+		s.InfoLog("login refused: empty password")
+		metrics.AuthenticationAttempts.WithLabelValues("imap", s.server.name, s.server.hostname, "failure").Inc()
+		if s.server.authLimiter != nil {
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+		}
+		return authFailedError()
 	}
 
 	// Parse address with potential suffix (master username or remotelookup token)

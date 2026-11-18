@@ -62,28 +62,28 @@ Examples:
 
 	fs.Parse(os.Args[3:])
 	if fs.NArg() > 0 {
-		fmt.Printf("Error: unexpected argument %q\n\n", fs.Arg(0))
+		fmt.Fprintf(os.Stderr, "Error: unexpected argument %q\n\n", fs.Arg(0))
 		fs.Usage()
 		os.Exit(1)
 	}
 	if *batchSize <= 0 {
-		fmt.Println("Error: --batch-size must be positive")
+		fmt.Fprintln(os.Stderr, "Error: --batch-size must be positive")
 		os.Exit(1)
 	}
 	if *startAfter < 0 {
-		fmt.Println("Error: --start-after must not be negative")
+		fmt.Fprintln(os.Stderr, "Error: --start-after must not be negative")
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
 
 	if err := repairNullReferences(ctx, rdb, *startAfter, *batchSize, *apply); err != nil {
-		fmt.Printf("Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 }

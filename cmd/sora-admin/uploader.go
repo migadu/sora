@@ -37,7 +37,7 @@ func handleUploaderCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printUploaderUsage()
 	default:
-		fmt.Printf("Unknown uploader subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown uploader subcommand: %s\n\n", subcommand)
 		printUploaderUsage()
 		os.Exit(1)
 	}
@@ -54,7 +54,7 @@ func handleUploaderStatus(ctx context.Context) {
 		fmt.Printf(`Show uploader queue status and failed uploads
 
 Usage:
-  sora-admin uploader status [options]
+  sora-admin --config PATH uploader status [options]
 
 Options:
   --config string        Path to TOML configuration file (required)
@@ -96,7 +96,7 @@ func handleUploaderResolve(ctx context.Context) {
 		fmt.Printf(`Resolve failed uploads by checking S3 and repairing or removing stale records.
 
 Usage:
-  sora-admin uploader resolve [options]
+  sora-admin --config PATH uploader resolve [options]
 
 Options:
   --dry-run     Show what would be done without making changes (default: false)
@@ -331,7 +331,7 @@ func printUploaderUsage() {
 	fmt.Printf(`Upload Queue Management
 
 Usage:
-  sora-admin uploader <subcommand> [options]
+  sora-admin --config PATH uploader <subcommand> [options]
 
 Subcommands:
   status   Show uploader queue status and failed uploads

@@ -92,7 +92,9 @@ sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
 
 - Reports and tables go to standard output, and so does the usage `--help` prints, so
   `sora-admin <command> <subcommand> --help | less` works. Log lines (`INFO`, `WARN`, `ERROR`, with a
-  timestamp) go to standard error. `sora-admin` does not use the `[logging]` section.
+  timestamp) go to standard error, and so do error messages (`Error: --email is required`,
+  `Unknown command: ...`, `Failed to ...`). The usage printed after a usage error goes to
+  standard output, as for `--help`. `sora-admin` does not use the `[logging]` section.
 - The exit status is `0` on success and `1` on error. A few commands report problems but still
   exit `0`; this is noted where it applies (for example `verify s3`).
 - Ctrl+C (SIGINT) or SIGTERM cancels the running operation. Long operations such as imports stop

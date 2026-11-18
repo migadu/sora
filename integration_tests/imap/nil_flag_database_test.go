@@ -4,6 +4,7 @@ package imap_test
 
 import (
 	"context"
+	"slices"
 	"testing"
 
 	"github.com/migadu/go-imap"
@@ -11,12 +12,10 @@ import (
 	"github.com/migadu/sora/integration_tests/common"
 )
 
-// TestIMAP_NILFlagAlreadyInDatabase tests that NIL flags that already exist
-// in the database (stored before validation was added) are properly filtered
-// out when reading flags.
-//
-// This test simulates the scenario where NIL flags were stored in the database
-// before validation was implemented, ensuring they are filtered out on read.
+// TestIMAP_NILFlagAlreadyInDatabase tests that a NIL keyword already stored in
+// the database is returned on read. NIL is an atom, hence a valid keyword
+// (flag-keyword = atom, RFC 3501 §9 / RFC 9051 §9); earlier releases dropped it
+// on read, which lost a client's keyword (#2013).
 func TestIMAP_NILFlagAlreadyInDatabase(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -64,8 +63,8 @@ func TestIMAP_NILFlagAlreadyInDatabase(t *testing.T) {
 
 	uid := appendData.UID
 
-	// Now manually inject a NIL flag directly into the database to simulate
-	// a flag that was stored before validation was added
+	// Inject a NIL keyword directly into the database, as an earlier release
+	// that accepted it would have stored it
 	ctx := context.Background()
 
 	accountID, err := server.ResilientDB.GetAccountIDByAddressWithRetry(ctx, account.Email)
@@ -78,8 +77,6 @@ func TestIMAP_NILFlagAlreadyInDatabase(t *testing.T) {
 		t.Fatalf("Failed to get INBOX: %v", err)
 	}
 
-	// Directly update the database to add NIL as a custom flag
-	// This simulates what would happen if NIL was stored before validation
 	t.Log("Injecting NIL flag directly into database...")
 	_, err = server.ResilientDB.ExecWithRetry(ctx, `
 		UPDATE message_state
@@ -93,15 +90,13 @@ func TestIMAP_NILFlagAlreadyInDatabase(t *testing.T) {
 	t.Log("NIL flag injected. Re-selecting to update announced flags...")
 
 	// Re-select INBOX to update the announcedFlags with the new flags from database
-	// This simulates a fresh session that sees the NIL flag in the database
 	_, err = c.Select("INBOX", nil).Wait()
 	if err != nil {
 		t.Fatalf("Failed to re-select INBOX after injection: %v", err)
 	}
 
-	t.Log("Now fetching message to verify NIL is filtered out...")
+	t.Log("Now fetching message to verify NIL is returned...")
 
-	// Fetch the message flags - NIL should be filtered out
 	uidSet := imap.UIDSet{}
 	uidSet.AddNum(uid)
 
@@ -121,12 +116,8 @@ func TestIMAP_NILFlagAlreadyInDatabase(t *testing.T) {
 
 	t.Logf("Fetched flags: %v", fetchedFlags)
 
-	// Verify NIL is NOT in the flags
-	for _, flag := range fetchedFlags {
-		flagStr := string(flag)
-		if flagStr == "NIL" || flagStr == "$NIL" {
-			t.Errorf("❌ NIL flag was NOT filtered out! Flags: %v", fetchedFlags)
-		}
+	if !slices.Contains(fetchedFlags, imap.Flag("NIL")) {
+		t.Errorf("❌ stored keyword NIL was dropped on FETCH: %v", fetchedFlags)
 	}
 
 	// Verify valid flags are still present
@@ -148,7 +139,7 @@ func TestIMAP_NILFlagAlreadyInDatabase(t *testing.T) {
 		t.Errorf("❌ Valid flag $Another was incorrectly filtered out: %v", fetchedFlags)
 	}
 
-	// Also check SELECT FLAGS response - NIL should not appear there either
+	// The SELECT FLAGS response lists the keyword in use too
 	selectData, err := c.Select("INBOX", nil).Wait()
 	if err != nil {
 		t.Fatalf("Failed to re-select INBOX: %v", err)
@@ -156,12 +147,7 @@ func TestIMAP_NILFlagAlreadyInDatabase(t *testing.T) {
 
 	t.Logf("SELECT FLAGS: %v", selectData.Flags)
 
-	for _, flag := range selectData.Flags {
-		flagStr := string(flag)
-		if flagStr == "NIL" || flagStr == "$NIL" {
-			t.Errorf("❌ NIL flag appears in SELECT FLAGS response: %v", selectData.Flags)
-		}
+	if !slices.Contains(selectData.Flags, imap.Flag("NIL")) {
+		t.Errorf("❌ keyword NIL in use is missing from SELECT FLAGS: %v", selectData.Flags)
 	}
-
-	t.Log("✅ NIL flag successfully filtered from database - never exposed to client")
 }

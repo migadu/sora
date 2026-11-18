@@ -29,7 +29,7 @@ func TestRedirectRateWindowsOtherThan(t *testing.T) {
 		tx, err := database.GetWritePool().Begin(ctx)
 		require.NoError(t, err)
 		defer tx.Rollback(ctx)
-		require.NoError(t, database.RecordRedirect(ctx, tx, accountID, window))
+		require.NoError(t, database.RecordRedirect(ctx, tx, accountID, window, 100))
 		require.NoError(t, tx.Commit(ctx))
 	}
 	for _, window := range []time.Duration{local, longer, shorter, 0, passed} {
