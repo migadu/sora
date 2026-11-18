@@ -633,12 +633,13 @@ type MessageUIDSeq struct {
 // GetDeletedMessageUIDsAndSeqs efficiently retrieves only UIDs and sequence numbers
 // for messages with the \Deleted flag, optimized for EXPUNGE operations.
 // This avoids fetching unnecessary columns like body_structure and recipients_json.
-// An optional UID set restricts UID EXPUNGE. Its wildcards use the highest live UID
-// from the same snapshot as the deleted messages, including an undeleted tail.
-func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID int64, uidSets ...imap.UIDSet) ([]MessageUIDSeq, error) {
+// A non-nil restrict limits the result to that UID set (UID EXPUNGE); nil means
+// every \Deleted message (EXPUNGE). Its wildcards use the highest live UID from the
+// same snapshot as the deleted messages, including an undeleted tail.
+func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID int64, restrict *imap.UIDSet) ([]MessageUIDSeq, error) {
 	var uidSet imap.UIDSet
-	if len(uidSets) > 0 {
-		uidSet = uidSets[0]
+	if restrict != nil {
+		uidSet = *restrict
 		if len(uidSet) == 0 {
 			return nil, nil
 		}
@@ -688,7 +689,7 @@ func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID 
 		if err != nil {
 			return nil, err
 		}
-		if len(uidSets) > 0 && !uidSet.Contains(entry.UID) {
+		if restrict != nil && !uidSet.Contains(entry.UID) {
 			continue
 		}
 		results = append(results, entry)

@@ -293,7 +293,7 @@ func TestGetDeletedMessageUIDsAndSeqs(t *testing.T) {
 	require.NoError(t, err)
 
 	// Test 1: No deleted messages initially
-	results, err := db.GetDeletedMessageUIDsAndSeqs(ctx, mailboxID)
+	results, err := db.GetDeletedMessageUIDsAndSeqs(ctx, mailboxID, nil)
 	require.NoError(t, err)
 	assert.Empty(t, results, "Expected no deleted messages before any flags are set")
 
@@ -306,7 +306,7 @@ func TestGetDeletedMessageUIDsAndSeqs(t *testing.T) {
 	err = tx2.Commit(ctx)
 	require.NoError(t, err)
 
-	results, err = db.GetDeletedMessageUIDsAndSeqs(ctx, mailboxID)
+	results, err = db.GetDeletedMessageUIDsAndSeqs(ctx, mailboxID, nil)
 	require.NoError(t, err)
 	require.Len(t, results, 1, "Expected exactly one deleted message")
 	assert.Equal(t, firstUID, results[0].UID)
@@ -321,7 +321,7 @@ func TestGetDeletedMessageUIDsAndSeqs(t *testing.T) {
 	err = tx3.Commit(ctx)
 	require.NoError(t, err)
 
-	results, err = db.GetDeletedMessageUIDsAndSeqs(ctx, mailboxID)
+	results, err = db.GetDeletedMessageUIDsAndSeqs(ctx, mailboxID, nil)
 	require.NoError(t, err)
 	assert.Empty(t, results, "Already-expunged message must not appear in deleted UIDs")
 
@@ -334,7 +334,7 @@ func TestGetDeletedMessageUIDsAndSeqs(t *testing.T) {
 	err = tx4.Commit(ctx)
 	require.NoError(t, err)
 
-	results, err = db.GetDeletedMessageUIDsAndSeqs(ctx, mailboxID)
+	results, err = db.GetDeletedMessageUIDsAndSeqs(ctx, mailboxID, nil)
 	require.NoError(t, err)
 	require.Len(t, results, 1)
 	assert.Equal(t, imap.UID(secondUID), results[0].UID)
