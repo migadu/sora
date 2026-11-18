@@ -45,27 +45,36 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 	}
 	var fromFound, toFound, ccFound bool
 	for _, r := range recipients {
-		if r.IsGroupMarker() {
+		if r.GroupEnd {
 			continue
+		}
+		// A group start is an address whose addr-mailbox is the group name (RFC 3501
+		// §7.4.2), so a header that starts with a group has it as its first address:
+		// RFC 5256 §3 sorts FROM/TO/CC by that addr-mailbox, and RFC 5957 §3 sorts
+		// DISPLAYFROM/DISPLAYTO by it too, the group having no addr-name. A later group
+		// start has no name or address of its own, so extra() leaves it out.
+		email := r.EmailAddress
+		if r.Group != "" {
+			email = r.Group
 		}
 		switch r.AddressType {
 		case "from":
 			if fromFound {
 				extra(0, r.Name, r.EmailAddress)
 			} else {
-				fromNameSort, fromEmailSort, fromFound = bound(r.Name), bound(r.EmailAddress), true
+				fromNameSort, fromEmailSort, fromFound = bound(r.Name), bound(email), true
 			}
 		case "to":
 			if toFound {
 				extra(1, r.Name, r.EmailAddress)
 			} else {
-				toNameSort, toEmailSort, toFound = bound(r.Name), bound(r.EmailAddress), true
+				toNameSort, toEmailSort, toFound = bound(r.Name), bound(email), true
 			}
 		case "cc":
 			if ccFound {
 				extra(2, r.Name, r.EmailAddress)
 			} else {
-				ccEmailSort, ccFound = bound(r.EmailAddress), true
+				ccEmailSort, ccFound = bound(email), true
 				extra(2, r.Name)
 			}
 		}

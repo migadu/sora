@@ -622,7 +622,8 @@ limiter logs a refusal at debug level at most once a minute per account.
   keys use the `*_sort` columns, so sorting by From, To or Cc uses the first address only. `FROM`,
   `TO` and `CC` sort by the address's local part (the part before the last `@`, RFC 5256 §3);
   `DISPLAYFROM` and `DISPLAYTO` by the display name, or the address when there is none
-  (RFC 5957). A message without a `Date:` header sorts by its INTERNALDATE under `DATE`.
+  (RFC 5957). When a header starts with a group (`Cc: team: a@example.com;`), its first address
+  is the group start, so the header sorts by the group name (RFC 3501 §7.4.2). A message without a `Date:` header sorts by its INTERNALDATE under `DATE`.
   Strings are compared with the `i;unicode-casemap` collation (RFC 5256 §7): case is ignored and
   compatibility characters are decomposed, then the strings are compared byte by byte, never by
   the database's own collation. Ties are broken by ascending UID, also under `REVERSE`.
