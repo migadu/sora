@@ -2,6 +2,16 @@ package storage
 
 import (
 	"context"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"slices"
+	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -24,151 +34,274 @@ func TestS3Object_Structure(t *testing.T) {
 	assert.Equal(t, "d41d8cd98f00b204e9800998ecf8427e", obj.ETag)
 }
 
-// TestListObjects_ChannelClosure tests that channels are properly closed
-func TestListObjects_ChannelClosure(t *testing.T) {
-	// This is a unit test that doesn't require a real S3 connection
-	// It tests the channel behavior with a context cancellation
+// listingS3 answers ListObjectsV2 the way S3 does for the parameters ListObjects sends:
+// keys in lexical order, prefix, delimiter (keys below a further delimiter are common
+// prefixes, not objects) and pages of pageSize entries chained by continuation tokens.
+type listingS3 struct {
+	mu       sync.Mutex
+	keys     []string
+	pageSize int
+	failPage int // when > 0, the request for this page (1-based) and later ones answer NoSuchBucket
+	requests []url.Values
+}
 
-	// Skip if no S3 endpoint is configured
-	if testing.Short() {
-		t.Skip("Skipping S3 integration test in short mode")
+func newListingS3(t *testing.T, keys ...string) (*listingS3, *S3Storage) {
+	t.Helper()
+	isolateAWSEnvironment(t)
+	l := &listingS3{keys: slices.Sorted(slices.Values(keys)), pageSize: 1000}
+	srv := httptest.NewServer(l)
+	t.Cleanup(srv.Close)
+	s, err := New(srv.URL, "AKIDEXAMPLE", "secret", "mail", false, false, 5*time.Second)
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return l, s
+}
+
+func (l *listingS3) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if r.Method != http.MethodGet || q.Get("list-type") != "2" || strings.Trim(r.URL.Path, "/") != "mail" {
+		w.WriteHeader(http.StatusNotImplemented)
+		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
+	l.mu.Lock()
+	l.requests = append(l.requests, q)
+	page := len(l.requests)
+	fail := l.failPage > 0 && page >= l.failPage
+	keys, pageSize := l.keys, l.pageSize
+	l.mu.Unlock()
 
-	// We can't easily test the real ListObjects without S3, but we can
-	// verify the function signature and basic structure
-	_ = ctx
-	_ = cancel
+	if fail {
+		w.Header().Set("Content-Type", "application/xml")
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = io.WriteString(w, `<?xml version="1.0" encoding="UTF-8"?><Error><Code>NoSuchBucket</Code><Message>The specified bucket does not exist</Message></Error>`)
+		return
+	}
 
-	// This test is more of a documentation of expected behavior:
-	// 1. ListObjects should return two channels: objects and errors
-	// 2. Both channels should be closed when operation completes
-	// 3. Context cancellation should stop the listing operation
-	// 4. If an error occurs, it should be sent on the error channel
+	prefix, delimiter := q.Get("prefix"), q.Get("delimiter")
+	start := 0
+	if token := q.Get("continuation-token"); token != "" {
+		start, _ = strconv.Atoi(token)
+	}
 
-	t.Log("ListObjects returns two channels that are closed on completion")
-	t.Log("Context cancellation stops the listing operation")
-	t.Log("Errors are sent on the error channel")
-}
-
-// TestListObjects_Integration tests ListObjects with a real S3 backend
-// This test is skipped by default and requires S3 configuration
-func TestListObjects_Integration(t *testing.T) {
-	// Skip this test by default - it requires a real S3 backend
-	// To run: go test -v ./storage -run TestListObjects_Integration
-	t.Skip("Skipping integration test - requires real S3 backend")
-
-	// This test would require:
-	// 1. S3 endpoint, credentials, bucket
-	// 2. Setup: create test objects
-	// 3. Test: list with various prefixes
-	// 4. Verify: correct objects returned
-	// 5. Cleanup: delete test objects
-
-	// Example test structure:
-	/*
-		s3, err := New("s3.endpoint", "accessKey", "secretKey", "test-bucket", true, false)
-		require.NoError(t, err)
-
-		// Setup test objects
-		testPrefix := "test-prefix/"
-		testObjects := []string{
-			testPrefix + "file1.txt",
-			testPrefix + "file2.txt",
-			testPrefix + "subdir/file3.txt",
+	var b strings.Builder
+	var commonPrefixes []string
+	entries, next := 0, -1
+	for i := start; i < len(keys); i++ {
+		key := keys[i]
+		if !strings.HasPrefix(key, prefix) {
+			continue
 		}
-
-		for _, key := range testObjects {
-			err := s3.Put(key, strings.NewReader("test content"), 12)
-			require.NoError(t, err)
+		if entries == pageSize {
+			next = i
+			break
 		}
-
-		// Test recursive listing
-		ctx := context.Background()
-		objectCh, errCh := s3.ListObjects(ctx, testPrefix, true)
-
-		objects := []S3Object{}
-		for {
-			select {
-			case err := <-errCh:
-				if err != nil {
-					t.Fatal(err)
+		if delimiter != "" {
+			if j := strings.Index(key[len(prefix):], delimiter); j >= 0 {
+				cp := key[:len(prefix)+j+len(delimiter)]
+				if !slices.Contains(commonPrefixes, cp) {
+					commonPrefixes = append(commonPrefixes, cp)
+					entries++
 				}
-			case obj, ok := <-objectCh:
-				if !ok {
-					goto done
-				}
-				objects = append(objects, obj)
+				continue
 			}
 		}
-		done:
+		b.WriteString("<Contents><Key>")
+		_ = xml.EscapeText(&b, []byte(key))
+		fmt.Fprintf(&b, `</Key><Size>%d</Size><ETag>"etag-%d"</ETag><LastModified>2026-01-02T03:04:05.000Z</LastModified></Contents>`, len(key), i)
+		entries++
+	}
+	for _, cp := range commonPrefixes {
+		b.WriteString("<CommonPrefixes><Prefix>")
+		_ = xml.EscapeText(&b, []byte(cp))
+		b.WriteString("</Prefix></CommonPrefixes>")
+	}
 
-		assert.Len(t, objects, len(testObjects))
+	w.Header().Set("Content-Type", "application/xml")
+	fmt.Fprintf(w, `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>mail</Name><KeyCount>%d</KeyCount>`, entries)
+	if next >= 0 {
+		fmt.Fprintf(w, "<IsTruncated>true</IsTruncated><NextContinuationToken>%d</NextContinuationToken>", next)
+	} else {
+		_, _ = io.WriteString(w, "<IsTruncated>false</IsTruncated>")
+	}
+	_, _ = io.WriteString(w, b.String()+"</ListBucketResult>")
+}
 
-		// Cleanup
-		for _, key := range testObjects {
-			s3.Delete(key)
+func (l *listingS3) recordedRequests() []url.Values {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return slices.Clone(l.requests)
+}
+
+// listAll lists prefix and drains both channels the way the callers do, failing the
+// test instead of hanging it if the lister never closes them.
+func listAll(t *testing.T, s *S3Storage, prefix string, recursive bool) ([]S3Object, error) {
+	t.Helper()
+	objectCh, errCh := s.ListObjects(context.Background(), prefix, recursive)
+	var objects []S3Object
+	timeout := time.After(10 * time.Second)
+	for {
+		select {
+		case obj, ok := <-objectCh:
+			if !ok {
+				// The lister closes errCh before objectCh, keeping an error it sent.
+				return objects, <-errCh
+			}
+			objects = append(objects, obj)
+		case <-timeout:
+			t.Fatalf("ListObjects did not close its channels within 10s (%d objects so far)", len(objects))
 		}
-	*/
+	}
 }
 
-// TestListObjects_Prefix tests prefix filtering behavior
+func objectKeys(objects []S3Object) []string {
+	keys := make([]string, len(objects))
+	for i, o := range objects {
+		keys[i] = o.Key
+	}
+	return keys
+}
+
+var listingFixture = []string{
+	"example.com/user1/aaa",
+	"example.com/user1/bbb",
+	"example.com/user1/sub/ccc",
+	"example.com/user2/ddd",
+	"example.org/user1/eee",
+}
+
+// TestListObjects_Prefix: the prefix reaches S3 and only that prefix's objects come
+// back, with their size, ETag (unquoted) and modification time; an empty prefix lists
+// everything and an unknown one nothing.
 func TestListObjects_Prefix(t *testing.T) {
-	t.Skip("Skipping - requires real S3 backend for prefix testing")
+	l, s := newListingS3(t, listingFixture...)
 
-	// Test cases for prefix filtering:
-	// 1. Empty prefix lists all objects
-	// 2. Domain prefix lists only objects for that domain
-	// 3. Domain/user prefix lists only objects for that user
-	// 4. Non-existent prefix returns empty result
+	objects, err := listAll(t, s, "example.com/user1/", true)
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	assert.Equal(t, []string{"example.com/user1/aaa", "example.com/user1/bbb", "example.com/user1/sub/ccc"}, objectKeys(objects))
+	assert.Equal(t, "example.com/user1/", l.recordedRequests()[0].Get("prefix"))
+	if assert.NotEmpty(t, objects) {
+		assert.Equal(t, int64(len("example.com/user1/aaa")), objects[0].Size)
+		assert.Equal(t, "etag-0", objects[0].ETag)
+		assert.Equal(t, time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC), objects[0].LastModified)
+	}
+
+	objects, err = listAll(t, s, "", true)
+	if err != nil {
+		t.Fatalf("ListObjects with empty prefix: %v", err)
+	}
+	assert.Equal(t, listingFixture, objectKeys(objects))
+
+	objects, err = listAll(t, s, "example.net/", true)
+	if err != nil {
+		t.Fatalf("ListObjects with unknown prefix: %v", err)
+	}
+	assert.Empty(t, objects)
 }
 
-// TestListObjects_Recursive tests recursive vs non-recursive listing
+// TestListObjects_Recursive: recursive lists every nested object; non-recursive asks
+// S3 for a "/" delimiter, so a "directory" below the prefix is not listed as objects.
 func TestListObjects_Recursive(t *testing.T) {
-	t.Skip("Skipping - requires real S3 backend for recursive testing")
+	l, s := newListingS3(t, listingFixture...)
 
-	// Test cases:
-	// 1. recursive=true lists all nested objects
-	// 2. recursive=false lists only immediate children (directories as single entries)
+	objects, err := listAll(t, s, "example.com/user1/", true)
+	if err != nil {
+		t.Fatalf("recursive ListObjects: %v", err)
+	}
+	assert.Equal(t, []string{"example.com/user1/aaa", "example.com/user1/bbb", "example.com/user1/sub/ccc"}, objectKeys(objects))
+	assert.False(t, l.recordedRequests()[0].Has("delimiter"), "recursive listing sent a delimiter")
+
+	objects, err = listAll(t, s, "example.com/user1/", false)
+	if err != nil {
+		t.Fatalf("non-recursive ListObjects: %v", err)
+	}
+	assert.Equal(t, []string{"example.com/user1/aaa", "example.com/user1/bbb"}, objectKeys(objects))
+	assert.Equal(t, "/", l.recordedRequests()[1].Get("delimiter"))
 }
 
-// TestListObjects_ContextCancellation tests context cancellation
-func TestListObjects_ContextCancellation(t *testing.T) {
-	t.Skip("Skipping - requires real S3 backend for cancellation testing")
-
-	// Test that:
-	// 1. Cancelling context stops listing operation
-	// 2. Channels are properly closed
-	// 3. No goroutine leaks occur
-}
-
-// TestListObjects_ErrorHandling tests error scenarios
-func TestListObjects_ErrorHandling(t *testing.T) {
-	t.Skip("Skipping - requires real S3 backend for error testing")
-
-	// Test cases:
-	// 1. Invalid bucket name returns error on error channel
-	// 2. Network errors are reported
-	// 3. Permission errors are reported
-}
-
-// TestListObjects_EmptyBucket tests listing with no objects
+// TestListObjects_EmptyBucket: nothing to list closes both channels with no error.
 func TestListObjects_EmptyBucket(t *testing.T) {
-	t.Skip("Skipping - requires real S3 backend")
+	_, s := newListingS3(t)
 
-	// Test that:
-	// 1. Empty bucket returns no objects
-	// 2. Channels are properly closed
-	// 3. No errors are returned
+	objects, err := listAll(t, s, "", true)
+	if err != nil {
+		t.Fatalf("ListObjects on an empty bucket: %v", err)
+	}
+	assert.Empty(t, objects)
 }
 
-// TestListObjects_LargeResults tests handling of large result sets
+// TestListObjects_LargeResults: S3 answers at most 1000 keys per request; ListObjects
+// follows the continuation tokens until the listing is complete, in key order.
 func TestListObjects_LargeResults(t *testing.T) {
-	t.Skip("Skipping - requires real S3 backend and large dataset")
+	keys := make([]string, 2500)
+	for i := range keys {
+		keys[i] = fmt.Sprintf("example.com/user1/%064d", i)
+	}
+	l, s := newListingS3(t, keys...)
 
-	// Test that:
-	// 1. Handles pagination correctly (S3 returns max 1000 objects per request)
-	// 2. All objects are eventually returned
-	// 3. No memory leaks with large result sets
+	objects, err := listAll(t, s, "example.com/user1/", true)
+	if err != nil {
+		t.Fatalf("ListObjects: %v", err)
+	}
+	assert.Equal(t, keys, objectKeys(objects))
+
+	requests := l.recordedRequests()
+	if assert.Len(t, requests, 3, "expected one request per 1000-key page") {
+		assert.Empty(t, requests[0].Get("continuation-token"))
+		assert.Equal(t, "1000", requests[1].Get("continuation-token"))
+		assert.Equal(t, "2000", requests[2].Get("continuation-token"))
+	}
+}
+
+// TestListObjects_ErrorHandling: a failed request is reported on the error channel and
+// both channels close; objects from pages that did arrive are still delivered.
+func TestListObjects_ErrorHandling(t *testing.T) {
+	t.Run("FirstPage", func(t *testing.T) {
+		l, s := newListingS3(t, listingFixture...)
+		l.failPage = 1
+
+		objects, err := listAll(t, s, "", true)
+		if err == nil {
+			t.Fatal("ListObjects against a missing bucket reported no error")
+		}
+		assert.Contains(t, err.Error(), "NoSuchBucket")
+		assert.Empty(t, objects)
+	})
+
+	t.Run("LaterPage", func(t *testing.T) {
+		l, s := newListingS3(t, listingFixture...)
+		l.pageSize = 2
+		l.failPage = 2
+
+		objects, err := listAll(t, s, "", true)
+		if err == nil {
+			t.Fatal("a failed second page reported no error")
+		}
+		assert.Equal(t, listingFixture[:2], objectKeys(objects))
+	})
+}
+
+// TestListObjects_ContextCancellation: once the caller's context is cancelled the lister
+// stops and closes its channels, even if the caller no longer reads objects (the callers
+// in cmd/sora-admin verify.go and tls.go return on ctx.Done() without draining).
+func TestListObjects_ContextCancellation(t *testing.T) {
+	// TODO(#2053): the lister sends on the unbuffered objects channel without
+	// watching ctx, so once the caller stops reading its goroutine blocks forever.
+	t.Skip("ListObjects ignores cancellation while sending an object; see #2053")
+
+	_, s := newListingS3(t, listingFixture...)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	objectCh, errCh := s.ListObjects(ctx, "", true)
+	<-objectCh // the page has arrived; the lister is now sending the rest of it
+	cancel()
+
+	select {
+	case <-errCh: // closed (or carrying ctx.Err()) once the lister has returned
+	case <-time.After(5 * time.Second):
+		t.Fatal("ListObjects kept running after its context was cancelled and the caller stopped reading")
+	}
 }

@@ -7,42 +7,6 @@ import (
 	"github.com/migadu/sora/server"
 )
 
-// TestConcurrentMapWriteRaceBugRepro demonstrates the original bug
-// that occurs during server startup when multiple proxy servers try to
-// register their connection trackers simultaneously WITHOUT synchronization.
-//
-// This test SHOULD FAIL with -race detector and may panic with "concurrent map writes"
-//
-// Run with: go test -race -run TestConcurrentMapWriteRaceBugRepro
-func TestConcurrentMapWriteRaceBugRepro(t *testing.T) {
-	t.Skip("Skipping bug reproduction test - this is expected to fail/panic")
-
-	// Simulate the OLD BUGGY code: deps.connectionTrackers map WITHOUT mutex
-	connectionTrackers := make(map[string]*server.ConnectionTracker)
-
-	// Simulate multiple proxy servers starting concurrently
-	var wg sync.WaitGroup
-	protocols := []string{"IMAP", "POP3", "ManageSieve", "LMTP", "UserAPI"}
-
-	for _, protocol := range protocols {
-		wg.Add(1)
-		go func(proto string) {
-			defer wg.Done()
-			// This simulates what happens in startDynamic*ProxyServer functions
-			// Line 1285, 1396, 1509, 1594, etc. - BUGGY VERSION
-			tracker := &server.ConnectionTracker{}
-			connectionTrackers[proto] = tracker // RACE CONDITION HERE
-		}(protocol)
-	}
-
-	wg.Wait()
-
-	// If we get here without panic, the race detector will still catch the issue
-	if len(connectionTrackers) != len(protocols) {
-		t.Errorf("Expected %d trackers, got %d", len(protocols), len(connectionTrackers))
-	}
-}
-
 // TestConcurrentMapWriteRaceFixed verifies the FIX works correctly
 // with proper mutex synchronization.
 //
