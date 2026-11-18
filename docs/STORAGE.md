@@ -837,8 +837,9 @@ minute is raised to 1 minute. In order, one cycle:
 5. **Vacation records.** Deletes records of vacation replies that can no longer stop a reply.
    These records stop a sender from getting a second reply within a vacation's `:days`. See
    [SIEVE.md](SIEVE.md).
-6. **Redirect log.** Deletes entries of the Sieve redirect rate limit older than
-   `grace_period`.
+6. **Redirect log.** Deletes entries of the Sieve redirect rate limit, and the records of which
+   LMTP deliveries were redirected where, older than `grace_period`. Until then a retried
+   delivery is not redirected again ([SIEVE.md](SIEVE.md#7-redirect)).
 7. **Health status.** Deletes health status rows not updated for `health_status_retention`
    (default 30 days; `0` keeps them).
 8. **Mailbox counters.** Repairs unseen counters that have drifted below zero.
@@ -1150,7 +1151,7 @@ An invalid duration or size in this section is logged as a warning and the defau
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `grace_period` | duration | `"14d"` | How long expunged mail and deleted accounts stay restorable. Also the minimum age before unuploaded mail can be reaped, and the age at which redirect log entries are deleted. |
+| `grace_period` | duration | `"14d"` | How long expunged mail and deleted accounts stay restorable. Also the minimum age before unuploaded mail can be reaped, and the age at which redirect log entries, and the records that keep a retried delivery from being redirected again, are deleted. |
 | `wake_interval` | duration | `"1h"` | How often the cleanup cycle runs. At least 1 minute. |
 | `max_age_restriction` | duration | none | Expunge messages whose row is older than this. Empty turns it off. |
 | `fts_retention` | duration | none (keep) | How long search vectors are kept. See [SEARCH.md](SEARCH.md). |
