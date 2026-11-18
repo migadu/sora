@@ -672,7 +672,8 @@ backend recovers, so their client does not jump back and forth.
   the same host.
 - An entry is dropped when its backend is no longer a member of the user's pool, is in maintenance,
   or is marked unhealthy. Unlike hashing and round robin, affinity does not give an unhealthy
-  backend another try after a minute.
+  backend another try after a minute: for affinity it stays unhealthy until a connection to it
+  succeeds, also when hashing or round robin has meanwhile given it its retry.
 - A lookup pin never uses affinity, and the mail proxies do not set it for a pinned user. The User
   API proxy records the pinned backend as the user's `userapi` affinity, which only matters if the
   API later stops pinning that user. It does not set affinity for login and token refresh
@@ -702,7 +703,8 @@ Proxies do not probe backends. They learn from their own connection attempts:
 - After **3 consecutive failures** the member is marked unhealthy. Hashing and round robin skip it.
 - **1 minute** after its last failure, hashing and round robin give it another try. A successful
   connection marks it healthy and resets the count.
-- Affinity does not use that one-minute retry ([section 6.2](#62-affinity)).
+- Affinity does not use that one-minute retry: only a successful connection makes the member
+  usable through affinity again ([section 6.2](#62-affinity)).
 - A pinned `server` that is not one of the proxy's own backends is tracked the same way,
   separately. While a pinned backend (of either kind) is marked unhealthy, logins pinned to it fail
   at once, until its one-minute retry.
