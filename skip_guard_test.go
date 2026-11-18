@@ -14,9 +14,9 @@ import (
 // skipIssueRef is how an always-skipped test names the open issue that keeps it skipped.
 var skipIssueRef = regexp.MustCompile(`#[0-9]+\b`)
 
-// TestNoUnconditionallySkippedTests: no Test function starts with a t.Skip, t.Skipf or
-// t.SkipNow outside a condition, because such a test never runs and its failures go
-// unseen (#1992). Skipping on testing.Short(), an environment variable, the OS and so
+// TestNoUnconditionallySkippedTests: no Test function, and no subtest (a func literal
+// passed to t.Run), starts with a t.Skip, t.Skipf or t.SkipNow outside a condition,
+// because such a test never runs and its failures go unseen (#1992, #2102). Skipping on testing.Short(), an environment variable, the OS and so
 // on is fine: the skip then sits inside an if. A test that must stay skipped until a
 // defect is fixed names the open issue in its skip message ("see #1234"), and the fix
 // removes the skip. Every git-tracked test file is parsed, whatever its build tags, so
@@ -72,9 +72,22 @@ func TestShort(t *testing.T) {
 }
 func TestNotFirst(t *testing.T) { t.Helper(); t.Skip("not the first statement") }
 func TestSub(t *testing.T) {
-	t.Run("x", func(t *testing.T) { t.Skip("subtests are not checked") })
+	for _, name := range []string{"a", "b"} {
+		t.Run(name, func(st *testing.T) { st.Skip("not implemented") })
+	}
+	t.Run("short", func(t *testing.T) {
+		if testing.Short() {
+			t.Skip("short")
+		}
+	})
+	t.Run("issue", func(t *testing.T) { t.Skip("see #2052") })
+	t.Run("named", namedSubtest)
 }
-func helper(t *testing.T)     { t.Skip("not a test") }
+func helper(t *testing.T) {
+	t.Skip("not a test")
+	t.Run("in a helper", func(t *testing.T) { t.SkipNow() })
+}
+func BenchmarkSub(b *testing.B) { b.Run("x", func(b *testing.B) { b.Skip("benchmark") }) }
 func BenchmarkX(b *testing.B) { b.Skip("not a test") }
 func TestOther(t *testing.T)  { other.Skip("someone else's Skip") }
 `
@@ -82,7 +95,7 @@ func TestOther(t *testing.T)  { other.Skip("someone else's Skip") }
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"TestBare", "TestBareSkipf", "TestBareSkipNow"}
+	want := []string{"TestBare", "TestBareSkipf", "TestBareSkipNow", "TestSub subtest name", "helper subtest \"in a helper\""}
 	if len(got) != len(want) {
 		t.Fatalf("got %q, want %q", got, want)
 	}
@@ -94,8 +107,9 @@ func TestOther(t *testing.T)  { other.Skip("someone else's Skip") }
 }
 
 // unconditionallySkippedTests parses one test file and returns "file:line:col: TestName"
-// for each Test function whose first statement is a skip on its own *testing.T and whose
-// skip message names no issue.
+// for each Test function, and "file:line:col: Func subtest <name>" for each func literal
+// passed to t.Run in any function, whose first statement is a skip on its own
+// *testing.T and whose skip message names no issue.
 func unconditionallySkippedTests(path string, src []byte) ([]string, error) {
 	fset := token.NewFileSet()
 	f, err := parser.ParseFile(fset, path, src, parser.SkipObjectResolution)
@@ -103,25 +117,45 @@ func unconditionallySkippedTests(path string, src []byte) ([]string, error) {
 		return nil, err
 	}
 	var found []string
-	for _, decl := range f.Decls {
-		fn, ok := decl.(*ast.FuncDecl)
-		if !ok || fn.Recv != nil || fn.Body == nil || len(fn.Body.List) == 0 || !strings.HasPrefix(fn.Name.Name, "Test") {
-			continue
+	// check records body when its first statement is an unconditional skip on tName.
+	check := func(ft *ast.FuncType, body *ast.BlockStmt, what string) {
+		tName := testingTParam(ft)
+		if tName == "" || body == nil || len(body.List) == 0 {
+			return
 		}
-		tName := testingTParam(fn.Type)
-		if tName == "" {
-			continue
-		}
-		call := skipCall(fn.Body.List[0], tName)
+		call := skipCall(body.List[0], tName)
 		if call == nil {
-			continue
+			return
 		}
 		// The message's source text, so a message built with + is read whole.
-		args := src[fset.Position(call.Lparen).Offset:fset.Position(call.Rparen).Offset]
-		if skipIssueRef.Match(args) {
+		if skipIssueRef.Match(src[fset.Position(call.Lparen).Offset:fset.Position(call.Rparen).Offset]) {
+			return
+		}
+		found = append(found, fset.Position(call.Pos()).String()+": "+what)
+	}
+	for _, decl := range f.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
 			continue
 		}
-		found = append(found, fset.Position(call.Pos()).String()+": "+fn.Name.Name)
+		if fn.Recv == nil && strings.HasPrefix(fn.Name.Name, "Test") {
+			check(fn.Type, fn.Body, fn.Name.Name)
+		}
+		// Subtests: t.Run(name, func(t *testing.T) { ... }), wherever they are started.
+		ast.Inspect(fn.Body, func(n ast.Node) bool {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || len(call.Args) != 2 {
+				return true
+			}
+			if sel, ok := call.Fun.(*ast.SelectorExpr); !ok || sel.Sel.Name != "Run" {
+				return true
+			}
+			if lit, ok := call.Args[1].(*ast.FuncLit); ok {
+				name := src[fset.Position(call.Args[0].Pos()).Offset:fset.Position(call.Args[0].End()).Offset]
+				check(lit.Type, lit.Body, fn.Name.Name+" subtest "+string(name))
+			}
+			return true
+		})
 	}
 	return found, nil
 }
