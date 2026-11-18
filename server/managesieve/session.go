@@ -558,6 +558,18 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 		}
 	}
 
+	// An empty password is a credential no account can have: refused without a
+	// lookup, but as a failed login, recorded and counted like an address that does
+	// not parse (below). No master password is empty.
+	if password == "" {
+		s.InfoLog("login refused: empty password")
+		if s.server.authLimiter != nil {
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+		}
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+		return errAuthFailed
+	}
+
 	address, err := server.NewAddress(username)
 	if err != nil {
 		s.DebugLog("invalid address", "error", err)
