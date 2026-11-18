@@ -476,8 +476,9 @@ func New(appCtx context.Context, name, hostname, addr string, s3 *storage.S3Stor
 
 	// SMTPUTF8 (RFC 6531): advertise the extension and accept its MAIL parameter, so an
 	// internationalized envelope (non-ASCII local part, U-label domain) is delivered
-	// instead of bounced with a syntax error. server.NewAddress validates the UTF-8 of
-	// every address; go-smtp only parses the delimiters around it.
+	// instead of bounced with a syntax error. server.NewAddress (NewReversePath for the
+	// sender) validates the UTF-8 of every address; go-smtp only parses the delimiters
+	// around it.
 	s.EnableSMTPUTF8 = true
 
 	// Connection admission (at accept): LMTP is internal-only, so when trusted_networks
@@ -609,10 +610,15 @@ func (b *LMTPServerBackend) NewSession(c *smtp.Conn) (smtp.Session, error) {
 	// the pre-reset session that was discarded. Applying them here rewrites RemoteIP to the
 	// real client and populates ForwardingParams (HELO/LOGIN/PROTO) on the session that
 	// actually delivers, so the Received: trace and logs name the client, not the proxy.
+	//
+	// go-smtp records the attributes after its own checks (a trusted_networks peer, valid
+	// values) and before calling the hook, so they stay recorded even when the hook refuses
+	// the command. Neither hook refusal can disagree with those checks: its trust check
+	// passes for every peer go-smtp trusts (the same socket peer and trusted_networks, or
+	// with proxy_protocol any peer the PROXY reader admitted), and the session lock fails
+	// only once the connection is closing, when no further session is created.
 	if xd := c.XCLIENTData(); len(xd) > 0 {
-		// Attributes the XCLIENT hook refused stay recorded on the Conn; they are
-		// refused here as well and leave this session with the peer's own address.
-		_ = s.applyXCLIENTAttrs(xd)
+		s.applyXCLIENTAttrs(xd)
 	}
 
 	s.Id = idgen.New()

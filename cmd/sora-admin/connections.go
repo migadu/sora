@@ -95,9 +95,6 @@ func handleKickConnections(ctx context.Context) {
 
 	userEmail := fs.String("user", "", "Kick all connections for specific user email")
 	protocol := fs.String("protocol", "", "Kick connections using specific protocol (IMAP, POP3, ManageSieve)")
-	server := fs.String("server", "", "Kick connections to specific server")
-	clientAddr := fs.String("client", "", "Kick connection from specific client address")
-	all := fs.Bool("all", false, "Kick all active connections")
 	confirm := fs.Bool("confirm", false, "Skip confirmation prompt")
 	yes := fs.Bool("y", false, "Skip confirmation prompt (alias for --confirm)")
 
@@ -135,9 +132,9 @@ Examples:
 		logger.Fatalf("Error parsing flags: %v", err)
 	}
 
-	// Validate that at least one filter is specified
-	if *userEmail == "" && *protocol == "" && *server == "" && *clientAddr == "" && !*all {
-		fmt.Printf("Error: At least one filtering option must be specified\n\n")
+	// The kick is per account: the gossip broadcast carries the account, so --user is required
+	if *userEmail == "" {
+		fmt.Printf("Error: --user is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -162,7 +159,7 @@ Examples:
 
 	// Kick connections
 	autoConfirm := *yes || *confirm
-	if err := kickConnections(ctx, globalConfig, *userEmail, *protocol, *server, *clientAddr, *all, autoConfirm); err != nil {
+	if err := kickConnections(ctx, globalConfig, *userEmail, *protocol, autoConfirm); err != nil {
 		logger.Fatalf("Failed to kick connections: %v", err)
 	}
 }
@@ -689,19 +686,10 @@ func listConnections(ctx context.Context, cfg AdminConfig, userEmail, domain, pr
 	return nil
 }
 
-func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol, serverAddr, clientAddr string, all, autoConfirm bool) error {
+func kickConnections(ctx context.Context, cfg AdminConfig, userEmail, protocol string, autoConfirm bool) error {
 	// Gossip-based kick requires user email (we need accountID)
-	if userEmail == "" && !all {
+	if userEmail == "" {
 		return fmt.Errorf("--user is required for gossip-based kick")
-	}
-
-	// serverAddr and clientAddr filtering not supported with gossip
-	if serverAddr != "" || clientAddr != "" {
-		return fmt.Errorf("--server and --client filtering not supported with gossip-based tracking")
-	}
-
-	if all {
-		return fmt.Errorf("--all not yet implemented for gossip-based tracking (kick users individually)")
 	}
 
 	// Confirm if not auto-confirmed

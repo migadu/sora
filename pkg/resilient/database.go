@@ -155,6 +155,9 @@ type RuntimeFailoverManager struct {
 	healthCheckStop    chan struct{}
 	healthCheckWg      sync.WaitGroup
 	mu                 sync.RWMutex
+	// sharedAccessOff is applied to every pool's database, including one a
+	// reconnect adds later (SetSharedMailboxAccess). Guarded by mu.
+	sharedAccessOff bool
 }
 
 // readPoolsAreDistinct reports whether the read pools are replicas rather than the
@@ -475,6 +478,21 @@ func (rd *ResilientDatabase) withTimeout(ctx context.Context, opType timeoutType
 	}
 
 	return context.WithTimeout(ctx, timeout)
+}
+
+// SetSharedMailboxAccess sets whether every pool serves other owners' shared
+// mailboxes ([shared_mailboxes] enabled); see db.Database.SetSharedMailboxAccess.
+// A pool a reconnect adds later gets the same setting.
+func (rd *ResilientDatabase) SetSharedMailboxAccess(enabled bool) {
+	fm := rd.failoverManager
+	fm.mu.Lock()
+	defer fm.mu.Unlock()
+	fm.sharedAccessOff = !enabled
+	for _, pools := range [][]*DatabasePool{fm.writePools, fm.readPools} {
+		for _, p := range pools {
+			p.database.SetSharedMailboxAccess(enabled)
+		}
+	}
 }
 
 func (rd *ResilientDatabase) GetDatabase() *db.Database {
@@ -1542,6 +1560,7 @@ func (rd *ResilientDatabase) attemptReconnectFailedHosts(ctx context.Context) {
 		dbPool.isHealthy.Store(true)
 
 		fm.mu.Lock()
+		pool.SetSharedMailboxAccess(!fm.sharedAccessOff)
 		if failed.poolType == "write" {
 			// Keep the slices in sync while write hosts also serve reads, without
 			// appending into a backing array that readPools may still share.

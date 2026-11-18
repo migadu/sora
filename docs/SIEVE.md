@@ -349,7 +349,9 @@ See [section 8](#8-vacation).
 
 ## 6. Errors, limits and timeouts
 
-A Sieve problem never makes delivery fail. Sora keeps the message instead.
+A Sieve problem never makes delivery fail. Sora keeps the message instead. The one exception is
+a user script that cannot be read: Sora defers the message rather than deliver it without the
+user's rules.
 
 | What goes wrong | What Sora does |
 |---|---|
@@ -358,7 +360,7 @@ A Sieve problem never makes delivery fail. Sora keeps the message instead.
 | The script runs longer than `[sieve] max_execution_time` | Same as a run-time error. |
 | The interpreter panics | Recovered and handled as a run-time error, so the LMTP connection stays up. |
 | The default script fails at run time | Logs `default sieve script evaluation error`; the message is kept in INBOX unless the user script decides otherwise. |
-| Reading the active script from the database fails | The default script's result is used. |
+| Reading the active script from the database fails | Logs `failed to get active sieve script` at warning level and defers the message: LMTP answers `451 4.3.0`, the Admin API reports a transient error, and the MTA retries. Nothing is stored, redirected or replied to. An account without an active script is not an error; the default script's result is used. |
 
 Every run, default or user, is counted in `sora_sieve_executions_total{protocol, result}` with
 `result` `success` or `failure`.
@@ -454,6 +456,17 @@ redirect actions in one run make the run fail, and the message is then handled a
 A redirect is handed to the relay only after the delivery has stored every copy it stores. A
 delivery that fails (`451` on LMTP, an error from the Admin API) relays nothing, so the sender's
 retry relays each address once.
+
+An LMTP delivery that succeeded can be delivered again: the MTA retries it when it did not see
+the `250` (the connection was lost after the reply). The stored copy is recognised and not stored
+twice, and so are the redirects: Sora records each address a delivery handed to the relay queue,
+keyed by the account and the message bytes as received, and a later delivery of the same bytes on
+any node skips those addresses (logged as `sieve redirect already queued by an earlier attempt of
+this delivery, skipping`). A different message that shares the `Message-ID` is redirected as
+usual. The records are kept for `[cleanup] grace_period` or the longest `redirect_rate_window`,
+whichever is longer ([STORAGE.md](STORAGE.md#11-the-cleanup-cycle)). An address is recorded after it was queued, so
+a node that stops in between, or a record that cannot be written (logged as a warning), means the
+retry redirects the message again rather than not at all.
 
 If the relay queue cannot take an address, the message is not redirected to that address; it still
 goes to the others. Sora logs a warning with the address (`redirect_to`) and the error:
@@ -652,7 +665,7 @@ in `fields` (for example `sieve.enabled_extensions`). At startup, and in
 | Key | Server types | Default | Meaning |
 |---|---|---|---|
 | `limits.redirect_rate_limit` | `lmtp`, `http_admin_api` | `100` | Redirected addresses allowed per account per window. `0` means no limit. |
-| `limits.redirect_rate_window` | `lmtp`, `http_admin_api` | `"1h"` | The window for the limit above. Zero or a negative value stops startup (use `redirect_rate_limit = 0` to turn the limit off). A value that does not parse falls back to `1h` with a log line. |
+| `limits.redirect_rate_window` | `lmtp`, `http_admin_api` | `"1h"` | The window for the limit above. Zero or a negative value stops startup (use `redirect_rate_limit = 0` to turn the limit off). A value that does not parse falls back to `1h` with a log line. The cleaner keeps redirect records for this window or `[cleanup] grace_period`, whichever is longer ([STORAGE.md](STORAGE.md#11-the-cleanup-cycle)). |
 | `limits.max_redirect_hops` | `lmtp`, `http_admin_api` | `2` | How many times Sora may redirect one message, counted in `X-Sora-Loop`. `1` allows one redirect. `0` means no limit; `Delivered-To` loop detection still applies. |
 | `max_script_size` | `managesieve` | `"16kb"` | Largest script ManageSieve accepts. Reloads on `SIGHUP`. |
 | `supported_extensions` | `managesieve_proxy` | the default set | Extensions the proxy advertises before login. |
@@ -707,6 +720,7 @@ Useful log lines (LMTP session logs carry the session and message fields):
 | `sieve message discarded` | info | Nothing was stored. |
 | `failed to get/create sieve executor` | warn | The stored script does not compile; it was skipped. |
 | `user sieve script evaluation error` | warn | The script failed at run time or timed out. |
+| `failed to get active sieve script` | warn | The account's active script could not be read from the database; the delivery was deferred with `451 4.3.0`. |
 | `Sieve fileinto "<name>" is unavailable or has no insert right; keeping in INBOX` | warn | `fileinto` named a missing folder, the shared namespace root, or a shared folder without the `i` right. |
 | `sieve set invalid IMAP keywords, dropped` | warn | A flag name was not a valid IMAP keyword. |
 | `mail loop detected via Delivered-To, rejecting` | warn | A redirect loop was refused with 550. |

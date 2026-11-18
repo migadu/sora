@@ -875,6 +875,8 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 	if opts != nil && opts.SharedMailboxes != nil {
 		testConfig.SharedMailboxes = *opts.SharedMailboxes
 	}
+	// As cmd/sora does: with sharing off, other owners' shared mailboxes are not served.
+	rdb.SetSharedMailboxAccess(testConfig.SharedMailboxes.Enabled)
 
 	server, err := imap.New(
 		context.Background(),
@@ -947,11 +949,17 @@ func SetupLMTPServerWithIdleTimeout(t *testing.T, idleTimeout time.Duration) (*T
 // a test needs enabled.
 func SetupLMTPServerWithOptions(t *testing.T, options lmtp.LMTPServerOptions) (*TestServer, TestAccount) {
 	t.Helper()
+	return SetupLMTPServerWithDatabase(t, SetupTestDatabase(t), options)
+}
+
+// SetupLMTPServerWithDatabase is SetupLMTPServerWithOptions on the given database, for a
+// test that needs database settings of its own (a short query_timeout, say).
+func SetupLMTPServerWithDatabase(t *testing.T, rdb *resilient.ResilientDatabase, options lmtp.LMTPServerOptions) (*TestServer, TestAccount) {
+	t.Helper()
 	if options.MaintenanceGate == nil {
 		options.MaintenanceGate = soraserver.NewMaintenanceGate(false)
 	}
 
-	rdb := SetupTestDatabase(t)
 	account := CreateTestAccount(t, rdb)
 	address := GetRandomAddress(t)
 

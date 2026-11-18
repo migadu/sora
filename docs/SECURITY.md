@@ -343,9 +343,9 @@ LMTP:
 
 Notes:
 
-- On `pop3` and `managesieve` backends, `command_timeout = "0"` does not turn the idle timer off. The
-  protocol library then uses its own default: 10 minutes for POP3, 30 minutes for ManageSieve. On
-  the other types, `0` turns the idle timer off (before login, `auth_idle_timeout` still applies).
+- On `pop3` and `managesieve` backends, `command_timeout = "0"` does not turn the idle timer off: it
+  means the type's default, 10 minutes for POP3 and 3 minutes for ManageSieve. On the other types,
+  `0` turns the idle timer off (before login, `auth_idle_timeout` still applies).
 - `command_timeout`, `absolute_session_timeout` and `min_bytes_per_minute` reload on SIGHUP for the
   six IMAP, POP3 and ManageSieve types, and `auth_idle_timeout` for the three proxies. Reloaded values
   apply to connections accepted afterwards.

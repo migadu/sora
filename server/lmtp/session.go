@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,7 +41,14 @@ var defaultSieveScript = delivery.DefaultSieveScript
 // limit, and reports whether all of them went; abort drops the ones still held.
 // arrivedHops is the redirect hop count of the message before the script's header
 // edits; every outgoing copy is stamped one above it.
-func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Result, arrivedHops int, fullMessageBytes []byte) (commit func() bool, abort func(), allHeld bool) {
+//
+// deliveryHash identifies the upstream submission (InsertMessageOptions.DeliveryHash).
+// A target an earlier attempt of the same delivery already handed over (an MTA retry
+// whose 250 was lost, maybe on another node) is skipped and counts as held, the way
+// the stored copy of such a retry is absorbed; commit records each target it hands
+// over, after handing it over, so a crash or a failed record errs toward relaying the
+// message again rather than not at all.
+func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Result, arrivedHops int, fullMessageBytes []byte, deliveryHash string) (commit func() bool, abort func(), allHeld bool) {
 	type heldRedirect struct {
 		to     string
 		commit func() error
@@ -61,7 +69,15 @@ func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Resu
 			// User.Address is the script owner's primary address, even for aliases.
 			// Replace earlier or sender-supplied attribution on the outgoing copy only.
 			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
+			queued, err := s.backend.rdb.RedirectedTargetsWithRetry(ctx, s.AccountID(), deliveryHash)
+			if err != nil {
+				s.WarnLog("could not check for redirects queued by an earlier attempt, queuing all", "error", err)
+			}
 			for _, redirectTo := range result.RedirectTo {
+				if slices.Contains(queued, redirectTo) {
+					s.InfoLog("sieve redirect already queued by an earlier attempt of this delivery, skipping", "redirect_to", redirectTo)
+					continue
+				}
 				commit, abort, err := s.backend.relayQueue.Hold(s.sender.FullAddress(), redirectTo, "redirect", relayBytes)
 				if err != nil {
 					// Delivery goes on: the message is kept in INBOX unless a fileinto
@@ -89,6 +105,9 @@ func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Resu
 			}
 			s.DebugLog("successfully queued message for relay delivery", "redirect_to", h.to)
 			s.notifyRelayWorker()
+			if err := s.backend.rdb.RecordRedirectDeliveryWithRetry(ctx, s.AccountID(), deliveryHash, h.to); err != nil {
+				s.WarnLog("failed to record a queued redirect, a retry of this delivery would queue it again", "redirect_to", h.to, "error", err)
+			}
 			// Only a queued redirect counts against the rate limit.
 			if result.RecordRedirect != nil {
 				if err := result.RecordRedirect(ctx); err != nil {
@@ -205,9 +224,9 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 		fromAddress = server.Address{} // Empty address for null sender
 		s.DebugLog("null sender accepted (bounce message)")
 	} else {
-		// Normal sender - validate address
+		// Normal sender - validate address, as leniently as go-smtp parsed it (#1907)
 		var err error
-		fromAddress, err = server.NewAddress(from)
+		fromAddress, err = server.NewReversePath(from)
 		if err != nil {
 			s.WarnLog("invalid from address", "from", from, "error", err)
 			recordMetrics("failure")
@@ -303,7 +322,7 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	s.DebugLog("processing rcpt to command", "to", to)
 
-	toAddress, err := server.NewAddress(to)
+	toAddress, err := server.NewForwardPath(to)
 	if err != nil {
 		s.WarnLog("invalid to address", "error", err)
 		recordMetrics("failure")
@@ -354,6 +373,10 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 				Message:      "No such user here",
 			}
 		}
+		if reply := s.rcptContextError(ctx, err, "user lookup"); reply != nil {
+			recordMetrics("failure")
+			return reply
+		}
 		// Database error (connection failure, timeout, etc.) - temporary failure
 		s.WarnLog("database error during user lookup", "address", lookupAddress, "error", err)
 		recordMetrics("failure")
@@ -368,24 +391,9 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	// (master-DB pinning) value. Ensure default mailboxes exist.
 	err = s.backend.rdb.CreateDefaultMailboxesWithRetry(ctx, AccountID)
 	if err != nil {
-		// Context error: distinguish the RCPT execution cap firing on a
-		// healthy-but-slow server from client disconnect / server shutdown.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if reply := s.rcptContextError(ctx, err, "mailbox creation"); reply != nil {
 			recordMetrics("failure")
-			if commandTimedOut(ctx) {
-				s.WarnLog("mailbox creation timed out", "cap", "rcpt")
-				return &smtp.SMTPError{
-					Code:         451,
-					EnhancedCode: smtp.EnhancedCode{4, 4, 3},
-					Message:      "Recipient validation timed out, please try again later",
-				}
-			}
-			s.InfoLog("mailbox creation cancelled due to server shutdown")
-			return &smtp.SMTPError{
-				Code:         421,
-				EnhancedCode: smtp.EnhancedCode{4, 2, 1},
-				Message:      "service shutting down",
-			}
+			return reply
 		}
 		recordMetrics("failure")
 		// The reply text reaches the sender in a delay or bounce notice: the database
@@ -398,23 +406,9 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	// User.Address should always be the primary address (not the recipient with +alias)
 	primaryAddr, err := s.backend.rdb.GetPrimaryEmailForAccountWithRetry(readCtx, AccountID)
 	if err != nil {
-		// Context error: RCPT cap timeout vs disconnect/shutdown (see above).
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if reply := s.rcptContextError(ctx, err, "primary email fetch"); reply != nil {
 			recordMetrics("failure")
-			if commandTimedOut(ctx) {
-				s.WarnLog("primary email fetch timed out", "cap", "rcpt")
-				return &smtp.SMTPError{
-					Code:         451,
-					EnhancedCode: smtp.EnhancedCode{4, 4, 3},
-					Message:      "Recipient validation timed out, please try again later",
-				}
-			}
-			s.InfoLog("primary email fetch cancelled due to server shutdown")
-			return &smtp.SMTPError{
-				Code:         421,
-				EnhancedCode: smtp.EnhancedCode{4, 2, 1},
-				Message:      "service shutting down",
-			}
+			return reply
 		}
 		s.WarnLog("failed to get primary email", "recipient_account_id", AccountID, "error", err)
 		recordMetrics("failure")
@@ -477,6 +471,32 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	}
 	recordMetrics("success")
 	return nil
+}
+
+// rcptContextError answers an RCPT step that failed because the command's context
+// ended: the RCPT timeout ran out on a healthy but slow server (451, the MTA retries),
+// or the session is ending by server shutdown or client disconnect (421). It returns
+// nil for any other error, including a context error of the database layer's own
+// per-query timeout while the command's context is still live: that is a database
+// failure for the caller's own reply.
+func (s *LMTPSession) rcptContextError(ctx context.Context, err error, step string) error {
+	if ctx.Err() == nil || !(errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+		return nil
+	}
+	if commandTimedOut(ctx) {
+		s.WarnLog(step+" timed out", "cap", "rcpt")
+		return &smtp.SMTPError{
+			Code:         451,
+			EnhancedCode: smtp.EnhancedCode{4, 4, 3},
+			Message:      "Recipient validation timed out, please try again later",
+		}
+	}
+	s.InfoLog(step + " cancelled due to server shutdown")
+	return &smtp.SMTPError{
+		Code:         421,
+		EnhancedCode: smtp.EnhancedCode{4, 2, 1},
+		Message:      "service shutting down",
+	}
 }
 
 func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
@@ -697,6 +717,33 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	activeScript, err := s.backend.rdb.GetActiveScriptWithRetry(readCtx, s.AccountID())
+	if err != nil && !errors.Is(err, consts.ErrDBNotFound) {
+		// A script that could not be read is not "no script": delivering with the
+		// default script alone would skip the user's fileinto, redirect, vacation and
+		// discard. Defer the message so the MTA retries once the database answers.
+		recordMetrics("failure")
+		if ctx.Err() != nil {
+			// The DATA cap fired, or the client went away / the server is shutting
+			// down: the same replies as a cancelled message save.
+			if commandTimedOut(ctx) {
+				s.WarnLog("active sieve script load timed out", "cap", "data")
+				return &smtp.SMTPError{
+					Code:         451,
+					EnhancedCode: smtp.EnhancedCode{4, 3, 0},
+					Message:      "Message processing timed out, please try again later",
+				}
+			}
+			s.InfoLog("active sieve script load cancelled due to server shutdown")
+			return &smtp.SMTPError{
+				Code:         421,
+				EnhancedCode: smtp.EnhancedCode{4, 2, 1},
+				Message:      "service shutting down",
+			}
+		}
+		// The reply text reaches the sender in a delay notice: the error stays in the log.
+		s.WarnLog("failed to get active sieve script", "error", err)
+		return s.InternalError("failed to load the recipient's Sieve script")
+	}
 	var result sieveengine.Result
 
 	// Create an adapter for the VacationOracle interface
@@ -807,11 +854,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			}
 		}
 	} else {
-		if err != nil && err != consts.ErrDBNotFound {
-			s.DebugLog("failed to get active sieve script", "error", err)
-		} else {
-			s.DebugLog("no active script found, using default script result")
-		}
+		s.DebugLog("no active script found, using default script result")
 	}
 
 	// Apply header edits if any (RFC 5293 - editheader extension)
@@ -856,14 +899,16 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// keeps the message in INBOX when nothing else stores it, and a delivery that fails
 	// is retried by the sender, so a redirect handed over before the failure would be
 	// relayed again by every retry. Whatever is not handed over when this delivery
-	// returns is dropped; the retry holds it again.
+	// returns is dropped; the retry holds it again. What was handed over is recorded
+	// against deliveryHash, so the retry of a delivery whose 250 the MTA did not see
+	// does not hand it over a second time (#1912).
 	//
 	// The hop count is the one the message arrived with, before the script's header
 	// edits, which RedirectAllowed checked: an editheader script may delete X-Sora-Loop
 	// (RFC 5293 §6 leaves which fields it may delete to local policy), and a count read
 	// after its edits would restart on every pass and never reach max_redirect_hops.
 	arrivedHops := helpers.RedirectHopCount(helpers.HeaderGetter(sieveCtx.Header))
-	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, arrivedHops, fullMessageBytes)
+	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, arrivedHops, fullMessageBytes, deliveryHash)
 	defer abortRedirects()
 	redirectFailed := !allHeld
 	destinations := result.Destinations(redirectFailed)
@@ -905,15 +950,9 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		filePath, err = s.backend.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
 		if err != nil {
 			recordMetrics("failure")
-			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
-				// The spool disk is full or read-only: RFC 3463 4.3.1 "mail system full" is
-				// the reply MTAs understand as "back off, storage", not a server error.
+			if reply := spoolFullReply(err); reply != nil {
 				s.WarnLog("spool disk cannot take the message", "error", err)
-				return &smtp.SMTPError{
-					Code:         452,
-					EnhancedCode: smtp.EnhancedCode{4, 3, 1},
-					Message:      "Insufficient system storage, please try again later",
-				}
+				return reply
 			}
 			// The error names spool files, and the reply text reaches the sending MTA
 			// (and can end up in a bounce): log it and answer with the cause only.
@@ -1018,7 +1057,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		// silently committed (commit ambiguity), in which case the upload
 		// worker still needs the file. Cleanup is the uploader's
 		// cleanupOrphanedFiles job either way.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		//
+		// Only when the DATA command's own context has ended: the database layer's
+		// per-query timeout (query_timeout) also yields context.DeadlineExceeded, and
+		// while the command is still live that is a slow database, answered with the
+		// temporary failure below, not "service shutting down".
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			if filePath != nil {
 				s.DebugLog("keeping file for cleanup job after cancellation", "content_hash", contentHash)
 			}
@@ -1052,10 +1096,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		}
 		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
 		recordMetrics("failure")
-		// The reply text reaches the sender in a delay or bounce notice: the folder the
-		// recipient's script files into and the database error stay in the log.
-		s.WarnLog("failed to save message", "mailbox", mailbox, "error", err)
-		return s.InternalError("failed to save message")
+		return s.saveFailedReply(mailbox, err)
 	}
 	resolvedDestinations, resolveErr := delivery.ResolveSieveDestinations(ctx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), result, redirectFailed, func(format string, args ...any) {
 		s.WarnLog(fmt.Sprintf(format, args...))
@@ -1220,6 +1261,33 @@ func (s *LMTPSession) fixedFieldsLog(logFn func(msg string, keysAndValues ...any
 	return func(msg string, keysAndValues ...any) {
 		logFn(msg, append([]any{"protocol", protocol, "session", s.Id}, keysAndValues...)...)
 	}
+}
+
+// spoolFullReply is the reply for staging that failed because the spool disk is full or
+// read-only: RFC 3463 4.3.1 "mail system full" is the reply MTAs understand as "back off,
+// storage", not a server error. It is nil for any other error.
+func spoolFullReply(err error) *smtp.SMTPError {
+	if !errors.Is(err, syscall.ENOSPC) && !errors.Is(err, syscall.EROFS) {
+		return nil
+	}
+	return &smtp.SMTPError{
+		Code:         452,
+		EnhancedCode: smtp.EnhancedCode{4, 3, 1},
+		Message:      "Insufficient system storage, please try again later",
+	}
+}
+
+// saveFailedReply is the reply for a message that could not be stored in mailbox.
+func (s *LMTPSession) saveFailedReply(mailbox string, err error) error {
+	// Staging the body for a shared mailbox's owner writes to the same spool disk.
+	if reply := spoolFullReply(err); reply != nil {
+		s.WarnLog("spool disk cannot take the message", "mailbox", mailbox, "error", err)
+		return reply
+	}
+	// The reply text reaches the sender in a delay or bounce notice: the folder the
+	// recipient's script files into and the database error stay in the log.
+	s.WarnLog("failed to save message", "mailbox", mailbox, "error", err)
+	return s.InternalError("failed to save message")
 }
 
 // InternalError is the reply for a server-side failure while handling ONE message: a

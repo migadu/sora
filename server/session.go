@@ -15,7 +15,7 @@ type ConnectionStatsProvider interface {
 type Session struct {
 	Id       string
 	RemoteIP string // Real client IP (from PROXY protocol or direct connection)
-	ProxyIP  string // Proxy IP (only set when connection comes through PROXY protocol)
+	ProxyIP  string // Proxy IP (set when a PROXY header or a trusted forwarder replaced RemoteIP)
 	*User
 	HostName   string
 	ServerName string // Name of the server instance (e.g., "imap0", "pop3-backend")

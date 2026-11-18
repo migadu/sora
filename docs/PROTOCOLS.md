@@ -893,6 +893,9 @@ The list is the same before and after login.
   trusted peers (section 7.5).
 - After login: `CAPA`, `STAT`, `LIST`, `UIDL`, `RETR`, `TOP`, `DELE`, `RSET`, `NOOP`, `LANG`, `UTF8`
   and `QUIT`. `UTF8` is also accepted after login, because some clients send it then.
+- `UTF8` (RFC 6856) changes nothing. Addresses and passwords may contain UTF-8 with or without it,
+  and `RETR` and `TOP` send messages as stored either way, also to a client that never sent `UTF8`
+  (no surrogate, no `-ERR [UTF8]`).
 - `APOP` is not supported: `-ERR Unknown command: APOP`. `LAST` gets `-ERR LAST is obsolete (RFC 1939)`.
 - `AUTH` supports only `PLAIN`, with or without an initial response.
 
@@ -1031,11 +1034,22 @@ Other replies before a transaction:
 
 ### 8.3 Envelope
 
-- `MAIL FROM:<>` (the null sender) is accepted. Any other sender must be a valid address, or the
-  reply is `553 5.1.7 Invalid sender`. A `MAIL` command that does not parse at all gets
-  `501 5.5.2 Was expecting MAIL arg syntax of FROM:<address>`.
+- `MAIL FROM:<>` (the null sender) is accepted. Any other sender must be an address, or the
+  reply is `553 5.1.7 Invalid sender`. The sender is read as leniently as Postfix reads it with its default
+  `strict_rfc821_envelopes = no`: leading, trailing and consecutive dots in the local part
+  (`first..last@example.com`), a quoted local part (`"john doe"@example.com`, `"a@b"@example.com`),
+  a domain without a dot (`user@localhost`) and an address literal (`user@[192.0.2.1]`) are
+  accepted. The `user@domain@SUFFIX` form of a master login has no meaning in an envelope address:
+  the last `@` starts the domain. A sender with a
+  control character, a malformed domain, or over the length limits of a recipient is refused. A
+  `MAIL` command that does not parse at all gets
+  `501 5.5.2 Was expecting MAIL arg syntax of FROM:<address>`. The LMTP proxy passes these
+  senders on to the backend as written. Recipients are not read leniently.
 - A recipient that is not a valid address gets `553 5.1.3 Invalid recipient address syntax`, or
-  `501 5.1.3 Was expecting RCPT arg syntax of TO:<address>` when the command does not parse.
+  `501 5.1.3 Was expecting RCPT arg syntax of TO:<address>` when the command does not parse. A
+  recipient with more than one `@` (a quoted local part such as `"a@b.example"@example.com`, or
+  `user@example.com@SUFFIX`) is not a valid address; the LMTP proxy answers it
+  `550 5.1.3 Bad destination mailbox address syntax`.
   Addresses are compared in lower case.
 - One recipient per transaction. A second `RCPT` gets `452 4.5.3 Maximum limit of 1 recipients reached`,
   and the MTA sends it in a new transaction.

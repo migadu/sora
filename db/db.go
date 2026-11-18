@@ -130,6 +130,9 @@ type Database struct {
 	fetchChunkSize int // Number of messages to fetch per chunk for large result sets
 	// The open AdvisoryLockTx on WritePool, which a failover fences (FenceAdvisoryLocks).
 	advisoryLocks advisoryLockFence
+	// sharedAccessOff hides other owners' shared mailboxes ([shared_mailboxes]
+	// enabled = false); see SetSharedMailboxAccess. The zero value serves them.
+	sharedAccessOff atomic.Bool
 }
 
 // mailboxLockStripes is the size of the per-mailbox mutex table. A mailbox always

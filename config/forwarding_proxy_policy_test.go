@@ -57,9 +57,9 @@ addr = "127.0.0.1:4190"
 `
 
 	tests := []struct {
-		name      string
-		toml      string
-		wantSub   []string // substrings that must all appear in the single warning; nil = want 0 warnings
+		name    string
+		toml    string
+		wantSub []string // substrings that must all appear in the single warning; nil = want 0 warnings
 	}{
 		{
 			name: "server imap_proxy alongside [[pool]] is never consulted",
