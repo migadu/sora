@@ -289,14 +289,15 @@ func (s *POP3Session) authenticateUser(ctx context.Context, identity, username, 
 
 	// Credentials no account can have: an empty password, or a user name or password
 	// that is not valid UTF-8 (RFC 6856 section 2.2: "The server MUST reject UTF-8
-	// usernames or passwords that fail to comply with the formal syntax in UTF-8").
-	// Refused without a lookup, but, like a user name that does not parse (below), as
+	// usernames or passwords that fail to comply with the formal syntax in UTF-8"),
+	// or an AUTH PLAIN authorization identity that is not (RFC 4616 section 2 makes
+	// every field of the message UTF-8). Refused without a lookup, but, like a user name that does not parse (below), as
 	// a failed login: recorded and counted, so a client sending garbage is slowed and
 	// blocked like one guessing passwords. Valid UTF-8 is compared as sent, without
 	// SASLprep. None of them can be the master SASL password, so this answers
 	// nothing about it.
-	if password == "" || !utf8.ValidString(username) || !utf8.ValidString(password) {
-		s.InfoLog("login refused: empty password, or user name or password not valid UTF-8")
+	if password == "" || !utf8.ValidString(identity) || !utf8.ValidString(username) || !utf8.ValidString(password) {
+		s.InfoLog("login refused: empty password, or credentials not valid UTF-8")
 		if s.server.authLimiter != nil {
 			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
 		}

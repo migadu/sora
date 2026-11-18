@@ -517,6 +517,12 @@ Because PLAIN carries the password in clear, Sora refuses these commands on an u
 connection unless plaintext logins are allowed on that listener
 ([SECURITY.md](SECURITY.md#2-tls-and-plaintext-logins)).
 
+RFC 4616 defines every field of a PLAIN message (authorization identity, authentication identity,
+password) as UTF-8. On every listener above, a PLAIN message with a field that is not valid UTF-8
+names no account: it gets the bad-credentials reply (section 6) before anything is looked up, and
+counts as a failed login, like a name that does not parse (section 3). The POP3 proxy refuses any
+authorization identity other than the authentication identity before the lookup anyway.
+
 On the IMAP backend, `AUTH=PLAIN` cannot be removed with `disabled_caps` or a `client_filters` entry.
 Sora logs a warning for such an entry and keeps advertising the mechanism wherever logins are
 allowed.
