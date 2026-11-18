@@ -91,3 +91,38 @@ func TestLMTP_VacationAndRedirectKeepSenderLocalPart(t *testing.T) {
 		})
 	}
 }
+
+// TestLMTP_VacationOwnAddressIgnoresSenderCase: the sender keeps the case it was sent
+// with (#2101), and a sender that is one of the script's :addresses still gets no reply
+// when the two differ only in case.
+func TestLMTP_VacationOwnAddressIgnoresSenderCase(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	rdb := common.SetupTestDatabase(t)
+	ctx := context.Background()
+	rq := &captureRelayQueue{}
+	addr := startTestLMTPServerWithRedirect(t, rdb, rq, 100, time.Hour)
+
+	account := common.CreateTestAccount(t, rdb)
+	accountID, err := rdb.GetAccountIDByAddressWithRetry(ctx, account.Email)
+	if err != nil {
+		t.Fatalf("account id: %v", err)
+	}
+	setActiveSieveScript(t, rdb, accountID, `require ["vacation"]; vacation :days 1 :addresses ["me@example.com"] "Away.";`)
+
+	stamp := time.Now().UnixNano()
+	msg := strings.Join([]string{
+		"From: Me@example.com",
+		"To: " + account.Email,
+		fmt.Sprintf("Subject: hello %d", stamp),
+		fmt.Sprintf("Message-ID: <%d@example.com>", stamp),
+		"", "body",
+	}, "\r\n")
+	if resp := deliverLMTPRaw(t, addr, "Me@example.com", account.Email, msg); !strings.HasPrefix(resp, "250") {
+		t.Fatalf("delivery %s", resp)
+	}
+	for _, it := range rq.items() {
+		if it.msgType == "vacation" {
+			t.Errorf("vacation replied to %q, one of the script's own :addresses", it.to)
+		}
+	}
+}

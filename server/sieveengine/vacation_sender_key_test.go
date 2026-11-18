@@ -53,3 +53,38 @@ func TestVacationKeyedByLowerCasedSender(t *testing.T) {
 		}
 	}
 }
+
+// A sender that is one of the script's own :addresses gets no reply, whatever the case
+// of either (#2101): the sender now keeps the case it was sent with, and go-sieve skips
+// only a sender equal to an address byte for byte (migadu/go-sieve#61), so
+// Me@example.com must still be the user's own me@example.com.
+func TestVacationOwnAddressesIgnoreCase(t *testing.T) {
+	for _, tt := range []struct {
+		from      string
+		addresses string
+		reply     bool
+	}{
+		{"Me@example.com", `["me@example.com"]`, false},
+		{"me@example.com", `["ME@Example.COM"]`, false},
+		{`"Me Too"@example.com`, `["\"me too\"@example.com"]`, false},
+		{"someone@example.com", `["me@example.com"]`, true},
+	} {
+		compiled, err := CompileScript(`require "vacation"; vacation :days 1 :addresses `+tt.addresses+` "Away.";`, EffectiveExtensions(nil))
+		if err != nil {
+			t.Fatal(err)
+		}
+		oracle := &recordingVacationOracle{}
+		result, err := compiled.NewExecutor(1, oracle, nil, 0, 0, 0).Evaluate(context.Background(), Context{
+			EnvelopeFrom: tt.from,
+			EnvelopeTo:   "jane@example.com",
+			Header:       map[string][]string{"to": {"jane@example.com"}},
+			Message:      bodyOnly("hello"),
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got := result.Vacation != nil; got != tt.reply {
+			t.Errorf("from %s, :addresses %s: reply %v, want %v", tt.from, tt.addresses, got, tt.reply)
+		}
+	}
+}
