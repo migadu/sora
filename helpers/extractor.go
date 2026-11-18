@@ -52,3 +52,27 @@ func ExtractRecipients(header message.Header) []Recipient {
 
 	return recipients
 }
+
+// ExtractEnvelopeRecipients returns the addresses a message is sent to: its To, Cc and
+// Bcc header addresses, in that order, each once (compared case-insensitively, the
+// spelling first seen is kept). It stands in for the envelope of a delivery that names
+// no recipients. ExtractRecipients, for the recipients metadata, also lists From,
+// Sender and Reply-To, which are not recipients.
+func ExtractEnvelopeRecipients(header message.Header) []string {
+	var addresses []string
+	seen := make(map[string]struct{})
+	for _, r := range ExtractRecipients(header) {
+		switch r.AddressType {
+		case "to", "cc", "bcc":
+		default:
+			continue
+		}
+		key := strings.ToLower(r.EmailAddress)
+		if _, dup := seen[key]; dup {
+			continue
+		}
+		seen[key] = struct{}{}
+		addresses = append(addresses, r.EmailAddress)
+	}
+	return addresses
+}

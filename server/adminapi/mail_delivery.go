@@ -183,12 +183,9 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract recipients from message if not provided
+	// Without recipients, deliver to the message's To, Cc and Bcc addresses, each once
 	if len(req.Recipients) == 0 {
-		recipients := helpers.ExtractRecipients(messageEntity.Header)
-		for _, r := range recipients {
-			req.Recipients = append(req.Recipients, r.EmailAddress)
-		}
+		req.Recipients = helpers.ExtractEnvelopeRecipients(messageEntity.Header)
 	}
 
 	// Trim and validate recipients
