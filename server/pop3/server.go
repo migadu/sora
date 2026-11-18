@@ -249,7 +249,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		logger.Info("POP3: Using default idle timeout (RFC 1939 §3)", "name", name, "timeout", commandTimeout)
 	}
 
-	// Ephemeral-storage retention drives the CAPA EXPIRE value (RFC 2449 §5.1);
+	// Ephemeral-storage retention drives the CAPA EXPIRE value (RFC 2449 §6.7);
 	// 0 means messages are kept forever (EXPIRE NEVER).
 	var maxMessageAge time.Duration
 	if options.Config != nil {
@@ -368,6 +368,20 @@ var knownCommands = map[string]bool{
 	"UTF8": true, "LANG": true, "LAST": true, "XCLIENT": true,
 }
 
+// expireParam is the CAPA EXPIRE argument for a message retention (RFC 2449
+// §6.7): NEVER when messages are kept forever, otherwise the retention in whole
+// days rounded down. An empty result omits EXPIRE for positive sub-day retention:
+// 0 forbids leaving mail on the server, while 1 promises at least a day.
+func expireParam(maxMessageAge time.Duration) string {
+	if maxMessageAge <= 0 {
+		return "NEVER"
+	}
+	if maxMessageAge < 24*time.Hour {
+		return ""
+	}
+	return strconv.Itoa(int(maxMessageAge / (24 * time.Hour)))
+}
+
 // buildLibServer constructs the go-pop3 protocol server from the current
 // runtime settings. It is called at startup and again from ReloadConfig so
 // SIGHUP-reloaded timeouts apply to new connections (existing connections keep
@@ -376,12 +390,10 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 	settings := s.settings.Load()
 
 	// Build custom capabilities based on config. Ephemeral-storage retention
-	// drives the CAPA EXPIRE value (RFC 2449 §5.1).
+	// drives the CAPA EXPIRE value (RFC 2449 §6.7).
 	var caps []pop3.Capability
-	if s.maxMessageAge <= 0 {
-		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{"NEVER"}})
-	} else {
-		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{strconv.Itoa(int(s.maxMessageAge.Hours() / 24))}})
+	if param := expireParam(s.maxMessageAge); param != "" {
+		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{param}})
 	}
 	caps = append(caps, pop3.Capability{Name: "AUTH-RESP-CODE"})
 	caps = append(caps, pop3.Capability{Name: "IMPLEMENTATION", Params: []string{"Sora-POP3-Server"}})
