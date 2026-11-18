@@ -72,11 +72,11 @@ This command shows:
   - Proxy backend health status (with --backends flag)
 
 Examples:
-  sora-admin health status
-  sora-admin health status --hostname server1.example.com
-  sora-admin health status --component database --detailed
-  sora-admin health status --backends
-  sora-admin health status --json
+  sora-admin health status --config config.toml
+  sora-admin health status --hostname server1.example.com --config config.toml
+  sora-admin health status --component database --detailed --config config.toml
+  sora-admin health status --backends --config config.toml
+  sora-admin health status --json --config config.toml
 `)
 	}
 
@@ -128,10 +128,10 @@ Subcommands:
   status   Show system health status and component monitoring
 
 Examples:
-  sora-admin health status
-  sora-admin health status --hostname server1.example.com
-  sora-admin health status --component database
-  sora-admin health status --detailed --json
+  sora-admin health status --config config.toml
+  sora-admin health status --hostname server1.example.com --config config.toml
+  sora-admin health status --component database --config config.toml
+  sora-admin health status --detailed --json --config config.toml
 
 Use 'sora-admin health <subcommand> --help' for detailed help.
 `)

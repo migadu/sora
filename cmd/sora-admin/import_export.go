@@ -104,34 +104,34 @@ custom IMAP keywords/flags, and maintain original UIDs from dovecot-uidlist file
 
 Examples:
   # Import all mail (correct path points to maildir root)
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir --config config.toml
 
   # Incremental import (skip already imported messages based on SQLite cache)
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --incremental
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --incremental --config config.toml
 
   # Dry run to preview (note: correct maildir path)
-  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
+  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run --config config.toml
 
   # Import only INBOX and Sent folders
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --mailbox-filter INBOX,Sent
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --mailbox-filter INBOX,Sent --config config.toml
 
   # Import messages from 2023
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31 --config config.toml
 
   # Import from specific paths file
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --paths-file failed_paths.txt
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --paths-file failed_paths.txt --config config.toml
 
   # Import with cleanup (removes the SQLite database after a successful import)
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db --config config.toml
 
   # Import from Dovecot with subscriptions and custom keywords
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot --config config.toml
 
   # Import with Sieve script
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --sieve /path/to/user.sieve
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --sieve /path/to/user.sieve --config config.toml
 
   # Import everything, but make only the last 6 months searchable by body
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --fts-retention 180d
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --fts-retention 180d --config config.toml
 `)
 	}
 
@@ -410,19 +410,19 @@ existing maildir, messages with the same content hash will be skipped unless
 
 Examples:
   # Export all mail to a new maildir
-  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir
+  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir --config config.toml
 
   # Export only INBOX and Sent folders
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent --config config.toml
 
   # Export with Dovecot metadata (includes dovecot-uidlist files)
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot --config config.toml
   
   # Export with only dovecot-uidlist files (no subscriptions)
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --export-dovecot-uidlist
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --export-dovecot-uidlist --config config.toml
 
   # Update flags on existing messages
-  sora-admin export maildir --email user@example.com --maildir-path /existing/maildir --overwrite-flags
+  sora-admin export maildir --email user@example.com --maildir-path /existing/maildir --overwrite-flags --config config.toml
 `)
 	}
 

@@ -62,8 +62,7 @@ This command shows:
   - Cache capacity and maximum object size
 
 Examples:
-  sora-admin cache stats
-  sora-admin cache stats --config /path/to/config.toml
+  sora-admin cache stats --config config.toml
 `)
 	}
 
@@ -100,9 +99,8 @@ This command removes all cached objects from the local cache directory
 and clears the cache index database. This action cannot be undone.
 
 Examples:
-  sora-admin cache purge
-  sora-admin cache purge --confirm
-  sora-admin cache purge --config /path/to/config.toml --confirm
+  sora-admin cache purge --config config.toml
+  sora-admin cache purge --confirm --config config.toml
 `)
 	}
 
@@ -150,10 +148,10 @@ This command shows:
   - Historical trends when using --history flag
 
 Examples:
-  sora-admin cache metrics
-  sora-admin cache metrics --instance server1-cache
-  sora-admin cache metrics --history --since 7d
-  sora-admin cache metrics --json
+  sora-admin cache metrics --config config.toml
+  sora-admin cache metrics --instance server1-cache --config config.toml
+  sora-admin cache metrics --history --since 7d --config config.toml
+  sora-admin cache metrics --json --config config.toml
 `)
 	}
 
