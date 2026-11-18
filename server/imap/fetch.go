@@ -572,7 +572,11 @@ func (s *IMAPSession) writeMessageFetchData(ctx context.Context, w *imapserver.F
 	}
 
 	if sections != nil {
-		if err := writeBodySections(m, options, sections); err != nil {
+		if err := writeBodySections(m, options, sections, func(section *imap.FetchItemBodySection, nuls int) {
+			metrics.IMAPBodyNULReplaced.WithLabelValues("imap").Inc()
+			s.WarnLog("sent NUL octets of a BODY section as 0x80", "uid", msg.UID,
+				"part", section.Part, "specifier", section.Specifier, "nuls", nuls)
+		}); err != nil {
 			return err
 		}
 	}
@@ -1085,27 +1089,61 @@ func (s *IMAPSession) loadSectionBody(ctx context.Context, msg *db.Message, body
 }
 
 // writeBodySections writes the BODY sections extractBodySections returned.
-func writeBodySections(w bodySectionWriter, options *imap.FetchOptions, b *bodySections) error {
+// onNUL, if not nil, is told of each section sent with NUL octets replaced.
+func writeBodySections(w bodySectionWriter, options *imap.FetchOptions, b *bodySections, onNUL func(section *imap.FetchItemBodySection, nuls int)) error {
 	for i, section := range options.BodySection {
-		if err := writeBodySectionData(w, section, b.contents[i]); err != nil {
+		nuls, err := writeBodySectionData(w, section, b.contents[i])
+		if err != nil {
 			return err
+		}
+		if nuls > 0 && onNUL != nil {
+			onNUL(section, nuls)
 		}
 	}
 	return nil
 }
 
-// writeBodySectionData writes one BODY[...] data item.
-func writeBodySectionData(w bodySectionWriter, section *imap.FetchItemBodySection, content []byte) error {
+// nulReplacement is what a NUL octet in a BODY section is sent as.
+const nulReplacement = 0x80
+
+// writeBodySectionData writes one BODY[...] data item and returns how many NUL
+// octets it sent as nulReplacement.
+//
+// BODY[] takes an nstring, never a literal8, and a literal is "*CHAR8" with
+// CHAR8 = %x01-ff (RFC 9051 §9). A stored section can still hold NUL: a body
+// stored before APPEND and delivery re-encoded such parts as base64, one
+// registered by import s3, a multipart without a boundary. Each NUL is sent as
+// 0x80, as Dovecot does (imap-msgpart.c, i_stream_create_nonuls), so the size
+// and every partial offset stay as they are. BINARY[] sends the octets as they
+// are, in a literal8. content is never modified: it can be the message body or
+// a section retained for later chunks.
+func writeBodySectionData(w bodySectionWriter, section *imap.FetchItemBodySection, content []byte) (nuls int, err error) {
 	if content == nil { // Ensure not nil for WriteBodySection
 		content = []byte{}
 	}
 	wc := w.WriteBodySection(section, int64(len(content))) // section is *FetchItemBodySection
-	_, writeErr := wc.Write(content)
+	var writeErr error
+	if bytes.IndexByte(content, 0) < 0 {
+		_, writeErr = wc.Write(content)
+	} else {
+		buf := make([]byte, min(len(content), 32<<10))
+		for rest := content; len(rest) > 0 && writeErr == nil; {
+			n := copy(buf, rest)
+			rest = rest[n:]
+			for i, c := range buf[:n] {
+				if c == 0 {
+					buf[i] = nulReplacement
+					nuls++
+				}
+			}
+			_, writeErr = wc.Write(buf[:n])
+		}
+	}
 	closeErr := wc.Close()
 	if writeErr != nil {
-		return writeErr
+		return nuls, writeErr
 	}
-	return closeErr
+	return nuls, closeErr
 }
 
 // chargeSectionCopy accounts the extractor's copy of a section against the session

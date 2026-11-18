@@ -192,6 +192,7 @@ Each counted IMAP error is also logged at WARN as `protocol error` with the same
 | `sora_imap_notify_events_sent_total` | counter | `type` | NOTIFY updates sent. `type`: `status`, `list`, `fetch`. |
 | `sora_imap_notify_overflow_total` | counter | none | NOTIFY watches dropped with NOTIFICATIONOVERFLOW. |
 | `sora_imap_search_refused_total` | counter | `reason` | SEARCH, SORT, THREAD and ESEARCH refused with `NO [LIMIT]`. `reason`: `result_cap` (too many matches), `rate_limit` (the account's search rate limit). See [SEARCH.md](SEARCH.md). |
+| `sora_body_section_nul_replaced_total` | counter | `protocol` | FETCH `BODY[...]` sections sent with their NUL octets replaced by 0x80, which an ordinary literal cannot carry. See [PROTOCOLS.md](PROTOCOLS.md). |
 | `sora_imap_preview_total` | counter | `source` | FETCH PREVIEW answers by source: `loaded`, `memo`, `local`, `storage` (an S3 download), `nil` (answered NIL), and the empty answers `unavailable`, `too_large`, `limited`, `error`. |
 | `sora_warmup_operations_total` | counter | `server_name`, `state` | Cache warmups at login. `state`: `enqueued`, `dropped`, `started`, `completed`, `cancelled`, `error`. |
 
