@@ -212,6 +212,54 @@ func TestThreadReferences_SubjectMergeRules(t *testing.T) {
 	}
 }
 
+// TestThreadReferences_DummyThreadSubject pins the subject a dummy thread merges
+// by in RFC 5256 REFERENCES step 5.B.i: "the base subject from either the current
+// message or its first child if the current message is a dummy", the children in
+// sent-date order (step 4); and 5.B.ii: "If the thread subject is empty, skip
+// this message". UIDs 1 and 2 answer a message not in the mailbox, so they are
+// the children of its dummy, linked in UID order.
+func TestThreadReferences_DummyThreadSubject(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		messages []db.ThreadMessageResult
+		want     []imap.ThreadData
+	}{
+		{
+			// UID 2 is linked second but sent first, so the thread subject is
+			// FOO, and UID 3 joins the dummy.
+			name: "first child by sent date",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", References: "gone@b", SubjectSort: "BAR", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "b@b", References: "gone@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-3 * time.Hour)},
+				{UID: 3, MessageID: "c@b", SubjectSort: "FOO", SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{SubThreads: []imap.ThreadData{{Chain: []uint32{2}}, {Chain: []uint32{1}}, {Chain: []uint32{3}}}}},
+		},
+		{
+			// The first child has no subject, so the dummy thread has none and
+			// is not merged, though its second child shares UID 3's.
+			name: "first child without a subject",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", References: "gone@b", SentDate: now.Add(-3 * time.Hour)},
+				{UID: 2, MessageID: "b@b", References: "gone@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 3, MessageID: "c@b", SubjectSort: "FOO", SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{
+				{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}}},
+				{Chain: []uint32{3}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, session.threadReferences(imapserver.NumKindUID, tt.messages, false))
+		})
+	}
+}
+
 // The ids below are written the way the messages table holds them: without angle
 // brackets, several ids joined by a space (db.InsertMessage).
 
