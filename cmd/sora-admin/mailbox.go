@@ -1256,7 +1256,7 @@ Examples:
   sora-admin mailbox repair-unseen --config config.toml
 
 For more information on a subcommand, run:
-  sora-admin mailbox <subcommand> --help`)
+  sora-admin mailbox <subcommand> --help --config config.toml`)
 }
 
 // isInboxMailboxName reports whether stored, a mailbox name resolved from the database,

@@ -339,11 +339,11 @@ Subcommands:
   resolve  Resolve failed uploads: repair [OK] EXISTS entries, delete [FAIL] MISSING entries
 
 Examples:
-  sora-admin uploader status
-  sora-admin uploader status --show-failed=false
-  sora-admin uploader status --failed-limit 20
-  sora-admin uploader resolve --dry-run
-  sora-admin uploader resolve
+  sora-admin uploader status --config config.toml
+  sora-admin uploader status --show-failed=false --config config.toml
+  sora-admin uploader status --failed-limit 20 --config config.toml
+  sora-admin uploader resolve --dry-run --config config.toml
+  sora-admin uploader resolve --config config.toml
 
 Use 'sora-admin uploader <subcommand> --help' for detailed help.
 `)
