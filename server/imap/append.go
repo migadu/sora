@@ -205,44 +205,41 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 	// RFC 3516 §§4.4, 6: a literal8 may carry binary MIME bodies, but ordinary
 	// BODY and BODYSTRUCTURE must describe a base-IMAP-safe representation.
 	// Normalize before deriving any metadata or content hash so every fetch
-	// item, size, and stored object refers to the same representation.
+	// item, size, and stored object refers to the same representation. Any
+	// other APPEND gets only its NUL-bearing parts base64 encoded (a UTF8
+	// literal8 may carry NUL too); one without NUL is not touched. Either way
+	// the encoded copy is reserved in full before it is allocated.
+	normalize := s.encodeNULAppend
 	if options.Binary {
-		normalized, releaseNormalized, normalizeErr := s.normalizeBinaryAppend(fullMessageBytes)
-		defer releaseNormalized()
-		if normalizeErr != nil {
-			s.DebugLog("binary APPEND normalization failed", "error", normalizeErr)
-			var imapErr *imap.Error
-			switch {
-			case errors.Is(normalizeErr, errAppendLiteralTooLarge):
-				metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
-				imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnavailable,
-					Text: "Session memory limit reached, please try again later"}
-			case errors.Is(normalizeErr, errAppendBinaryTooLarge):
-				imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTooBig,
-					Text: "Encoded binary message exceeds maximum stored message size"}
-			case errors.Is(normalizeErr, helpers.ErrBinaryAppendUnsafe):
-				imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnknownCTE,
-					Text: "Binary message cannot be converted to a safe transfer encoding"}
-			default:
-				imapErr = s.internalError("failed to normalize binary message: %v", normalizeErr)
-			}
-			s.classifyAndTrackError("APPEND", nil, imapErr)
-			recordMetrics(imapErr)
-			return nil, imapErr
-		}
-		fullMessageBytes = normalized
+		normalize = s.normalizeBinaryAppend
 	}
-
-	// A part holding NUL (a literal8 APPEND of binary content) is stored base64
-	// encoded: FETCH BODY sends ordinary literals, which cannot carry NUL, and
-	// RFC 3516 §4.4 permits a lossless CTE change. BINARY[] decodes it back.
-	if encoded, ok := helpers.EncodeNULParts(fullMessageBytes); ok {
-		if grow := int64(len(encoded) - len(fullMessageBytes)); s.memTracker != nil && grow > 0 && s.memTracker.Allocate(grow) == nil {
-			defer s.memTracker.Free(grow)
+	normalized, releaseNormalized, normalizeErr := normalize(fullMessageBytes)
+	defer releaseNormalized()
+	if normalizeErr != nil {
+		s.DebugLog("APPEND normalization failed", "error", normalizeErr, "binary", options.Binary)
+		var imapErr *imap.Error
+		switch {
+		case errors.Is(normalizeErr, errAppendLiteralTooLarge):
+			metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+			imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnavailable,
+				Text: "Session memory limit reached, please try again later"}
+		case errors.Is(normalizeErr, errAppendBinaryTooLarge):
+			imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTooBig,
+				Text: "Encoded message exceeds maximum stored message size"}
+		case errors.Is(normalizeErr, helpers.ErrBinaryAppendUnsafe):
+			imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnknownCTE,
+				Text: "Binary message cannot be converted to a safe transfer encoding"}
+		default:
+			imapErr = s.internalError("failed to normalize message: %v", normalizeErr)
 		}
-		s.DebugLog("re-encoded NUL-bearing body parts as base64", "size", len(fullMessageBytes), "encoded_size", len(encoded))
-		fullMessageBytes = encoded
+		s.classifyAndTrackError("APPEND", nil, imapErr)
+		recordMetrics(imapErr)
+		return nil, imapErr
 	}
+	if len(normalized) != len(fullMessageBytes) {
+		s.DebugLog("re-encoded APPEND body parts as base64", "size", len(fullMessageBytes), "encoded_size", len(normalized))
+	}
+	fullMessageBytes = normalized
 
 	messageContent, err := server.ParseMessage(bytes.NewReader(fullMessageBytes))
 	if err != nil {
