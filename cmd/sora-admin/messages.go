@@ -35,7 +35,7 @@ func handleMessagesCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printMessagesUsage()
 	default:
-		fmt.Printf("Unknown messages subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown messages subcommand: %s\n\n", subcommand)
 		printMessagesUsage()
 		os.Exit(1)
 	}
@@ -89,7 +89,7 @@ Examples:
 	// Validate required arguments
 	// Validate required flags
 	if *email == "" {
-		fmt.Println("ERROR: --email is required")
+		fmt.Fprintln(os.Stderr, "ERROR: --email is required")
 		fmt.Println()
 		fs.Usage()
 		os.Exit(1)
@@ -185,7 +185,7 @@ Examples:
 	// Validate required arguments
 	// Validate required flags
 	if *email == "" {
-		fmt.Println("ERROR: --email is required")
+		fmt.Fprintln(os.Stderr, "ERROR: --email is required")
 		fmt.Println()
 		fs.Usage()
 		os.Exit(1)
@@ -193,7 +193,7 @@ Examples:
 
 	// Validate that at least one filter is provided
 	if *ids == "" && *mailbox == "" && *since == "" && *until == "" {
-		fmt.Println("ERROR: At least one filter option is required (--ids, --mailbox, --since, or --until)")
+		fmt.Fprintln(os.Stderr, "ERROR: At least one filter option is required (--ids, --mailbox, --since, or --until)")
 		fmt.Println()
 		fs.Usage()
 		os.Exit(1)

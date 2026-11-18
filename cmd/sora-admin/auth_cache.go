@@ -25,7 +25,7 @@ func handleAuthCacheCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printAuthCacheUsage()
 	default:
-		fmt.Printf("Unknown auth-cache subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown auth-cache subcommand: %s\n\n", subcommand)
 		printAuthCacheUsage()
 		os.Exit(1)
 	}

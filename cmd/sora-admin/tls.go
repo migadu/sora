@@ -46,7 +46,7 @@ func handleTLSCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printTLSUsage()
 	default:
-		fmt.Printf("Unknown tls subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown tls subcommand: %s\n\n", subcommand)
 		printTLSUsage()
 		os.Exit(1)
 	}
@@ -153,13 +153,13 @@ certificate for the name.
 	}
 
 	if *domain == "" && *s3Key == "" {
-		fmt.Println("Error: Either --domain or --key must be specified")
+		fmt.Fprintln(os.Stderr, "Error: Either --domain or --key must be specified")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *domain != "" && *s3Key != "" {
-		fmt.Println("Error: Cannot specify both --domain and --key")
+		fmt.Fprintln(os.Stderr, "Error: Cannot specify both --domain and --key")
 		fs.Usage()
 		os.Exit(1)
 	}

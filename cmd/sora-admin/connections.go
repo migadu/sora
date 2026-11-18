@@ -36,7 +36,7 @@ func handleConnectionsCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printConnectionsUsage()
 	default:
-		fmt.Printf("Unknown connections subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown connections subcommand: %s\n\n", subcommand)
 		printConnectionsUsage()
 		os.Exit(1)
 	}
@@ -134,7 +134,7 @@ Examples:
 
 	// The kick is per account: the gossip broadcast carries the account, so --user is required
 	if *userEmail == "" {
-		fmt.Printf("Error: --user is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --user is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -151,7 +151,7 @@ Examples:
 			}
 		}
 		if !valid {
-			fmt.Printf("Error: Invalid protocol. Must be one of: %s\n\n", strings.Join(validProtocols, ", "))
+			fmt.Fprintf(os.Stderr, "Error: Invalid protocol. Must be one of: %s\n\n", strings.Join(validProtocols, ", "))
 			fs.Usage()
 			os.Exit(1)
 		}
@@ -183,7 +183,7 @@ func handleAffinityCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printAffinityUsage()
 	default:
-		fmt.Printf("Unknown affinity subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown affinity subcommand: %s\n\n", subcommand)
 		printAffinityUsage()
 		os.Exit(1)
 	}
@@ -222,7 +222,7 @@ Examples:
 
 	// Validate required arguments
 	if *userEmail == "" || *protocol == "" || *backendAddr == "" {
-		fmt.Printf("Error: --user, --protocol, and --backend are required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --user, --protocol, and --backend are required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -231,7 +231,7 @@ Examples:
 	validProtocols := map[string]bool{"imap": true, "pop3": true, "managesieve": true}
 	*protocol = strings.ToLower(*protocol)
 	if !validProtocols[*protocol] {
-		fmt.Printf("Error: protocol must be one of: imap, pop3, managesieve\n\n")
+		fmt.Fprintf(os.Stderr, "Error: protocol must be one of: imap, pop3, managesieve\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -287,7 +287,7 @@ Examples:
 
 	// Validate required arguments
 	if *userEmail == "" || *protocol == "" {
-		fmt.Printf("Error: --user, and --protocol are required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --user, and --protocol are required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -410,7 +410,7 @@ Examples:
 
 	// Validate required arguments
 	if *userEmail == "" || *protocol == "" {
-		fmt.Printf("Error: --user, and --protocol are required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --user, and --protocol are required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
