@@ -447,6 +447,11 @@ shared mailbox, whatever `allow_user_create` says. See [SHARED_MAILBOXES.md](SHA
 
 ### mailbox list
 
+```sh
+sora-admin --config config.toml mailbox list --email user@example.com
+sora-admin --config config.toml mailbox list --email user@example.com --subscribed
+```
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--subscribed` | `false` | List only subscribed mailboxes. |
@@ -481,6 +486,11 @@ sora-admin --config config.toml mailbox delete --email user@example.com --mailbo
 
 Renames or moves a mailbox, with its children.
 
+```sh
+sora-admin --config config.toml mailbox rename --email user@example.com --old-name "Work" --new-name "Business"
+sora-admin --config config.toml mailbox rename --email user@example.com --old-name "Projects/2024" --new-name "Archive/Projects/2024"
+```
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--old-name` | | Current name (required). |
@@ -495,6 +505,11 @@ Refused, with nothing changed, when:
   across the shared namespace boundary.
 
 ### mailbox subscribe and mailbox unsubscribe
+
+```sh
+sora-admin --config config.toml mailbox subscribe --email user@example.com --mailbox "Work"
+sora-admin --config config.toml mailbox unsubscribe --email user@example.com --mailbox "Work"
+```
 
 | Flag | Default | Meaning |
 |---|---|---|
