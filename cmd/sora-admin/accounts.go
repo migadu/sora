@@ -62,7 +62,7 @@ func handleCreateAccount(ctx context.Context) {
 		fmt.Printf(`Create a new account
 
 Usage:
-  sora-admin accounts create [options]
+  sora-admin --config PATH accounts create [options]
 
 Options:
   --email string         Email address for the new account (required unless --credentials is provided)
@@ -164,7 +164,7 @@ This command displays a summary of all accounts for the specified domain includi
 - Account creation date
 
 Usage:
-  sora-admin accounts list --domain <domain> [options]
+  sora-admin --config PATH accounts list --domain <domain> [options]
 
 Options:
   --config string        Path to TOML configuration file (required)
@@ -209,7 +209,7 @@ This command displays comprehensive information about an account including:
 - All associated email addresses with their status
 
 Usage:
-  sora-admin accounts show --email <email> [options]
+  sora-admin --config PATH accounts show --email <email> [options]
 
 Options:
   --email string      Email address of the account to show (required)
@@ -256,7 +256,7 @@ func handleUpdateAccount(ctx context.Context) {
 		fmt.Printf(`Update an existing account's password and/or primary status
 
 Usage:
-  sora-admin accounts update [options]
+  sora-admin --config PATH accounts update [options]
 
 Options:
   --email string         Email address for the account to update (required)
@@ -351,7 +351,7 @@ taken out of service and marked for purging first; if the purge stops partway, i
 out of service, and the server's purge worker (or running the command again) finishes it.
 
 Usage:
-  sora-admin accounts delete [options]
+  sora-admin --config PATH accounts delete [options]
 
 Options:
   --email string      Email address for the account to delete (required)
@@ -411,7 +411,7 @@ the grace period. The account and all its data (mailboxes, messages, credentials
 will be restored to active status.
 
 Usage:
-  sora-admin accounts restore [options]
+  sora-admin --config PATH accounts restore [options]
 
 Options:
   --email string      Email address for the account to restore (required)
@@ -469,7 +469,7 @@ The operation is RESUMABLE - you can interrupt with Ctrl+C and re-run
 the same command to continue where you left off.
 
 Usage:
-  sora-admin accounts purge-domain [options]
+  sora-admin --config PATH accounts purge-domain [options]
 
 Options:
   --domain string     Domain to purge (e.g., example.com) (required)
@@ -514,7 +514,7 @@ func printAccountsUsage() {
 	fmt.Printf(`Account Management
 
 Usage:
-  sora-admin accounts <subcommand> [options]
+  sora-admin --config PATH accounts <subcommand> [options]
 
 Subcommands:
   create        Create a new account

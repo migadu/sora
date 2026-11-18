@@ -68,7 +68,7 @@ func printVerifyUsage() {
 	fmt.Printf(`Verification Commands
 
 Usage:
-  sora-admin verify <subcommand> [options]
+  sora-admin --config PATH verify <subcommand> [options]
 
 Subcommands:
   s3       Verify S3 storage consistency for a user

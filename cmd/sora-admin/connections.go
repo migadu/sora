@@ -55,7 +55,7 @@ func handleListConnections(ctx context.Context) {
 		fmt.Printf(`List active proxy connections
 
 Usage:
-  sora-admin connections list [options]
+  sora-admin --config PATH connections list [options]
 
 Options:
   --user string         Filter connections by user email
@@ -104,7 +104,7 @@ func handleKickConnections(ctx context.Context) {
 		fmt.Printf(`Force disconnect proxy connections via gossip protocol
 
 Usage:
-  sora-admin connections kick [options]
+  sora-admin --config PATH connections kick [options]
 
 Options:
   --user string         Kick all connections for specific user email (REQUIRED)
@@ -200,7 +200,7 @@ func handleSetAffinity(ctx context.Context) {
 		fmt.Printf(`Set backend server affinity for a user
 
 Usage:
-  sora-admin affinity set [options]
+  sora-admin --config PATH affinity set [options]
 
 Options:
   --config string    Path to TOML configuration file (required)
@@ -269,7 +269,7 @@ func handleGetAffinity(ctx context.Context) {
 		fmt.Printf(`Get backend server affinity for a user
 
 Usage:
-  sora-admin affinity get [options]
+  sora-admin --config PATH affinity get [options]
 
 Options:
   --config string    Path to TOML configuration file (required)
@@ -323,7 +323,7 @@ func handleListAffinity(ctx context.Context) {
 		fmt.Printf(`List backend server affinities
 
 Usage:
-  sora-admin affinity list [options]
+  sora-admin --config PATH affinity list [options]
 
 Options:
   --config string    Path to TOML configuration file (required)
@@ -389,7 +389,7 @@ func handleDeleteAffinity(ctx context.Context) {
 		fmt.Printf(`Delete backend server affinity for a user
 
 Usage:
-  sora-admin affinity delete [options]
+  sora-admin --config PATH affinity delete [options]
 
 Options:
   --config string    Path to TOML configuration file (required)
@@ -437,7 +437,7 @@ func printConnectionsUsage() {
 	fmt.Printf(`Connection Management
 
 Usage:
-  sora-admin connections <subcommand> [options]
+  sora-admin --config PATH connections <subcommand> [options]
 
 Subcommands:
   list   List active proxy connections
@@ -456,7 +456,7 @@ func printAffinityUsage() {
 	fmt.Printf(`Manage user-to-backend affinity mappings (via gossip)
 
 Usage:
-  sora-admin affinity <subcommand> [options]
+  sora-admin --config PATH affinity <subcommand> [options]
 
 Subcommands:
   set      Set backend affinity for a user (gossiped to all nodes)

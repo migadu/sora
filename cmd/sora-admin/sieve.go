@@ -541,7 +541,7 @@ Examples:
 
 // printSieveUsage prints usage information for the 'sieve' command
 func printSieveUsage() {
-	fmt.Println(`Usage: sora-admin sieve <subcommand> [options]
+	fmt.Println(`Usage: sora-admin --config PATH sieve <subcommand> [options]
 
 Subcommands:
   list          List all Sieve scripts for an account

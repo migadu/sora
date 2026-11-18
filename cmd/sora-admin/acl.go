@@ -47,7 +47,7 @@ func handleACLGrant(ctx context.Context) {
 		fmt.Printf(`Grant ACL rights to a user or identifier on a mailbox
 
 Usage:
-  sora-admin acl grant [options]
+  sora-admin --config PATH acl grant [options]
 
 Options:
   --email string       Email address of the mailbox owner (required)
@@ -132,7 +132,7 @@ func handleACLRevoke(ctx context.Context) {
 		fmt.Printf(`Revoke ACL rights from a user or identifier on a mailbox
 
 Usage:
-  sora-admin acl revoke [options]
+  sora-admin --config PATH acl revoke [options]
 
 Options:
   --email string       Email address of the mailbox owner (required)
@@ -207,7 +207,7 @@ func handleACLList(ctx context.Context) {
 		fmt.Printf(`List all ACL entries for a mailbox
 
 Usage:
-  sora-admin acl list [options]
+  sora-admin --config PATH acl list [options]
 
 Options:
   --email string    Email address of the mailbox owner (required)
@@ -271,7 +271,7 @@ Examples:
 
 // printACLUsage prints usage information for the 'acl' command
 func printACLUsage() {
-	fmt.Println(`Usage: sora-admin acl <subcommand> [options]
+	fmt.Println(`Usage: sora-admin --config PATH acl <subcommand> [options]
 
 Subcommands:
   grant   Grant ACL rights to a user or identifier on a mailbox

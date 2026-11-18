@@ -57,7 +57,7 @@ func handleAddCredential(ctx context.Context) {
 		fmt.Printf(`Add a credential to an existing account
 
 Usage:
-  sora-admin credentials add [options]
+  sora-admin --config PATH credentials add [options]
 
 Options:
   --primary string       Primary identity of the account to add credential to (required)
@@ -139,7 +139,7 @@ func handleListCredentials(ctx context.Context) {
 		fmt.Printf(`List all credentials for an account
 
 Usage:
-  sora-admin credentials list [options]
+  sora-admin --config PATH credentials list [options]
 
 Options:
   --email string       Email address associated with the account (required)
@@ -185,7 +185,7 @@ This command displays comprehensive information about a specific credential incl
 - Associated account summary information
 
 Usage:
-  sora-admin credentials show --email <email> [options]
+  sora-admin --config PATH credentials show --email <email> [options]
 
 Options:
   --email string      Email address (credential) to show details for (required)
@@ -235,7 +235,7 @@ Restrictions:
   instead (sora-admin accounts delete), which removes all its data.
 
 Usage:
-  sora-admin credentials delete [options]
+  sora-admin --config PATH credentials delete [options]
 
 Options:
   --email string      Email address of the credential to delete (required)
@@ -269,7 +269,7 @@ func printCredentialsUsage() {
 	fmt.Printf(`Credential Management
 
 Usage:
-  sora-admin credentials <subcommand> [options]
+  sora-admin --config PATH credentials <subcommand> [options]
 
 Subcommands:
   add      Add a credential to an existing account

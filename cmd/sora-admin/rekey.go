@@ -537,7 +537,7 @@ resumed with --start-after. Do not run it while an import into the account is
 running, and import with a sora-admin that hashes with BLAKE3 afterwards.
 
 Usage:
-  sora-admin import rekey --email <email> [options]
+  sora-admin --config PATH import rekey --email <email> [options]
 
 Options:
   --email string        Email address of the account to repair (required)
