@@ -1018,7 +1018,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		// silently committed (commit ambiguity), in which case the upload
 		// worker still needs the file. Cleanup is the uploader's
 		// cleanupOrphanedFiles job either way.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		//
+		// Only when the DATA command's own context has ended: the database layer's
+		// per-query timeout (query_timeout) also yields context.DeadlineExceeded, and
+		// while the command is still live that is a slow database, answered with the
+		// temporary failure below, not "service shutting down".
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			if filePath != nil {
 				s.DebugLog("keeping file for cleanup job after cancellation", "content_hash", contentHash)
 			}
