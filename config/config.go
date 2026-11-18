@@ -2559,7 +2559,7 @@ func (s *ServerConfig) defaultCommandTimeout() time.Duration {
 		// gets to send its BYE.
 		return 30 * time.Minute
 	case "managesieve", "managesieve_proxy":
-		return 3 * time.Minute // 3 minutes for ManageSieve
+		return 3 * time.Minute // 3 minutes for ManageSieve; a managesieve backend also gives "0" this value (managesieve.DefaultIdleTimeout)
 	case "lmtp":
 		// RFC 5321 §4.5.3.2.7: "An SMTP server SHOULD have a timeout of at least
 		// 5 minutes while it is awaiting the next command from the sender", and

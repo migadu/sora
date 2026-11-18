@@ -52,6 +52,20 @@ func getProxyProtocolTrustedProxies(proxyProtocolTrusted, trustedNetworks []stri
 
 const DefaultMaxScriptSize = 16 * 1024 // 16 KB
 
+// DefaultIdleTimeout is the managesieve command_timeout default, and what
+// command_timeout = "0" means: go-managesieve would turn an IdleTimeout of 0
+// into its own 30-minute default.
+const DefaultIdleTimeout = 3 * time.Minute
+
+// idleTimeout is the idle timeout a command_timeout value sets: the value
+// itself, or DefaultIdleTimeout for 0.
+func idleTimeout(commandTimeout time.Duration) time.Duration {
+	if commandTimeout == 0 {
+		return DefaultIdleTimeout
+	}
+	return commandTimeout
+}
+
 // reloadableSettings are the settings a config reload (SIGHUP) replaces. ReloadConfig
 // publishes a new one whole and none is changed after: a session or a login loads it
 // once and uses that copy throughout, so it never mixes the values of two reloads.
@@ -156,7 +170,7 @@ type ManageSieveServerOptions struct {
 	AuthRateLimit               serverPkg.AuthRateLimiterConfig
 	LookupCache                 *config.LookupCacheConfig // Authentication cache configuration
 	AuthIdleTimeout             time.Duration             // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
-	CommandTimeout              time.Duration             // Maximum idle time before disconnection
+	CommandTimeout              time.Duration             // Maximum idle time before disconnection (0 = DefaultIdleTimeout)
 	CommandTimeoutOverrides     map[string]time.Duration  // Per-command hard execution timeouts (overrides defaults)
 	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-managesieve enforces it)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = disabled)
@@ -275,7 +289,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	}
 	serverInstance.settings.Store(&reloadableSettings{
 		maxScriptSize:          maxScriptSize,
-		commandTimeout:         options.CommandTimeout,
+		commandTimeout:         idleTimeout(options.CommandTimeout),
 		absoluteSessionTimeout: options.AbsoluteSessionTimeout,
 		minBytesPerMinute:      options.MinBytesPerMinute,
 		masterSASLUsername:     []byte(options.MasterSASLUsername),
@@ -318,7 +332,7 @@ func New(appCtx context.Context, name, hostname, addr string, rdb *resilient.Res
 	// Start connection limiter cleanup
 	serverInstance.limiter.StartCleanup(serverCtx)
 
-	reportCommandTimeout(options.CommandTimeout)
+	reportCommandTimeout(idleTimeout(options.CommandTimeout))
 
 	// Initialize local connection tracking (no gossip, just local tracking)
 	// This enables per-user connection limits and kick functionality on backend servers
@@ -799,7 +813,7 @@ func (s *ManageSieveServer) ReloadConfig(cfg config.ServerConfig) error {
 	// uses the default).
 	if timeout, err := cfg.GetCommandTimeout(); err != nil {
 		logger.Warn("ManageSieve config reload: invalid command_timeout, keeping the running value", "name", s.name, "error", err, "running", next.commandTimeout)
-	} else if timeout != next.commandTimeout {
+	} else if timeout = idleTimeout(timeout); timeout != next.commandTimeout {
 		next.commandTimeout = timeout
 		reloaded = append(reloaded, "command_timeout")
 		reportCommandTimeout(timeout)
