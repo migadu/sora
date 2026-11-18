@@ -77,8 +77,8 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 	decodedNumSet = s.decodeNumSetLocked(view, numSet)
 	release()
 
-	// Sanitize flags to remove invalid values (e.g., NIL, NULL, empty strings)
-	// This prevents protocol errors like "Keyword used without being in FLAGS: NIL"
+	// Sanitize flags to remove values no IMAP response can encode (empty
+	// strings, non-atom keywords; see helpers.SanitizeFlags)
 	sanitizedFlags := helpers.SanitizeFlags(flags.Flags)
 
 	// Create a sanitized StoreFlags structure
