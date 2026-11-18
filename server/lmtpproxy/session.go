@@ -1148,11 +1148,13 @@ func extractAddressString(param string) (address string, ok bool) {
 }
 
 // extractReversePath is extractAddress for the reverse-path of MAIL. It also reads a
-// path in angle brackets whose quoted local part holds a space, `<"john doe"@example.org>`,
-// which go-smtp reads and a sora backend accepts (server.NewReversePath, #1907); forwarded
-// between its angle brackets, go-smtp on the backend reads the quoted string to its
-// closing quote. A space anywhere else, an angle bracket inside the path, and every other
-// refusal of extractAddress stand. A forward-path is read by extractAddress alone.
+// path in angle brackets whose quoted local part holds a space or an angle bracket,
+// `<"john doe"@example.org>` or `<"alice@x>"@example.org>`, which go-smtp reads and a sora
+// backend accepts (server.NewReversePath, #1907, #1948). It is forwarded byte for byte
+// between its angle brackets, and go-smtp on the backend reads the quoted string to its
+// closing quote, so a ">" inside it cannot end the path early or put text after the path
+// (#1853). A space or an angle bracket outside the quotes, and every other refusal of
+// extractAddress, stand. A forward-path is read by extractAddress alone.
 func extractReversePath(param string) (address string, ok bool) {
 	if address, ok := extractAddressString(param); ok {
 		return address, true
@@ -1162,7 +1164,7 @@ func extractReversePath(param string) (address string, ok bool) {
 		return "", false
 	}
 	address = param[1 : len(param)-1]
-	if address[0] != '"' || strings.ContainsAny(address, "<>") {
+	if address[0] != '"' {
 		return "", false
 	}
 	escaped := false
@@ -1174,7 +1176,7 @@ func extractReversePath(param string) (address string, ok bool) {
 			escaped = true
 		case address[i] == '"':
 			domain, found := strings.CutPrefix(address[i+1:], "@")
-			if !found || domain == "" || strings.ContainsAny(domain, ` "`) {
+			if !found || domain == "" || strings.ContainsAny(domain, ` "<>`) {
 				return "", false
 			}
 			return address, true

@@ -25,6 +25,7 @@ func TestMAILAcceptsLenientReversePath(t *testing.T) {
 		"user@localhost",
 		`"quoted local"@example.com`,
 		`"quoted\"escaped"@example.com`,
+		`"alice@x>"@example.com`,
 		"user@[192.0.2.1]",
 		"user@[IPv6:2001:db8::1]",
 	} {
