@@ -1193,12 +1193,6 @@ func (s *Session) authenticateCredentials(authzID, username, password string, sa
 		s.username = username // Fallback to raw username if parsing fails
 	}
 
-	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
-	// Empty passwords are never valid under any condition
-	if password == "" {
-		return consts.ErrAuthenticationFailed
-	}
-
 	// Rate-limit key for this attempt. Canonicalised from the submitted username so
 	// that the CanAttemptAuth* check and every RecordAuthAttempt* call below use the
 	// SAME key. Checking the raw string while recording a mix of raw username,
@@ -1274,12 +1268,12 @@ func (s *Session) authenticateCredentials(authzID, username, password string, sa
 		return err
 	}
 
-	// RFC 4616 section 2: every field of a PLAIN message is UTF-8 ("SAFE = ... any
-	// UTF-8 encoded Unicode character except NUL"). A field that is not names no
-	// account: refused without a lookup, but as a failed login, recorded and counted
-	// like a name that does not parse.
-	if saslPlain && (!utf8.ValidString(authzID) || !utf8.ValidString(username) || !utf8.ValidString(password)) {
-		s.InfoLog("authentication refused: SASL PLAIN field not valid UTF-8")
+	// Credentials no account can have: an empty password, or a SASL PLAIN field that
+	// is not UTF-8 (RFC 4616 section 2: "SAFE = ... any UTF-8 encoded Unicode
+	// character except NUL"). Refused without a lookup, but as a failed login,
+	// recorded and counted like a name that does not parse.
+	if password == "" || (saslPlain && (!utf8.ValidString(authzID) || !utf8.ValidString(username) || !utf8.ValidString(password))) {
+		s.InfoLog("authentication refused: empty password, or SASL PLAIN field not valid UTF-8")
 		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
 		metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
 		return consts.ErrAuthenticationFailed
