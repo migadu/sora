@@ -2,6 +2,7 @@ package db
 
 import (
 	"errors"
+	"io"
 	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
@@ -85,8 +86,17 @@ func ClassifyDBError(err error) error {
 	}
 
 	// pgx closes a connection once its socket fails or the server ends the session,
-	// and a statement on it then fails with pgconn.ErrConnClosed ("conn closed").
-	if errors.Is(err, pgconn.ErrConnClosed) {
+	// and a statement on it then fails with pgconn.ErrConnClosed ("conn closed"). The
+	// statement that finds the socket closed fails with io.ErrUnexpectedEOF instead
+	// (pgproto3 reports every EOF as that): the first one on a pooled connection that
+	// the database side, PgBouncer, or a relay in front of them dropped while it sat
+	// in the pool, which pgxpool hands out without a ping when it was used within the
+	// last second. Either way the database side had closed it, and the request gets
+	// a temporary failure ([UNAVAILABLE], [SYS/TEMP]), not a server bug. A connection
+	// attempt that reads EOF is no such connection but a failure to connect
+	// (pgconn.ConnectError), classified below.
+	var connectErr *pgconn.ConnectError
+	if errors.Is(err, pgconn.ErrConnClosed) || (errors.Is(err, io.ErrUnexpectedEOF) && !errors.As(err, &connectErr)) {
 		return errors.Join(ErrConnectionClosed, err)
 	}
 

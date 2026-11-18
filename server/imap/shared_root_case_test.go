@@ -39,7 +39,7 @@ func TestSharedNamespaceRootMatchesConfigCaseRules(t *testing.T) {
 			sharedRoot := strings.TrimSuffix(tc.prefix, "/")
 
 			// 1. listMailbox \Noselect classification
-			data := listMailbox(&db.DBMailbox{ID: 1, Name: tc.name}, &imap.ListOptions{}, caps, sharedRoot)
+			data := listMailbox(&db.DBMailbox{ID: 1, Name: tc.name}, false, &imap.ListOptions{}, caps, sharedRoot)
 			if data == nil {
 				t.Fatalf("listMailbox(%q) returned nil", tc.name)
 			}
@@ -95,7 +95,7 @@ func TestSharedNamespaceRootMatchesConfigCaseRules(t *testing.T) {
 
 	// Sharing disabled (sharedRoot == "") must never mark names (including "") \Noselect.
 	for _, name := range []string{"Shared", "ix", ""} {
-		data := listMailbox(&db.DBMailbox{ID: 1, Name: name}, &imap.ListOptions{}, caps, "")
+		data := listMailbox(&db.DBMailbox{ID: 1, Name: name}, false, &imap.ListOptions{}, caps, "")
 		if slices.Contains(data.Attrs, imap.MailboxAttrNoSelect) {
 			t.Errorf("sharing disabled: listMailbox(%q) falsely marked \\Noselect: %v", name, data.Attrs)
 		}

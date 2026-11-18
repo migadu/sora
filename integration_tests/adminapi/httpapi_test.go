@@ -2032,9 +2032,12 @@ func TestACLManagement(t *testing.T) {
 	defer server.Close()
 
 	// Create test accounts
-	owner := common.CreateTestAccount(t, server.rdb)
-	user2 := common.CreateTestAccount(t, server.rdb)
-	user3 := common.CreateTestAccount(t, server.rdb)
+	// Own domain: "anyone" reaches every account in the owner's domain, and a grant
+	// left behind on example.com would list this mailbox to every later test.
+	domain := common.UniqueTestDomain()
+	owner := common.CreateTestAccountInDomain(t, server.rdb, domain)
+	user2 := common.CreateTestAccountInDomain(t, server.rdb, domain)
+	user3 := common.CreateTestAccountInDomain(t, server.rdb, domain)
 
 	// Create a shared mailbox via database
 	ctx := context.Background()
@@ -2259,7 +2262,7 @@ func TestACLManagement(t *testing.T) {
 		revokeReq := map[string]any{
 			"owner":      owner.Email,
 			"mailbox":    mailboxName,
-			"identifier": "nonexistent@example.com",
+			"identifier": "nonexistent@" + domain,
 		}
 
 		resp, body := server.makeRequest(t, "POST", "/admin/mailboxes/acl/revoke", revokeReq)
@@ -2445,8 +2448,12 @@ func TestACLGrantAnyoneFollowsAllowAnyoneIdentifier(t *testing.T) {
 				server := setupHTTPAPIServer(t, func(o *adminapi.ServerOptions) { o.SharedMailboxes = shared })
 				defer server.Close()
 
-				owner := common.CreateTestAccount(t, server.rdb)
-				member := common.CreateTestAccount(t, server.rdb)
+				// Own domain: "anyone" reaches every account in the owner's domain, and
+				// a grant left behind on example.com would list this mailbox to every
+				// later test.
+				domain := common.UniqueTestDomain()
+				owner := common.CreateTestAccountInDomain(t, server.rdb, domain)
+				member := common.CreateTestAccountInDomain(t, server.rdb, domain)
 				creator := config.SharedMailboxesConfig{Enabled: true, NamespacePrefix: "Shared/"}
 				ctx := context.WithValue(context.Background(), consts.ConfigContextKey, &config.Config{SharedMailboxes: creator})
 				ownerID, err := server.rdb.GetAccountIDByAddressWithRetry(ctx, owner.Email)

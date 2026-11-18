@@ -144,7 +144,7 @@ func (rd *ResilientDatabase) PassS3WriteGateWithRetry(ctx context.Context, pendi
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, true).PassS3WriteGate(ctx, pendingID, accountID, contentHash, owner, ttl)
 	}
-	result, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
+	result, err := rd.executeAutocommitWriteWithRetry(ctx, cleanupRetryConfig, timeoutRead, op)
 	if err != nil {
 		return db.S3WriteBusy, err
 	}
@@ -157,7 +157,7 @@ func (rd *ResilientDatabase) RenewPendingUploadLeaseWithRetry(ctx context.Contex
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, true).RenewPendingUploadLease(ctx, pendingID, owner, ttl)
 	}
-	result, err := rd.executeReadWithRetry(ctx, leaseRetryConfig, timeoutWrite, op)
+	result, err := rd.executeAutocommitWriteWithRetry(ctx, leaseRetryConfig, timeoutWrite, op)
 	if err != nil {
 		return false, err
 	}
@@ -170,7 +170,7 @@ func (rd *ResilientDatabase) ReleasePendingUploadLeaseWithRetry(ctx context.Cont
 	op := func(ctx context.Context) (any, error) {
 		return nil, rd.getOperationalDatabaseForOperation(ctx, true).ReleasePendingUploadLease(ctx, pendingID, owner)
 	}
-	_, err := rd.executeReadWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
+	_, err := rd.executeAutocommitWriteWithRetry(ctx, cleanupRetryConfig, timeoutWrite, op)
 	return err
 }
 

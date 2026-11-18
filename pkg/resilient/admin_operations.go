@@ -766,7 +766,22 @@ func (rd *ResilientDatabase) executeWriteInTxWithRetry(ctx context.Context, conf
 }
 
 // executeReadWithRetry provides a generic wrapper for executing a read operation with retries and circuit breaker protection.
+// The operation is repeated on another connection when the pooled one it got was already
+// closed (againOnDeadConn), so it must be safe to run twice: an operation that writes goes
+// through executeAutocommitWriteWithRetry.
 func (rd *ResilientDatabase) executeReadWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context) (any, error), nonRetryableErrors ...error) (any, error) {
+	return rd.executeStatementWithRetry(ctx, config, opType, true, op, nonRetryableErrors...)
+}
+
+// executeAutocommitWriteWithRetry is executeReadWithRetry for an operation that writes
+// without a transaction of this package (one statement, or a transaction of its own).
+// It is not repeated when its connection turns out to be closed (againOnDeadConn): the
+// connection may have gone after the server applied the write.
+func (rd *ResilientDatabase) executeAutocommitWriteWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, op func(ctx context.Context) (any, error), nonRetryableErrors ...error) (any, error) {
+	return rd.executeStatementWithRetry(ctx, config, opType, false, op, nonRetryableErrors...)
+}
+
+func (rd *ResilientDatabase) executeStatementWithRetry(ctx context.Context, config retry.BackoffConfig, opType timeoutType, readOnly bool, op func(ctx context.Context) (any, error), nonRetryableErrors ...error) (any, error) {
 	if db.HasReadSnapshot(ctx) {
 		return op(ctx)
 	}
@@ -776,6 +791,9 @@ func (rd *ResilientDatabase) executeReadWithRetry(ctx context.Context, config re
 		defer cancel()
 
 		res, cbErr := rd.queryBreaker.Execute(func() (any, error) {
+			if readOnly {
+				return againOnDeadConn(func() (any, error) { return op(opCtx) })
+			}
 			return op(opCtx)
 		})
 		if cbErr != nil {

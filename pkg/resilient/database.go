@@ -575,6 +575,45 @@ func (rd *ResilientDatabase) isRetryableError(err error) bool {
 	return false
 }
 
+// deadConnAttempts bounds how many times againOnDeadConn runs one statement.
+const deadConnAttempts = 5
+
+// againOnDeadConn runs op, and again, up to deadConnAttempts times, while it fails
+// because the pooled connection it was given had already been closed. pgxpool pings
+// a connection on acquire only when it has been idle for more than a second, so once
+// PostgreSQL or PgBouncer restarts, every connection used within the last second is
+// handed out dead and the first statement on it fails with io.ErrUnexpectedEOF; pgx
+// then discards it, so the next run gets another connection. A failed connection
+// attempt is not a dead connection (it is a pgconn.ConnectError, the database being
+// down) and is returned at once.
+//
+// Only for a statement that is safe to send twice, a read or a BEGIN: the same error
+// comes from a connection that went down after the server had applied a write.
+// It runs inside the circuit breaker call, so the breaker counts one result for the
+// operation as before, not one failure per dead connection: those are stale local
+// resources, not the database failing, and counting them opened the breaker after a
+// short outage.
+func againOnDeadConn[T any](op func() (T, error)) (T, error) {
+	for attempt := 1; ; attempt++ {
+		res, err := op()
+		if err == nil || attempt == deadConnAttempts || !isDeadPooledConn(err) {
+			return res, err
+		}
+		logger.Debug("Repeating statement on another connection: pooled connection was closed", "component", "RESILIENT-FAILOVER", "attempt", attempt, "error", err)
+	}
+}
+
+// isDeadPooledConn reports whether err is a statement finding its connection already
+// closed: io.ErrUnexpectedEOF for the first statement on it (pgproto3 reports every
+// EOF as that), pgconn.ErrConnClosed for the ones after, and not a failure to connect.
+func isDeadPooledConn(err error) bool {
+	var connectErr *pgconn.ConnectError
+	if errors.As(err, &connectErr) {
+		return false
+	}
+	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, pgconn.ErrConnClosed)
+}
+
 // logsWriteErrorAtWarn reports whether an error from a write through the breaker is
 // logged at WARN: a retryable error (a deadlock or serialization failure, which is retried
 // and does not count against the breaker, or a connection timeout), or the database
@@ -612,8 +651,7 @@ func (rd *ResilientDatabase) QueryWithRetry(ctx context.Context, sql string, arg
 		queryCtx, cancel := rd.withTimeout(ctx, timeoutRead)
 
 		result, cbErr := rd.queryBreaker.Execute(func() (any, error) {
-			r, queryErr := pool.Query(queryCtx, sql, args...)
-			return r, queryErr
+			return againOnDeadConn(func() (pgx.Rows, error) { return pool.Query(queryCtx, sql, args...) })
 		})
 
 		if cbErr != nil {
@@ -750,7 +788,7 @@ func (rd *ResilientDatabase) beginWriteTxWithRetry(ctx context.Context, txOption
 			for {
 				pool := rd.getOperationalPoolForOperation(writeCtx, true)
 				gen := pool.resetGen.Load()
-				t, txErr := pool.database.BeginTx(writeCtx, txOptions)
+				t, txErr := againOnDeadConn(func() (pgx.Tx, error) { return pool.database.BeginTx(writeCtx, txOptions) })
 				if txErr != nil {
 					return nil, txErr
 				}

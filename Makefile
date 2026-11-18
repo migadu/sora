@@ -74,6 +74,10 @@ RACE ?=
 RACE_FLAG = $(if $(RACE),-race,)
 TEST_TIMEOUT = $(if $(RACE),40m,20m)
 TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(TEST_TIMEOUT) $(RACE_FLAG)
+# The imap package alone runs ~29m (~770 tests, none dominating), past TEST_TIMEOUT,
+# so it gets its own budget.
+IMAP_TEST_TIMEOUT = $(if $(RACE),90m,45m)
+IMAP_TEST_FLAGS = -v -tags=integration -count=1 -timeout=$(IMAP_TEST_TIMEOUT) $(RACE_FLAG)
 # Slowloris timing tests live in their own package (integration_tests/imap_slowloris)
 # so they don't share the imap package's timeout budget. The two tests use real
 # wall-clock sleeps (~7m + ~9.5m run serially), so they get a larger timeout.
@@ -125,11 +129,11 @@ integration-tests-quick-race:
 # Core protocol integration tests
 integration-tests-imap: reset-test-db build-test-sora-admin
 	@echo "Running IMAP integration tests..."
-	@cd integration_tests/imap && go test $(TEST_FLAGS) .
+	@cd integration_tests/imap && go test $(IMAP_TEST_FLAGS) .
 
 integration-tests-imap-quick: reset-test-db build-test-sora-admin
 	@echo "Running IMAP integration tests (quick mode, skipping long tests)..."
-	@cd integration_tests/imap && go test -short $(TEST_FLAGS) .
+	@cd integration_tests/imap && go test -short $(IMAP_TEST_FLAGS) .
 
 # Long-running slowloris timing tests (real wall-clock, ~16m total) — isolated
 # package with its own timeout so they don't collide with the imap suite cap.

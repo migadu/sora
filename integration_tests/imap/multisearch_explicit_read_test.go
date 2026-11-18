@@ -13,9 +13,13 @@ import (
 
 func TestIMAP_MultiSearchExplicitReadWithoutLookup(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
-	server, owner := common.SetupIMAPServer(t)
+	server, _ := common.SetupIMAPServer(t)
 	defer server.Close()
-	reader, password := createSecondUser(t, server, "example.com", "explicitreader")
+	// Own domain: "anyone" reaches every account in the owner's domain, and a grant
+	// left behind on example.com would list this mailbox to every later test.
+	domain := common.UniqueTestDomain()
+	owner := common.CreateTestAccountInDomain(t, server.ResilientDB, domain)
+	reader, password := createSecondUser(t, server, domain, "explicitreader")
 	oc, or := esearchDialLogin(t, server, owner.Email, owner.Password)
 	defer oc.Close()
 	prefix := fmt.Sprintf("Shared/ExplicitRead-%d", common.GetTimestamp())
@@ -46,7 +50,7 @@ func TestIMAP_MultiSearchExplicitReadWithoutLookup(t *testing.T) {
 	require.True(t, strings.HasSuffix(esearchLine(lines, readable), " UID ALL 1"), "%q", lines)
 	// A normal namespace winner with l but no r must keep shadowing another
 	// owner's r-only mailbox, rather than ESEARCH changing the meaning of a name.
-	otherOwner, otherPassword := createSecondUser(t, server, "example.com", "lookupowner")
+	otherOwner, otherPassword := createSecondUser(t, server, domain, "lookupowner")
 	lc, lr := esearchDialLogin(t, server, otherOwner, otherPassword)
 	defer lc.Close()
 	esearchCreate(t, lc, lr, "c1", readable)
