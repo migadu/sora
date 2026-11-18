@@ -275,8 +275,9 @@ func main() {
 
 	// Help needs no config: without a file that loads, a help flag prints the usage of the
 	// command named before it. A file that loads keeps the line as given, so a "--help"
-	// that is a flag's value stays that value.
-	help := helpRequested(newArgs[1:])
+	// that is a flag's value stays that value. "help" as the subcommand (`accounts help`)
+	// asks for the command's usage too; anywhere else it is an argument or a value.
+	help := helpRequested(newArgs[1:]) || (len(newArgs) > 2 && newArgs[1] == command && newArgs[2] == "help")
 	loaded := false
 	if configPath == "" {
 		if !help {

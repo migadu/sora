@@ -76,8 +76,10 @@ sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
 - Worker counts (`--jobs`, `--workers`) must be at least `1`. So must the batch sizes and limits
   this document marks "at least 1"; a smaller value stops the command with an error.
 - `sora-admin <command> --help` lists the subcommands. `sora-admin <command> <subcommand> --help`
-  prints the subcommand's flags. `-h` and `-help` do the same. Help needs no config file: without
-  `--config`, or with a file that does not load, a line with a help flag prints the usage of the
+  prints the subcommand's flags. `-h` and `-help` do the same, and so does `help` given as the
+  subcommand (`sora-admin accounts help`); anywhere else on the line `help` is an ordinary
+  argument or value. Help needs no config file: without `--config`, or with a file that does not
+  load, a line with a help flag, or with `help` as the subcommand, prints the usage of the
   command and subcommand named before the first flag, exits `0` and runs nothing, whatever else
   the line holds. With a file that loads, the line is parsed as written, so `--help` given as a
   flag's value (`--email --help`) is that value.

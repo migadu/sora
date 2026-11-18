@@ -30,7 +30,7 @@ func handleImportCommand(ctx context.Context) {
 		handleImportS3(ctx)
 	case "rekey":
 		handleImportRekey(ctx)
-	case "--help", "-h":
+	case "help", "--help", "-h":
 		printImportUsage()
 	default:
 		fmt.Printf("Unknown import subcommand: %s\n\n", subcommand)
@@ -358,7 +358,7 @@ func handleExportCommand(ctx context.Context) {
 	switch subcommand {
 	case "maildir":
 		handleExportMaildir(ctx)
-	case "--help", "-h":
+	case "help", "--help", "-h":
 		printExportUsage()
 	default:
 		fmt.Printf("Unknown export subcommand: %s\n\n", subcommand)

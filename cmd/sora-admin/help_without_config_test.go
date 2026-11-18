@@ -88,3 +88,66 @@ func TestHelpAsFlagValueWithConfig(t *testing.T) {
 		t.Errorf("--help as the value of --email printed the usage:\n%s", out)
 	}
 }
+
+// TestCommandHelpWordWithoutConfig (#1979): `<command> help` prints the command's usage and
+// exits 0 without a config file, or with one that does not load, like `<command> --help`.
+// The commands are those that answer `help` with their usage when the config loads. "help"
+// anywhere but right after the command is an argument, not a request for help.
+func TestCommandHelpWordWithoutConfig(t *testing.T) {
+	configPath := unreachableAdminConfig(t, true)
+	missing := filepath.Join(t.TempDir(), "missing.toml")
+
+	top, _ := runAdminMain(t, "help")
+	var offering []string
+	for _, cmd := range listedNames(top, "Commands:") {
+		if cmd == "help" || cmd == "version" {
+			continue
+		}
+		if out, code := runAdminMain(t, "--config", configPath, cmd, "help"); code == 0 && strings.Contains(out, "Usage") {
+			offering = append(offering, cmd)
+		}
+	}
+	if len(offering) < minListedCommand {
+		t.Fatalf("%d commands answer `help` with their usage: %v", len(offering), offering)
+	}
+
+	for _, cmd := range offering {
+		for _, args := range [][]string{
+			{cmd, "help"},
+			{"--config", missing, cmd, "help"},
+			{cmd, "help", "--config=" + missing},
+		} {
+			name := strings.ReplaceAll(strings.Join(args, " "), missing, "missing.toml")
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
+				out, code := runAdminMain(t, args...)
+				if code != 0 {
+					t.Errorf("exit code %d, want 0:\n%s", code, out)
+				}
+				if !strings.Contains(out, "Usage") {
+					t.Errorf("no usage printed:\n%s", out)
+				}
+				for _, bad := range []string{"--config flag is required", "Failed to "} {
+					if strings.Contains(out, bad) {
+						t.Errorf("output has %q:\n%s", bad, out)
+					}
+				}
+			})
+		}
+	}
+
+	// "help" as a flag's value or as a later argument still needs the config.
+	for _, args := range [][]string{
+		{"mailbox", "create", "--email", "user@example.com", "--mailbox", "help"},
+		{"accounts", "show", "--email=help"},
+		{"backends", "maintenance", "help"},
+	} {
+		t.Run(strings.Join(args, " "), func(t *testing.T) {
+			t.Parallel()
+			out, code := runAdminMain(t, args...)
+			if code == 0 || !strings.Contains(out, "--config flag is required") {
+				t.Errorf("exit code %d, want the missing --config error:\n%s", code, out)
+			}
+		})
+	}
+}
