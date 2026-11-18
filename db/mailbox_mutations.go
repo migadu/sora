@@ -33,7 +33,8 @@ func (d *Database) CreateMailboxReturningState(ctx context.Context, tx pgx.Tx, o
 // winner as the watch snapshot, constrained to one name. Lock the actual row
 // before a name-based subscription write so DELETE/RENAME cannot swap its
 // identity before commit. A missing/renamed/hidden row is conservative unknown.
-func lockNotifyMailboxForMutation(ctx context.Context, tx pgx.Tx, actorID int64, name string) (*NotifyMailbox, error) {
+// sharedAccess (Database.sharedAccess) gates the other owners' candidates.
+func lockNotifyMailboxForMutation(ctx context.Context, tx pgx.Tx, actorID int64, name string, sharedAccess bool) (*NotifyMailbox, error) {
 	var m NotifyMailbox
 	var validity int64
 	err := tx.QueryRow(ctx, `
@@ -42,11 +43,11 @@ func lockNotifyMailboxForMutation(ctx context.Context, tx pgx.Tx, actorID int64,
 			WHERE account_id=$1 AND LOWER(name)=LOWER($2) AND deleted_at IS NULL
 			UNION ALL
 			SELECT m.id,1 FROM mailbox_acls a JOIN mailboxes m ON m.id=a.mailbox_id
-			WHERE a.account_id=$1 AND position('l' IN a.rights)>0 AND m.is_shared=TRUE
+			WHERE $3::boolean AND a.account_id=$1 AND position('l' IN a.rights)>0 AND m.is_shared=TRUE
 			  AND m.deleted_at IS NULL AND LOWER(m.name)=LOWER($2)
 			UNION ALL
 			SELECT m.id,2 FROM mailbox_acls a JOIN mailboxes m ON m.id=a.mailbox_id
-			WHERE a.identifier='anyone' AND position('l' IN a.rights)>0 AND m.is_shared=TRUE
+			WHERE $3::boolean AND a.identifier='anyone' AND position('l' IN a.rights)>0 AND m.is_shared=TRUE
 			  AND m.deleted_at IS NULL AND LOWER(m.name)=LOWER($2)
 			  AND m.owner_domain=(SELECT domain FROM credentials WHERE account_id=$1 AND primary_identity=TRUE)
 		), winner AS (SELECT id FROM candidates ORDER BY priority,id LIMIT 1)
@@ -55,7 +56,7 @@ func lockNotifyMailboxForMutation(ctx context.Context, tx pgx.Tx, actorID int64,
 		FROM mailboxes m JOIN winner w ON w.id=m.id
 		WHERE m.deleted_at IS NULL AND LOWER(m.name)=LOWER($2)
 		FOR NO KEY UPDATE OF m
-	`, actorID, name).Scan(&m.ID, &m.Name, &m.NameKey, &validity, &m.OwnerID, &m.Subscribed)
+	`, actorID, name, sharedAccess).Scan(&m.ID, &m.Name, &m.NameKey, &validity, &m.OwnerID, &m.Subscribed)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, nil
 	}
@@ -103,7 +104,7 @@ type SubscriptionMutation struct {
 }
 
 func (d *Database) UpdateSubscriptionReturningState(ctx context.Context, tx pgx.Tx, actorID int64, name string, subscribe bool) (SubscriptionMutation, error) {
-	m, err := lockNotifyMailboxForMutation(ctx, tx, actorID, name)
+	m, err := lockNotifyMailboxForMutation(ctx, tx, actorID, name, d.sharedAccess())
 	if err != nil {
 		return SubscriptionMutation{}, err
 	}

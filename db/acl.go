@@ -363,7 +363,7 @@ func (db *Database) SetMailboxACL(ctx context.Context, mailboxID, grantorAccount
 	ownEntry := target.accountID != nil && *target.accountID == grantorAccountID
 	if grantorAccountID != 0 && grantorAccountID != mb.ownerAccountID && !(ownEntry && (final == "" || reduction)) {
 		var allowed bool
-		if err := tx.QueryRow(ctx, "SELECT has_mailbox_right($1, $2, 'a')", mailboxID, grantorAccountID).Scan(&allowed); err != nil {
+		if err := tx.QueryRow(ctx, "SELECT "+db.rightSQL("$1", "$2", "'a'"), mailboxID, grantorAccountID).Scan(&allowed); err != nil {
 			return fmt.Errorf("failed to check admin permission: %w", err)
 		}
 		if !allowed {
@@ -585,9 +585,8 @@ func (db *Database) GetMailboxACLs(ctx context.Context, mailboxID int64) ([]ACLE
 // Uses the PostgreSQL function for efficient permission checking
 func (db *Database) CheckMailboxPermission(ctx context.Context, mailboxID, accountID int64, right ACLRight) (bool, error) {
 	var hasRight bool
-	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT has_mailbox_right($1, $2, $3)
-	`, mailboxID, accountID, string(right)).Scan(&hasRight)
+	err := db.GetReadPoolWithContext(ctx).QueryRow(ctx,
+		"SELECT "+db.rightSQL("$1", "$2", "$3"), mailboxID, accountID, string(right)).Scan(&hasRight)
 	if err != nil {
 		return false, fmt.Errorf("failed to check permission: %w", err)
 	}
@@ -602,11 +601,8 @@ func (db *Database) CheckMailboxPermission(ctx context.Context, mailboxID, accou
 // caller passes equal ids; the function still returns all three booleans correctly.
 func (db *Database) CheckMoveRights(ctx context.Context, srcMailboxID, destMailboxID, accountID int64) (canInsertDest, canDeleteSrc, canExpungeSrc bool, err error) {
 	err = db.GetReadPoolWithContext(ctx).QueryRow(ctx, `
-		SELECT
-			has_mailbox_right($1, $3, 'i'),
-			has_mailbox_right($2, $3, 't'),
-			has_mailbox_right($2, $3, 'e')
-	`, destMailboxID, srcMailboxID, accountID).Scan(&canInsertDest, &canDeleteSrc, &canExpungeSrc)
+		SELECT `+db.rightSQL("$1", "$3", "'i'")+`, `+db.rightSQL("$2", "$3", "'t'")+`, `+db.rightSQL("$2", "$3", "'e'"),
+		destMailboxID, srcMailboxID, accountID).Scan(&canInsertDest, &canDeleteSrc, &canExpungeSrc)
 	if err != nil {
 		return false, false, false, fmt.Errorf("failed to check move permissions: %w", err)
 	}
@@ -648,6 +644,10 @@ func (db *Database) GetUserMailboxRights(ctx context.Context, mailboxID, account
 	// Owners have all rights (both shared and non-shared mailboxes)
 	if isOwner {
 		return AllACLRights, nil
+	}
+	// With shared access off, no grant counts (SetSharedMailboxAccess).
+	if !db.sharedAccess() {
+		return "", nil
 	}
 
 	// Effective rights are the UNION of the user-specific ACL and any applicable

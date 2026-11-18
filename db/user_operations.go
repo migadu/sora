@@ -633,7 +633,7 @@ func (db *Database) GetMessageByID(ctx context.Context, accountID int64, message
 		-- A shared mailbox's messages belong to its owner. Anyone else reads them with the
 		-- "r" right on the mailbox, as SELECT requires (RFC 4314 section 4), the same gate
 		-- as the message list; without it the message is not found.
-		AND (m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'r'))
+		AND (m.account_id = $2 OR ` + db.rightSQL("m.mailbox_id", "$2", "'r'") + `)
 	`
 
 	msg := &DBMessage{}
@@ -689,13 +689,13 @@ func (db *Database) UpdateMessageFlags(ctx context.Context, accountID int64, mes
 	var maySeen, mayDelete, mayWrite bool
 	err = tx.QueryRow(ctx, `
 		SELECT m.mailbox_id, m.account_id,
-		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 's'),
-		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 't'),
-		       m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'w')
+		       m.account_id = $2 OR `+db.rightSQL("m.mailbox_id", "$2", "'s'")+`,
+		       m.account_id = $2 OR `+db.rightSQL("m.mailbox_id", "$2", "'t'")+`,
+		       m.account_id = $2 OR `+db.rightSQL("m.mailbox_id", "$2", "'w'")+`
 		FROM messages m
 		JOIN mailboxes mb ON mb.id = m.mailbox_id
 		WHERE m.id = $1 AND m.expunged_at IS NULL AND mb.deleted_at IS NULL
-		  AND (m.account_id = $2 OR has_mailbox_right(m.mailbox_id, $2, 'r'))
+		  AND (m.account_id = $2 OR `+db.rightSQL("m.mailbox_id", "$2", "'r'")+`)
 	`, messageID, accountID).Scan(&mailboxID, &ownerID, &maySeen, &mayDelete, &mayWrite)
 
 	if err != nil {

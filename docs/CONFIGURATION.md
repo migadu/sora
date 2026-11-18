@@ -636,7 +636,7 @@ See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Turn on shared mailboxes and ACLs. |
+| `enabled` | bool | `false` | Turn on shared mailboxes and ACLs. Off, a node serves every mailbox to its owner only, whatever its ACL says. Use the same value on every node. |
 | `namespace_prefix` | string | `"Shared/"` | Prefix of the shared namespace. `Shared/` covers the root `Shared` and the names under `Shared/`, not `SharedNotes`. While sharing is on, Sora refuses to start with a prefix that is not a mailbox name followed by `/` (an empty one, `Shared` or `Shared//`), or with `INBOX/`. |
 | `allow_user_create` | bool | `false` | Let users create shared mailboxes. |
 | `default_rights` | string | `"lrswipkxtea"` | ACL rights of the creator. |

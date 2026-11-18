@@ -46,13 +46,14 @@ func (db *Database) GetMailboxNotifySnapshot(ctx context.Context, accountID int6
 			SELECT m.id, m.name, m.uid_validity, m.account_id, 1 AS priority
 			FROM mailboxes m
 			INNER JOIN mailbox_acls acl ON m.id = acl.mailbox_id
-			WHERE m.is_shared = TRUE AND acl.account_id = $1
+			-- $3: shared mailbox access is on (SetSharedMailboxAccess).
+			WHERE $3::boolean AND m.is_shared = TRUE AND acl.account_id = $1
 			  AND position('l' IN acl.rights) > 0 AND m.deleted_at IS NULL
 			UNION ALL
 			SELECT m.id, m.name, m.uid_validity, m.account_id, 2 AS priority
 			FROM mailboxes m
 			INNER JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id
-			WHERE m.is_shared = TRUE AND m.owner_domain = $2
+			WHERE $3::boolean AND m.is_shared = TRUE AND m.owner_domain = $2
 			  AND anyone_acl.identifier = 'anyone'
 			  AND position('l' IN anyone_acl.rights) > 0 AND m.deleted_at IS NULL
 		), visible_mailboxes AS (
@@ -65,7 +66,7 @@ func (db *Database) GetMailboxNotifySnapshot(ctx context.Context, accountID int6
 		       (subs.mailbox_name IS NOT NULL) AS subscribed
 		FROM visible_mailboxes m
 		LEFT JOIN subscriptions subs ON subs.account_id = $1 AND LOWER(subs.mailbox_name) = LOWER(m.name)
-	`, accountID, ownerDomain)
+	`, accountID, ownerDomain, db.sharedAccess())
 	if err != nil {
 		return nil, fmt.Errorf("failed to query notify snapshot: %w", err)
 	}
