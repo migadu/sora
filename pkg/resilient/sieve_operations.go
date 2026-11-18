@@ -276,3 +276,26 @@ func (rd *ResilientDatabase) RecordRedirectWithRetry(ctx context.Context, Accoun
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
 	return err
 }
+
+// RedirectedTargetsWithRetry returns the redirect targets already queued for the
+// account's delivery of the message identified by deliveryHash, read from the primary.
+func (rd *ResilientDatabase) RedirectedTargetsWithRetry(ctx context.Context, accountID int64, deliveryHash string) ([]string, error) {
+	op := func(ctx context.Context) (any, error) {
+		return rd.getOperationalDatabaseForOperation(ctx, true).RedirectedTargets(ctx, accountID, deliveryHash)
+	}
+	result, err := rd.executeReadWithRetry(ctx, sieveReadRetryConfig, timeoutRead, op)
+	if err != nil {
+		return nil, err
+	}
+	return result.([]string), nil
+}
+
+// RecordRedirectDeliveryWithRetry records that the account's delivery of the message
+// identified by deliveryHash has queued its redirect to redirectTo.
+func (rd *ResilientDatabase) RecordRedirectDeliveryWithRetry(ctx context.Context, accountID int64, deliveryHash, redirectTo string) error {
+	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordRedirectDelivery(ctx, tx, accountID, deliveryHash, redirectTo)
+	}
+	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
+	return err
+}

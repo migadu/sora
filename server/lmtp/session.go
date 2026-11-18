@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,7 +41,14 @@ var defaultSieveScript = delivery.DefaultSieveScript
 // limit, and reports whether all of them went; abort drops the ones still held.
 // arrivedHops is the redirect hop count of the message before the script's header
 // edits; every outgoing copy is stamped one above it.
-func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Result, arrivedHops int, fullMessageBytes []byte) (commit func() bool, abort func(), allHeld bool) {
+//
+// deliveryHash identifies the upstream submission (InsertMessageOptions.DeliveryHash).
+// A target an earlier attempt of the same delivery already handed over (an MTA retry
+// whose 250 was lost, maybe on another node) is skipped and counts as held, the way
+// the stored copy of such a retry is absorbed; commit records each target it hands
+// over, after handing it over, so a crash or a failed record errs toward relaying the
+// message again rather than not at all.
+func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Result, arrivedHops int, fullMessageBytes []byte, deliveryHash string) (commit func() bool, abort func(), allHeld bool) {
 	type heldRedirect struct {
 		to     string
 		commit func() error
@@ -61,7 +69,15 @@ func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Resu
 			// User.Address is the script owner's primary address, even for aliases.
 			// Replace earlier or sender-supplied attribution on the outgoing copy only.
 			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
+			queued, err := s.backend.rdb.RedirectedTargetsWithRetry(ctx, s.AccountID(), deliveryHash)
+			if err != nil {
+				s.WarnLog("could not check for redirects queued by an earlier attempt, queuing all", "error", err)
+			}
 			for _, redirectTo := range result.RedirectTo {
+				if slices.Contains(queued, redirectTo) {
+					s.InfoLog("sieve redirect already queued by an earlier attempt of this delivery, skipping", "redirect_to", redirectTo)
+					continue
+				}
 				commit, abort, err := s.backend.relayQueue.Hold(s.sender.FullAddress(), redirectTo, "redirect", relayBytes)
 				if err != nil {
 					// Delivery goes on: the message is kept in INBOX unless a fileinto
@@ -89,6 +105,9 @@ func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Resu
 			}
 			s.DebugLog("successfully queued message for relay delivery", "redirect_to", h.to)
 			s.notifyRelayWorker()
+			if err := s.backend.rdb.RecordRedirectDeliveryWithRetry(ctx, s.AccountID(), deliveryHash, h.to); err != nil {
+				s.WarnLog("failed to record a queued redirect, a retry of this delivery would queue it again", "redirect_to", h.to, "error", err)
+			}
 			// Only a queued redirect counts against the rate limit.
 			if result.RecordRedirect != nil {
 				if err := result.RecordRedirect(ctx); err != nil {
@@ -856,14 +875,16 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// keeps the message in INBOX when nothing else stores it, and a delivery that fails
 	// is retried by the sender, so a redirect handed over before the failure would be
 	// relayed again by every retry. Whatever is not handed over when this delivery
-	// returns is dropped; the retry holds it again.
+	// returns is dropped; the retry holds it again. What was handed over is recorded
+	// against deliveryHash, so the retry of a delivery whose 250 the MTA did not see
+	// does not hand it over a second time (#1912).
 	//
 	// The hop count is the one the message arrived with, before the script's header
 	// edits, which RedirectAllowed checked: an editheader script may delete X-Sora-Loop
 	// (RFC 5293 §6 leaves which fields it may delete to local policy), and a count read
 	// after its edits would restart on every pass and never reach max_redirect_hops.
 	arrivedHops := helpers.RedirectHopCount(helpers.HeaderGetter(sieveCtx.Header))
-	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, arrivedHops, fullMessageBytes)
+	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, arrivedHops, fullMessageBytes, deliveryHash)
 	defer abortRedirects()
 	redirectFailed := !allHeld
 	destinations := result.Destinations(redirectFailed)
