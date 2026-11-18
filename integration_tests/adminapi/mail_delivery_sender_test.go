@@ -19,8 +19,9 @@ import (
 )
 
 // senderCase is a sender handed to /admin/mail/deliver and the envelope sender Sieve
-// and vacation must see for it. An empty want means the sender does not parse: the
-// message is delivered with no envelope sender, so vacation does not reply.
+// and vacation must see for it. An empty want means the sender does not parse: a named
+// "from" is refused with 400 Invalid sender (#1995), while a From: header fallback is
+// ignored and the message delivered with no envelope sender, so vacation does not reply.
 type senderCase struct {
 	name, from, want string
 	notJSON          bool // invalid UTF-8, which a JSON string cannot carry
@@ -68,7 +69,9 @@ var headerSenders = []senderCase{
 // (#2101). An explicit "from" (JSON, query, form or X-From) is in its written form and
 // is decoded once; the From: header fallback is already decoded by net/mail and is not
 // decoded or trimmed again. The serialized `"John Doe"@example.com` and the From: field
-// naming the same mailbox reach the same sender.
+// naming the same mailbox reach the same sender. Every explicit case runs through both
+// the request check (#1995) and delivery, which must agree: what the check lets
+// through is delivered with exactly that sender, and nothing else is delivered.
 func TestAdminAPI_DeliverMail_SenderReadAsReversePath(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -128,6 +131,15 @@ func checkDeliverySender(t *testing.T, server *HTTPAPITestServer, rq *captureRel
 	message := "From: " + fromHeader + "\r\nTo: " + email + "\r\nSubject: who sent this\r\n" +
 		"Message-ID: <" + marker + "@example.net>\r\n\r\nbody\r\n"
 	resp, body := deliverWithSender(t, server, format, tc.from, email, message)
+	if tc.want == "" && format != "" {
+		if resp.StatusCode != http.StatusBadRequest || !strings.Contains(string(body), "Invalid sender") {
+			t.Errorf("sender %q does not parse: deliver %d %s, want 400 Invalid sender", tc.from, resp.StatusCode, body)
+		}
+		if n := len(rq.snapshot()) - before; n != 0 {
+			t.Errorf("sender %q does not parse, but %d relay items were queued", tc.from, n)
+		}
+		return
+	}
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("deliver: %d %s", resp.StatusCode, string(body))
 	}
