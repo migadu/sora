@@ -202,19 +202,49 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 
 	// The caller is responsible for beginning and committing/rolling back the transaction.
 
-	// Lock both mailboxes rows before any message row, the order MOVE, EXPUNGE, STORE and
-	// the failed-upload cleanup take them in: the source rows are locked next, and each of
-	// those holds its mailbox row while it waits for them (see lockCopyMailboxes).
-	if err := lockCopyMailboxes(ctx, tx, srcMailboxID, destMailboxID); err != nil {
+	// Lock the destination's mailbox row before any message row, the order MOVE takes
+	// them in: source rows are locked next, and a MOVE into this mailbox holds this row
+	// while it waits for them. The source's mailbox row is not locked: the copy only reads
+	// that mailbox, and holding its row would make every flag change and expunge there
+	// wait for the copy, and the copy for them.
+	if err := lockMailboxStats(ctx, tx, destMailboxID); err != nil {
 		return nil, nil, err
 	}
 
-	// Get the source message IDs and UIDs, and hold the rows live until the commit. A
-	// copy within one account takes no S3 body lock (lockS3SourceClaims): its bodies stand
-	// because the source rows it copies from stay live, and FOR SHARE keeps an expunge or
-	// a delete of one from committing before the copies do. Locked in UID order, as MOVE
-	// locks them.
-	rows, err := tx.Query(ctx, `SELECT id, uid, account_id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid FOR SHARE`, srcMailboxID, uids)
+	// Hold the uploaded source rows live until the commit. A copy within one account takes
+	// no S3 body lock (lockS3SourceClaims): the body of a copy marked uploaded stands
+	// because the source row it is copied from stays live, and FOR SHARE keeps an expunge
+	// or a delete of that row from committing before the copy does. Locked in UID order,
+	// as MOVE locks them.
+	//
+	// Only uploaded rows are held, and only a copy of a held row is marked uploaded
+	// (heldSources below). A row that is not uploaded has no object for a deleter to take:
+	// its copy starts not uploaded, with a pending upload (restagePendingUploads), like a
+	// copy made just before the source's upload finished. Leaving those rows unlocked
+	// keeps the copy out of the way of the failed-upload cleanup, which deletes the
+	// pending upload row first and the unuploaded message rows second, while the copy
+	// takes them the other way round (DeleteFailedUpload).
+	heldSources := make(map[int64]struct{})
+	heldRows, err := tx.Query(ctx, `SELECT id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL AND uploaded ORDER BY uid FOR SHARE`, srcMailboxID, uids)
+	if err != nil {
+		return nil, nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
+	}
+	for heldRows.Next() {
+		var id int64
+		if err := heldRows.Scan(&id); err != nil {
+			heldRows.Close()
+			return nil, nil, fmt.Errorf("failed to scan held source message: %w", err)
+		}
+		heldSources[id] = struct{}{}
+	}
+	heldRows.Close()
+	if err := heldRows.Err(); err != nil {
+		return nil, nil, fmt.Errorf("failed to hold the uploaded source messages: %w", err)
+	}
+
+	// Get the source message IDs and UIDs, from a snapshot taken after the wait for those
+	// row locks: a source expunged meanwhile is not copied.
+	rows, err := tx.Query(ctx, `SELECT id, uid, account_id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
 	}
@@ -224,12 +254,15 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	var sourceUIDsForMap []imap.UID
 	var expectedHashes []string // per message: sourceHashes, checked for re-keyed rows only
 	var rekeyed []bool          // per message: owned by another account than destAccountID
+	var held []bool             // per message: uploaded and locked above (heldSources)
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
 		if err := rows.Scan(&messageID, &sourceUID, &sourceAccountID); err != nil {
 			return nil, nil, fmt.Errorf("failed to scan message ID and UID: %w", err)
 		}
+		_, isHeld := heldSources[messageID]
+		held = append(held, isHeld)
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
 		expectedHashes = append(expectedHashes, sourceHashes[sourceUID])
@@ -302,7 +335,10 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		WITH src_data AS (
 			SELECT
 				m.content_hash,
-				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
+				-- A copy within the account is uploaded only if its source was uploaded and
+				-- locked before it was read (held): an upload that finished since leaves the
+				-- copy to the pending upload re-staged below.
+				CASE WHEN m.account_id = $6 THEN m.uploaded AND d.held ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
 				m.message_id, m.in_reply_to, m."references",
 				m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
@@ -312,7 +348,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				d.new_uid,
 				d.custom_flags_canon
 			FROM messages m
-			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::text[]) AS d(message_id, new_uid, custom_flags_canon, expected_hash) ON m.id = d.message_id
+			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::text[], $11::boolean[]) AS d(message_id, new_uid, custom_flags_canon, expected_hash, held) ON m.id = d.message_id
 			-- A row re-keyed to another account is copied only with the hash whose body the
 			-- caller made available under the owner's key (sourceHashes); a row left out
 			-- here fails the copy below.
@@ -354,7 +390,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			RETURNING message_id
 		)
 		SELECT id FROM inserted ORDER BY uid
-	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, expectedHashes, destObjects)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, expectedHashes, destObjects, held)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to batch copy messages: %w", err)
 	}

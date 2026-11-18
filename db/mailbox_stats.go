@@ -75,36 +75,6 @@ func lockMailboxStatsPair(ctx context.Context, tx pgx.Tx, a, b int64) error {
 	return nil
 }
 
-// lockCopyMailboxes locks the mailboxes rows of a COPY before it locks its source
-// message rows: the destination FOR UPDATE (lockMailboxStats: the copies change its
-// counters and UIDs), the source FOR KEY SHARE, in ascending id order like every other
-// path that locks more than one.
-//
-// Every path that locks, expunges or deletes live message rows first takes its mailbox
-// FOR UPDATE (lockMailboxStats, lockLiveMessageMailboxes), and some of them hold other
-// locks the copy needs later: DeleteFailedUpload deletes the pending_uploads row before it
-// expunges the messages, and the copy re-stages that row after it has locked the same
-// messages. The source's lock orders the copy before or after each of them as a whole.
-// FOR KEY SHARE conflicts with nothing else: deliveries into the source mailbox and
-// other copies out of it go on.
-func lockCopyMailboxes(ctx context.Context, tx pgx.Tx, srcMailboxID, destMailboxID int64) error {
-	lockSource := func() error {
-		if _, err := tx.Exec(ctx, "SELECT 1 FROM mailboxes WHERE id = $1 FOR KEY SHARE", srcMailboxID); err != nil {
-			return fmt.Errorf("failed to lock source mailbox %d for copy: %w", srcMailboxID, err)
-		}
-		return nil
-	}
-	lockDest := func() error { return lockMailboxStats(ctx, tx, destMailboxID) }
-	first, second := lockSource, lockDest
-	if destMailboxID < srcMailboxID {
-		first, second = lockDest, lockSource
-	}
-	if err := first(); err != nil {
-		return err
-	}
-	return second()
-}
-
 // RecomputeMailboxUnseen recomputes unseen_count for a single mailbox from the
 // authoritative source of truth (its live messages without \Seen, see
 // liveUnseenCount) and writes it back into the mailbox_stats cache. It is the self-healing counterpart to

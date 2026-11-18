@@ -320,24 +320,49 @@ func TestConcurrentSameAccountCopyAndMoveDoNotDeadlock(t *testing.T) {
 	assert.Zero(t, inInbox)
 }
 
-// pauseBeforePendingUploads is a transaction that stops before its first statement on
-// pending_uploads until resume is closed, and closes reached when it gets there.
-type pauseBeforePendingUploads struct {
+// pauseTx is a transaction that stops before its first statement containing match until
+// resume is closed, and closes reached when it gets there.
+type pauseTx struct {
 	pgx.Tx
+	match   string
 	reached chan struct{}
 	resume  chan struct{}
 }
 
-func (p pauseBeforePendingUploads) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
-	if strings.Contains(sql, "INSERT INTO pending_uploads") {
-		close(p.reached)
-		select {
-		case <-p.resume:
-		case <-ctx.Done():
-			return pgconn.CommandTag{}, ctx.Err()
-		}
+func newPauseTx(tx pgx.Tx, match string) *pauseTx {
+	return &pauseTx{Tx: tx, match: match, reached: make(chan struct{}), resume: make(chan struct{})}
+}
+
+func (p *pauseTx) pause(ctx context.Context, sql string) error {
+	if !strings.Contains(sql, p.match) {
+		return nil
+	}
+	select {
+	case <-p.reached:
+		return nil // only the first one
+	default:
+	}
+	close(p.reached)
+	select {
+	case <-p.resume:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (p *pauseTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if err := p.pause(ctx, sql); err != nil {
+		return pgconn.CommandTag{}, err
 	}
 	return p.Tx.Exec(ctx, sql, args...)
+}
+
+func (p *pauseTx) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	if err := p.pause(ctx, sql); err != nil {
+		return nil, err
+	}
+	return p.Tx.Query(ctx, sql, args...)
 }
 
 // waitUntilBlocked waits until the backend pid waits for a lock, or until done yields.
@@ -361,11 +386,24 @@ func waitUntilBlocked(t *testing.T, ctx context.Context, db *Database, pid int, 
 	}
 }
 
-// A COPY holds its source rows and then re-stages their pending upload; the failed-upload
-// cleanup deletes the pending upload and then expunges the same rows. Locked in those
-// orders alone the two deadlock. The copy therefore locks the source's mailbox row first,
-// which DeleteFailedUpload takes FOR UPDATE before anything else (lockCopyMailboxes): one
-// of them runs as a whole before the other.
+// liveRowsWithoutUpload counts the live rows of (accountID, hash) that are not uploaded and
+// have no pending upload: rows nothing will ever upload.
+func liveRowsWithoutUpload(t *testing.T, ctx context.Context, db *Database, accountID int64, hash string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, db.GetWritePool().QueryRow(ctx, `
+		SELECT count(*) FROM messages m
+		WHERE m.account_id = $1 AND m.content_hash = $2 AND m.expunged_at IS NULL AND NOT m.uploaded
+		  AND NOT EXISTS (SELECT 1 FROM pending_uploads pu WHERE pu.account_id = m.account_id AND pu.content_hash = m.content_hash)`,
+		accountID, hash).Scan(&n))
+	return n
+}
+
+// The failed-upload cleanup deletes the pending upload row and then expunges the
+// unuploaded message rows; a COPY re-stages the pending upload row after it has read its
+// sources. If the copy held an unuploaded source row, the two would wait for each other:
+// the copy for the deleted pending row, the cleanup for the message row. The copy holds
+// only uploaded source rows (CopyMessages), so the cleanup never waits for it.
 func TestCopyOfUnuploadedSourceDoesNotDeadlockWithDeleteFailedUpload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -386,11 +424,11 @@ func TestCopyOfUnuploadedSourceDoesNotDeadlockWithDeleteFailedUpload(t *testing.
 	_, err = db.GetWritePool().Exec(ctx, `INSERT INTO pending_uploads (account_id, instance_id, content_hash, size, attempts) VALUES ($1, 'dead-instance', $2, 100, $3)`, accountID, hash, maxAttempts)
 	require.NoError(t, err)
 
-	// The copy has locked its source row and is about to re-stage the pending upload.
+	// The copy has inserted its row and is about to re-stage the pending upload.
 	copyTx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer copyTx.Rollback(context.Background())
-	paused := pauseBeforePendingUploads{Tx: copyTx, reached: make(chan struct{}), resume: make(chan struct{})}
+	paused := newPauseTx(copyTx, "INSERT INTO pending_uploads")
 	copyDone := make(chan error, 1)
 	go func() {
 		uids := []imap.UID{uid}
@@ -405,29 +443,89 @@ func TestCopyOfUnuploadedSourceDoesNotDeadlockWithDeleteFailedUpload(t *testing.
 		t.Fatal(ctx.Err())
 	}
 
+	// The cleanup runs to its end while the copy is open.
 	deleteTx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer deleteTx.Rollback(context.Background())
-	var deletePID int
-	require.NoError(t, deleteTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&deletePID))
-	deleteDone := make(chan error, 1)
-	go func() {
-		_, err := db.DeleteFailedUpload(ctx, deleteTx, hash, accountID, maxAttempts)
-		deleteDone <- err
-	}()
-	require.True(t, waitUntilBlocked(t, ctx, db, deletePID, deleteDone),
-		"DeleteFailedUpload did not wait for the open copy of the message it deletes")
+	_, err = deleteTx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`)
+	require.NoError(t, err)
+	_, err = db.DeleteFailedUpload(ctx, deleteTx, hash, accountID, maxAttempts)
+	require.NoError(t, err, "DeleteFailedUpload waited for an open copy of the message it deletes")
+	require.NoError(t, deleteTx.Commit(ctx))
 
-	// Both finish, the copy first.
 	close(paused.resume)
 	require.NoError(t, <-copyDone)
 	require.NoError(t, copyTx.Commit(ctx))
-	require.NoError(t, <-deleteDone)
-	require.NoError(t, deleteTx.Commit(ctx))
 
 	var sources int
 	require.NoError(t, db.GetWritePool().QueryRow(ctx, `SELECT count(*) FROM messages WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid).Scan(&sources))
 	assert.Zero(t, sources, "DeleteFailedUpload left the source message")
+	// The copy the cleanup could not see has a pending upload of its own.
+	assert.Zero(t, liveRowsWithoutUpload(t, ctx, db, accountID, hash), "the copy is not uploaded and has no pending upload")
+}
+
+// A copy is marked uploaded only if its source row was uploaded when the copy locked it.
+// A source whose upload finishes after that is not held by the copy, so its copy must not
+// claim the object: it starts not uploaded, with a pending upload, and the uploader marks
+// it from its sibling.
+func TestCopyOfSourceUploadedAfterItWasReadStartsNotUploaded(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, _, accountID, inboxID := setupCleanerTestDatabase(t)
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	archiveID := createRestageMailbox(t, ctx, db, accountID, "Archive")
+	hash := fmt.Sprintf("copy_upload_finishes_%d", time.Now().UnixNano())
+	const uid = 9861
+	insertRestageFixture(t, ctx, db.GetWritePool(), accountID, inboxID, uid, hash, false)
+	_, err := db.GetWritePool().Exec(ctx, `UPDATE messages SET uploaded = FALSE WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid)
+	require.NoError(t, err)
+
+	copyTx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer copyTx.Rollback(context.Background())
+	paused := newPauseTx(copyTx, "WITH src_data")
+	type copyResult struct {
+		uids map[imap.UID]imap.UID
+		err  error
+	}
+	copyDone := make(chan copyResult, 1)
+	go func() {
+		uids := []imap.UID{uid}
+		copied, _, err := db.CopyMessages(ctx, paused, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
+		copyDone <- copyResult{copied, err}
+	}()
+	select {
+	case <-paused.reached:
+	case res := <-copyDone:
+		t.Fatalf("CopyMessages finished without inserting: %v", res.err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	// The upload finishes: the source is not held, so this does not wait for the copy.
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(context.Background())
+	_, err = tx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`)
+	require.NoError(t, err)
+	_, err = tx.Exec(ctx, `UPDATE messages SET uploaded = TRUE WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid)
+	require.NoError(t, err, "marking the source uploaded waited for the open copy")
+	require.NoError(t, tx.Commit(ctx))
+
+	close(paused.resume)
+	res := <-copyDone
+	require.NoError(t, res.err)
+	require.NoError(t, copyTx.Commit(ctx))
+
+	var uploaded bool
+	require.NoError(t, db.GetWritePool().QueryRow(ctx, `SELECT uploaded FROM messages WHERE mailbox_id = $1 AND uid = $2`, archiveID, res.uids[uid]).Scan(&uploaded))
+	assert.False(t, uploaded, "the copy claims an object through a source row the copy did not hold")
+	assert.Zero(t, liveRowsWithoutUpload(t, ctx, db, accountID, hash), "the copy is not uploaded and has no pending upload")
 }
 
 // The missing-object repair marks the rows of a key not uploaded under the exclusive body
@@ -506,4 +604,61 @@ func TestMissingObjectRepairCoversOpenSameAccountCopyAndMove(t *testing.T) {
 			assert.Equal(t, wantChanged, changed)
 		})
 	}
+}
+
+// A COPY reads its source mailbox; it must not hold that mailbox up. Flag changes and
+// expunges of other messages there go on while a copy out of it is open, and a copy does
+// not wait for one of them: only the messages being copied are held (the uploaded ones,
+// see CopyMessages).
+func TestCopyDoesNotHoldUpItsSourceMailbox(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, _, accountID, inboxID := setupCleanerTestDatabase(t)
+	defer db.Close()
+
+	ctx := context.Background()
+	archiveID := createRestageMailbox(t, ctx, db, accountID, "Archive")
+	base := time.Now().UnixNano()
+	const copied, other, later = 9851, 9852, 9853
+	for _, uid := range []int64{copied, other, later} {
+		insertRestageFixture(t, ctx, db.GetWritePool(), accountID, inboxID, uid, fmt.Sprintf("copy_source_mailbox_%d_%d", base, uid), true)
+	}
+
+	t.Run("STORE and EXPUNGE during an open copy", func(t *testing.T) {
+		copyTx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer copyTx.Rollback(ctx)
+		uids := []imap.UID{copied}
+		_, _, err = db.CopyMessages(ctx, copyTx, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
+		require.NoError(t, err)
+
+		tx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer tx.Rollback(ctx)
+		_, err = tx.Exec(ctx, `SET LOCAL lock_timeout = '300ms'`)
+		require.NoError(t, err)
+		_, _, err = db.AddMessageFlags(ctx, tx, other, inboxID, []imap.Flag{imap.FlagSeen})
+		require.NoError(t, err, "a STORE in the source mailbox waited for an open copy out of it")
+		_, err = db.ExpungeMessageUIDs(ctx, tx, inboxID, other)
+		require.NoError(t, err, "an EXPUNGE in the source mailbox waited for an open copy out of it")
+	})
+
+	t.Run("copy during an open STORE", func(t *testing.T) {
+		// What STORE and EXPUNGE hold for as long as they run.
+		holder, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer holder.Rollback(ctx)
+		require.NoError(t, lockMailboxStats(ctx, holder, inboxID))
+
+		copyTx, err := db.GetWritePool().Begin(ctx)
+		require.NoError(t, err)
+		defer copyTx.Rollback(ctx)
+		_, err = copyTx.Exec(ctx, `SET LOCAL lock_timeout = '300ms'`)
+		require.NoError(t, err)
+		uids := []imap.UID{later}
+		_, _, err = db.CopyMessages(ctx, copyTx, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
+		require.NoError(t, err, "a copy waited for a STORE in its source mailbox")
+	})
 }
