@@ -44,9 +44,22 @@ func withRecentFlag(flags []imap.Flag, uid, recentAbove imap.UID) []imap.Flag {
 	return append(slices.Clip(flags), flagRecent)
 }
 
+// recentAboveLocked returns the UID above which the messages of mailbox
+// mailboxID are \Recent for this session: in the selected mailbox the
+// session's own threshold (recentAboveUID); in any other what an EXAMINE would
+// count from, the UID of the last read-write selection (mailboxRecentUIDs, see
+// Select), or 0, every message, when there was none. The caller holds s.mutex.
+func (s *IMAPSession) recentAboveLocked(mailboxID int64) imap.UID {
+	if s.selectedMailbox != nil && s.selectedMailbox.ID == mailboxID {
+		return s.recentAboveUID
+	}
+	above, _ := s.server.mailboxRecentUIDs.Load(mailboxID)
+	return above
+}
+
 // withSessionRecent returns criteria with its \Recent keys answered for mailbox
-// mailboxID: from the session's threshold in the selected mailbox, and as no
-// message in any other, since this session has seen nothing arrive there.
+// mailboxID from recentAboveLocked, so that SEARCH, multimailbox SEARCH and
+// STATUS (statusNumRecent) agree on which messages are recent.
 func (s *IMAPSession) withSessionRecent(criteria *imap.SearchCriteria, mailboxID int64) (*imap.SearchCriteria, error) {
 	if criteria == nil || !mentionsRecent(criteria) {
 		return criteria, nil
@@ -59,11 +72,12 @@ func (s *IMAPSession) withSessionRecent(criteria *imap.SearchCriteria, mailboxID
 			Text: "Server busy, please try again",
 		}
 	}
-	recent := imap.UIDSet{}
-	if s.selectedMailbox != nil && s.selectedMailbox.ID == mailboxID && s.recentAboveUID < math.MaxUint32 {
-		recent = imap.UIDSet{{Start: s.recentAboveUID + 1, Stop: math.MaxUint32}}
-	}
+	above := s.recentAboveLocked(mailboxID)
 	release()
+	recent := imap.UIDSet{}
+	if above < math.MaxUint32 {
+		recent = imap.UIDSet{{Start: above + 1, Stop: math.MaxUint32}}
+	}
 	return recentAsUIDs(criteria, recent), nil
 }
 
@@ -118,28 +132,22 @@ func isRecentFlag(f imap.Flag) bool {
 
 // statusNumRecent returns the STATUS (and LIST RETURN (STATUS)) RECENT item of
 // mailbox mailboxID, whose summary is given: "The number of messages with the
-// \Recent flag set" (RFC 3501 §6.3.10). STATUS is the alternative to "doing an
-// EXAMINE command on a mailbox" in a second connection, so it counts what that
-// EXAMINE would: the messages above the UID of the last read-write selection
-// (mailboxRecentUIDs, see Select), all of them when there is none. In the
-// selected mailbox it counts this session's \Recent messages, those above
-// recentAboveUID, as SELECT and SEARCH RECENT do. A failed count makes every
-// message recent, as "it is not possible to determine" otherwise (§2.3.2).
+// \Recent flag set" (RFC 3501 §6.3.10), those above recentAboveLocked. STATUS
+// is the alternative to "doing an EXAMINE command on a mailbox" in a second
+// connection, which is what that threshold counts from outside the selected
+// mailbox. A failed count makes every message recent, as "it is not possible to
+// determine" otherwise (§2.3.2).
 func (s *IMAPSession) statusNumRecent(ctx context.Context, mailboxID int64, summary *db.MailboxSummary) uint32 {
 	var above imap.UID
-	hasAbove := false
 	if acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx); acquired {
-		if s.selectedMailbox != nil && s.selectedMailbox.ID == mailboxID {
-			above, hasAbove = s.recentAboveUID, true
-		}
+		above = s.recentAboveLocked(mailboxID)
 		release()
-	}
-	if !hasAbove {
-		above, hasAbove = s.server.mailboxRecentUIDs.Load(mailboxID)
+	} else {
+		above, _ = s.server.mailboxRecentUIDs.Load(mailboxID)
 	}
 	total := uint32(summary.NumMessages)
 	switch {
-	case !hasAbove || above == 0:
+	case above == 0:
 		return total
 	case int64(above) >= summary.UIDNext-1:
 		return 0
