@@ -482,8 +482,11 @@ A mailbox opened with `EXAMINE` reports an empty `PERMANENTFLAGS` list. `STORE` 
 Sora tracks `\Recent` in memory on each server, per mailbox, from the highest UID at the last
 read-write `SELECT`. It is approximate across several servers and is reset on restart. Within a
 session, the `RECENT` count, `SEARCH RECENT` (and `NEW`, `OLD`) and the `\Recent` flag in `FETCH
-FLAGS` all use the same threshold, so they agree. A client that has enabled IMAP4rev2, where
-`\Recent` is deprecated, sees it on no message.
+FLAGS` all use the same threshold, so they agree. `EXAMINE` and `CLOSE` leave `\Recent` alone.
+`STATUS` and `LIST ... RETURN (STATUS (RECENT))` count what an `EXAMINE` would see: the messages
+above that UID, or all of them before the first read-write `SELECT` since the server started; for
+the session's selected mailbox, the session's own `\Recent` messages. A client that has enabled
+IMAP4rev2, where `\Recent` is deprecated, sees it on no message.
 
 **EXPUNGE**
 
