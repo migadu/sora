@@ -19,7 +19,8 @@ import (
 // local part with consecutive dots is a sender go-smtp hands on (#1907), and a second "@"
 // can only come from a quoted local part, never from a master-token suffix (#1938). The
 // script answers only when Sieve sees the expected envelope sender, and the vacation
-// reply is addressed to it.
+// reply is addressed to it. Whitespace around "from" is trimmed, as NewAddress did, not
+// read as a quoted local part.
 func TestAdminAPI_DeliverMail_SenderReadAsReversePath(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -35,6 +36,7 @@ func TestAdminAPI_DeliverMail_SenderReadAsReversePath(t *testing.T) {
 	}{
 		{name: "consecutive dots", from: "first..last@example.com", want: "first..last@example.com"},
 		{name: "second at sign", from: "a@b.example@example.com", want: `"a@b.example"@example.com`},
+		{name: "surrounding whitespace", from: " sender@example.org ", want: "sender@example.org"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			marker := fmt.Sprintf("sender-%d", time.Now().UnixNano())

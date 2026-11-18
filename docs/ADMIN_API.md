@@ -798,7 +798,7 @@ The `Content-Type` header picks the format.
 |---|---|
 | `message` | The whole RFC 5322 message. Required. |
 | `recipients` | Addresses to deliver to. When empty, the `To`, `Cc` and `Bcc` header addresses are used, each once (`From`, `Sender` and `Reply-To` are not recipients). |
-| `from` | Envelope sender, as Sieve and vacation see it. When empty, the first `From` header address. An address that does not parse is ignored. |
+| `from` | Envelope sender, as Sieve and vacation see it. When empty, the first `From` header address. It is read as LMTP reads `MAIL FROM` ([PROTOCOLS.md section 8.3](PROTOCOLS.md#83-envelope)): `first..last@example.com` is accepted, and `a@b.example@example.com` is the sender `"a@b.example"@example.com`, not a master login suffix. An address that does not parse is ignored. |
 | `mailbox` | Deliver straight into this mailbox. Sieve does not run, and no `Received:` or `Delivered-To:` header is added. A mailbox that does not exist means `INBOX`. |
 | `uid`, `uid_validity` | Keep these IMAP values, for migrations. |
 

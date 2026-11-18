@@ -344,9 +344,10 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 
 	logger.Log("recipient found AccountID=%d", recipientInfo.AccountID)
 
-	// Set from address if provided
+	// Set from address if provided. It is the envelope sender, read as LMTP reads
+	// MAIL FROM (#1970); surrounding whitespace is a client's, not a quoted local part's.
 	if req.From != "" {
-		if addr, parseErr := server.NewAddress(req.From); parseErr == nil {
+		if addr, parseErr := server.NewReversePath(strings.TrimSpace(req.From)); parseErr == nil {
 			recipientInfo.FromAddress = &addr
 		}
 	}
