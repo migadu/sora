@@ -1,6 +1,9 @@
 package server
 
-import "testing"
+import (
+	"errors"
+	"testing"
+)
 
 // The master-token suffix (user@domain@SUFFIX) belongs to login names, not to envelope
 // addresses (#1938). go-smtp hands a quoted local part over unquoted, so the sender
@@ -40,5 +43,26 @@ func TestNewReversePathNoMasterSuffix(t *testing.T) {
 	}
 	if addr.Suffix() != "SUFFIX" || addr.BaseAddress() != "user@example.com" {
 		t.Errorf("NewAddress(user@example.com@SUFFIX) = base %q suffix %q, want user@example.com SUFFIX", addr.BaseAddress(), addr.Suffix())
+	}
+}
+
+// A recipient with a second "@" is refused: it is a quoted local part go-smtp unquoted,
+// or a master-token suffix, and neither names an account (#1938).
+func TestNewForwardPathNoMasterSuffix(t *testing.T) {
+	for _, in := range []string{"a@b.example@example.com", "user@example.com@SUFFIX", "user@example.com@a@b"} {
+		if addr, err := NewForwardPath(in); err == nil {
+			t.Errorf("NewForwardPath(%q) = %q (suffix %q), want an error", in, addr.FullAddress(), addr.Suffix())
+		} else if !errors.Is(err, ErrInvalidAddress) {
+			t.Errorf("NewForwardPath(%q): %v does not match ErrInvalidAddress", in, err)
+		}
+	}
+	for _, in := range []string{"user@example.com", "User+Tag@Example.com", "josé@bücher.example"} {
+		want, err := NewAddress(in)
+		if err != nil {
+			t.Fatalf("NewAddress(%q): %v", in, err)
+		}
+		if got, err := NewForwardPath(in); err != nil || got != want {
+			t.Errorf("NewForwardPath(%q) = %+v, %v, want %+v", in, got, err, want)
+		}
 	}
 }
