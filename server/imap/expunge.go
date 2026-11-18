@@ -70,22 +70,17 @@ func (s *IMAPSession) Expunge(ctx context.Context, w *imapserver.ExpungeWriter, 
 	// Middle phase: Get the \Deleted messages to expunge (outside lock).
 	// Only the UIDs are needed — sequence numbers for the EXPUNGE notifications
 	// are computed by the post-command poll (see the notification note below).
-	var uidSets []imap.UIDSet
-	if uidSet != nil {
-		uidSets = []imap.UIDSet{*uidSet}
-	}
-	deletedMessages, err := s.server.rdb.GetDeletedMessageUIDsAndSeqsWithRetry(ctx, mailboxID, uidSets...)
+	deletedMessages, err := s.server.rdb.GetDeletedMessageUIDsAndSeqsWithRetry(ctx, mailboxID, uidSet)
 	if err != nil {
 		return s.internalError("failed to fetch deleted messages: %v", err)
 	}
-
-	var uidsToDelete []imap.UID
-	for _, msg := range deletedMessages {
-		uidsToDelete = append(uidsToDelete, msg.UID)
+	if len(deletedMessages) == 0 {
+		return nil
 	}
 
-	if len(uidsToDelete) == 0 {
-		return nil
+	uidsToDelete := make([]imap.UID, len(deletedMessages))
+	for i, msg := range deletedMessages {
+		uidsToDelete[i] = msg.UID
 	}
 
 	// Database operation - no lock needed
