@@ -1,6 +1,7 @@
 package db
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -38,5 +39,37 @@ func TestSortColumnsFirstAddressIsGroup(t *testing.T) {
 		if !strings.Contains(extra, v) {
 			t.Errorf("extra_addresses %q lacks %q", extra, v)
 		}
+	}
+}
+
+// TestSortColumnsCcWithinAddressBudget: a long To list does not crowd the Cc section out of
+// extra_addresses (#2113). Every section keeps an equal share of the budget, or all of
+// itself if it is smaller, and what a short section leaves goes to the others.
+func TestSortColumnsCcWithinAddressBudget(t *testing.T) {
+	recipients := []helpers.Recipient{{AddressType: "from", EmailAddress: "sender@example.com"}}
+	for i := range 60 {
+		recipients = append(recipients, helpers.Recipient{AddressType: "to", Name: fmt.Sprintf("Recipient Number %d", i), EmailAddress: fmt.Sprintf("recipient.number.%d@example.com", i)})
+	}
+	recipients = append(recipients,
+		helpers.Recipient{AddressType: "cc", Group: "mm-team"},
+		helpers.Recipient{AddressType: "cc", EmailAddress: "member@example.org"},
+		helpers.Recipient{AddressType: "cc", GroupEnd: true})
+	_, fromName, fromEmail, toName, toEmail, ccEmail, extra := sortColumnsFor("", recipients)
+	sections := strings.Split(extra, "\n")
+	if len(sections) != 3 {
+		t.Fatalf("extra_addresses has %d sections, want 3: %q", len(sections), extra)
+	}
+	if got, want := sections[2], "mm-team\tmember@example.org"; got != want {
+		t.Errorf("Cc section = %q, want %q", got, want)
+	}
+	if !strings.HasPrefix(sections[1], "recipient number 1\trecipient.number.1@example.com\t") {
+		t.Errorf("To section lost its start: %q", sections[1][:min(len(sections[1]), 80)])
+	}
+	used := len(fromName) + len(fromEmail) + len(toName) + len(toEmail) + len(ccEmail)
+	if used+len(extra) > helpers.MaxAddressColumnsBytes {
+		t.Errorf("address columns use %d bytes, over the %d budget", used+len(extra), helpers.MaxAddressColumnsBytes)
+	}
+	if used+len(extra) < helpers.MaxAddressColumnsBytes-4 {
+		t.Errorf("address columns use %d bytes: the To section should take what Cc leaves", used+len(extra))
 	}
 }
