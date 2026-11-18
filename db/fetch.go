@@ -61,10 +61,14 @@ func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 				logger.Warn("Database: malformed email address for recipient", "email", emailAddress, "type", addressType, "uid", msg.UID, "mailbox_id", msg.MailboxID)
 				continue
 			}
+			// Route is addr-adl, the obsolete source route of "<@hop:user@domain>" (RFC 9051
+			// §7.5.2); empty, NIL on the wire, for every other address and for rows stored
+			// before the route was kept.
 			address = imap.Address{
 				Name:    name,
 				Mailbox: emailAddress[:at],
 				Host:    emailAddress[at+1:],
+				Route:   recipient.Route,
 			}
 		}
 

@@ -15,17 +15,34 @@ import (
 // (section 4.4 says to ignore them), then without addr-spec CFWS. Use it for every
 // address header so search, ENVELOPE, vacation and delivery agree on the addresses.
 func ParseAddressList(value string) ([]*mail.Address, error) {
-	addresses, err := mail.ParseAddressList(value)
+	addresses, _, err := parseAddressListRoutes(value)
+	return addresses, err
+}
+
+// parseAddressListRoutes is ParseAddressList that also returns the source routes it
+// removed, for the ENVELOPE, which reports a route as addr-adl (RFC 9051 §7.5.2) even
+// though the route is ignored when the address is interpreted. routes is nil when no
+// address has one; otherwise it has an entry per address, the canonical route
+// (addressRouteEnd) or "". A route is kept only when it is certain which address it
+// belongs to: the value must be a plain run of mailboxes, one per comma-separated
+// element, which is how parseAddressGroups passes group members and the runs between
+// groups. A flat-parsed value with group syntax keeps its addresses without routes.
+func parseAddressListRoutes(value string) (addresses []*mail.Address, routes []string, err error) {
+	addresses, err = mail.ParseAddressList(value)
+	aligned := false
 	if err != nil {
-		if normalized := stripAddressRoutes(value); normalized != value {
-			value = normalized
+		if normalized, found, ok := stripAddressRoutes(value); normalized != value {
+			value, routes, aligned = normalized, found, ok
 			addresses, err = mail.ParseAddressList(value)
 		}
 	}
 	if err != nil {
 		addresses, err = mail.ParseAddressList(stripAddressCFWS(value))
 	}
-	return addresses, err
+	if err != nil || !aligned || len(routes) != len(addresses) {
+		return addresses, nil, err
+	}
+	return addresses, routes, nil
 }
 
 // Recipient is one entry of a message's stored address lists (messages.recipients_json),
@@ -40,6 +57,10 @@ type Recipient struct {
 	Name         string `json:"name,omitempty"`
 	Group        string `json:"group,omitempty"`
 	GroupEnd     bool   `json:"group_end,omitempty"`
+	// Route is the obsolete source route of an address written "<@hop1,@hop2:user@domain>"
+	// (RFC 5322 §4.4), in canonical form ("@hop1,@hop2"). Only the ENVELOPE reports it,
+	// as addr-adl; it is no part of the address for search, sorting, delivery or replies.
+	Route string `json:"route,omitempty"`
 }
 
 // IsGroupMarker reports whether r is a group start or end rather than an address.
@@ -55,13 +76,17 @@ func ExtractRecipients(header message.Header) []Recipient {
 
 	extractAddresses := func(key string) {
 		addressType := strings.ToLower(key)
-		addAddresses := func(addresses []*mail.Address) {
-			for _, addr := range addresses {
-				recipients = append(recipients, Recipient{
+		addAddresses := func(addresses []*mail.Address, routes []string) {
+			for i, addr := range addresses {
+				recipient := Recipient{
 					EmailAddress: SanitizeUTF8(addr.Address),
 					AddressType:  addressType,
 					Name:         SanitizeUTF8(addr.Name),
-				})
+				}
+				if routes != nil {
+					recipient.Route = routes[i]
+				}
+				recipients = append(recipients, recipient)
 			}
 		}
 		for _, value := range header.Values(key) {
@@ -69,17 +94,17 @@ func ExtractRecipients(header message.Header) []Recipient {
 			if parts, ok := parseAddressGroups(value); ok {
 				for _, part := range parts {
 					if part.group == "" {
-						addAddresses(part.addresses)
+						addAddresses(part.addresses, part.routes)
 						continue
 					}
 					recipients = append(recipients, Recipient{AddressType: addressType, Group: part.group})
-					addAddresses(part.addresses)
+					addAddresses(part.addresses, part.routes)
 					recipients = append(recipients, Recipient{AddressType: addressType, GroupEnd: true})
 				}
 				continue
 			}
-			if addresses, err := ParseAddressList(value); err == nil {
-				addAddresses(addresses)
+			if addresses, routes, err := parseAddressListRoutes(value); err == nil {
+				addAddresses(addresses, routes)
 			}
 		}
 	}
@@ -118,6 +143,7 @@ func DistinctAddresses(recipients []Recipient) []Recipient {
 type addressListPart struct {
 	group     string
 	addresses []*mail.Address
+	routes    []string // nil, or the source route of each address (parseAddressListRoutes)
 }
 
 // parseAddressGroups parses an address-list header value that holds RFC 5322 §3.4
@@ -134,11 +160,11 @@ func parseAddressGroups(value string) (parts []addressListPart, ok bool) {
 		if isBlankAddressList(list) {
 			return true
 		}
-		addresses, err := ParseAddressList(list)
+		addresses, routes, err := parseAddressListRoutes(list)
 		if err != nil {
 			return false
 		}
-		parts = append(parts, addressListPart{addresses: addresses})
+		parts = append(parts, addressListPart{addresses: addresses, routes: routes})
 		return true
 	}
 	segStart, lastComma := 0, -1
@@ -180,11 +206,11 @@ func parseAddressGroups(value string) (parts []addressListPart, ok bool) {
 			}
 			part := addressListPart{group: groupName}
 			if members := value[segStart:i]; !isBlankAddressList(members) {
-				addresses, err := ParseAddressList(members)
+				addresses, routes, err := parseAddressListRoutes(members)
 				if err != nil {
 					return nil, false
 				}
-				part.addresses = addresses
+				part.addresses, part.routes = addresses, routes
 			}
 			parts = append(parts, part)
 			inGroup, segStart, lastComma = false, i+1, -1
@@ -391,88 +417,124 @@ func isAddressWSP(ch byte) bool {
 // stripAddressRoutes removes only a syntactically valid obs-route at the start of
 // an angle-addr. Colons in display names, comments, local parts and domain literals
 // are not route separators. The normal parser still validates the final mailbox.
-func stripAddressRoutes(value string) string {
+// routes has the canonical route (addressRouteEnd), or "", of each non-empty
+// comma-separated element in order; aligned is false when the value has group syntax
+// at its top level, where an element is not one mailbox. Without a route to remove,
+// stripped is value itself.
+func stripAddressRoutes(value string) (stripped string, routes []string, aligned bool) {
 	var out strings.Builder
 	start := 0
+	aligned = true
+	route, nonBlank := "", false
+	endElement := func() {
+		if nonBlank {
+			routes = append(routes, route)
+		}
+		route, nonBlank = "", false
+	}
 	for i := 0; i < len(value); i++ {
 		switch value[i] {
-		case '"':
-			i = skipQuotedString(value, i)
+		case ' ', '\t', '\r', '\n':
+		case ',':
+			endElement()
 		case '(':
 			i = skipComment(value, i)
+		case '"':
+			nonBlank = true
+			i = skipQuotedString(value, i)
 		case '[':
+			nonBlank = true
 			i = skipDomainLiteral(value, i)
 		case '<':
-			if end, ok := addressRouteEnd(value, i+1); ok {
+			nonBlank = true
+			if end, canonical, ok := addressRouteEnd(value, i+1); ok {
 				out.WriteString(value[start : i+1])
-				start, i = end, end-1
+				start, route = end, canonical
+				i = skipAngleAddr(value, end-1)
 			} else {
 				i = skipAngleAddr(value, i)
 			}
+		case ':', ';':
+			aligned = false
+		default:
+			nonBlank = true
 		}
 	}
+	endElement()
 	if start == 0 {
-		return value
+		return value, nil, aligned
 	}
 	out.WriteString(value[start:])
-	return out.String()
+	return out.String(), routes, aligned
 }
 
 // addressRouteEnd recognizes RFC 5322 section 4.4 obs-domain-list ":" and returns
 // the first byte of its final addr-spec. Empty route-list entries are permitted,
 // but at least one @domain is required and every nonempty hop must be valid.
-func addressRouteEnd(value string, i int) (int, bool) {
-	var ok bool
+// route is the at-domain-list as the ENVELOPE reports it in addr-adl (RFC 9051
+// section 7.5.2), in Dovecot's form: every hop as "@" domain, joined by ",", with
+// comments, white space and empty entries dropped ("@first,@second").
+func addressRouteEnd(value string, i int) (end int, route string, ok bool) {
+	var hops strings.Builder
 	i, ok = addressCFWSEnd(value, i)
 	for ok && i < len(value) && value[i] == ',' {
 		i, ok = addressCFWSEnd(value, i+1)
 	}
 	if !ok || i == len(value) || value[i] != '@' {
-		return 0, false
+		return 0, "", false
 	}
 	for {
-		i, ok = addressRouteDomainEnd(value, i+1)
+		if hops.Len() > 0 {
+			hops.WriteByte(',')
+		}
+		hops.WriteByte('@')
+		i, ok = addressRouteDomainEnd(value, i+1, &hops)
 		if !ok || i == len(value) {
-			return 0, false
+			return 0, "", false
 		}
 		if value[i] == ':' {
-			return i + 1, true
+			return i + 1, hops.String(), true
 		}
 		if value[i] != ',' {
-			return 0, false
+			return 0, "", false
 		}
 		for value[i] == ',' {
 			i, ok = addressCFWSEnd(value, i+1)
 			if !ok || i == len(value) {
-				return 0, false
+				return 0, "", false
 			}
 		}
 		if value[i] == ':' {
-			return i + 1, true
+			return i + 1, hops.String(), true
 		}
 		if value[i] != '@' {
-			return 0, false
+			return 0, "", false
 		}
 	}
 }
 
 // addressRouteDomainEnd validates a route hop's domain, including obsolete CFWS
-// between its dot-separated atoms and domain literals containing colons.
-func addressRouteDomainEnd(value string, i int) (int, bool) {
+// between its dot-separated atoms and domain literals containing colons, and appends
+// it to hops without that CFWS (a domain literal as written, unfolded).
+func addressRouteDomainEnd(value string, i int, hops *strings.Builder) (int, bool) {
 	i, ok := addressCFWSEnd(value, i)
 	if !ok || i == len(value) {
 		return 0, false
 	}
 	if value[i] == '[' {
+		hops.WriteByte('[')
 		for i++; i < len(value); i++ {
 			switch ch := value[i]; ch {
 			case ']':
+				hops.WriteByte(']')
 				return addressCFWSEnd(value, i+1)
 			case '\\':
 				i++
 				if i == len(value) || value[i] == 0 || value[i] == '\r' || value[i] == '\n' {
 					return 0, false
 				}
+				hops.WriteByte('\\')
+				hops.WriteByte(value[i])
 			case '\r':
 				if i+2 >= len(value) || value[i+1] != '\n' || (value[i+2] != ' ' && value[i+2] != '\t') {
 					return 0, false
@@ -484,6 +546,7 @@ func addressRouteDomainEnd(value string, i int) (int, bool) {
 				if ch > 127 {
 					return 0, false
 				}
+				hops.WriteByte(ch)
 			}
 		}
 		return 0, false
@@ -496,10 +559,12 @@ func addressRouteDomainEnd(value string, i int) (int, bool) {
 		if start == i {
 			return 0, false
 		}
+		hops.WriteString(value[start:i])
 		i, ok = addressCFWSEnd(value, i)
 		if !ok || i == len(value) || value[i] != '.' {
 			return i, ok
 		}
+		hops.WriteByte('.')
 		i, ok = addressCFWSEnd(value, i+1)
 		if !ok {
 			return 0, false

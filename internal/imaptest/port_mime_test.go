@@ -131,7 +131,9 @@ func TestPortMIMEByteAssertionsAcceptLiteralRepresentationButRejectChangedBytes(
 	}
 }
 
-func TestPortMIMEEnvelopeAllowsIgnoredSourceRouteButRequiresMailbox(t *testing.T) {
+// The fixture's source-routed From must come back with its route as addr-adl
+// (RFC 9051 section 7.5.2), as Dovecot reports it; NIL there is a difference.
+func TestPortMIMEEnvelopeRequiresSourceRoute(t *testing.T) {
 	parse := func(raw string) Value {
 		t.Helper()
 		parser := valueParser{data: []byte(raw)}
@@ -147,8 +149,8 @@ func TestPortMIMEEnvelopeAllowsIgnoredSourceRouteButRequiresMailbox(t *testing.T
 		match        bool
 	}{
 		{"original route", want, true},
-		{"ignored routes", strings.ReplaceAll(want, `"@route"`, "NIL"), true},
-		{"one ignored route", strings.Replace(want, `"@route"`, "NIL", 1), true},
+		{"ignored routes", strings.ReplaceAll(want, `"@route"`, "NIL"), false},
+		{"one ignored route", strings.Replace(want, `"@route"`, "NIL", 1), false},
 		{"different route", strings.ReplaceAll(want, `"@route"`, `"@other"`), false},
 		{"different mailbox", strings.ReplaceAll(want, `"user"`, `"other"`), false},
 		{"different host", strings.ReplaceAll(want, `"domain"`, `"other"`), false},
@@ -156,15 +158,10 @@ func TestPortMIMEEnvelopeAllowsIgnoredSourceRouteButRequiresMailbox(t *testing.T
 		{"all addresses lost", `("Thu, 15 Feb 2007 01:02:03 +0200" NIL NIL NIL NIL NIL NIL NIL NIL NIL)`, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if match := portMIMEEnvelopeEqual(parse(tc.actual), parse(want)); match != tc.match {
+			if match := portMIMEValueEqual(parse(tc.actual), parse(want)); match != tc.match {
 				t.Fatalf("ENVELOPE comparison=%t, want %t", match, tc.match)
 			}
 		})
-	}
-	for _, envelope := range portMIMEEnvelopes {
-		if !portMIMEEnvelopeEqual(parse(envelope), parse(envelope)) {
-			t.Fatalf("unchanged envelope no longer matches: %s", envelope)
-		}
 	}
 }
 
