@@ -12,17 +12,22 @@ is required.
 
 ```sh
 make sora-imaptest
+./sora-imaptest -clients 4
 ./sora-imaptest -list
 ```
 
-Use an existing test account that permits mailbox creation and deletion. Supply its password
-through `SORA_IMAPTEST_PASSWORD`, another environment variable, or a local password file. The CLI
-has no password argument, so the password need not appear in process arguments.
+Defaults match the local seed: `localhost:143`, no TLS, username `alice@example.com`, and
+password `password`. The account must permit mailbox creation and deletion.
+
+Override the endpoint, transport, and account with `-addr`, `-tls`, and `-user`.
+`SORA_IMAPTEST_PASSWORD`, when set, overrides the seeded password; `-password-env` selects
+another environment variable, and `-password-file` takes precedence over environment variables.
+An explicitly selected password environment variable must be set.
 
 For implicit TLS:
 
 ```sh
-./sora-imaptest -addr mail.example.test:993 -user imaptest@example.test
+./sora-imaptest -addr mail.example.test:993 -tls implicit -user imaptest@example.test
 ```
 
 For STARTTLS:
@@ -58,9 +63,9 @@ Case names use `group/scenario`. `-run` is a Go regular expression:
 
 ```sh
 ./sora-imaptest -list -run '^(fetch|search)/'
-./sora-imaptest -addr mail.example.test:993 -user imaptest@example.test \
+./sora-imaptest -addr mail.example.test:993 -tls implicit -user imaptest@example.test \
   -run '^(append|fetch|store)/'
-./sora-imaptest -addr mail.example.test:993 -user imaptest@example.test \
+./sora-imaptest -addr mail.example.test:993 -tls implicit -user imaptest@example.test \
   -format json > imap-report.json
 ```
 
@@ -84,7 +89,7 @@ also skip with a reason. An all-skipped selection exits `2`.
 To make required coverage explicit, specify capabilities expected on the endpoint:
 
 ```sh
-./sora-imaptest -addr mail.example.test:993 -user imaptest@example.test \
+./sora-imaptest -addr mail.example.test:993 -tls implicit -user imaptest@example.test \
   -require-cap UIDPLUS,MOVE,CONDSTORE,LITERAL+
 ```
 
@@ -158,8 +163,7 @@ See [SEARCH.md](SEARCH.md) for the search model.
 `-clients N` runs N independent case workers concurrently (default `1`, maximum `1024`):
 
 ```sh
-./sora-imaptest -addr mail.example.test:993 -user imaptest@example.test \
-  -run '^imaptest/' -clients 4 -format json > imap-report.json
+./sora-imaptest -clients 4 -format json > imap-report.json
 ```
 
 Each case retains its isolated mailboxes. Cases with multiple protocol sessions open additional

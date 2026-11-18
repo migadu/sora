@@ -44,8 +44,9 @@ func TestListNeedsNoServerOrCredentials(t *testing.T) {
 
 func TestCLIRejectsInvalidInputsWithoutConnecting(t *testing.T) {
 	for _, args := range [][]string{
-		{"-run", "["}, {"-list", "-run", "^absent$"}, {"-format", "xml"}, {"-addr", "localhost:143"},
-		{"-addr", "localhost:143", "-user", "test"}, {"-addr", "localhost:143", "-user", "test", "-timeout", "-1s"}, {"positional"},
+		{"-run", "["}, {"-list", "-run", "^absent$"}, {"-format", "xml"}, {"-addr", ""},
+		{"-user", ""}, {"-timeout", "-1s"}, {"positional"},
+		{"-password-env", "MISSING_PASSWORD"}, {"-password-env", "SORA_IMAPTEST_PASSWORD"},
 		{"-list", "-clients", "0"}, {"-list", "-clients", "-1"}, {"-list", "-clients", "1025"},
 	} {
 		var out, stderr bytes.Buffer
@@ -56,6 +57,43 @@ func TestCLIRejectsInvalidInputsWithoutConnecting(t *testing.T) {
 	var out, stderr bytes.Buffer
 	if code := run(context.Background(), []string{"-help"}, &out, &stderr, noPassword); code != 0 {
 		t.Errorf("help exit %d", code)
+	}
+	for _, want := range []string{`(default "localhost:143")`, `(default "alice@example.com")`, `(default "none")`, `password "password"`} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("help omits seeded default %s: %s", want, &stderr)
+		}
+	}
+}
+
+func TestCLISeededDefaultsAndPasswordOverrides(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		args     []string
+		env      map[string]string
+		username string
+		password string
+	}{
+		{name: "seed", username: "alice@example.com", password: "password"},
+		{name: "default environment", env: map[string]string{"SORA_IMAPTEST_PASSWORD": "env-password"}, username: "alice@example.com", password: "env-password"},
+		{name: "empty environment", env: map[string]string{"SORA_IMAPTEST_PASSWORD": ""}, username: "alice@example.com"},
+		{name: "selected environment and user", args: []string{"-password-env", "CUSTOM_PASSWORD", "-user", "other@example.com"}, env: map[string]string{"CUSTOM_PASSWORD": "custom-password", "SORA_IMAPTEST_PASSWORD": "unused"}, username: "other@example.com", password: "custom-password"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			addr := cliEndpoint(t, false, "LOGIN "+imaptest.Quote(tc.username)+" "+imaptest.Quote(tc.password))
+			args := append([]string{"-addr", addr, "-clients", "4", "-run", "^core/capability-noop$", "-format", "json"}, tc.args...)
+			var out, stderr bytes.Buffer
+			code := run(context.Background(), args, &out, &stderr, func(name string) (string, bool) {
+				value, present := tc.env[name]
+				return value, present
+			})
+			var report imaptest.Report
+			if err := json.Unmarshal(out.Bytes(), &report); err != nil {
+				t.Fatalf("invalid JSON: %v\n%s\n%s", err, &out, &stderr)
+			}
+			if code != 0 || report.Passed != 1 || report.Clients != 4 {
+				t.Fatalf("seeded defaults or override failed: exit=%d report=%+v stderr=%s", code, report, &stderr)
+			}
+		})
 	}
 }
 
@@ -75,7 +113,7 @@ func TestCLIReportsRequestedClientCount(t *testing.T) {
 
 // cliEndpoint is a minimal network peer for command/report integration. It has
 // no dependency on Sora's protocol parser or services.
-func cliEndpoint(t *testing.T, refuseNOOP bool) string {
+func cliEndpoint(t *testing.T, refuseNOOP bool, wantLogin ...string) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -109,6 +147,9 @@ func cliEndpoint(t *testing.T, refuseNOOP bool) string {
 					}
 					tag, command, _ := strings.Cut(strings.TrimSpace(line), " ")
 					status := "OK"
+					if len(wantLogin) > 0 && strings.HasPrefix(command, "LOGIN ") && command != wantLogin[0] {
+						status = "NO"
+					}
 					if command == "CAPABILITY" {
 						fmt.Fprint(conn, "* CAPABILITY IMAP4rev1\r\n")
 					}
@@ -157,7 +198,7 @@ func TestCLIReportsPassAndAssertionFailureOverTCP(t *testing.T) {
 }
 
 func TestCLIReadsPasswordFileAndWritesPrivateTrace(t *testing.T) {
-	addr := cliEndpoint(t, false)
+	addr := cliEndpoint(t, false, `LOGIN "tester" "file-password"`)
 	passwordFile := filepath.Join(t.TempDir(), "password")
 	if err := os.WriteFile(passwordFile, []byte("file-password\r\n"), 0600); err != nil {
 		t.Fatal(err)
@@ -165,7 +206,7 @@ func TestCLIReadsPasswordFileAndWritesPrivateTrace(t *testing.T) {
 	trace := filepath.Join(t.TempDir(), "protocol.log")
 	var out, stderr bytes.Buffer
 	args := []string{"-addr", addr, "-tls", "none", "-user", "tester", "-password-file", passwordFile, "-rawlog", trace, "-run", "^core/capability-noop$"}
-	if code := run(context.Background(), args, &out, &stderr, noPassword); code != 0 {
+	if code := run(context.Background(), args, &out, &stderr, func(string) (string, bool) { return "unused-env-password", true }); code != 0 {
 		t.Fatalf("exit %d: %s%s", code, &out, &stderr)
 	}
 	data, err := os.ReadFile(trace)
