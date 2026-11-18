@@ -51,7 +51,7 @@ by their BLAKE3 hash.
 | `sieve_scripts` | Sieve scripts per account. |
 | `vacation_responses` | Which senders got a vacation reply and when. |
 | `redirect_log` | Sieve redirects per account, for the redirect rate limit. |
-| `redirect_deliveries` | Which redirect addresses each LMTP delivery was queued for, so that the MTA's retry of a delivery is not redirected again. |
+| `redirect_deliveries` | Which redirect addresses each delivery (LMTP or Admin API) was queued for, so that a retry of the delivery is not redirected again. |
 | `metadata` | IMAP METADATA entries. |
 | `locks` | Named locks with an expiry, for work that must run on exactly one node (TLS certificate issuance). |
 | `credential_changes` | One row for every changed or removed password, login address or account, written by database triggers. Every node reads it to drop cached logins ([AUTHENTICATION.md](AUTHENTICATION.md#121-the-credential-change-feed)). Rows are deleted 7 days after a node first saw them. |
@@ -840,7 +840,7 @@ until then expunged rows and deleted accounts stay in the database.
 mode; see [ADMIN_CLI.md](ADMIN_CLI.md):
 
 - [`mailbox repair-unseen`](ADMIN_CLI.md#mailbox-repair-unseen) recounts unseen counters that
-  are too high (the cleaner already repairs counters that went below zero);
+  are too high or too low (the cleaner already repairs counters that went below zero);
 - [`mailbox repair-hierarchy`](ADMIN_CLI.md#mailbox-repair-hierarchy) repairs the parent links
   of mailboxes;
 - [`messages repair-references`](ADMIN_CLI.md#messages-repair-references) fills the stored

@@ -10,6 +10,7 @@ import (
 // TestCommandOverviewExamples (#1936): a command group's overview (`sora-admin <group>
 // help`) shows an example for every subcommand it lists. The mailbox overview had none
 // for repair-unseen or unsubscribe, the verify overview none for body-deletions.
+// Every example also passes --config (#1954), since every command but `config` needs it.
 func TestCommandOverviewExamples(t *testing.T) {
 	configPath := filepath.Join(t.TempDir(), "config.toml")
 	if err := os.WriteFile(configPath, []byte("[database]\n"), 0o600); err != nil {
@@ -45,11 +46,20 @@ func TestCommandOverviewExamples(t *testing.T) {
 			}
 			shown := map[string]bool{}
 			for _, line := range strings.Split(examples, "\n") {
-				_, cmd, ok := strings.Cut(line, "sora-admin ")
+				cmd, ok := strings.CutPrefix(strings.TrimSpace(line), "sora-admin ")
 				if !ok {
 					continue
 				}
 				fields := strings.Fields(cmd)
+				hasConfig := false
+				for _, f := range fields {
+					if f == "--config" || strings.HasPrefix(f, "--config=") {
+						hasConfig = true
+					}
+				}
+				if !hasConfig {
+					t.Errorf("%s overview example omits --config: %s", group, strings.TrimSpace(line))
+				}
 				// The global --config may come before the group.
 				for len(fields) > 1 && fields[0] == "--config" {
 					fields = fields[2:]

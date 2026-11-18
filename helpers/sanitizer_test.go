@@ -24,39 +24,11 @@ func TestSanitizeFlags(t *testing.T) {
 			expected: []imap.Flag{"$Valid", "$Important", "\\Seen"},
 		},
 		{
-			name:     "NIL flag (uppercase)",
-			input:    []imap.Flag{"$Valid", "NIL", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"},
-		},
-		{
-			name:     "NIL flag (lowercase)",
-			input:    []imap.Flag{"$Valid", "nil", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"},
-		},
-		{
-			name:     "$NIL flag",
-			input:    []imap.Flag{"$Valid", "$NIL", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"},
-		},
-		{
-			name:     "$nil flag (lowercase)",
-			input:    []imap.Flag{"$Valid", "$nil", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"},
-		},
-		{
-			name:     "NULL flag (uppercase)",
-			input:    []imap.Flag{"$Valid", "NULL", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"},
-		},
-		{
-			name:     "null flag (lowercase)",
-			input:    []imap.Flag{"$Valid", "null", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"},
-		},
-		{
-			name:     "$NULL flag",
-			input:    []imap.Flag{"$Valid", "$NULL", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"},
+			// #2013: NIL, NULL and their "$" forms are atoms, hence valid
+			// keywords (flag-keyword = atom, RFC 3501 §9 / RFC 9051 §9).
+			name:     "NIL and NULL are keywords",
+			input:    []imap.Flag{"$Valid", "NIL", "nil", "$NIL", "NULL", "$null", "$Another"},
+			expected: []imap.Flag{"$Valid", "NIL", "nil", "$NIL", "NULL", "$null", "$Another"},
 		},
 		{
 			name:     "Empty string flag",
@@ -69,29 +41,19 @@ func TestSanitizeFlags(t *testing.T) {
 			expected: []imap.Flag{"$Valid", "$Another"},
 		},
 		{
-			name:     "Multiple invalid flags",
-			input:    []imap.Flag{"$Valid", "NIL", "", "NULL", "   ", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"},
+			name:     "Multiple invalid flags around the NIL keyword",
+			input:    []imap.Flag{"$Valid", "", "NIL", "   ", "$Another"},
+			expected: []imap.Flag{"$Valid", "NIL", "$Another"},
 		},
 		{
 			name:     "All invalid flags",
-			input:    []imap.Flag{"NIL", "NULL", "", "   "},
+			input:    []imap.Flag{"", "   "},
 			expected: []imap.Flag{},
 		},
 		{
-			name:     "Mixed case NIL",
-			input:    []imap.Flag{"$Valid", "Nil", "nIL", "$Another"},
-			expected: []imap.Flag{"$Valid", "$Another"},
-		},
-		{
-			name:     "Flags containing NIL as substring are kept",
-			input:    []imap.Flag{"$Valid", "$NOTNIL", "$Another"},
-			expected: []imap.Flag{"$Valid", "$NOTNIL", "$Another"}, // only the bare NIL/NULL tokens are dropped
-		},
-		{
-			name:     "System flags with NIL-like names",
+			name:     "System flags next to the NIL keyword",
 			input:    []imap.Flag{"\\Seen", "\\Deleted", "NIL", "$Valid"},
-			expected: []imap.Flag{"\\Seen", "\\Deleted", "$Valid"},
+			expected: []imap.Flag{"\\Seen", "\\Deleted", "NIL", "$Valid"},
 		},
 	}
 

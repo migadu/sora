@@ -17,14 +17,18 @@ type configurableRedirectOracle struct {
 	countErr  error // error returned by CountRedirectsSince (simulates DB trouble)
 	recordErr error // error returned by RecordRedirect
 	recordedN int   // number of RecordRedirect calls observed
+	// window and limit of the last RecordRedirect call
+	recordedWindow time.Duration
+	recordedLimit  int
 }
 
 func (m *configurableRedirectOracle) CountRedirectsSince(ctx context.Context, accountID int64, window time.Duration) (int, error) {
 	return m.count, m.countErr
 }
 
-func (m *configurableRedirectOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+func (m *configurableRedirectOracle) RecordRedirect(ctx context.Context, accountID int64, window time.Duration, limit int) error {
 	m.recordedN++
+	m.recordedWindow, m.recordedLimit = window, limit
 	return m.recordErr
 }
 
@@ -144,6 +148,11 @@ func TestRedirectRateLimit(t *testing.T) {
 		relayAll(t, res)
 		if ro.recordedN != 1 {
 			t.Errorf("expected exactly 1 RecordRedirect call, got %d", ro.recordedN)
+		}
+		// The record keeps the window and limit that charged it, so a node can tell
+		// redirects charged under another node's settings (#1994, #2020).
+		if ro.recordedWindow != time.Hour || ro.recordedLimit != 100 {
+			t.Errorf("RecordRedirect got window %v and limit %d, want 1h0m0s and 100", ro.recordedWindow, ro.recordedLimit)
 		}
 	})
 
@@ -278,7 +287,7 @@ func (o *countingRedirectOracle) CountRedirectsSince(ctx context.Context, accoun
 	return o.recorded, nil
 }
 
-func (o *countingRedirectOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+func (o *countingRedirectOracle) RecordRedirect(ctx context.Context, accountID int64, window time.Duration, limit int) error {
 	o.recorded++
 	return nil
 }

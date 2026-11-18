@@ -44,7 +44,9 @@ func (o *fakeVacationOracle) CountRedirectsSince(_ context.Context, _ int64, _ t
 	return 0, nil
 }
 
-func (o *fakeVacationOracle) RecordRedirect(_ context.Context, _ int64) error { return nil }
+func (o *fakeVacationOracle) RecordRedirect(_ context.Context, _ int64, _ time.Duration, _ int) error {
+	return nil
+}
 
 // orderedRelayQueue notes how many suppression records existed at handoff time.
 type orderedRelayQueue struct {

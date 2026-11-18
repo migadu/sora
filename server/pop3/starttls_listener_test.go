@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -76,7 +77,8 @@ func dialSTLS(t *testing.T, addr string) (*tls.Conn, *bufio.Reader) {
 		t.Errorf("plaintext CAPA must offer STLS, got:\n%s", caps)
 	}
 	// insecure_auth is off (tls = true), so login waits for the upgrade.
-	if strings.Contains(caps, "USER") || strings.Contains(caps, "SASL") {
+	// Whole lines: "UTF8 USER" is advertised whatever the TLS state.
+	if slices.Contains(strings.Split(caps, "\n"), "USER") || strings.Contains(caps, "SASL") {
 		t.Errorf("plaintext CAPA must not offer USER or SASL before STLS, got:\n%s", caps)
 	}
 

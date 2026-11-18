@@ -914,7 +914,7 @@ names it.
 | `search_rate_limit_burst` | integer | `search_rate_limit_per_min` | `imap` | Searches allowed back to back. `0` or less means the default. |
 | `thread_max_messages` | integer | `50000` | `imap` | Matches one THREAD command may process. `0` or less means the default. |
 | `redirect_rate_limit` | integer | `100` | `lmtp`, `http_admin_api` | Sieve redirects per account per window. `0` means no limit. |
-| `redirect_rate_window` | duration | `"1h"` | `lmtp`, `http_admin_api` | Window of the redirect limit. Must be positive. The cleaner keeps redirect records for the longest window or `[cleanup] grace_period`, whichever is longer ([STORAGE.md](STORAGE.md#11-the-cleanup-cycle)). |
+| `redirect_rate_window` | duration | `"1h"` | `lmtp`, `http_admin_api` | Window of the redirect limit. Must be positive, and the same on every server that applies the limit on every node; Sora warns when it is not ([SIEVE.md](SIEVE.md#keys-in-server-blocks)). See [STORAGE.md](STORAGE.md#11-the-cleanup-cycle) for cleanup retention. |
 | `max_redirect_hops` | integer | `2` | `lmtp`, `http_admin_api` | Redirects of one message before further ones are suppressed. `0` means no limit. |
 | `preview_s3_per_min` | integer | `300` | `imap` | S3 downloads per account per minute to answer FETCH PREVIEW. `0` or less means no limit. |
 | `preview_s3_burst` | integer | `min(200, preview_s3_per_min)` | `imap` | Of those, how many may run back to back. |
@@ -969,6 +969,7 @@ names it. The same holds for `[[server.client_filters]]`.
 | `append_limit` | size | `"25mb"` | `imap` | Largest message accepted by APPEND. |
 | `max_message_size` | size | `"50mb"` | `lmtp`, `lmtp_proxy`, `http_admin_api` | Largest message accepted for delivery. `0` also means 50 MiB. |
 | `max_script_size` | size | `"16kb"` | `managesieve` | Largest Sieve script. |
+| `strict_utf8_content` | bool | `false` | `pop3` | Answer `RETR` and `TOP` of a message with UTF-8 in its headers with `-ERR [UTF8]` until the client sends `UTF8` (RFC 6856). Behind a `pop3_proxy`, turn on only when the proxy has `remote_use_utf8 = true`, and so does the `[[pool]]` or `[server.remote_lookup]` that routes users here. See [PROTOCOLS.md](PROTOCOLS.md#72-commands). |
 | `supported_extensions` | list of strings | the default set | `managesieve_proxy` | Sieve extensions the proxy advertises. A `managesieve` backend uses `[sieve] enabled_extensions`. |
 | `enable_preview` | bool | `false` | `imap` | Advertise FETCH PREVIEW (RFC 8970). |
 | `disabled_caps` | list of strings | none | `imap` | Capabilities never advertised. Capabilities that depend on a removed one are removed too (for example QRESYNC with CONDSTORE); see [PROTOCOLS.md](PROTOCOLS.md#6-controlling-imap-capabilities). |

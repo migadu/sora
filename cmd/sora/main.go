@@ -701,6 +701,10 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		deps.resilientDB.StartPoolMetrics(ctx)
 		deps.resilientDB.StartPoolHealthMonitoring(ctx)
 		logger.Info("Database resilience features initialized: failover, circuit breakers, pool monitoring")
+		// The redirect rate limit is one limit only with one redirect_rate_window and one
+		// redirect_rate_limit on every node: warn about this node's and about the windows
+		// and limits other nodes charge (#1994, #2020).
+		go delivery.WatchRedirectRateWindows(ctx, deps.resilientDB, cfg.RedirectRateWindows(), cfg.RedirectRateLimits(), time.Hour)
 	}
 
 	// Initialize persistent auth cache if enabled (survives restarts, prevents thundering herd)
@@ -1714,6 +1718,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		AbsoluteSessionTimeout:    absoluteSessionTimeout,
 		MinBytesPerMinute:         serverConfig.GetMinBytesPerMinute(),
 		InsecureAuth:              serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (backend behind proxy)
+		StrictUTF8Content:         serverConfig.StrictUTF8Content,
 		Config:                    &deps.config,
 	})
 

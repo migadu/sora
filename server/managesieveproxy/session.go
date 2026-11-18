@@ -14,6 +14,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-managesieve/managesieveserver"
@@ -281,12 +282,6 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 		s.username = username
 	}
 
-	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
-	// Empty passwords are never valid under any condition
-	if password == "" {
-		return consts.ErrAuthenticationFailed
-	}
-
 	// Rate-limit key for this attempt. Canonicalised from the submitted username so
 	// that the CanAttemptAuth* check and every RecordAuthAttempt* call below use the
 	// SAME key. Checking the raw string while recording a mix of raw username,
@@ -355,6 +350,17 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 		// Unknown rate limiting error
 		metrics.ProtocolErrors.WithLabelValues("managesieve_proxy", "AUTH", "rate_limited", "client_error").Inc()
 		return err
+	}
+
+	// Credentials no account can have: an empty password, or a SASL PLAIN field that
+	// is not UTF-8 (RFC 4616 section 2: "SAFE = ... any UTF-8 encoded Unicode
+	// character except NUL"). Refused without a lookup, but as a failed login,
+	// recorded and counted like a name that does not parse.
+	if password == "" || !utf8.ValidString(authzID) || !utf8.ValidString(username) || !utf8.ValidString(password) {
+		s.InfoLog("authentication refused: empty password, or SASL PLAIN field not valid UTF-8")
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve_proxy", s.server.name, s.server.hostname, "failure").Inc()
+		return consts.ErrAuthenticationFailed
 	}
 
 	// Check cache

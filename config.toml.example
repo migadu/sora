@@ -663,7 +663,10 @@ max_staging_size = "100gb"    # Maximum size of this node's own upload staging b
 # messages according to configured retention policies.
 
 [cleanup]
-grace_period = "14d"              # Recovery window for accidentally deleted messages before permanent removal.
+grace_period = "14d"              # How long expunged messages stay restorable before permanent removal, and how
+                                  # long a soft-deleted account keeps its data before hard delete. Also the minimum
+                                  # age before unuploaded mail can be reaped, and the shortest time Sieve redirect
+                                  # records are kept. See docs/STORAGE.md (sections 9-11 and 13).
 wake_interval = "1h"              # How often the cleanup worker runs.
 purge_poll_interval = "30s"       # How often the purge worker looks for accounts marked for purging
                                   # (DELETE /admin/accounts/{email}?purge=true). Runs on nodes with
@@ -1463,8 +1466,10 @@ limits.redirect_rate_window = "1h"       # Time window for redirect rate limitin
                                          # settings (disable the limit with redirect_rate_limit = 0). The cleaner keeps
                                          # the redirect records for [cleanup] grace_period or the longest window of
                                          # the LMTP and Admin API servers on the node that runs it, whichever is
-                                         # longer. A window longer than grace_period needs that window on every
-                                         # node with an imap, pop3 or lmtp server (they all run the cleaner).
+                                         # longer, and each record until the window of the server that charged it
+                                         # has passed. Cluster-wide: use the same window (and redirect_rate_limit)
+                                         # on every lmtp and http_admin_api server of every node, or an account's
+                                         # limit depends on the node that delivers; sora warns when windows or limits differ.
 limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
                                          # backstop, counted via the X-Sora-Loop header (default: 2; 1 = allow a
                                          # single redirect then stop; 0 = unlimited). Delivered-To loop detection
@@ -1513,6 +1518,12 @@ tls_verify = false
 # tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for POP3
 proxy_protocol_timeout = "5s"
+strict_utf8_content = false   # true: RETR/TOP of a message with UTF-8 (8-bit) headers gets -ERR [UTF8] until the
+                              # session sends UTF8 (RFC 6856 §2.1). Default false: sent as stored, because a
+                              # client that never saw UTF8 in CAPA could not download it, and classic Outlook
+                              # aborts the whole download on -ERR. Behind a pop3_proxy, enable ONLY when the
+                              # proxy has remote_use_utf8 = true, and so does the [[pool]] or
+                              # [server.remote_lookup] routing users here. Not reloaded on SIGHUP.
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
@@ -2404,7 +2415,7 @@ proxy_protocol_timeout = "5s"
 
 # Sieve redirect limits for /admin/mail/deliver, as on the LMTP server above:
 # limits.redirect_rate_limit = 100      # (default: 100, 0 = unlimited)
-# limits.redirect_rate_window = "1h"    # (default: "1h", must be positive)
+# limits.redirect_rate_window = "1h"    # (default: "1h", must be positive, the same as the LMTP servers')
 # limits.max_redirect_hops = 2          # (default: 2, 0 = unlimited)
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint

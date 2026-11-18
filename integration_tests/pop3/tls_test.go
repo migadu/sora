@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"fmt"
 	"net"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -302,7 +303,8 @@ func TestPOP3STARTTLS(t *testing.T) {
 	if !strings.Contains(caps, "STLS") {
 		t.Errorf("plaintext CAPA must advertise STLS, got:\n%s", caps)
 	}
-	if strings.Contains(caps, "USER") || strings.Contains(caps, "SASL") {
+	// Whole lines: "UTF8 USER" is advertised whatever the TLS state.
+	if slices.Contains(strings.Split(caps, "\n"), "USER") || strings.Contains(caps, "SASL") {
 		t.Errorf("plaintext CAPA must not advertise USER or SASL with insecure_auth off, got:\n%s", caps)
 	}
 	fmt.Fprintf(conn, "USER %s\r\n", account.Email)

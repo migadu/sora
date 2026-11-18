@@ -1,11 +1,13 @@
 package imap
 
 import (
+	"context"
 	"math"
 	"slices"
 	"strings"
 
 	"github.com/migadu/go-imap"
+	"github.com/migadu/sora/db"
 )
 
 // RFC 3501 §2.3.2: \Recent is a session flag, so Sora does not store it (see
@@ -112,4 +114,41 @@ func mentionsRecent(c *imap.SearchCriteria) bool {
 
 func isRecentFlag(f imap.Flag) bool {
 	return strings.EqualFold(string(f), string(flagRecent))
+}
+
+// statusNumRecent returns the STATUS (and LIST RETURN (STATUS)) RECENT item of
+// mailbox mailboxID, whose summary is given: "The number of messages with the
+// \Recent flag set" (RFC 3501 §6.3.10). STATUS is the alternative to "doing an
+// EXAMINE command on a mailbox" in a second connection, so it counts what that
+// EXAMINE would: the messages above the UID of the last read-write selection
+// (mailboxRecentUIDs, see Select), all of them when there is none. In the
+// selected mailbox it counts this session's \Recent messages, those above
+// recentAboveUID, as SELECT and SEARCH RECENT do. A failed count makes every
+// message recent, as "it is not possible to determine" otherwise (§2.3.2).
+func (s *IMAPSession) statusNumRecent(ctx context.Context, mailboxID int64, summary *db.MailboxSummary) uint32 {
+	var above imap.UID
+	hasAbove := false
+	if acquired, release := s.mutexHelper.AcquireReadLockWithTimeout(ctx); acquired {
+		if s.selectedMailbox != nil && s.selectedMailbox.ID == mailboxID {
+			above, hasAbove = s.recentAboveUID, true
+		}
+		release()
+	}
+	if !hasAbove {
+		above, hasAbove = s.server.mailboxRecentUIDs.Load(mailboxID)
+	}
+	total := uint32(summary.NumMessages)
+	switch {
+	case !hasAbove || above == 0:
+		return total
+	case int64(above) >= summary.UIDNext-1:
+		return 0
+	}
+	count, err := s.server.rdb.CountMessagesGreaterThanUIDWithRetry(ctx, mailboxID, above)
+	if err != nil {
+		s.DebugLog("error counting recent messages for STATUS, reporting all as recent", "mailbox_id", mailboxID, "uid", above, "error", err)
+		return total
+	}
+	// The count and the summary are separate reads; RECENT never exceeds MESSAGES.
+	return min(count, total)
 }

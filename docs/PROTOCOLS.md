@@ -237,7 +237,8 @@ new logins and deliveries ([PROXY.md](PROXY.md)). What clients see:
 On shutdown, IMAP sends `* BYE Server shutting down, please reconnect` to every session, POP3 sends
 `-ERR Server shutting down, please reconnect`, and ManageSieve sends
 `BYE (TRYLATER) "Server shutting down, please reconnect"`. Each then waits up to 30 seconds for
-sessions to end. LMTP answers commands in progress with `421 4.2.1 service shutting down`. The full
+sessions to end. LMTP answers commands in progress with `421 4.2.1 service shutting down`, waits up
+to 2 seconds for the transactions under way to be answered, then closes its connections. The full
 shutdown order is in [OPERATIONS.md](OPERATIONS.md).
 
 ---
@@ -481,8 +482,11 @@ A mailbox opened with `EXAMINE` reports an empty `PERMANENTFLAGS` list. `STORE` 
 Sora tracks `\Recent` in memory on each server, per mailbox, from the highest UID at the last
 read-write `SELECT`. It is approximate across several servers and is reset on restart. Within a
 session, the `RECENT` count, `SEARCH RECENT` (and `NEW`, `OLD`) and the `\Recent` flag in `FETCH
-FLAGS` all use the same threshold, so they agree. A client that has enabled IMAP4rev2, where
-`\Recent` is deprecated, sees it on no message.
+FLAGS` all use the same threshold, so they agree. `EXAMINE` and `CLOSE` leave `\Recent` alone.
+`STATUS` and `LIST ... RETURN (STATUS (RECENT))` count what an `EXAMINE` would see: the messages
+above that UID, or all of them before the first read-write `SELECT` since the server started; for
+the session's selected mailbox, the session's own `\Recent` messages. A client that has enabled
+IMAP4rev2, where `\Recent` is deprecated, sees it on no message.
 
 **EXPUNGE**
 
@@ -880,7 +884,7 @@ this order:
 | `STLS` | On a STARTTLS listener, before the upgrade. |
 | `SASL PLAIN` | When login is allowed on this connection. |
 | `LANG` | Always. |
-| `UTF8` | Always. |
+| `UTF8 USER` | Always. `USER` says that user names and passwords may be UTF-8 (RFC 6856 §2.2). |
 | `EXPIRE NEVER` or `EXPIRE <days>` | `NEVER` when `[cleanup] max_age_restriction` is unlimited. For retention of at least 24 hours, `<days>` is whole days rounded down. Omitted for positive retention under 24 hours: RFC 2449 §6.7 cannot express fractional days, `EXPIRE 0` forbids leaving mail on the server, and `EXPIRE 1` would promise a day of retention. |
 | `AUTH-RESP-CODE` | Always. |
 | `IMPLEMENTATION Sora-POP3-Server` | Always. |
@@ -893,9 +897,20 @@ The list is the same before and after login.
   trusted peers (section 7.5).
 - After login: `CAPA`, `STAT`, `LIST`, `UIDL`, `RETR`, `TOP`, `DELE`, `RSET`, `NOOP`, `LANG`, `UTF8`
   and `QUIT`. `UTF8` is also accepted after login, because some clients send it then.
-- `UTF8` (RFC 6856) changes nothing. Addresses and passwords may contain UTF-8 with or without it,
-  and `RETR` and `TOP` send messages as stored either way, also to a client that never sent `UTF8`
-  (no surrogate, no `-ERR [UTF8]`).
+- `UTF8` (RFC 6856) changes nothing by default. Addresses and passwords may contain UTF-8 with or
+  without it, and `RETR` and `TOP` send messages as stored either way, also to a client that never
+  sent `UTF8` (no surrogate, no `-ERR [UTF8]`). This is the default because the POP3 proxy hides
+  `UTF8` from `CAPA` unless `remote_use_utf8 = true`, so most clients can never send it, and classic
+  Outlook stops the whole download at the first `-ERR`.
+- With `strict_utf8_content = true`, a session that has not sent `UTF8` gets
+  `-ERR [UTF8] Message has UTF-8 headers, issue UTF8 to retrieve it` for `RETR` and `TOP` of a
+  message with any byte above 0x7F in its header section (RFC 6856 §2.1 and §5). After `UTF8`,
+  before or after login, the same command returns the message. Messages with ASCII headers are
+  always sent, 8bit bodies included. No surrogate message is built. The server advertises `UTF8` to
+  every client that connects to it directly; behind a `pop3_proxy` the client sees it only when the
+  proxy has `remote_use_utf8 = true`, and the proxy passes a `UTF8` sent before login on only when
+  the `[[pool]]` or `[server.remote_lookup]` that routes the user here has it too. Turn the setting
+  on only then, or the messages cannot be downloaded at all. It is read at startup, not on reload.
 - `APOP` is not supported: `-ERR Unknown command: APOP`. `LAST` gets `-ERR LAST is obsolete (RFC 1939)`.
 - `AUTH` supports only `PLAIN`, with or without an initial response.
 
@@ -932,6 +947,7 @@ at the moment, gets `-ERR [SYS/TEMP] Session memory limit reached, please try ag
 | Situation | Reply |
 |---|---|
 | Wrong address or password, an address that does not parse, or rate-limited | `-ERR [AUTH] Authentication failed` |
+| An empty password, or a user name or password that is not valid UTF-8 | `-ERR [AUTH] Authentication failed` |
 | Login before TLS on a STARTTLS port with `insecure_auth = false` | `-ERR Authentication requires TLS. Use STLS first` |
 | Too many logins waiting in the delay queue | `-ERR [SYS/TEMP] Too many concurrent authentication attempts. Please try again later.` |
 | The database cannot be reached | `-ERR [SYS/TEMP] Service temporarily unavailable, please try again later` |
@@ -943,6 +959,18 @@ at the moment, gets `-ERR [SYS/TEMP] Session memory limit reached, please try ag
 
 An address that does not parse is answered and counted like a wrong password, so the reply does
 not tell a guessed name from a real one.
+
+User names and passwords are UTF-8, as `UTF8 USER` says, and a client may use them without sending
+`UTF8` first. They are compared as sent: Sora does not apply SASLprep (RFC 4013), which RFC 6856
+§2.2 recommends, because the stored password hashes were made from the passwords as typed. A
+user name or password that is not valid UTF-8 (RFC 3629) is refused, as RFC 6856 §2.2 requires.
+
+An empty password and a user name or password that is not valid UTF-8, with `USER`/`PASS` or
+`AUTH PLAIN` (whose authorization identity must be UTF-8 too, RFC 4616), are credentials no account
+can have. They are refused without being looked up, but otherwise like an address that does not
+parse: after the rate-limit check, and counted as a failed login
+([AUTHENTICATION.md](AUTHENTICATION.md#3-how-a-login-name-is-read)). The POP3 proxy follows the
+same rule.
 
 The library closes a session after 4 errors (failed logins included), with
 `-ERR Too many errors, closing connection`. Each error adds a delay of 3 seconds times the error
@@ -1037,10 +1065,11 @@ Other replies before a transaction:
 - `MAIL FROM:<>` (the null sender) is accepted. Any other sender must be an address, or the
   reply is `553 5.1.7 Invalid sender`. The sender is read as leniently as Postfix reads it with its default
   `strict_rfc821_envelopes = no`: leading, trailing and consecutive dots in the local part
-  (`first..last@example.com`), a quoted local part (`"john doe"@example.com`, `"a@b"@example.com`),
-  a domain without a dot (`user@localhost`) and an address literal (`user@[192.0.2.1]`) are
-  accepted. The `user@domain@SUFFIX` form of a master login has no meaning in an envelope address:
-  the last `@` starts the domain. A sender with a
+  (`first..last@example.com`), a quoted local part (`"john doe"@example.com`, `"a@b"@example.com`,
+  `"alice@x>"@example.com`: `<` and `>` may stand inside the quotes), a domain without a dot
+  (`user@localhost`) and an address literal (`user@[192.0.2.1]`) are accepted. The
+  `user@domain@SUFFIX` form of a master login has no meaning in an envelope address: the last `@`
+  starts the domain. A sender with a
   control character, a malformed domain, or over the length limits of a recipient is refused. A
   `MAIL` command that does not parse at all gets
   `501 5.5.2 Was expecting MAIL arg syntax of FROM:<address>`. The LMTP proxy passes these
