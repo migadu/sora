@@ -131,6 +131,43 @@ func TestPortMIMEByteAssertionsAcceptLiteralRepresentationButRejectChangedBytes(
 	}
 }
 
+func TestPortMIMEEnvelopeAllowsIgnoredSourceRouteButRequiresMailbox(t *testing.T) {
+	parse := func(raw string) Value {
+		t.Helper()
+		parser := valueParser{data: []byte(raw)}
+		value, err := parser.value(0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	want := portMIMEEnvelopes[5]
+	for _, tc := range []struct {
+		name, actual string
+		match        bool
+	}{
+		{"original route", want, true},
+		{"ignored routes", strings.ReplaceAll(want, `"@route"`, "NIL"), true},
+		{"one ignored route", strings.Replace(want, `"@route"`, "NIL", 1), true},
+		{"different route", strings.ReplaceAll(want, `"@route"`, `"@other"`), false},
+		{"different mailbox", strings.ReplaceAll(want, `"user"`, `"other"`), false},
+		{"different host", strings.ReplaceAll(want, `"domain"`, `"other"`), false},
+		{"missing address", strings.Replace(want, `((NIL "@route" "user" "domain"))`, "NIL", 1), false},
+		{"all addresses lost", `("Thu, 15 Feb 2007 01:02:03 +0200" NIL NIL NIL NIL NIL NIL NIL NIL NIL)`, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if match := portMIMEEnvelopeEqual(parse(tc.actual), parse(want)); match != tc.match {
+				t.Fatalf("ENVELOPE comparison=%t, want %t", match, tc.match)
+			}
+		})
+	}
+	for _, envelope := range portMIMEEnvelopes {
+		if !portMIMEEnvelopeEqual(parse(envelope), parse(envelope)) {
+			t.Fatalf("unchanged envelope no longer matches: %s", envelope)
+		}
+	}
+}
+
 func TestPortMIMEFetchUsesSemanticHeaderKeys(t *testing.T) {
 	c := coreReplyClient(t, "* 1 FETCH (FLAGS () BODY[HEADER.FIELDS (\"Subject\")] {18}\r\nSubject: Value\r\n\r\n)\r\n")
 	step := portMIMEFetchStep{command: "FETCH 1 BODY.PEEK[HEADER.FIELDS (SUBJECT)]", reply: "* 1 FETCH (BODY[HEADER.FIELDS (SUBJECT)] {18}\r\nSubject: Value\r\n\r\n)\r\n"}
