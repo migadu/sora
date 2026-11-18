@@ -17,6 +17,19 @@ import (
 // sessions go-smtp creates, in order.
 func startProxiedXCLIENTBackend(t *testing.T) (string, <-chan *LMTPSession) {
 	t.Helper()
+	return startXCLIENTBackend(t, LMTPServerOptions{
+		// The load balancer (127.0.0.1) and a proxy behind it (127.0.0.2).
+		TrustedNetworks:             []string{"127.0.0.1/32", "127.0.0.2/32"},
+		ProxyProtocol:               true,
+		ProxyProtocolTrustedProxies: []string{"127.0.0.1/32"},
+		MaxConnections:              10,
+	})
+}
+
+// startXCLIENTBackend serves a database-free LMTP backend with opts and returns its address
+// and the sessions go-smtp creates, in order.
+func startXCLIENTBackend(t *testing.T, opts LMTPServerOptions) (string, <-chan *LMTPSession) {
+	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -27,13 +40,7 @@ func startProxiedXCLIENTBackend(t *testing.T) (string, <-chan *LMTPSession) {
 	addr := l.Addr().String()
 	l.Close()
 
-	b, err := New(ctx, "xclient-proxy-trust", "localhost", addr, nil, nil, nil, LMTPServerOptions{
-		// The load balancer (127.0.0.1) and a proxy behind it (127.0.0.2).
-		TrustedNetworks:             []string{"127.0.0.1/32", "127.0.0.2/32"},
-		ProxyProtocol:               true,
-		ProxyProtocolTrustedProxies: []string{"127.0.0.1/32"},
-		MaxConnections:              10,
-	})
+	b, err := New(ctx, "xclient-test", "localhost", addr, nil, nil, nil, opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
