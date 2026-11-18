@@ -391,12 +391,11 @@ func TestHTTPRemoteLookupCircuitBreaker(t *testing.T) {
 }
 
 // TestHTTPRemoteLookupCircuitBreakerHalfOpen verifies that ErrTooManyRequests in half-open state
-// is properly wrapped as ErrRemoteLookupTransient (skipped by default - takes 65 seconds)
+// is properly wrapped as ErrRemoteLookupTransient
 func TestHTTPRemoteLookupCircuitBreakerHalfOpen(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping long-running test in short mode")
-	}
-
+	// The default settings with a short open timeout, so the breaker goes half-open
+	// without the test sleeping through the default.
+	const openTimeout = 500 * time.Millisecond
 	requestCount := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requestCount++
@@ -430,8 +429,8 @@ func TestHTTPRemoteLookupCircuitBreakerHalfOpen(t *testing.T) {
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
 		false, // remoteUseUTF8
-		nil,   // circuit breaker settings (use defaults)
-		nil,   // transport settings (use defaults)
+		&CircuitBreakerSettings{MaxRequests: 3, Timeout: openTimeout, FailureRatio: 0.6, MinRequests: 3},
+		nil, // transport settings (use defaults)
 	)
 
 	ctx := context.Background()
@@ -443,7 +442,7 @@ func TestHTTPRemoteLookupCircuitBreakerHalfOpen(t *testing.T) {
 	}
 
 	// Wait for circuit breaker to transition to half-open
-	time.Sleep(65 * time.Second) // Default timeout is 60s
+	time.Sleep(openTimeout + 100*time.Millisecond)
 
 	// First request in half-open should go through
 	_, _, err1 := client.LookupUserRoute(ctx, "test@example.com", "password") // Will fail auth but succeed request
