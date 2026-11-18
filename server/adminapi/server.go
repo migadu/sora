@@ -94,6 +94,10 @@ type Server struct {
 	// maintenance gate, which refuses new ones while this backend is in maintenance.
 	deliveriesOpen  atomic.Int64
 	maintenanceGate *server.MaintenanceGate
+
+	// deliveryMemory is limits.delivery_memory_limit: the message bytes all
+	// /admin/mail/deliver requests under way may hold at once (0 = no limit).
+	deliveryMemory *server.SessionMemoryTracker
 }
 
 // DrainSessions reports the mail deliveries (/admin/mail/deliver), which stage uploads:
@@ -148,6 +152,7 @@ type ServerOptions struct {
 	ProxyProtocolTimeout        string   // Timeout for reading PROXY protocol headers (e.g., "5s")
 	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
 	TrustedNetworks             []string // CIDR blocks for trusted networks (for PROXY protocol validation)
+	DeliveryMemoryLimit         int64    // Message bytes all /admin/mail/deliver requests under way may hold at once (limits.delivery_memory_limit; 0 = no limit)
 }
 
 // AffinityManager interface for managing user-to-backend affinity
@@ -283,6 +288,7 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		relayQueue:         options.RelayQueue,
 		relayWorker:        options.RelayWorker,
 		maxMessageSize:     options.MaxMessageSize,
+		deliveryMemory:     server.NewSessionMemoryTracker(options.DeliveryMemoryLimit),
 		maxConnections:     options.MaxConnections,
 		tls:                options.TLS,
 		tlsConfig:          tlsConfig,

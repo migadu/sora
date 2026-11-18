@@ -10,6 +10,7 @@ import (
 type SessionMemoryTracker struct {
 	allocatedBytes atomic.Int64 // Current allocated bytes
 	peakBytes      atomic.Int64 // Peak allocated bytes during session lifetime
+	totalBytes     atomic.Int64 // Bytes of every allocation that succeeded, freed or not
 	maxAllowed     int64        // Maximum allowed bytes (0 = unlimited)
 }
 
@@ -36,6 +37,8 @@ func (t *SessionMemoryTracker) Allocate(bytes int64) error {
 		return fmt.Errorf("memory limit exceeded: would use %d bytes (limit: %d bytes)",
 			current, t.maxAllowed)
 	}
+
+	t.totalBytes.Add(bytes)
 
 	// Update peak if needed (lock-free algorithm)
 	for {
@@ -95,6 +98,13 @@ func (t *SessionMemoryTracker) Current() int64 {
 // Peak returns the peak allocated bytes during the session
 func (t *SessionMemoryTracker) Peak() int64 {
 	return t.peakBytes.Load()
+}
+
+// TotalAllocated returns the bytes of every allocation that succeeded, freed or
+// not: what was charged over the tracker's lifetime, which a test compares with
+// what was actually allocated.
+func (t *SessionMemoryTracker) TotalAllocated() int64 {
+	return t.totalBytes.Load()
 }
 
 // MaxAllowed returns the maximum allowed bytes

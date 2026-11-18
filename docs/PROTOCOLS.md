@@ -1176,6 +1176,16 @@ all, because LMTP answers once per accepted recipient, and there is none (RFC 20
    chunk that takes the message over the limit gets `552 5.3.4 Max message size exceeded`; the
    chunk is thrown away and the transaction reset.
 
+With `limits.delivery_memory_limit` set, the bytes all transactions of the server hold at once are
+bounded too: the `DATA` (or `BDAT`) buffer is charged before each time it grows, the old and the new
+buffer together while it is copied, and each copy of the message is charged before it is built: the
+base64 copy of NUL-bearing parts, the copy stamped with `Received` and `Delivered-To`, and the copy a
+Sieve `editheader` script rewrites. Every charge is held until the transaction ends. A transaction
+that does not fit gets
+`452 4.3.1 Delivery memory limit reached, please try again later`, so the MTA retries it later
+([CONFIGURATION.md](CONFIGURATION.md#95-limits-serverlimits)). The limit is unset (no budget) by
+default.
+
 `max_message_size = "0"` means the default 50 MiB, not unlimited. A value above 2147483647 bytes
 (2 GiB - 1) is lowered to that, with a warning at startup. An empty message gets
 `550 5.6.0 empty message rejected: a message must contain at least headers`.

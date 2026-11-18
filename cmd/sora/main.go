@@ -1650,7 +1650,22 @@ func buildLMTPServerOptions(deps *serverDependencies, serverConfig config.Server
 		SharedMailboxes:         deps.config.SharedMailboxes,
 		CommandTimeoutOverrides: lmtpCommandTimeoutOverrides,
 		IdleTimeout:             serverConfig.GetCommandTimeoutWithDefault(),
+		DeliveryMemoryLimit:     deliveryMemoryLimit(serverConfig, "LMTP"),
 	}
+}
+
+// deliveryMemoryLimit is the server's limits.delivery_memory_limit; one that does not
+// parse is no limit, the default, with a warning.
+func deliveryMemoryLimit(serverConfig config.ServerConfig, protocol string) int64 {
+	limit, err := serverConfig.GetDeliveryMemoryLimit()
+	if err != nil {
+		logger.Warn(protocol+": Invalid limits.delivery_memory_limit - using no limit (the default)", "name", serverConfig.Name, "error", err)
+		return 0
+	}
+	serverConfig.WarnDeliveryMemoryLimit(func(format string, args ...any) {
+		logger.Warn(protocol + ": " + fmt.Sprintf(format, args...))
+	})
+	return limit
 }
 
 func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serverConfig config.ServerConfig, errChan chan error) {
@@ -2503,6 +2518,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		ProxyProtocolTimeout: serverConfig.GetProxyProtocolTimeoutWithDefault(),
 		TrustedNetworks:      deps.config.Servers.TrustedNetworks,
 	}
+	options.DeliveryMemoryLimit = deliveryMemoryLimit(serverConfig, "Admin API")
 	// Set only when the feature is on: a nil pointer stored in an interface field is a
 	// non-nil interface, and the handlers tell "not enabled on this node" by comparing
 	// the interface with nil.

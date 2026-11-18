@@ -438,8 +438,6 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		}
 	}
 
-	var buf bytes.Buffer
-
 	// One copy of the reloadable settings for the whole delivery, however a config
 	// reload replaces them meanwhile.
 	settings := s.backend.settings.Load()
@@ -452,10 +450,16 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Add 1 byte to detect when limit is exceeded
 	reader := io.LimitReader(r, limitToUse+1)
 
-	_, err := io.Copy(&buf, reader)
+	// The buffer is charged to the delivery memory budget before it grows; what the
+	// read charged is held until the delivery ends, on every path.
+	data, charged, err := server.ReadAllCharged(reader, s.backend.deliveryMemory)
+	defer s.backend.freeDeliveryMemory(charged)
+	if errors.Is(err, server.ErrMemoryBudgetExhausted) {
+		return s.deliveryMemoryRefusal(recordMetrics, err, len(data))
+	}
 	// go-smtp's DATA reader stops at the same limit (Server.MaxMessageBytesFunc) with
 	// ErrDataTooLarge: the message is too big, which is no read error.
-	tooLarge := int64(buf.Len()) > limitToUse || errors.Is(err, smtp.ErrDataTooLarge)
+	tooLarge := int64(len(data)) > limitToUse || errors.Is(err, smtp.ErrDataTooLarge)
 	if err != nil && !tooLarge {
 		// Read errors during DATA command:
 		// - unexpected EOF: client disconnected, incomplete transmission, or malformed message stream
@@ -463,7 +467,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		// - connection reset: network interruption
 		// Note: If connection is truly closed, this error response won't reach the client,
 		// but the SMTP library handles failed writes gracefully and we need proper cleanup.
-		s.WarnLog("error reading message data", "error", err, "bytes_read", buf.Len())
+		s.WarnLog("error reading message data", "error", err, "bytes_read", len(data))
 		// Bypass metric tracking for client socket timeouts so they don't skew our P99 durations
 		return &smtp.SMTPError{
 			Code:         421,
@@ -487,7 +491,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Check if message exceeds configured limit
 	// LimitReader allows reading limitToUse+1 bytes to detect oversized messages
 	if tooLarge {
-		s.WarnLog("message size exceeds limit", "size", buf.Len(), "limit", limitToUse)
+		s.WarnLog("message size exceeds limit", "size", len(data), "limit", limitToUse)
 		recordMetrics("failure")
 		return &smtp.SMTPError{
 			Code:         552,
@@ -496,10 +500,10 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		}
 	}
 
-	s.DebugLog("message data read", "size", buf.Len())
+	s.DebugLog("message data read", "size", len(data))
 
 	// Use the full message bytes as received for hashing, size, and header extraction.
-	fullMessageBytes := buf.Bytes()
+	fullMessageBytes := data
 
 	// Reject empty messages — a valid RFC 5322 message always has headers.
 	// A 0-byte DATA can occur from buggy MTAs or truncated connections.
@@ -536,8 +540,13 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	// A part holding NUL is stored base64 encoded, as APPEND stores it: FETCH
 	// BODY sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3). A
-	// re-encoded form too large to store is refused before it is allocated.
-	encoded, changed, err := helpers.EncodeNULParts(fullMessageBytes, delivery.ReserveStorable)
+	// re-encoded form too large to store, or one the delivery memory budget cannot
+	// hold beside the DATA buffer, is refused before it is allocated.
+	encoded, changed, encodedCharged, err := delivery.EncodeNULPartsCharged(fullMessageBytes, s.backend.deliveryMemory)
+	defer s.backend.freeDeliveryMemory(encodedCharged)
+	if errors.Is(err, server.ErrMemoryBudgetExhausted) {
+		return s.deliveryMemoryRefusal(recordMetrics, err, len(fullMessageBytes))
+	}
 	if err != nil {
 		s.WarnLog("re-encoded message too large to store", "size", len(fullMessageBytes), "error", err, "limit", consts.MaxStoredMessageSize)
 		recordMetrics("failure")
@@ -605,8 +614,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		received := helpers.BuildReceivedHeader(
 			helpers.ReceivedFrom(helo, s.RemoteIP),
 			s.backend.hostname, withProtocol, deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
-		fullMessageBytes = helpers.PrependRawHeader(fullMessageBytes, received)
-		fullMessageBytes = helpers.PrependHeaderLine(fullMessageBytes, helpers.DeliveredToHeader, deliveredTo)
+		// One stamped copy, charged to the delivery memory budget before it is made.
+		var traceCharged int64
+		stamped, err := helpers.PrependTrace(fullMessageBytes, received, deliveredTo, s.backend.deliveryMemory.Reserver(&traceCharged))
+		defer s.backend.freeDeliveryMemory(traceCharged)
+		if err != nil {
+			return s.deliveryMemoryRefusal(recordMetrics, err, len(fullMessageBytes))
+		}
+		fullMessageBytes = stamped
 		if messageContent, err = server.ParseMessage(bytes.NewReader(fullMessageBytes)); err != nil {
 			recordMetrics("failure")
 			return s.InternalError("failed to re-parse message after Delivered-To/Received: %v", err)
@@ -783,7 +798,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Apply header edits if any (RFC 5293 - editheader extension)
 	if len(result.HeaderEdits) > 0 {
 		s.DebugLog("applying header edits", "count", len(result.HeaderEdits))
-		modifiedBytes, err := sieveengine.ApplyHeaderEdits(fullMessageBytes, result.HeaderEdits)
+		// The edited copy is charged to the delivery memory budget before it is made;
+		// a refusal comes before any vacation reply or redirect is sent.
+		var editCharged int64
+		modifiedBytes, err := sieveengine.ApplyHeaderEditsReserved(fullMessageBytes, result.HeaderEdits, s.backend.deliveryMemory.Reserver(&editCharged))
+		defer s.backend.freeDeliveryMemory(editCharged)
+		if errors.Is(err, server.ErrMemoryBudgetExhausted) {
+			return s.deliveryMemoryRefusal(recordMetrics, err, len(fullMessageBytes))
+		}
 		if err != nil {
 			s.WarnLog("failed to apply header edits", "error", err)
 			// Continue with original message on error
@@ -1364,4 +1386,25 @@ func (s *LMTPSession) saveMessageToMailbox(ctx context.Context, mailbox *db.DBMa
 	s.backend.uploader.NotifyUploadQueued()
 	s.DebugLog("message saved", "uid", messageUID, "mailbox", mailbox.Name)
 	return nil
+}
+
+// freeDeliveryMemory gives back n bytes charged to the delivery memory budget.
+func (b *LMTPServerBackend) freeDeliveryMemory(n int64) {
+	if b.deliveryMemory != nil && n > 0 {
+		b.deliveryMemory.Free(n)
+	}
+}
+
+// deliveryMemoryRefusal answers a delivery the delivery memory budget
+// (limits.delivery_memory_limit) cannot hold: 452 4.3.1, temporary, so the MTA
+// retries once the deliveries holding the budget have ended.
+func (s *LMTPSession) deliveryMemoryRefusal(recordMetrics func(string), err error, size int) error {
+	s.WarnLog("refusing delivery: delivery memory limit reached", "error", err, "size", size)
+	metrics.SessionMemoryLimitExceeded.WithLabelValues("lmtp", s.backend.name, s.backend.hostname).Inc()
+	recordMetrics("failure")
+	return &smtp.SMTPError{
+		Code:         452,
+		EnhancedCode: smtp.EnhancedCode{4, 3, 1},
+		Message:      "Delivery memory limit reached, please try again later",
+	}
 }

@@ -159,6 +159,8 @@ var limitsAppliedBy = map[string]struct {
 	"redirect_rate_limit":  {func(l *ServerLimitsConfig) { n := 0; l.RedirectRateLimit = &n }, []string{"lmtp", "http_admin_api"}},
 	"redirect_rate_window": {func(l *ServerLimitsConfig) { l.RedirectRateWindow = "2h" }, []string{"lmtp", "http_admin_api"}},
 	"max_redirect_hops":    {func(l *ServerLimitsConfig) { n := 1; l.MaxRedirectHops = &n }, []string{"lmtp", "http_admin_api"}},
+	// The delivery memory budget: LMTP DATA and /admin/mail/deliver.
+	"delivery_memory_limit": {func(l *ServerLimitsConfig) { l.DeliveryMemoryLimit = "500mb" }, []string{"lmtp", "http_admin_api"}},
 }
 
 // TestLimitsAppliedByCoversEveryKey keeps limitsAppliedBy complete: a new

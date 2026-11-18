@@ -50,6 +50,9 @@ type DeliveryContext struct {
 	// Sieve mailboxexists resolves its root (FileintoTarget). Left zero, sharing
 	// counts as disabled.
 	SharedMailboxes config.SharedMailboxesConfig
+	// Memory is the server's delivery memory budget (limits.delivery_memory_limit),
+	// charged for the re-encoded copy of NUL-bearing parts. nil: no budget.
+	Memory *server.SessionMemoryTracker
 }
 
 // uploadInstanceID is the identity this delivery stamps on the pending_uploads row it
@@ -130,12 +133,44 @@ func CheckStorableSize(size int) error {
 	return nil
 }
 
+// deliveryMemoryMessage is the reply text of a delivery the delivery memory budget
+// (limits.delivery_memory_limit) cannot hold.
+const deliveryMemoryMessage = "Delivery memory limit reached, try again later"
+
+// freeMemory gives back n bytes charged to the delivery memory budget.
+func (d *DeliveryContext) freeMemory(n int64) {
+	if d.Memory != nil && n > 0 {
+		d.Memory.Free(n)
+	}
+}
+
 // ReserveStorable is CheckStorableSize as the reserve callback of
-// helpers.EncodeNULParts on the paths without a session memory budget (LMTP and
-// Admin API delivery): a message whose re-encoded form sora cannot store is
+// helpers.EncodeNULParts: a message whose re-encoded form sora cannot store is
 // refused before that form is allocated.
 func ReserveStorable(size int64) error {
 	return CheckStorableSize(int(size))
+}
+
+// EncodeNULPartsCharged is helpers.EncodeNULParts for a delivery (LMTP, Admin API):
+// before the encoded copy is allocated it must be storable (ReserveStorable) and is
+// charged to budget, the delivery memory budget (nil: none), on top of the message it
+// is made from. A refused charge is an error wrapping server.ErrMemoryBudgetExhausted.
+// It returns the bytes charged, which the caller frees once done with the copy.
+func EncodeNULPartsCharged(data []byte, budget *server.SessionMemoryTracker) ([]byte, bool, int64, error) {
+	var charged int64
+	encoded, changed, err := helpers.EncodeNULParts(data, func(size int64) error {
+		if err := ReserveStorable(size); err != nil {
+			return err
+		}
+		if budget != nil {
+			if err := budget.Allocate(size); err != nil {
+				return fmt.Errorf("%w: %v", server.ErrMemoryBudgetExhausted, err)
+			}
+			charged = size
+		}
+		return nil
+	})
+	return encoded, changed, charged, err
 }
 
 // DeliverMessage is the main entry point for message delivery.
@@ -159,9 +194,13 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 
 	// A part holding NUL is stored base64 encoded, as APPEND stores it: FETCH
 	// BODY sends ordinary literals, which cannot carry NUL (RFC 9051 §4.3).
-	messageBytes, _, err := helpers.EncodeNULParts(messageBytes, ReserveStorable)
+	messageBytes, _, charged, err := EncodeNULPartsCharged(messageBytes, d.Memory)
+	defer d.freeMemory(charged)
 	if err != nil {
 		result.ErrorMessage = err.Error()
+		if errors.Is(err, server.ErrMemoryBudgetExhausted) {
+			result.ErrorMessage = deliveryMemoryMessage
+		}
 		return result, err
 	}
 
@@ -190,8 +229,15 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 		}
 		// Add our Received: trace for this delivery hop, then Delivered-To on top.
 		received := helpers.BuildReceivedHeader("", d.Hostname, "HTTP", deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
-		messageBytes = helpers.PrependRawHeader(messageBytes, received)
-		messageBytes = helpers.PrependHeaderLine(messageBytes, helpers.DeliveredToHeader, deliveredTo)
+		// One stamped copy, charged to the delivery memory budget before it is made.
+		var traceCharged int64
+		stamped, err := helpers.PrependTrace(messageBytes, received, deliveredTo, d.Memory.Reserver(&traceCharged))
+		defer d.freeMemory(traceCharged)
+		if err != nil {
+			result.ErrorMessage = deliveryMemoryMessage
+			return result, err
+		}
+		messageBytes = stamped
 		if messageEntity, err = server.ParseMessage(bytes.NewReader(messageBytes)); err != nil {
 			result.ErrorMessage = fmt.Sprintf("Invalid RFC822 message after Delivered-To/Received: %v", err)
 			return result, err
@@ -235,8 +281,14 @@ func (d *DeliveryContext) DeliverMessage(recipient RecipientInfo, messageBytes [
 			messageEntity,
 			messageBytes,
 		)
+		if outcome != nil {
+			defer d.freeMemory(outcome.memoryCharged)
+		}
 		if err != nil {
 			result.ErrorMessage = fmt.Sprintf("Sieve execution error: %v", err)
+			if errors.Is(err, server.ErrMemoryBudgetExhausted) {
+				result.ErrorMessage = deliveryMemoryMessage
+			}
 			return result, err
 		}
 
