@@ -42,7 +42,7 @@ func handleAccountsCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printAccountsUsage()
 	default:
-		fmt.Printf("Unknown accounts subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown accounts subcommand: %s\n\n", subcommand)
 		printAccountsUsage()
 		os.Exit(1)
 	}
@@ -62,7 +62,7 @@ func handleCreateAccount(ctx context.Context) {
 		fmt.Printf(`Create a new account
 
 Usage:
-  sora-admin accounts create [options]
+  sora-admin --config PATH accounts create [options]
 
 Options:
   --email string         Email address for the new account (required unless --credentials is provided)
@@ -92,26 +92,26 @@ Examples:
 
 	// Validate required arguments
 	if *credentials == "" && *email == "" {
-		fmt.Printf("Error: either --email or --credentials is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: either --email or --credentials is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *credentials != "" && (*email != "" || *password != "" || *passwordHash != "") {
-		fmt.Printf("Error: cannot specify --credentials with --email, --password, or --password-hash\n\n")
+		fmt.Fprintf(os.Stderr, "Error: cannot specify --credentials with --email, --password, or --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *credentials == "" {
 		if *password == "" && *passwordHash == "" {
-			fmt.Printf("Error: either --password or --password-hash is required\n\n")
+			fmt.Fprintf(os.Stderr, "Error: either --password or --password-hash is required\n\n")
 			fs.Usage()
 			os.Exit(1)
 		}
 
 		if *password != "" && *passwordHash != "" {
-			fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
+			fmt.Fprintf(os.Stderr, "Error: cannot specify both --password and --password-hash\n\n")
 			fs.Usage()
 			os.Exit(1)
 		}
@@ -127,7 +127,7 @@ Examples:
 		}
 	}
 	if !hashTypeValid {
-		fmt.Printf("Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
+		fmt.Fprintf(os.Stderr, "Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -164,7 +164,7 @@ This command displays a summary of all accounts for the specified domain includi
 - Account creation date
 
 Usage:
-  sora-admin accounts list --domain <domain> [options]
+  sora-admin --config PATH accounts list --domain <domain> [options]
 
 Options:
   --config string        Path to TOML configuration file (required)
@@ -182,7 +182,7 @@ Examples:
 
 	// Validate required arguments
 	if *domain == "" {
-		fmt.Printf("Error: --domain is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --domain is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -209,7 +209,7 @@ This command displays comprehensive information about an account including:
 - All associated email addresses with their status
 
 Usage:
-  sora-admin accounts show --email <email> [options]
+  sora-admin --config PATH accounts show --email <email> [options]
 
 Options:
   --email string      Email address of the account to show (required)
@@ -229,7 +229,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -256,7 +256,7 @@ func handleUpdateAccount(ctx context.Context) {
 		fmt.Printf(`Update an existing account's password and/or primary status
 
 Usage:
-  sora-admin accounts update [options]
+  sora-admin --config PATH accounts update [options]
 
 Options:
   --email string         Email address for the account to update (required)
@@ -281,19 +281,19 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *password == "" && *passwordHash == "" && !*makePrimary {
-		fmt.Printf("Error: either --password, --password-hash, or --make-primary must be specified\n\n")
+		fmt.Fprintf(os.Stderr, "Error: either --password, --password-hash, or --make-primary must be specified\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *password != "" && *passwordHash != "" {
-		fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
+		fmt.Fprintf(os.Stderr, "Error: cannot specify both --password and --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -308,7 +308,7 @@ Examples:
 		}
 	}
 	if !hashTypeValid {
-		fmt.Printf("Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
+		fmt.Fprintf(os.Stderr, "Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -351,7 +351,7 @@ taken out of service and marked for purging first; if the purge stops partway, i
 out of service, and the server's purge worker (or running the command again) finishes it.
 
 Usage:
-  sora-admin accounts delete [options]
+  sora-admin --config PATH accounts delete [options]
 
 Options:
   --email string      Email address for the account to delete (required)
@@ -374,13 +374,13 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if !*confirm {
-		fmt.Printf("Error: --confirm is required for account deletion\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --confirm is required for account deletion\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -411,7 +411,7 @@ the grace period. The account and all its data (mailboxes, messages, credentials
 will be restored to active status.
 
 Usage:
-  sora-admin accounts restore [options]
+  sora-admin --config PATH accounts restore [options]
 
 Options:
   --email string      Email address for the account to restore (required)
@@ -429,7 +429,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -469,7 +469,7 @@ The operation is RESUMABLE - you can interrupt with Ctrl+C and re-run
 the same command to continue where you left off.
 
 Usage:
-  sora-admin accounts purge-domain [options]
+  sora-admin --config PATH accounts purge-domain [options]
 
 Options:
   --domain string     Domain to purge (e.g., example.com) (required)
@@ -491,13 +491,13 @@ Examples:
 
 	// Validate required arguments
 	if *domain == "" {
-		fmt.Printf("Error: --domain is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --domain is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if !*confirm {
-		fmt.Printf("Error: --confirm is required for domain purge\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --confirm is required for domain purge\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -514,7 +514,7 @@ func printAccountsUsage() {
 	fmt.Printf(`Account Management
 
 Usage:
-  sora-admin accounts <subcommand> [options]
+  sora-admin --config PATH accounts <subcommand> [options]
 
 Subcommands:
   create        Create a new account

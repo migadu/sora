@@ -32,7 +32,7 @@ func handleHealthCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printHealthUsage()
 	default:
-		fmt.Printf("Unknown health subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown health subcommand: %s\n\n", subcommand)
 		printHealthUsage()
 		os.Exit(1)
 	}
@@ -54,7 +54,7 @@ func handleHealthStatus(ctx context.Context) {
 		fmt.Printf(`Show system health status and component monitoring
 
 Usage:
-  sora-admin health status [options]
+  sora-admin --config PATH health status [options]
 
 Options:
   --hostname string     Show health status for specific hostname
@@ -122,7 +122,7 @@ func printHealthUsage() {
 	fmt.Printf(`System Health Management
 
 Usage:
-  sora-admin health <subcommand> [options]
+  sora-admin --config PATH health <subcommand> [options]
 
 Subcommands:
   status   Show system health status and component monitoring

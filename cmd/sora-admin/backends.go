@@ -50,7 +50,7 @@ func handleBackendsCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printBackendsUsage()
 	default:
-		fmt.Printf("Unknown backends subcommand: %s\n\n", os.Args[2])
+		fmt.Fprintf(os.Stderr, "Unknown backends subcommand: %s\n\n", os.Args[2])
 		printBackendsUsage()
 		os.Exit(1)
 	}
@@ -82,7 +82,7 @@ func handleBackendsMaintenance(ctx context.Context) {
 
 	h, err := normalizeBackendHost(*host)
 	if err != nil {
-		fmt.Printf("Error: %v\n\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
 		printBackendsUsage()
 		os.Exit(1)
 	}
@@ -232,7 +232,7 @@ func handleBackendsStatus(ctx context.Context) {
 	if *host != "" || *wait {
 		h, err := normalizeBackendHost(*host)
 		if err != nil {
-			fmt.Printf("Error: %v\n\n", err)
+			fmt.Fprintf(os.Stderr, "Error: %v\n\n", err)
 			printBackendsUsage()
 			os.Exit(1)
 		}
@@ -493,9 +493,9 @@ grace period it refuses new sessions itself. The backend keeps running, so it fi
 the uploads only it can do (its spool is node-local), and is then safe to stop.
 
 Usage:
-  sora-admin backends maintenance on  --host HOST [--instance ID] [--reason TEXT] [--wait]
-  sora-admin backends maintenance off --host HOST
-  sora-admin backends status [--host HOST] [--wait]
+  sora-admin --config PATH backends maintenance on  --host HOST [--instance ID] [--reason TEXT] [--wait]
+  sora-admin --config PATH backends maintenance off --host HOST
+  sora-admin --config PATH backends status [--host HOST] [--wait]
 
 Options:
   --host string       Backend host as the proxies know it: a name or an IP, without a

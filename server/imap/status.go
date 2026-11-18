@@ -126,7 +126,7 @@ func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap
 		statusData.UIDNext = imap.UID(summary.UIDNext)
 	}
 	if options.NumRecent {
-		num := uint32(summary.RecentCount)
+		num := s.statusNumRecent(ctx, mailbox.ID, summary)
 		statusData.NumRecent = &num
 	}
 	if options.NumUnseen {

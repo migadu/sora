@@ -72,3 +72,39 @@ func TestSubcommandHelpOnStdout(t *testing.T) {
 		}
 	}
 }
+
+// TestUsageErrorStreams (#2025): a subcommand run without a required flag prints the error
+// line on stderr and the usage after it on stdout, the stream --help prints it on. acl wrote
+// the error on stdout and its flag listing on stderr, so either redirect showed half of it.
+func TestUsageErrorStreams(t *testing.T) {
+	configPath := unreachableAdminConfig(t, true)
+	for _, tc := range []struct {
+		missing string
+		args    []string
+	}{
+		{"--email", []string{"acl", "grant"}},
+		{"--mailbox", []string{"acl", "grant", "--email", "owner@example.com"}},
+		{"--identifier", []string{"acl", "grant", "--email", "owner@example.com", "--mailbox", "Shared/Sales"}},
+		{"--rights", []string{"acl", "grant", "--email", "owner@example.com", "--mailbox", "Shared/Sales", "--user", "bob@example.com"}},
+		{"--email", []string{"acl", "revoke"}},
+		{"--identifier", []string{"acl", "revoke", "--email", "owner@example.com", "--mailbox", "Shared/Sales"}},
+		{"--mailbox", []string{"acl", "list", "--email", "owner@example.com"}},
+		{"--id", []string{"relay", "show"}},
+		{"--id", []string{"relay", "delete"}},
+		{"--id", []string{"relay", "requeue"}},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			t.Parallel()
+			stdout, stderr, code := runAdminMainSplit(t, append([]string{"--config", configPath}, tc.args...)...)
+			if code != 1 {
+				t.Errorf("exit code %d, want 1", code)
+			}
+			if !strings.Contains(stderr, "Error: "+tc.missing) || strings.Contains(stderr, "Usage") {
+				t.Errorf("stderr does not hold just the %s error:\n%s", tc.missing, stderr)
+			}
+			if !strings.Contains(stdout, "Usage:\n  sora-admin --config PATH "+strings.Join(tc.args[:2], " ")) || strings.Contains(stdout, "Error") {
+				t.Errorf("stdout does not hold just the usage:\n%s", stdout)
+			}
+		})
+	}
+}

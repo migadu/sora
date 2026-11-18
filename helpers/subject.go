@@ -39,8 +39,26 @@ import (
 // §2); SORT and THREAD finish that preparation when they read the stored key
 // (db.subjectCasemapKey).
 func NormalizeSubjectForSort(subject string) string {
+	base, _ := baseSubject(subject)
+	return base
+}
+
+// SubjectIsReplyOrForward reports whether a subject marks its message as a reply
+// or forward, which the subject merge of THREAD REFERENCES goes by. RFC 5256
+// section 3: "A message is considered to be a reply or forward if the base
+// subject extraction rules, applied to the original subject, remove any of the
+// following: a subj-refwd, a "(fwd)" subj-trailer, or a subj-fwd-hdr and
+// subj-fwd-trl."
+func SubjectIsReplyOrForward(subject string) bool {
+	_, replyOrForward := baseSubject(subject)
+	return replyOrForward
+}
+
+// baseSubject returns the base subject (see NormalizeSubjectForSort) and whether
+// extracting it removed a reply or forward marker (see SubjectIsReplyOrForward).
+func baseSubject(subject string) (base string, replyOrForward bool) {
 	if subject == "" {
-		return ""
+		return "", false
 	}
 
 	// Step 1: collapse all whitespace runs to a single space and trim, then fold
@@ -50,8 +68,9 @@ func NormalizeSubjectForSort(subject string) string {
 	for {
 		// Step 2: strip trailing subj-trailer ("(fwd)" / WSP) until stable.
 		for {
-			if next, ok := stripSubjTrailer(s); ok {
+			if next, ok, fwd := stripSubjTrailer(s); ok {
 				s = next
+				replyOrForward = replyOrForward || fwd
 				continue
 			}
 			break
@@ -60,9 +79,10 @@ func NormalizeSubjectForSort(subject string) string {
 		// Steps 3-5: strip leaders and leading blobs until nothing changes.
 		for {
 			changed := false
-			if next, ok := stripSubjLeader(s); ok {
+			if next, ok, refwd := stripSubjLeader(s); ok {
 				s = next
 				changed = true
+				replyOrForward = replyOrForward || refwd
 			}
 			if next, ok := stripLeadingBlob(s); ok {
 				s = next
@@ -76,30 +96,33 @@ func NormalizeSubjectForSort(subject string) string {
 		// Step 6: if wrapped as "[fwd: ... ]", unwrap and reprocess from step 2.
 		if next, ok := unwrapSubjFwd(s); ok {
 			s = next
+			replyOrForward = true
 			continue
 		}
 		break
 	}
 
-	return strings.TrimSpace(s)
+	return strings.TrimSpace(s), replyOrForward
 }
 
 // stripSubjTrailer removes one trailing subj-trailer: "(fwd)" or a single space.
-func stripSubjTrailer(s string) (string, bool) {
+// fwd reports that it was "(fwd)".
+func stripSubjTrailer(s string) (next string, ok, fwd bool) {
 	if strings.HasSuffix(s, "(FWD)") {
-		return s[:len(s)-len("(FWD)")], true
+		return s[:len(s)-len("(FWD)")], true, true
 	}
 	if strings.HasSuffix(s, " ") {
-		return s[:len(s)-1], true
+		return s[:len(s)-1], true, false
 	}
-	return s, false
+	return s, false, false
 }
 
 // stripSubjLeader removes one leading subj-leader. A leader is either a run of
 // zero-or-more subj-blobs followed by a subj-refwd, or a single WSP. Blobs are
 // only consumed here when a refwd follows them; a bare leading blob is left for
-// stripLeadingBlob (step 4), which guards against emptying the subject.
-func stripSubjLeader(s string) (string, bool) {
+// stripLeadingBlob (step 4), which guards against emptying the subject. refwd
+// reports that the leader held a subj-refwd.
+func stripSubjLeader(s string) (next string, ok, refwd bool) {
 	// Try (*subj-blob subj-refwd).
 	rest := s
 	for {
@@ -110,14 +133,14 @@ func stripSubjLeader(s string) (string, bool) {
 		break
 	}
 	if next, ok := matchSubjRefwd(rest); ok {
-		return next, true
+		return next, true, true
 	}
 
 	// Try WSP.
 	if len(s) > 0 && s[0] == ' ' {
-		return s[1:], true
+		return s[1:], true, false
 	}
-	return s, false
+	return s, false, false
 }
 
 // stripLeadingBlob removes a single leading subj-blob, but only if doing so

@@ -36,7 +36,7 @@ func handleRelayCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printRelayUsage()
 	default:
-		fmt.Printf("Unknown relay subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown relay subcommand: %s\n\n", subcommand)
 		printRelayUsage()
 		os.Exit(1)
 	}
@@ -67,7 +67,7 @@ func handleRelayStats(_ context.Context) {
 		fmt.Printf(`Show relay queue statistics
 
 Usage:
-  sora-admin relay stats
+  sora-admin --config PATH relay stats
 
 Counts the messages in the pending, processing and failed queues of this host.
 
@@ -81,7 +81,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -131,7 +131,7 @@ func handleRelayList(_ context.Context) {
 		fmt.Printf(`List messages in a relay queue
 
 Usage:
-  sora-admin relay list [options]
+  sora-admin --config PATH relay list [options]
 
 Options:
   --queue string  Queue to list: pending, processing, failed (default: pending)
@@ -147,7 +147,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -241,7 +241,7 @@ func handleRelayShow(_ context.Context) {
 		fmt.Printf(`Show detailed information for a specific relay queue message
 
 Usage:
-  sora-admin relay show [options]
+  sora-admin --config PATH relay show [options]
 
 Options:
   --id string     Message ID to display (required)
@@ -263,7 +263,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -336,7 +336,7 @@ func handleRelayDelete(_ context.Context) {
 		fmt.Printf(`Delete a message or all messages from a relay queue
 
 Usage:
-  sora-admin relay delete [options]
+  sora-admin --config PATH relay delete [options]
 
 Options:
   --id string     Message ID to delete, or 'all' to delete all messages (required)
@@ -365,7 +365,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -435,7 +435,7 @@ func handleRelayRequeue(_ context.Context) {
 		fmt.Printf(`Move message(s) from the failed relay queue back to pending
 
 Usage:
-  sora-admin relay requeue [options]
+  sora-admin --config PATH relay requeue [options]
 
 Options:
   --id string  Message ID to requeue, or 'all' to requeue all failed messages (required)
@@ -463,7 +463,7 @@ Examples:
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -515,7 +515,7 @@ func printRelayUsage() {
 	fmt.Printf(`Relay Queue Management
 
 Usage:
-  sora-admin relay <subcommand> [options]
+  sora-admin --config PATH relay <subcommand> [options]
 
 Subcommands:
   stats      Show relay queue statistics

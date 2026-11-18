@@ -25,7 +25,7 @@ func handleAffinityCacheCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printAffinityCacheUsage()
 	default:
-		fmt.Printf("Unknown affinity-cache subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown affinity-cache subcommand: %s\n\n", subcommand)
 		printAffinityCacheUsage()
 		os.Exit(1)
 	}
@@ -41,6 +41,9 @@ Usage:
 
 Asks the Admin API ([admin_cli] addr and api_key) for the affinity cache's entries and
 broadcast queue.
+
+Examples:
+  sora-admin --config config.toml affinity-cache status
 `)
 	}
 	if err := fs.Parse(os.Args[3:]); err != nil {
@@ -86,7 +89,7 @@ broadcast queue.
 
 	stats, ok := result["stats"].(map[string]any)
 	if !ok {
-		fmt.Println("Error: Invalid response format")
+		fmt.Fprintln(os.Stderr, "Error: Invalid response format")
 		return
 	}
 
@@ -137,7 +140,7 @@ func printAffinityCacheUsage() {
 	fmt.Printf(`Affinity Cache Management
 
 Usage:
-  sora-admin affinity-cache <subcommand> [options]
+  sora-admin --config PATH affinity-cache <subcommand> [options]
 
 Subcommands:
   status      Show affinity cache statistics (entries, queue status, etc.)

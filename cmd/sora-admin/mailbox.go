@@ -45,7 +45,7 @@ func handleMailboxCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printMailboxUsage()
 	default:
-		fmt.Printf("Unknown mailbox subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown mailbox subcommand: %s\n\n", subcommand)
 		printMailboxUsage()
 		os.Exit(1)
 	}
@@ -81,12 +81,12 @@ Examples:
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -94,7 +94,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -102,7 +102,7 @@ Examples:
 	// Get account ID
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -114,7 +114,7 @@ Examples:
 	createCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: sharedMailboxes})
 	err = rdb.CreateMailboxForUserWithRetry(createCtx, accountID, *mailbox)
 	if err != nil {
-		fmt.Printf("Failed to create mailbox: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to create mailbox: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -151,7 +151,7 @@ Examples:
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -159,7 +159,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -167,14 +167,14 @@ Examples:
 	// Get account
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Get mailboxes
 	mailboxes, err := rdb.GetMailboxesForUserWithRetry(ctx, accountID, *subscribedOnly)
 	if err != nil {
-		fmt.Printf("Failed to list mailboxes: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to list mailboxes: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -240,17 +240,17 @@ Examples:
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if !*confirm {
-		fmt.Println("Error: --confirm is required for safety")
+		fmt.Fprintln(os.Stderr, "Error: --confirm is required for safety")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -258,7 +258,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -266,7 +266,7 @@ Examples:
 	// Get account
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -277,21 +277,21 @@ Examples:
 	// --purge first would expunge messages and then leave the mailbox in place, emptied.
 	target, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, *mailbox)
 	if err != nil {
-		fmt.Printf("Failed to find mailbox '%s': %v\n", *mailbox, err)
+		fmt.Fprintf(os.Stderr, "Failed to find mailbox '%s': %v\n", *mailbox, err)
 		os.Exit(1)
 	}
 	if target.AccountID == accountID && isInboxMailboxName(target.Name) {
-		fmt.Println("Failed to delete mailbox: cannot delete INBOX")
+		fmt.Fprintln(os.Stderr, "Failed to delete mailbox: cannot delete INBOX")
 		os.Exit(1)
 	}
 	if target.AccountID != accountID {
 		hasDeleteRight, err := rdb.CheckMailboxPermissionWithRetry(ctx, target.ID, accountID, db.ACLRightDelete)
 		if err != nil {
-			fmt.Printf("Failed to check delete permission on '%s': %v\n", *mailbox, err)
+			fmt.Fprintf(os.Stderr, "Failed to check delete permission on '%s': %v\n", *mailbox, err)
 			os.Exit(1)
 		}
 		if !hasDeleteRight {
-			fmt.Printf("Failed to delete mailbox: %v: no delete right on shared mailbox '%s'\n", consts.ErrNotPermitted, *mailbox)
+			fmt.Fprintf(os.Stderr, "Failed to delete mailbox: %v: no delete right on shared mailbox '%s'\n", consts.ErrNotPermitted, *mailbox)
 			os.Exit(1)
 		}
 	}
@@ -299,11 +299,11 @@ Examples:
 	// a live grandchild under a mailbox an earlier build tombstoned.
 	hasDescendants, err := rdb.HasLiveDescendantsWithRetry(ctx, target.AccountID, target.Path)
 	if err != nil {
-		fmt.Printf("Failed to check child mailboxes of '%s': %v\n", *mailbox, err)
+		fmt.Fprintf(os.Stderr, "Failed to check child mailboxes of '%s': %v\n", *mailbox, err)
 		os.Exit(1)
 	}
 	if hasDescendants {
-		fmt.Printf("Mailbox '%s' has child mailboxes; delete them first\n", *mailbox)
+		fmt.Fprintf(os.Stderr, "Mailbox '%s' has child mailboxes; delete them first\n", *mailbox)
 		os.Exit(1)
 	}
 
@@ -314,7 +314,7 @@ Examples:
 
 		err = purgeResolvedMailboxMessages(ctx, rdb, target)
 		if err != nil {
-			fmt.Printf("Failed to purge messages: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to purge messages: %v\n", err)
 			os.Exit(1)
 		}
 	}
@@ -322,7 +322,7 @@ Examples:
 	// Delete mailbox
 	err = rdb.DeleteMailboxForUserWithRetry(ctx, accountID, *mailbox)
 	if err != nil {
-		fmt.Printf("Failed to delete mailbox: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to delete mailbox: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -365,17 +365,17 @@ Examples:
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *oldName == "" {
-		fmt.Println("Error: --old-name is required")
+		fmt.Fprintln(os.Stderr, "Error: --old-name is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *newName == "" {
-		fmt.Println("Error: --new-name is required")
+		fmt.Fprintln(os.Stderr, "Error: --new-name is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -383,7 +383,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -391,7 +391,7 @@ Examples:
 	// Get account
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -400,11 +400,11 @@ Examples:
 	// Get the mailbox to rename
 	mbox, err := rdb.GetMailboxByNameWithRetry(ctx, accountID, *oldName)
 	if err != nil {
-		fmt.Printf("Failed to find mailbox '%s': %v\n", *oldName, err)
+		fmt.Fprintf(os.Stderr, "Failed to find mailbox '%s': %v\n", *oldName, err)
 		os.Exit(1)
 	}
 	if mbox.AccountID == accountID && isInboxMailboxName(mbox.Name) {
-		fmt.Println("Failed to rename mailbox: cannot rename INBOX")
+		fmt.Fprintln(os.Stderr, "Failed to rename mailbox: cannot rename INBOX")
 		os.Exit(1)
 	}
 
@@ -419,12 +419,12 @@ Examples:
 	if nameErr == nil {
 		crosses, err = rdb.RenameCrossesSharedBoundaryWithRetry(ctx, globalConfig.SharedMailboxes, mbox, created)
 		if err != nil {
-			fmt.Printf("Failed to check mailbox '%s' against the shared namespace: %v\n", *oldName, err)
+			fmt.Fprintf(os.Stderr, "Failed to check mailbox '%s' against the shared namespace: %v\n", *oldName, err)
 			os.Exit(1)
 		}
 	}
 	if nameErr != nil || crosses {
-		fmt.Println("Failed to rename mailbox: invalid destination or shared namespace boundary")
+		fmt.Fprintln(os.Stderr, "Failed to rename mailbox: invalid destination or shared namespace boundary")
 		os.Exit(1)
 	}
 	*newName = created
@@ -432,11 +432,11 @@ Examples:
 	// under its collation), not a Go case mapping's.
 	below, err := rdb.MailboxNameIsBelowWithRetry(ctx, *newName, mbox)
 	if err != nil {
-		fmt.Printf("Failed to check whether '%s' is below '%s': %v\n", *newName, *oldName, err)
+		fmt.Fprintf(os.Stderr, "Failed to check whether '%s' is below '%s': %v\n", *newName, *oldName, err)
 		os.Exit(1)
 	}
 	if below {
-		fmt.Println("Failed to rename mailbox: a mailbox cannot be renamed to a name below itself")
+		fmt.Fprintln(os.Stderr, "Failed to rename mailbox: a mailbox cannot be renamed to a name below itself")
 		os.Exit(1)
 	}
 	renameCtx := context.WithValue(ctx, consts.ConfigContextKey, &config.Config{SharedMailboxes: globalConfig.SharedMailboxes})
@@ -444,13 +444,13 @@ Examples:
 	if index := strings.LastIndex(*newName, string(consts.MailboxDelimiter)); index >= 0 {
 		parentID, err = rdb.ResolveOrCreateMailboxPathWithRetry(renameCtx, mbox.AccountID, (*newName)[:index])
 		if err != nil {
-			fmt.Printf("Failed to resolve destination parent: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to resolve destination parent: %v\n", err)
 			os.Exit(1)
 		}
 	}
 	err = rdb.RenameMailboxWithRetry(renameCtx, mbox.ID, mbox.AccountID, *newName, parentID)
 	if err != nil {
-		fmt.Printf("Failed to rename mailbox: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to rename mailbox: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -483,12 +483,12 @@ Examples:
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -496,7 +496,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -504,14 +504,14 @@ Examples:
 	// Get account
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Subscribe to mailbox
 	err = rdb.SubscribeToMailboxWithRetry(ctx, accountID, *mailbox)
 	if err != nil {
-		fmt.Printf("Failed to subscribe to mailbox: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to subscribe to mailbox: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -544,12 +544,12 @@ Examples:
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
@@ -557,7 +557,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -565,14 +565,14 @@ Examples:
 	// Get account
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Unsubscribe from mailbox
 	err = rdb.UnsubscribeFromMailboxWithRetry(ctx, accountID, *mailbox)
 	if err != nil {
-		fmt.Printf("Failed to unsubscribe from mailbox: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to unsubscribe from mailbox: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -621,7 +621,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -636,7 +636,7 @@ Examples:
 	if *email != "" {
 		accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 		if err != nil {
-			fmt.Printf("Failed to find account: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 			os.Exit(1)
 		}
 		query = `SELECT id, account_id, name, path, COALESCE(is_shared, FALSE) FROM mailboxes WHERE account_id = $1 AND name ~ '` + encoded + `' AND deleted_at IS NULL ORDER BY account_id, name`
@@ -860,20 +860,20 @@ Examples:
 		} else {
 			dbRows, err := opDB.WritePool.Query(ctx, query, args...)
 			if err != nil {
-				fmt.Printf("Failed to query mailboxes: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Failed to query mailboxes: %v\n", err)
 				os.Exit(1)
 			}
 
 			for dbRows.Next() {
 				var r candidate
 				if err := dbRows.Scan(&r.MailboxID, &r.AccountID, &r.MailboxName, &r.Path, &r.IsShared); err != nil {
-					fmt.Printf("Failed to scan row: %v\n", err)
+					fmt.Fprintf(os.Stderr, "Failed to scan row: %v\n", err)
 					os.Exit(1)
 				}
 				rows = append(rows, r)
 			}
 			if err := dbRows.Err(); err != nil {
-				fmt.Printf("Failed to iterate mailbox rows: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Failed to iterate mailbox rows: %v\n", err)
 				os.Exit(1)
 			}
 			dbRows.Close()
@@ -1072,13 +1072,13 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	if *batchSize < 1 || *batchSize > db.MaxHierarchyScanAccounts {
-		fmt.Printf("Error: --batch-size must be between 1 and %d\n", db.MaxHierarchyScanAccounts)
+		fmt.Fprintf(os.Stderr, "Error: --batch-size must be between 1 and %d\n", db.MaxHierarchyScanAccounts)
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -1139,7 +1139,7 @@ Examples:
 	if *email != "" {
 		accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 		if err != nil {
-			fmt.Printf("Failed to find account: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 			os.Exit(1)
 		}
 		repairAccount(accountID, *email)
@@ -1149,12 +1149,12 @@ Examples:
 		var after int64
 		for {
 			if err := ctx.Err(); err != nil {
-				fmt.Printf("Interrupted: %v\n", err)
+				fmt.Fprintf(os.Stderr, "Interrupted: %v\n", err)
 				os.Exit(1)
 			}
 			problems, last, err := database.FindMailboxHierarchyProblems(ctx, after, *batchSize)
 			if err != nil {
-				fmt.Printf("Failed to scan accounts after account_id=%d: %v\n", after, err)
+				fmt.Fprintf(os.Stderr, "Failed to scan accounts after account_id=%d: %v\n", after, err)
 				os.Exit(1)
 			}
 			if last == after {
@@ -1211,7 +1211,7 @@ func renamedDescendantName(name, oldName, newName string) string {
 
 // printMailboxUsage prints usage information for the 'mailbox' command
 func printMailboxUsage() {
-	fmt.Println(`Usage: sora-admin mailbox <subcommand> [options]
+	fmt.Println(`Usage: sora-admin --config PATH mailbox <subcommand> [options]
 
 Subcommands:
   create        Create a new mailbox

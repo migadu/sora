@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"errors"
+	"io/fs"
 	"strings"
 	"testing"
 
@@ -111,14 +112,23 @@ func TestMigrateCommands_DownForceUpRoundTrip(t *testing.T) {
 		t.Fatalf("version after up: %d dirty %v err %v", latest, dirty, err)
 	}
 
+	migrations, err := fs.Sub(db.MigrationsFS, "migrations")
+	if err != nil {
+		t.Fatalf("migrations subdirectory: %v", err)
+	}
+	prev, err := previousMigrationVersion(migrations, latest)
+	if err != nil {
+		t.Fatalf("version below %d: %v", latest, err)
+	}
+
 	if err := m.Steps(-1); err != nil {
 		t.Fatalf("down one step: %v", err)
 	}
-	if v, dirty, err := m.Version(); err != nil || dirty || v != latest-1 {
-		t.Fatalf("version after down: %d dirty %v err %v, want %d clean", v, dirty, err, latest-1)
+	if v, dirty, err := m.Version(); err != nil || dirty || v != prev {
+		t.Fatalf("version after down: %d dirty %v err %v, want %d clean", v, dirty, err, prev)
 	}
 
-	if err := m.Force(int(latest - 1)); err != nil {
+	if err := m.Force(int(prev)); err != nil {
 		t.Fatalf("force: %v", err)
 	}
 	if err := m.Up(); err != nil {

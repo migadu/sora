@@ -163,7 +163,6 @@ func isAtomChar(ch byte) bool {
 // were stored or advertised.
 //
 // Filters out:
-//   - The IMAP NIL / NULL atoms (whole-token match), which are parser artifacts
 //   - Empty or whitespace-only flags
 //   - Anything that is not a syntactically valid flag (IsValidFlagName): most
 //     importantly keywords holding non-ASCII characters, which no IMAP response
@@ -183,23 +182,14 @@ func SanitizeFlags(flags []imap.Flag) []imap.Flag {
 
 	sanitized := make([]imap.Flag, 0, len(flags))
 	for _, flag := range flags {
-		flagStr := string(flag)
-		flagUpper := strings.ToUpper(flagStr)
-
 		// Skip empty or whitespace-only flags
-		if strings.TrimSpace(flagStr) == "" {
+		if strings.TrimSpace(string(flag)) == "" {
 			continue
 		}
 
-		// Skip the IMAP NIL / NULL atoms (and their "$"-prefixed forms), which
-		// arise as parser artifacts (e.g. "Keyword used without being in FLAGS:
-		// NIL"). Match the whole token only — legitimate keywords that merely
-		// CONTAIN these substrings ("Nile", "nullable", "Manila", "$NOTNIL") are
-		// kept.
-		switch flagUpper {
-		case "NIL", "$NIL", "NULL", "$NULL":
-			continue
-		}
+		// "NIL" (and "NULL", "$NIL", ...) is kept: flag-keyword is an atom
+		// (RFC 3501 §9, RFC 9051 §9) and no flag grammar has a nil alternative,
+		// so a client storing NIL means the keyword NIL (#2013).
 
 		// Drop anything that is not encodable as an IMAP flag. Without this a
 		// keyword such as a Cyrillic Sieve addflag value reaches the mailbox

@@ -9,6 +9,7 @@ import (
 	"github.com/migadu/go-imap"
 	"github.com/migadu/go-imap/imapserver"
 	"github.com/migadu/sora/db"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/resilient"
 )
 
@@ -97,6 +98,45 @@ func getDisplayFlagsInSnapshot(ctx context.Context, rdb *resilient.ResilientData
 		}
 	}
 	return buildDisplayFlags(customFlagsFromDB), nil
+}
+
+// mailboxFlagsWithNewKeywords returns announced, the FLAGS list the client has,
+// extended by the keywords of the messages in updates that it lacks, or nil
+// when it lacks none. The list only grows: a FLAGS response replaces the
+// client's list, so leaving out a keyword still on a message would tell the
+// client the mailbox no longer has it.
+func mailboxFlagsWithNewKeywords(announced []imap.Flag, updates []db.MessageUpdate) []imap.Flag {
+	known := make(map[string]struct{}, len(announced))
+	for _, f := range announced {
+		known[strings.ToLower(string(f))] = struct{}{}
+	}
+	var added []string
+	for _, update := range updates {
+		if update.IsExpunge {
+			continue
+		}
+		for _, kw := range update.CustomFlags {
+			key := strings.ToLower(kw)
+			if _, ok := known[key]; ok {
+				continue
+			}
+			// Poll and FETCH drop a keyword that is not an atom, so it is
+			// never shown and must not be announced either.
+			if len(helpers.SanitizeFlags([]imap.Flag{imap.Flag(kw)})) == 0 {
+				continue
+			}
+			known[key] = struct{}{}
+			added = append(added, kw)
+		}
+	}
+	if len(added) == 0 {
+		return nil
+	}
+	all := make([]string, 0, len(announced)+len(added))
+	for _, f := range announced {
+		all = append(all, string(f))
+	}
+	return buildDisplayFlags(append(all, added...))
 }
 
 func buildDisplayFlags(customFlagsFromDB []string) []imap.Flag {
