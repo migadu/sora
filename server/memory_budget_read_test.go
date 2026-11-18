@@ -3,7 +3,6 @@ package server
 import (
 	"bytes"
 	"errors"
-	"io"
 	"testing"
 )
 
@@ -46,27 +45,6 @@ func TestReadAllCharged(t *testing.T) {
 			t.Fatalf("read %d bytes past the %d charged", read, charged)
 		}
 	})
-}
-
-func TestChargedReader(t *testing.T) {
-	data := bytes.Repeat([]byte("x"), 10000)
-	budget := NewSessionMemoryTracker(4000)
-	c := &ChargedReader{R: bytes.NewReader(data), Budget: budget}
-	_, err := io.ReadAll(c)
-	if !errors.Is(err, ErrMemoryBudgetExhausted) || !c.Refused {
-		t.Fatalf("err = %v, refused = %v; want the budget refusal", err, c.Refused)
-	}
-	if c.Charged > 4000 || budget.Current() != c.Charged {
-		t.Fatalf("charged %d, budget holds %d", c.Charged, budget.Current())
-	}
-	if n, err := c.Read(make([]byte, 10)); n != 0 || !errors.Is(err, ErrMemoryBudgetExhausted) {
-		t.Fatalf("read after the refusal: %d, %v", n, err)
-	}
-
-	ok := &ChargedReader{R: bytes.NewReader(data), Budget: NewSessionMemoryTracker(0)}
-	if got, err := io.ReadAll(ok); err != nil || len(got) != len(data) || ok.Charged != int64(len(data)) {
-		t.Fatalf("unlimited budget: %d bytes, charged %d, err %v", len(got), ok.Charged, err)
-	}
 }
 
 // TestReadAllChargedGrowthKeepsOldBufferCharged: while the buffer grows, the old

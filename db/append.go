@@ -858,6 +858,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			AddressType:  r.AddressType,
 			Group:        helpers.SanitizeUTF8(r.Group),
 			GroupEnd:     r.GroupEnd,
+			Route:        helpers.SanitizeUTF8(r.Route),
 		}
 	}
 
@@ -1248,6 +1249,7 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			AddressType:  r.AddressType,
 			Group:        helpers.SanitizeUTF8(r.Group),
 			GroupEnd:     r.GroupEnd,
+			Route:        helpers.SanitizeUTF8(r.Route),
 		}
 	}
 
@@ -1507,6 +1509,7 @@ func (d *Database) InsertMessagesBatch(
 				AddressType:  r.AddressType,
 				Group:        helpers.SanitizeUTF8(r.Group),
 				GroupEnd:     r.GroupEnd,
+				Route:        helpers.SanitizeUTF8(r.Route),
 			}
 		}
 
