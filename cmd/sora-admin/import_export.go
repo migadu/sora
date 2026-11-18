@@ -539,12 +539,12 @@ Subcommands:
   rekey          Re-key bodies an older import stored under their SHA-256 digest
 
 Examples:
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir
-  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
-  sora-admin import s3 --email user@example.com --dry-run
-  sora-admin import s3 --email user@example.com --workers 5 --batch-size 500
-  sora-admin import rekey --email user@example.com --dry-run
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --config config.toml
+  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run --config config.toml
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot --config config.toml
+  sora-admin import s3 --email user@example.com --dry-run --config config.toml
+  sora-admin import s3 --email user@example.com --workers 5 --batch-size 500 --config config.toml
+  sora-admin import rekey --email user@example.com --dry-run --config config.toml
 
 Use 'sora-admin import <subcommand> --help' for detailed help.
 `)
@@ -560,9 +560,9 @@ Subcommands:
   maildir  Export messages to maildir format
 
 Examples:
-  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot
+  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir --config config.toml
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent --config config.toml
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot --config config.toml
 
 Use 'sora-admin export <subcommand> --help' for detailed help.
 `)
