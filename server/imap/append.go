@@ -202,6 +202,37 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		return nil, imapErr
 	}
 
+	// RFC 3516 §§4.4, 6: a literal8 may carry binary MIME bodies, but ordinary
+	// BODY and BODYSTRUCTURE must describe a base-IMAP-safe representation.
+	// Normalize before deriving any metadata or content hash so every fetch
+	// item, size, and stored object refers to the same representation.
+	if options.Binary {
+		normalized, releaseNormalized, normalizeErr := s.normalizeBinaryAppend(fullMessageBytes)
+		defer releaseNormalized()
+		if normalizeErr != nil {
+			s.DebugLog("binary APPEND normalization failed", "error", normalizeErr)
+			var imapErr *imap.Error
+			switch {
+			case errors.Is(normalizeErr, errAppendLiteralTooLarge):
+				metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+				imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnavailable,
+					Text: "Session memory limit reached, please try again later"}
+			case errors.Is(normalizeErr, errAppendBinaryTooLarge):
+				imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTooBig,
+					Text: "Encoded binary message exceeds maximum stored message size"}
+			case errors.Is(normalizeErr, helpers.ErrBinaryAppendUnsafe):
+				imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnknownCTE,
+					Text: "Binary message cannot be converted to a safe transfer encoding"}
+			default:
+				imapErr = s.internalError("failed to normalize binary message: %v", normalizeErr)
+			}
+			s.classifyAndTrackError("APPEND", nil, imapErr)
+			recordMetrics(imapErr)
+			return nil, imapErr
+		}
+		fullMessageBytes = normalized
+	}
+
 	messageContent, err := server.ParseMessage(bytes.NewReader(fullMessageBytes))
 	if err != nil {
 		// ParseMessage can fail for severely malformed MIME (e.g., missing header colons).
