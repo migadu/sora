@@ -73,3 +73,48 @@ func TestSortColumnsCcWithinAddressBudget(t *testing.T) {
 		t.Errorf("address columns use %d bytes: the To section should take what Cc leaves", used+len(extra))
 	}
 }
+
+// TestSortColumnsCcGroupKeyIndependentOfOtherExtraAddresses: a leading Cc group's name is
+// the CC sort key (groupAwareAddrMailboxExpr reads the head of the Cc section), so it must
+// not depend on how many other addresses share the extra_addresses budget. The same
+// 180-byte group, beside 200-byte first From/To names and addresses, keeps all of itself
+// whether or not long later From/To lists crowd the sections; a name longer than the
+// 200-byte sort-column bound is cut at that bound, as the other sort keys are (#2113).
+func TestSortColumnsCcGroupKeyIndependentOfOtherExtraAddresses(t *testing.T) {
+	first := func(kind string) helpers.Recipient {
+		return helpers.Recipient{AddressType: kind, Name: strings.Repeat(kind[:1], 200), EmailAddress: strings.Repeat(kind[:1], 188) + "@example.com"}
+	}
+	ccKey := func(group string, crowded bool) string {
+		recipients := []helpers.Recipient{first("from"), first("to")}
+		if crowded {
+			for i := range 20 {
+				recipients = append(recipients,
+					helpers.Recipient{AddressType: "from", Name: fmt.Sprintf("Later Sender %d", i), EmailAddress: fmt.Sprintf("later.sender.%d@example.com", i)},
+					helpers.Recipient{AddressType: "to", Name: fmt.Sprintf("Later Recipient %d", i), EmailAddress: fmt.Sprintf("later.recipient.%d@example.com", i)})
+			}
+		}
+		recipients = append(recipients,
+			helpers.Recipient{AddressType: "cc", Group: group},
+			helpers.Recipient{AddressType: "cc", EmailAddress: "member@example.org"},
+			helpers.Recipient{AddressType: "cc", GroupEnd: true})
+		_, _, _, _, _, ccEmail, extra := sortColumnsFor("", recipients)
+		if ccEmail != "" {
+			t.Fatalf("cc_email_sort = %q, want empty for a leading group", ccEmail)
+		}
+		sections := strings.Split(extra, "\n")
+		if len(sections) != 3 {
+			t.Fatalf("extra_addresses has %d sections, want 3", len(sections))
+		}
+		return strings.Split(sections[2], "\t")[0]
+	}
+	for _, tc := range []struct{ name, group, want string }{
+		{"180 bytes", strings.Repeat("g", 180), strings.Repeat("g", 180)},
+		{"over the sort-column bound", strings.Repeat("h", 250), strings.Repeat("h", helpers.MaxSortColumnBytes)},
+	} {
+		for _, crowded := range []bool{false, true} {
+			if got := ccKey(tc.group, crowded); got != tc.want {
+				t.Errorf("%s, crowded %v: Cc group key is %d bytes, want %d", tc.name, crowded, len(got), len(tc.want))
+			}
+		}
+	}
+}
