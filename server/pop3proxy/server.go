@@ -415,6 +415,18 @@ func New(appCtx context.Context, hostname, addr string, rdb *resilient.Resilient
 	return srv, nil
 }
 
+// libIdleTimeout is the go-pop3 IdleTimeout for a command_timeout value. On the
+// proxy 0 turns the idle timer off, but the library would turn an IdleTimeout of
+// 0 into its own 10-minute default, which applies before login when
+// auth_idle_timeout is also 0; a negative value disables it there. After login
+// the relay owns the connection and the library timer no longer applies.
+func libIdleTimeout(commandTimeout time.Duration) time.Duration {
+	if commandTimeout == 0 {
+		return -1
+	}
+	return commandTimeout
+}
+
 // buildLibServer constructs the go-pop3 protocol server from the current
 // runtime settings. It is called at startup and again from ReloadConfig so
 // SIGHUP-reloaded settings apply to new connections (existing connections keep
@@ -452,7 +464,7 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 		TLSConfig:              server.StartTLSConfig(s.tlsConfig, "pop3_proxy"), // records JA4 on STLS, as SoraTLSConn does for implicit TLS
 		OnStartTLS:             server.BeginStartTLS,
 		OnTLSHandshakeComplete: server.CompleteStartTLS,
-		IdleTimeout:            settings.commandTimeout,
+		IdleTimeout:            libIdleTimeout(settings.commandTimeout),
 		AuthIdleTimeout:        settings.authIdleTimeout,
 		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
 		CommandTimeout:         settings.commandTimeout,
