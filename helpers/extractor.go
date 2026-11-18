@@ -7,6 +7,20 @@ import (
 	"github.com/emersion/go-message/mail"
 )
 
+// ParseAddressList parses the value of an address header field (From, To, Cc, ...) as
+// go-message's mail.ParseAddressList does, encoded-word display names included. net/mail
+// rejects comments and white space inside an addr-spec, which RFC 5322 allows (see
+// stripAddressCFWS), so a value it rejects is parsed once more without them rather than
+// lost. Use it for every address header of a message, so search, ENVELOPE, vacation and
+// delivery agree on the addresses.
+func ParseAddressList(value string) ([]*mail.Address, error) {
+	addresses, err := mail.ParseAddressList(value)
+	if err != nil {
+		addresses, err = mail.ParseAddressList(stripAddressCFWS(value))
+	}
+	return addresses, err
+}
+
 type Recipient struct {
 	EmailAddress string `json:"email"`
 	AddressType  string `json:"type"`
@@ -20,16 +34,7 @@ func ExtractRecipients(header message.Header) []Recipient {
 	extractAddresses := func(key string) {
 		values := header.Values(key)
 		for _, value := range values {
-			value := SanitizeUTF8(value)
-			// TODO: is this the right way to handle the addresses? ParseAddressList says
-			// to use Header.AddressList instead
-			addresses, err := mail.ParseAddressList(value)
-			if err != nil {
-				// net/mail rejects comments and white space inside an addr-spec
-				// (see stripAddressCFWS); retry without them rather than drop the
-				// header, which lost the address from SEARCH and the ENVELOPE.
-				addresses, err = mail.ParseAddressList(stripAddressCFWS(value))
-			}
+			addresses, err := ParseAddressList(SanitizeUTF8(value))
 			if err == nil {
 				for _, addr := range addresses {
 					addressType := strings.ToLower(key)
