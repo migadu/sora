@@ -222,7 +222,7 @@ func TestList_EmptyPatternMatchesNoMailbox(t *testing.T) {
 			SelectSubscribed:     true,
 			SelectRecursiveMatch: true,
 			ReturnChildren:       true,
-		}, mboxes, subscribed, caps, "")
+		}, mboxes, visibleSuperiors(mboxes), subscribed, caps, "")
 		if len(got) != 0 {
 			t.Errorf("buildSubscribedList(ref=%q, patterns=[\"\"]) = %+v, want empty", ref, got)
 		}

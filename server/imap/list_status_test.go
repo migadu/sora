@@ -144,7 +144,7 @@ func TestListMailbox_SharedNamespaceRootAlwaysNoSelect(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			data := listMailbox(tc.mbox, &imap.ListOptions{}, caps, tc.sharedRoot)
+			data := listMailbox(tc.mbox, tc.mbox.HasChildren, &imap.ListOptions{}, caps, tc.sharedRoot)
 			if data == nil {
 				t.Fatalf("listMailbox(%q) returned nil", tc.mbox.Name)
 			}

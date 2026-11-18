@@ -80,6 +80,8 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 	// snapshot once rather than per mailbox.
 	caps := s.GetCapabilities()
 
+	superiors := visibleSuperiors(mboxes)
+
 	var l []imap.ListData
 	if options.SelectSubscribed {
 		// SUBSCRIBED selection (RFC 5258 §3.5), including RECURSIVEMATCH/CHILDINFO
@@ -95,13 +97,13 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		if err != nil {
 			return s.internalError("failed to fetch subscriptions: %v", err)
 		}
-		l = buildSubscribedList(ref, patterns, options, mboxes, subscribed, caps, sharedNamespaceRoot)
+		l = buildSubscribedList(ref, patterns, options, mboxes, superiors, subscribed, caps, sharedNamespaceRoot)
 	} else {
 		for _, mbox := range mboxes {
 			if !matchesAnyPattern(mbox.Name, ref, patterns) {
 				continue
 			}
-			data := listMailbox(mbox, options, caps, sharedNamespaceRoot)
+			data := listMailbox(mbox, superiors[mbox.NameKey], options, caps, sharedNamespaceRoot)
 			if data != nil {
 				l = append(l, *data)
 			}
@@ -315,6 +317,29 @@ func hasDescendant[V any](key, delim string, names map[string]V) bool {
 	return false
 }
 
+// visibleSuperiors returns the key of every name that one of mboxes is below, i.e.
+// the names that have a child the user can see. RFC 5258 §4 defines the child
+// attributes by what the user can access: \HasNoChildren "indicates that the mailbox
+// has NO child mailboxes that are accessible to the currently authenticated user",
+// and "A server SHOULD NOT set [\HasChildren] if there are child mailboxes and the
+// user does not have permission to access any of them." So LIST takes them from the
+// mailboxes GetMailboxes returned (everything the user can look up), not from the
+// database's has_children, which looks at the owner's own hierarchy only: it missed
+// another owner's shared mailbox below the user's own shared namespace root, and
+// counted a shared child the user cannot look up. NOTIFY derives them the same way
+// (diffNotifySnapshots). Each mailbox walks only its own ancestors, so this is linear
+// in the number of mailboxes.
+func visibleSuperiors(mboxes []*db.DBMailbox) map[string]bool {
+	superiors := make(map[string]bool)
+	for _, m := range mboxes {
+		// lower() leaves the delimiter alone, so the key has the name's levels.
+		for i := strings.LastIndexByte(m.NameKey, consts.MailboxDelimiter); i > 0 && !superiors[m.NameKey[:i]]; i = strings.LastIndexByte(m.NameKey[:i], consts.MailboxDelimiter) {
+			superiors[m.NameKey[:i]] = true
+		}
+	}
+	return superiors
+}
+
 // childAttr is the RFC 5258 §4 child attribute for a mailbox name.
 func childAttr(hasChildren bool) imap.MailboxAttr {
 	if hasChildren {
@@ -344,7 +369,7 @@ func childAttr(hasChildren bool) imap.MailboxAttr {
 // mapping would part ways with it, e.g. strings.ToLower("İx") is "ix" while ICU's
 // lower() keeps the two names apart.
 func buildSubscribedList(ref string, patterns []string, options *imap.ListOptions,
-	mboxes []*db.DBMailbox, subscribed map[string]string,
+	mboxes []*db.DBMailbox, superiors map[string]bool, subscribed map[string]string,
 	serverCaps imap.CapSet, sharedNamespaceRoot string) []imap.ListData {
 
 	recursive := options.SelectRecursiveMatch
@@ -400,7 +425,7 @@ func buildSubscribedList(ref string, patterns []string, options *imap.ListOption
 
 		var data imap.ListData
 		if m, ok := liveByKey[key]; ok {
-			md := listMailbox(m, options, serverCaps, sharedNamespaceRoot)
+			md := listMailbox(m, superiors[key], options, serverCaps, sharedNamespaceRoot)
 			if md == nil {
 				continue // filtered out (e.g. SELECT SPECIAL-USE with no special-use)
 			}
@@ -427,7 +452,7 @@ func buildSubscribedList(ref string, patterns []string, options *imap.ListOption
 			// mailbox whose parent the user cannot see (§3.5: "\NonExistent
 			// \HasChildren").
 			if options.ReturnChildren {
-				data.Attrs = append(data.Attrs, childAttr(hasDescendant(key, delim, liveByKey)))
+				data.Attrs = append(data.Attrs, childAttr(superiors[key]))
 			}
 		}
 
@@ -439,7 +464,7 @@ func buildSubscribedList(ref string, patterns []string, options *imap.ListOption
 	return l
 }
 
-func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.CapSet, sharedNamespaceRoot string) *imap.ListData {
+func listMailbox(mbox *db.DBMailbox, hasChildren bool, options *imap.ListOptions, serverCaps imap.CapSet, sharedNamespaceRoot string) *imap.ListData {
 	attributes := []imap.MailboxAttr{}
 
 	// Add \Noselect for the shared-namespace root (e.g. "Shared" for prefix
@@ -458,7 +483,7 @@ func listMailbox(mbox *db.DBMailbox, options *imap.ListOptions, serverCaps imap.
 	// option belongs to LIST-EXTENDED, which stays advertised when CHILDREN is
 	// disabled; without it a disabled CHILDREN keeps them off.
 	if serverCaps.Has(imap.CapChildren) || options.ReturnChildren {
-		attributes = append(attributes, childAttr(mbox.HasChildren))
+		attributes = append(attributes, childAttr(hasChildren))
 	}
 
 	// RFC 6154 special-use is a persisted per-mailbox attribute (see the
