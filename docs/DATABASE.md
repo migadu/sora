@@ -51,7 +51,7 @@ by their BLAKE3 hash.
 | `sieve_scripts` | Sieve scripts per account. |
 | `vacation_responses` | Which senders got a vacation reply and when. |
 | `redirect_log` | Sieve redirects per account, for the redirect rate limit. |
-| `redirect_deliveries` | Which redirect addresses each LMTP delivery was queued for, so that the MTA's retry of a delivery is not redirected again. |
+| `redirect_deliveries` | Which redirect addresses each delivery (LMTP or Admin API) was queued for, so that a retry of the delivery is not redirected again. |
 | `metadata` | IMAP METADATA entries. |
 | `locks` | Named locks with an expiry, for work that must run on exactly one node (TLS certificate issuance). |
 | `credential_changes` | One row for every changed or removed password, login address or account, written by database triggers. Every node reads it to drop cached logins ([AUTHENTICATION.md](AUTHENTICATION.md#121-the-credential-change-feed)). Rows are deleted 7 days after a node first saw them. |

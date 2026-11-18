@@ -457,8 +457,9 @@ A redirect is handed to the relay only after the delivery has stored every copy 
 delivery that fails (`451` on LMTP, an error from the Admin API) relays nothing, so the sender's
 retry relays each address once.
 
-An LMTP delivery that succeeded can be delivered again: the MTA retries it when it did not see
-the `250` (the connection was lost after the reply). The stored copy is recognised and not stored
+A delivery that succeeded can be delivered again: the MTA retries an LMTP delivery when it did
+not see the `250` (the connection was lost after the reply), and an Admin API caller retries
+`POST /admin/mail/deliver` when it did not see the response. The stored copy is recognised and not stored
 twice, and so are the redirects: Sora records each address a delivery handed to the relay queue,
 keyed by the account and the message bytes as received, and a later delivery of the same bytes on
 any node skips those addresses (logged as `sieve redirect already queued by an earlier attempt of
