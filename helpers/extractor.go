@@ -365,11 +365,15 @@ func isAddressWSP(ch byte) bool {
 // Bcc header addresses, in that order, each once (compared case-insensitively, the
 // spelling first seen is kept). It stands in for the envelope of a delivery that names
 // no recipients. ExtractRecipients, for the recipients metadata, also lists From,
-// Sender and Reply-To, which are not recipients.
+// Sender and Reply-To, which are not recipients, and the group markers, which are not
+// addresses: a group contributes its members, an empty group nothing.
 func ExtractEnvelopeRecipients(header message.Header) []string {
 	var addresses []string
 	seen := make(map[string]struct{})
 	for _, r := range ExtractRecipients(header) {
+		if r.IsGroupMarker() {
+			continue
+		}
 		switch r.AddressType {
 		case "to", "cc", "bcc":
 		default:
