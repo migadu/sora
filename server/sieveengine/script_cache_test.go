@@ -219,7 +219,7 @@ func (o *recordingRedirectOracle) CountRedirectsSince(ctx context.Context, accou
 	return 0, nil
 }
 
-func (o *recordingRedirectOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+func (o *recordingRedirectOracle) RecordRedirect(ctx context.Context, accountID int64, window time.Duration, limit int) error {
 	o.accountIDs = append(o.accountIDs, accountID)
 	return nil
 }

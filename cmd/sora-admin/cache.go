@@ -36,7 +36,7 @@ func handleCacheCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printCacheUsage()
 	default:
-		fmt.Printf("Unknown cache subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown cache subcommand: %s\n\n", subcommand)
 		printCacheUsage()
 		os.Exit(1)
 	}
@@ -50,7 +50,7 @@ func handleCacheStats(ctx context.Context) {
 		fmt.Printf(`Show local cache size and object count
 
 Usage:
-  sora-admin cache stats [options]
+  sora-admin --config PATH cache stats [options]
 
 Options:
   --config string        Path to TOML configuration file (required)
@@ -62,8 +62,7 @@ This command shows:
   - Cache capacity and maximum object size
 
 Examples:
-  sora-admin cache stats
-  sora-admin cache stats --config /path/to/config.toml
+  sora-admin cache stats --config config.toml
 `)
 	}
 
@@ -90,7 +89,7 @@ func handleCachePurge(ctx context.Context) {
 		fmt.Printf(`Clear all cached objects
 
 Usage:
-  sora-admin cache purge [options]
+  sora-admin --config PATH cache purge [options]
 
 Options:
   --config string        Path to TOML configuration file (required)
@@ -100,9 +99,8 @@ This command removes all cached objects from the local cache directory
 and clears the cache index database. This action cannot be undone.
 
 Examples:
-  sora-admin cache purge
-  sora-admin cache purge --confirm
-  sora-admin cache purge --config /path/to/config.toml --confirm
+  sora-admin cache purge --config config.toml
+  sora-admin cache purge --confirm --config config.toml
 `)
 	}
 
@@ -133,7 +131,7 @@ func handleCacheMetrics(ctx context.Context) {
 		fmt.Printf(`Show cache hit/miss ratios and performance metrics
 
 Usage:
-  sora-admin cache metrics [options]
+  sora-admin --config PATH cache metrics [options]
 
 Options:
   --instance string    Show metrics for specific instance ID
@@ -150,10 +148,10 @@ This command shows:
   - Historical trends when using --history flag
 
 Examples:
-  sora-admin cache metrics
-  sora-admin cache metrics --instance server1-cache
-  sora-admin cache metrics --history --since 7d
-  sora-admin cache metrics --json
+  sora-admin cache metrics --config config.toml
+  sora-admin cache metrics --instance server1-cache --config config.toml
+  sora-admin cache metrics --history --since 7d --config config.toml
+  sora-admin cache metrics --json --config config.toml
 `)
 	}
 
@@ -179,7 +177,7 @@ func printCacheUsage() {
 	fmt.Printf(`Cache Management
 
 Usage:
-  sora-admin cache <subcommand> [options]
+  sora-admin --config PATH cache <subcommand> [options]
 
 Subcommands:
   stats    Show local cache size and object count

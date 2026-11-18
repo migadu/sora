@@ -1,0 +1,423 @@
+{
+  "repository": "https://github.com/dovecot/imaptest",
+  "revision": "0682be5f3617149e55cb6a2f4de4b23be8092c53",
+  "scripts": [
+    {
+      "name": "append",
+      "status": "ported",
+      "go_case": "imaptest/append"
+    },
+    {
+      "name": "append-binary",
+      "status": "ported",
+      "go_case": "imaptest/append-binary"
+    },
+    {
+      "name": "atoms",
+      "status": "ported",
+      "go_case": "imaptest/atoms"
+    },
+    {
+      "name": "catenate",
+      "status": "excluded",
+      "requires": [
+        "CATENATE"
+      ],
+      "reason": "Unsupported extensions: CATENATE"
+    },
+    {
+      "name": "catenate-multiappend",
+      "status": "excluded",
+      "requires": [
+        "CATENATE",
+        "MULTIAPPEND"
+      ],
+      "reason": "Unsupported extensions: CATENATE, MULTIAPPEND"
+    },
+    {
+      "name": "close",
+      "status": "ported",
+      "go_case": "imaptest/close"
+    },
+    {
+      "name": "copy",
+      "status": "ported",
+      "go_case": "imaptest/copy"
+    },
+    {
+      "name": "esearch",
+      "status": "ported",
+      "go_case": "imaptest/esearch"
+    },
+    {
+      "name": "esearch-condstore",
+      "status": "ported",
+      "go_case": "imaptest/esearch-condstore"
+    },
+    {
+      "name": "esort",
+      "status": "ported",
+      "go_case": "imaptest/esort"
+    },
+    {
+      "name": "expunge",
+      "status": "ported",
+      "go_case": "imaptest/expunge"
+    },
+    {
+      "name": "expunge2",
+      "status": "ported",
+      "go_case": "imaptest/expunge2"
+    },
+    {
+      "name": "fetch",
+      "status": "ported",
+      "go_case": "imaptest/fetch"
+    },
+    {
+      "name": "fetch-binary-mime",
+      "status": "ported",
+      "go_case": "imaptest/fetch-binary-mime"
+    },
+    {
+      "name": "fetch-binary-mime-base64",
+      "status": "ported",
+      "go_case": "imaptest/fetch-binary-mime-base64"
+    },
+    {
+      "name": "fetch-binary-mime-qp",
+      "status": "ported",
+      "go_case": "imaptest/fetch-binary-mime-qp"
+    },
+    {
+      "name": "fetch-body",
+      "status": "ported",
+      "go_case": "imaptest/fetch-body"
+    },
+    {
+      "name": "fetch-body-message-rfc822",
+      "status": "ported",
+      "go_case": "imaptest/fetch-body-message-rfc822"
+    },
+    {
+      "name": "fetch-body-message-rfc822-mime",
+      "status": "ported",
+      "go_case": "imaptest/fetch-body-message-rfc822-mime"
+    },
+    {
+      "name": "fetch-body-message-rfc822-x2",
+      "status": "ported",
+      "go_case": "imaptest/fetch-body-message-rfc822-x2"
+    },
+    {
+      "name": "fetch-body-mime",
+      "status": "ported",
+      "go_case": "imaptest/fetch-body-mime"
+    },
+    {
+      "name": "fetch-bodystructure",
+      "status": "ported",
+      "go_case": "imaptest/fetch-bodystructure"
+    },
+    {
+      "name": "fetch-envelope",
+      "status": "ported",
+      "go_case": "imaptest/fetch-envelope"
+    },
+    {
+      "name": "id",
+      "status": "ported",
+      "go_case": "imaptest/id"
+    },
+    {
+      "name": "list",
+      "status": "ported",
+      "go_case": "imaptest/list"
+    },
+    {
+      "name": "listext",
+      "status": "ported",
+      "go_case": "imaptest/listext"
+    },
+    {
+      "name": "logout",
+      "status": "ported",
+      "go_case": "imaptest/logout"
+    },
+    {
+      "name": "move",
+      "status": "ported",
+      "go_case": "imaptest/move"
+    },
+    {
+      "name": "multiappend",
+      "status": "excluded",
+      "requires": [
+        "MULTIAPPEND"
+      ],
+      "reason": "Unsupported extensions: MULTIAPPEND"
+    },
+    {
+      "name": "mutf7",
+      "status": "ported",
+      "go_case": "imaptest/mutf7"
+    },
+    {
+      "name": "nil",
+      "status": "ported",
+      "go_case": "imaptest/nil"
+    },
+    {
+      "name": "notify",
+      "status": "ported",
+      "go_case": "imaptest/notify"
+    },
+    {
+      "name": "pipeline",
+      "status": "ported",
+      "go_case": "imaptest/pipeline"
+    },
+    {
+      "name": "pipeline-connections",
+      "status": "ported",
+      "go_case": "imaptest/pipeline-connections"
+    },
+    {
+      "name": "search-addresses",
+      "status": "ported",
+      "go_case": "imaptest/search-addresses"
+    },
+    {
+      "name": "search-body",
+      "status": "ported",
+      "go_case": "imaptest/search-body"
+    },
+    {
+      "name": "search-context-update",
+      "status": "excluded",
+      "requires": [
+        "CONTEXT=SEARCH"
+      ],
+      "reason": "Unsupported extensions: CONTEXT=SEARCH"
+    },
+    {
+      "name": "search-context-update2",
+      "status": "excluded",
+      "requires": [
+        "CONTEXT=SEARCH"
+      ],
+      "reason": "Unsupported extensions: CONTEXT=SEARCH"
+    },
+    {
+      "name": "search-context-update3",
+      "status": "excluded",
+      "requires": [
+        "CONTEXT=SEARCH"
+      ],
+      "reason": "Unsupported extensions: CONTEXT=SEARCH"
+    },
+    {
+      "name": "search-date",
+      "status": "ported",
+      "go_case": "imaptest/search-date"
+    },
+    {
+      "name": "search-flags",
+      "status": "ported",
+      "go_case": "imaptest/search-flags"
+    },
+    {
+      "name": "search-header",
+      "status": "ported",
+      "go_case": "imaptest/search-header"
+    },
+    {
+      "name": "search-partial",
+      "status": "excluded",
+      "requires": [
+        "CONTEXT=SEARCH"
+      ],
+      "reason": "Unsupported extensions: CONTEXT=SEARCH"
+    },
+    {
+      "name": "search-sets",
+      "status": "ported",
+      "go_case": "imaptest/search-sets"
+    },
+    {
+      "name": "search-size",
+      "status": "ported",
+      "go_case": "imaptest/search-size"
+    },
+    {
+      "name": "select",
+      "status": "ported",
+      "go_case": "imaptest/select"
+    },
+    {
+      "name": "sort-addresses",
+      "status": "ported",
+      "go_case": "imaptest/sort-addresses"
+    },
+    {
+      "name": "sort-arrival",
+      "status": "ported",
+      "go_case": "imaptest/sort-arrival"
+    },
+    {
+      "name": "sort-date",
+      "status": "ported",
+      "go_case": "imaptest/sort-date"
+    },
+    {
+      "name": "sort-display-from",
+      "status": "ported",
+      "go_case": "imaptest/sort-display-from"
+    },
+    {
+      "name": "sort-display-to",
+      "status": "ported",
+      "go_case": "imaptest/sort-display-to"
+    },
+    {
+      "name": "sort-partial",
+      "status": "excluded",
+      "requires": [
+        "CONTEXT=SORT"
+      ],
+      "reason": "Unsupported extensions: CONTEXT=SORT"
+    },
+    {
+      "name": "sort-size",
+      "status": "ported",
+      "go_case": "imaptest/sort-size"
+    },
+    {
+      "name": "sort-subject",
+      "status": "ported",
+      "go_case": "imaptest/sort-subject"
+    },
+    {
+      "name": "store",
+      "status": "ported",
+      "go_case": "imaptest/store"
+    },
+    {
+      "name": "subscribe",
+      "status": "ported",
+      "go_case": "imaptest/subscribe"
+    },
+    {
+      "name": "thread",
+      "status": "ported",
+      "go_case": "imaptest/thread"
+    },
+    {
+      "name": "thread-orderedsubject",
+      "status": "ported",
+      "go_case": "imaptest/thread-orderedsubject"
+    },
+    {
+      "name": "thread-orderedsubject2",
+      "status": "ported",
+      "go_case": "imaptest/thread-orderedsubject2"
+    },
+    {
+      "name": "thread2",
+      "status": "ported",
+      "go_case": "imaptest/thread2"
+    },
+    {
+      "name": "thread3",
+      "status": "ported",
+      "go_case": "imaptest/thread3"
+    },
+    {
+      "name": "thread4",
+      "status": "ported",
+      "go_case": "imaptest/thread4"
+    },
+    {
+      "name": "thread5",
+      "status": "ported",
+      "go_case": "imaptest/thread5"
+    },
+    {
+      "name": "thread6",
+      "status": "ported",
+      "go_case": "imaptest/thread6"
+    },
+    {
+      "name": "thread7",
+      "status": "ported",
+      "go_case": "imaptest/thread7"
+    },
+    {
+      "name": "thread8",
+      "status": "ported",
+      "go_case": "imaptest/thread8"
+    },
+    {
+      "name": "uidbatches",
+      "status": "excluded",
+      "requires": [
+        "UIDBATCHES"
+      ],
+      "reason": "Unsupported extensions: UIDBATCHES"
+    },
+    {
+      "name": "uidbatches-empty",
+      "status": "excluded",
+      "requires": [
+        "UIDBATCHES"
+      ],
+      "reason": "Unsupported extensions: UIDBATCHES"
+    },
+    {
+      "name": "uidplus",
+      "status": "ported",
+      "go_case": "imaptest/uidplus"
+    },
+    {
+      "name": "uidvalidity",
+      "status": "ported",
+      "go_case": "imaptest/uidvalidity"
+    },
+    {
+      "name": "uidvalidity-rename",
+      "status": "ported",
+      "go_case": "imaptest/uidvalidity-rename"
+    },
+    {
+      "name": "urlauth",
+      "status": "excluded",
+      "requires": [
+        "URLAUTH"
+      ],
+      "reason": "Unsupported extensions: URLAUTH"
+    },
+    {
+      "name": "urlauth-binary",
+      "status": "excluded",
+      "requires": [
+        "URLAUTH",
+        "URLAUTH=BINARY"
+      ],
+      "reason": "Unsupported extensions: URLAUTH, URLAUTH=BINARY"
+    },
+    {
+      "name": "urlauth2",
+      "status": "excluded",
+      "requires": [
+        "URLAUTH"
+      ],
+      "reason": "Unsupported extensions: URLAUTH"
+    }
+  ],
+  "outside_suite": [
+    {
+      "name": "broken/search-intdate",
+      "reason": "Upstream's broken directory is not run by its normal suite; this script assumes server INTERNALDATE is stored in EET/EEST, which RFC 3501 does not require."
+    }
+  ]
+}

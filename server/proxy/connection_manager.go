@@ -36,6 +36,12 @@ type BackendHealth struct {
 	LastFailure      time.Time // Time of last failure
 	LastSuccess      time.Time // Time of last successful connection
 	IsHealthy        bool      // Current health status
+
+	// awaitingSuccess is set when the backend is marked unhealthy and cleared only by a
+	// successful connection. The one-minute retry of hashing and round robin sets
+	// IsHealthy again without clearing it, so affinity keeps refusing the backend
+	// until a connection to it has actually succeeded.
+	awaitingSuccess bool
 }
 
 // backendPool is one group of backends the manager can route into, with its own hash
@@ -732,7 +738,8 @@ func (cm *ConnectionManager) healthWithAutoRecovery(backend string, remoteLookup
 
 // IsBackendHealthy checks if a backend is healthy based on detailed health tracking
 // Returns true if healthy, false if marked unhealthy
-// Auto-recovers backends after 1 minute of being marked unhealthy
+// Auto-recovers backends after 1 minute of being marked unhealthy. That retry is
+// for hashing and round robin only; IsBackendHealthyForAffinity is not affected.
 func (cm *ConnectionManager) IsBackendHealthy(backend string) bool {
 	// If health checks are disabled, always return true (all backends healthy)
 	if !cm.enableBackendHealthCheck {
@@ -766,11 +773,10 @@ func (cm *ConnectionManager) IsBackendHealthyForAffinity(backend string) bool {
 		return true
 	}
 
-	// For affinity checks, do NOT apply auto-recovery
-	// Return the actual health status WITHOUT checking the 1-minute grace period
-	// Even if the backend was marked unhealthy >1 minute ago, we still consider it unhealthy
-	// for affinity purposes (sticky failover)
-	return health.IsHealthy
+	// For affinity checks, do NOT apply auto-recovery: a backend marked unhealthy stays
+	// unhealthy for affinity until a connection to it succeeds (sticky failover), even
+	// after IsBackendHealthy has given it its one-minute retry and set IsHealthy again.
+	return health.IsHealthy && !health.awaitingSuccess
 }
 
 // IsRemoteLookupBackendHealthy checks if a remote lookup backend (not in pool) is healthy
@@ -941,10 +947,11 @@ func (cm *ConnectionManager) RecordConnectionSuccess(backend string) {
 		return
 	}
 
-	wasUnhealthy := !health.IsHealthy
+	wasUnhealthy := !health.IsHealthy || health.awaitingSuccess
 	health.LastSuccess = time.Now()
 	health.ConsecutiveFails = 0 // Reset consecutive failures on success
 	health.IsHealthy = true
+	health.awaitingSuccess = false
 
 	if wasUnhealthy {
 		logger.Info("ConnectionManager: Backend recovered (consecutive failures reset)", "backend", backend)
@@ -986,6 +993,7 @@ func (cm *ConnectionManager) RecordConnectionFailure(backend string) bool {
 	// Mark unhealthy after 3 consecutive failures
 	if health.ConsecutiveFails >= 3 {
 		health.IsHealthy = false
+		health.awaitingSuccess = true
 		if wasHealthy {
 			logger.Warn("ConnectionManager: Backend marked unhealthy after consecutive failures", "backend", backend, "count", health.ConsecutiveFails, "server", cm.serverName)
 			return true // Just became unhealthy

@@ -13,8 +13,9 @@ import (
 // TestIMAP_BinaryPartial_IncludesOriginOctet is a regression test for audit
 // finding H4 (2026-07-01 IMAP command-correctness audit).
 //
-// RFC 3516 §4.2.2 / RFC 3501 §7.4.2: a partial BINARY fetch MUST echo the
-// <origin octet> in the response, e.g. `BINARY[]<0> ~{10}...`. The fork's
+// RFC 3516 §4.3 / RFC 3501 §7.4.2: the response to a partial BINARY fetch
+// carries the origin, e.g. `BINARY[]<0> ~{10}...` (`BINARY<section-binary>[<<number>>]`;
+// without the origin the data claims to be the whole section). The fork's
 // WriteBinarySection ignores section.Partial and emits `BINARY[] ~{10}...`,
 // dropping the `<0>`. Strict clients treat the missing origin as a malformed
 // FETCH.
@@ -79,6 +80,6 @@ func TestIMAP_BinaryPartial_IncludesOriginOctet(t *testing.T) {
 	}
 	if sec.Section.Partial == nil {
 		t.Errorf("REGRESSION: partial BINARY response omits the <origin> octet; " +
-			"RFC 3516 §4.2.2 requires the response to echo e.g. BINARY[]<0>.")
+			"RFC 3516 §4.3 / RFC 3501 §7.4.2 require the response to echo e.g. BINARY[]<0>.")
 	}
 }

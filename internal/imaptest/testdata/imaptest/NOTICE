@@ -1,0 +1,7 @@
+Message fixtures and adapted assertion tables are from dovecot/imaptest,
+revision 0682be5f3617149e55cb6a2f4de4b23be8092c53 (MIT license).
+https://github.com/dovecot/imaptest/tree/0682be5f3617149e55cb6a2f4de4b23be8092c53/src/tests
+
+The Go client and scenario implementations run without Dovecot libraries.
+Only supported RFC scenarios are included. See docs/IMAPTEST_COVERAGE.md
+for the source mapping, exclusions, and RFC adaptations.

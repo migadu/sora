@@ -39,7 +39,7 @@ func handleMigrateCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printMigrateUsage()
 	default:
-		fmt.Printf("Unknown migrate subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown migrate subcommand: %s\n\n", subcommand)
 		printMigrateUsage()
 		os.Exit(1)
 	}
@@ -54,7 +54,7 @@ subcommands require stopping sora instances first; they take the migration leade
 and refuse to run while a starting instance holds it.
 
 Usage:
-  sora-admin migrate <subcommand> [options]
+  sora-admin --config PATH migrate <subcommand> [options]
 
 Subcommands:
   up        Apply all pending upwards migrations
@@ -76,8 +76,14 @@ Use 'sora-admin migrate <subcommand> --help' for detailed help.
 func handleMigrateUp(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate up", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Println("Usage: sora-admin migrate up --config config.toml")
-		fmt.Println("Applies all pending upwards migrations.")
+		fmt.Print(`Applies all pending upwards migrations.
+
+Usage:
+  sora-admin --config PATH migrate up
+
+Examples:
+  sora-admin --config config.toml migrate up
+`)
 	}
 	fs.Parse(os.Args[3:])
 
@@ -100,9 +106,17 @@ func handleMigrateDown(ctx context.Context) {
 	limit := fs.Int("limit", 1, "Number of migrations to revert")
 	all := fs.Bool("all", false, "Revert every migration after the first (the initial schema)")
 	fs.Usage = func() {
-		fmt.Println("Usage: sora-admin migrate down --config config.toml [--limit N | --all]")
-		fmt.Println("Reverts migrations. Defaults to reverting one migration.")
-		fmt.Println("The first migration (the initial schema) is never reverted.")
+		fmt.Print(`Reverts migrations. Defaults to reverting one migration.
+The first migration (the initial schema) is never reverted.
+
+Usage:
+  sora-admin --config PATH migrate down [--limit N | --all]
+
+Examples:
+  sora-admin --config config.toml migrate down
+  sora-admin --config config.toml migrate down --limit 2
+  sora-admin --config config.toml migrate down --all
+`)
 	}
 	fs.Parse(os.Args[3:])
 	// A limit below 1 reverts nothing, and a negative one would migrate up.
@@ -195,8 +209,14 @@ func downTarget(versions []uint, current uint, limit int, all bool) (uint, error
 func handleMigrateVersion(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate version", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Println("Usage: sora-admin migrate version --config config.toml")
-		fmt.Println("Shows the current migration version and dirty state.")
+		fmt.Print(`Shows the current migration version and dirty state.
+
+Usage:
+  sora-admin --config PATH migrate version
+
+Examples:
+  sora-admin --config config.toml migrate version
+`)
 	}
 	fs.Parse(os.Args[3:])
 
@@ -230,8 +250,14 @@ func handleMigrateVersion(ctx context.Context) {
 func handleMigrateForce(ctx context.Context) {
 	fs := flag.NewFlagSet("migrate force", flag.ExitOnError)
 	fs.Usage = func() {
-		fmt.Println("Usage: sora-admin migrate force --config config.toml <version>")
-		fmt.Println("Forcibly sets the database migration version. USE WITH CAUTION.")
+		fmt.Print(`Forcibly sets the database migration version. USE WITH CAUTION.
+
+Usage:
+  sora-admin --config PATH migrate force <version>
+
+Examples:
+  sora-admin --config config.toml migrate force 1
+`)
 	}
 	fs.Parse(os.Args[3:])
 

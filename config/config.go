@@ -2438,7 +2438,8 @@ func (s *ServerConfig) GetRedirectRateWindow() (time.Duration, error) {
 // servers that apply the Sieve redirect rate limit, LMTP and the Admin API, and at
 // least the default (1h), which a server also uses for a window that does not parse.
 // The limit counts redirect_log rows within the window, so the cleaner keeps them at
-// least this long.
+// least this long; each row also keeps the end of the window that charged it, which
+// holds it on a node whose own servers have a shorter window.
 func (c *Config) LongestRedirectRateWindow() time.Duration {
 	longest := time.Hour
 	for _, server := range c.GetAllServers() {
@@ -2450,6 +2451,48 @@ func (c *Config) LongestRedirectRateWindow() time.Duration {
 		}
 	}
 	return longest
+}
+
+// RedirectRateWindows returns the distinct redirect_rate_window values, shortest first, of
+// the enabled servers that apply the Sieve redirect rate limit: lmtp and http_admin_api
+// servers with a redirect_rate_limit above 0, with the 1h default for a window that does
+// not parse, as start-up uses. The limit counts an account's redirects within the window
+// of the server that delivers, so it is one limit only if every such server, on every
+// node, has the same window (#1994).
+func (c *Config) RedirectRateWindows() []time.Duration {
+	var windows []time.Duration
+	for _, server := range c.GetAllServers() {
+		if (server.Type != "lmtp" && server.Type != "http_admin_api") || server.GetRedirectRateLimit() <= 0 {
+			continue
+		}
+		window, err := server.GetRedirectRateWindow()
+		if err != nil {
+			window = time.Hour
+		}
+		if !slices.Contains(windows, window) {
+			windows = append(windows, window)
+		}
+	}
+	slices.Sort(windows)
+	return windows
+}
+
+// RedirectRateLimits returns the distinct redirect_rate_limit values above 0, smallest
+// first, of the enabled lmtp and http_admin_api servers. The limit counts an account's
+// redirects on every server and node, so it is one limit only if every such server, on
+// every node, has the same value (#2020).
+func (c *Config) RedirectRateLimits() []int {
+	var limits []int
+	for _, server := range c.GetAllServers() {
+		if server.Type != "lmtp" && server.Type != "http_admin_api" {
+			continue
+		}
+		if limit := server.GetRedirectRateLimit(); limit > 0 && !slices.Contains(limits, limit) {
+			limits = append(limits, limit)
+		}
+	}
+	slices.Sort(limits)
+	return limits
 }
 
 // GetMaxRedirectHops returns how many times one message may be redirected before

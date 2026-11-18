@@ -34,7 +34,7 @@ func handleCredentialsCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printCredentialsUsage()
 	default:
-		fmt.Printf("Unknown credentials subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown credentials subcommand: %s\n\n", subcommand)
 		printCredentialsUsage()
 		os.Exit(1)
 	}
@@ -57,7 +57,7 @@ func handleAddCredential(ctx context.Context) {
 		fmt.Printf(`Add a credential to an existing account
 
 Usage:
-  sora-admin credentials add [options]
+  sora-admin --config PATH credentials add [options]
 
 Options:
   --primary string       Primary identity of the account to add credential to (required)
@@ -81,25 +81,25 @@ Examples:
 
 	// Validate required arguments
 	if *primaryIdentity == "" {
-		fmt.Printf("Error: --primary is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --primary is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *password == "" && *passwordHash == "" {
-		fmt.Printf("Error: either --password or --password-hash is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: either --password or --password-hash is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *password != "" && *passwordHash != "" {
-		fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
+		fmt.Fprintf(os.Stderr, "Error: cannot specify both --password and --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -114,7 +114,7 @@ Examples:
 		}
 	}
 	if !hashTypeValid {
-		fmt.Printf("Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
+		fmt.Fprintf(os.Stderr, "Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -139,7 +139,7 @@ func handleListCredentials(ctx context.Context) {
 		fmt.Printf(`List all credentials for an account
 
 Usage:
-  sora-admin credentials list [options]
+  sora-admin --config PATH credentials list [options]
 
 Options:
   --email string       Email address associated with the account (required)
@@ -157,7 +157,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -185,7 +185,7 @@ This command displays comprehensive information about a specific credential incl
 - Associated account summary information
 
 Usage:
-  sora-admin credentials show --email <email> [options]
+  sora-admin --config PATH credentials show --email <email> [options]
 
 Options:
   --email string      Email address (credential) to show details for (required)
@@ -193,9 +193,8 @@ Options:
   --json             Output in JSON format instead of human-readable format
 
 Examples:
-  sora-admin credentials show --email user@example.com
-  sora-admin credentials show --email alias@example.com --json
-  sora-admin credentials show --email user@example.com --config /path/to/config.toml
+  sora-admin credentials show --email user@example.com --config config.toml
+  sora-admin credentials show --email alias@example.com --json --config config.toml
 `)
 	}
 
@@ -206,7 +205,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -236,7 +235,7 @@ Restrictions:
   instead (sora-admin accounts delete), which removes all its data.
 
 Usage:
-  sora-admin credentials delete [options]
+  sora-admin --config PATH credentials delete [options]
 
 Options:
   --email string      Email address of the credential to delete (required)
@@ -253,7 +252,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -270,7 +269,7 @@ func printCredentialsUsage() {
 	fmt.Printf(`Credential Management
 
 Usage:
-  sora-admin credentials <subcommand> [options]
+  sora-admin --config PATH credentials <subcommand> [options]
 
 Subcommands:
   add      Add a credential to an existing account

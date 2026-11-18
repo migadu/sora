@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1742,13 +1743,13 @@ func TestMessageRestoration(t *testing.T) {
 
 // TestMailDelivery tests the HTTP mail delivery endpoint
 func TestMailDelivery(t *testing.T) {
-	t.Skip("Mail delivery tests require uploader configuration (not set up in test environment)")
-	server := setupHTTPAPIServer(t)
+	common.SkipIfDatabaseUnavailable(t)
+	server, _ := setupHTTPAPIServerWithUploader(t)
 	defer server.Close()
 
 	// Create a test account to deliver mail to
 	createReq := map[string]string{
-		"email":    fmt.Sprintf("delivery-test-%d@example.com", time.Now().Unix()),
+		"email":    fmt.Sprintf("delivery-test-%d@example.com", time.Now().UnixNano()),
 		"password": "testpassword123",
 	}
 	resp, body := server.makeRequest(t, "POST", "/admin/accounts", createReq)
@@ -1813,7 +1814,7 @@ This is a test message delivered via HTTP API.
 	t.Run("DeliverMail_MultipleRecipients", func(t *testing.T) {
 		// Create a second recipient
 		createReq2 := map[string]string{
-			"email":    fmt.Sprintf("delivery-test2-%d@example.com", time.Now().Unix()),
+			"email":    fmt.Sprintf("delivery-test2-%d@example.com", time.Now().UnixNano()),
 			"password": "testpassword123",
 		}
 		resp, body := server.makeRequest(t, "POST", "/admin/accounts", createReq2)
@@ -1930,10 +1931,12 @@ This message has one valid and one invalid recipient.
 	})
 
 	t.Run("DeliverMail_NoRecipients", func(t *testing.T) {
+		// No recipients field and no To/Cc/Bcc header: nothing to deliver to. (No From
+		// either, so the 400 comes from the missing recipients, not from an unknown
+		// sender being tried as one; see DeliverMail_RecipientsFromToCcBccOnly.)
 		deliveryReq := map[string]any{
 			"recipients": []string{},
-			"message": `From: sender@example.com
-Subject: No Recipients
+			"message": `Subject: No Recipients
 Message-ID: <test-norecip@example.com>
 
 This message has no recipients.
@@ -1943,6 +1946,28 @@ This message has no recipients.
 		resp, body := server.makeRequest(t, "POST", "/admin/mail/deliver", deliveryReq)
 		if resp.StatusCode != http.StatusBadRequest {
 			t.Errorf("Expected status 400 for no recipients, got %d - %s", resp.StatusCode, string(body))
+		}
+	})
+
+	t.Run("DeliverMail_RecipientsFromToCcBccOnly", func(t *testing.T) {
+		// Without a recipients field the message goes to its To, Cc and Bcc addresses,
+		// each once (docs/ADMIN_API.md). A local sender, also named in Reply-To and Cc,
+		// gets the one copy Cc asks for, not one per header.
+		external := fmt.Sprintf("recipient-%d@example.org", time.Now().UnixNano())
+		resp, body := server.makeRequest(t, "POST", "/admin/mail/deliver", map[string]any{
+			"message": fmt.Sprintf("From: %s\r\nSender: %s\r\nReply-To: %s\r\nTo: %s\r\nCc: %s\r\nBcc: %s\r\nSubject: Header recipients\r\n\r\nbody\r\n",
+				testEmail, testEmail, testEmail, external, testEmail, testEmail),
+		})
+		var deliveryResp map[string]any
+		server.expectJSON(t, body, &deliveryResp)
+		recipients, _ := deliveryResp["recipients"].([]any)
+		var got []string
+		for _, r := range recipients {
+			got = append(got, r.(map[string]any)["email"].(string))
+		}
+		t.Logf("status %d, recipients %v", resp.StatusCode, got)
+		if want := []string{external, testEmail}; !slices.Equal(got, want) {
+			t.Errorf("expected the To, Cc and Bcc addresses once each %v, got %v", want, got)
 		}
 	})
 

@@ -1048,7 +1048,6 @@ type MailboxSummary struct {
 	NumMessages       int
 	TotalSize         int64
 	HighestModSeq     uint64
-	RecentCount       int
 	UnseenCount       int
 	FirstUnseenSeqNum uint32 // Sequence number of the first unseen message
 }
@@ -1109,6 +1108,12 @@ func (d *Database) GetMailboxSummary(ctx context.Context, mailboxID int64) (*Mai
 // In a view (WithSeqView) the first unseen message is looked for among the view's
 // messages and numbered in the view, so that it is a message of the EXISTS the SELECT
 // sends for that view.
+//
+// A message without a message_state row (left by older builds) has no flags, so it is
+// unseen, as for SEARCH UNSEEN and unseen_count (#1949). The unseen state rows are found
+// through the partial index idx_message_state_first_unseen; a message without a row
+// can only be found by walking the mailbox, so that walk stops at the first unseen
+// state row's UID, the same range the sequence-number count below reads.
 func (d *Database) GetFirstUnseenSeqNum(ctx context.Context, mailboxID int64) (uint32, error) {
 	var firstUnseenUID int64
 	view := seqViewOf(ctx)
@@ -1119,18 +1124,29 @@ func (d *Database) GetFirstUnseenSeqNum(ctx context.Context, mailboxID int64) (u
 		args = append(args, int64(view))
 	}
 	query := fmt.Sprintf(`
-		SELECT m.uid FROM message_state ms
-		JOIN messages m ON ms.message_id = m.id
-		WHERE ms.mailbox_id = $1 AND (ms.flags & %d) = 0 AND %s
-		ORDER BY ms.message_id ASC LIMIT 1
-	`, FlagSeen, inMailbox)
-	err := d.readQuerier(ctx).QueryRow(ctx, query, args...).Scan(&firstUnseenUID)
+		WITH first_unseen_state AS (
+			SELECT m.uid FROM message_state ms
+			JOIN messages m ON ms.message_id = m.id
+			WHERE ms.mailbox_id = $1 AND (ms.flags & %d) = 0 AND %s
+			ORDER BY ms.message_id ASC LIMIT 1
+		)
+		SELECT COALESCE(
+			(SELECT m.uid FROM messages m
+			 WHERE m.mailbox_id = $1 AND %s
+			   AND m.uid < COALESCE((SELECT uid FROM first_unseen_state), 9223372036854775807)
+			   AND NOT EXISTS (SELECT 1 FROM message_state ms WHERE ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id)
+			 ORDER BY m.uid LIMIT 1),
+			(SELECT uid FROM first_unseen_state))
+	`, FlagSeen, inMailbox, inMailbox)
+	var uid *int64
+	err := d.readQuerier(ctx).QueryRow(ctx, query, args...).Scan(&uid)
 	if err != nil {
-		if err == pgx.ErrNoRows {
-			return 0, nil
-		}
 		return 0, fmt.Errorf("failed to fetch first unseen UID: %w", err)
 	}
+	if uid == nil {
+		return 0, nil
+	}
+	firstUnseenUID = *uid
 
 	var seqNum uint32
 	args = []any{mailboxID, firstUnseenUID}

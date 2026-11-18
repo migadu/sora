@@ -1,71 +1,85 @@
 package lmtpproxy
 
 import (
+	"bufio"
 	"context"
+	"io"
+	"net"
+	"strings"
 	"testing"
 	"time"
 )
 
-// TestContextCancellationDetectedInCommandLoop verifies that when the session
-// context is cancelled (by absolute timeout or server shutdown), the command loop
-// detects it and exits gracefully
-func TestContextCancellationDetectedInCommandLoop(t *testing.T) {
-	// This is a unit test that verifies the fix for the absolute timeout bug
-	// The bug: command loop (handleConnection lines 110-358) doesn't check ctx.Done()
-	// The fix: added select case to check ctx.Done() at the top of the loop
+// startIdleTestSession starts a real proxy session on an in-memory connection, reads
+// its greeting and leaves the client idle. It returns the session, the client end and
+// a channel closed when handleConnection returns.
+func startIdleTestSession(t *testing.T, absoluteTimeout time.Duration) (*Session, net.Conn, <-chan struct{}) {
+	t.Helper()
+	srv, err := New(context.Background(), nil, "test-host", ServerOptions{
+		Name: "idle", RemoteAddrs: []string{"127.0.0.1:1"}, RemotePort: 24, ConnectTimeout: time.Second,
+		AbsoluteSessionTimeout: absoluteTimeout,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Stop() })
 
-	ctx, cancel := context.WithCancel(context.Background())
+	front, serverEnd := net.Pipe()
+	sess := newSession(srv, serverEnd, nil)
+	done := make(chan struct{})
+	go func() { defer close(done); sess.handleConnection() }()
+	t.Cleanup(func() {
+		front.Close()
+		<-done
+	})
+	front.SetDeadline(time.Now().Add(10 * time.Second))
+	if greeting := readReply(t, bufio.NewReader(front)); !strings.HasPrefix(greeting, "220 ") {
+		t.Fatalf("greeting = %q", greeting)
+	}
+	return sess, front, done
+}
 
-	// Simulate what happens during a session
-	loopExited := make(chan struct{})
-
-	go func() {
-		// Simplified version of the command loop
-		for {
-			select {
-			case <-ctx.Done():
-				// This is the fix - without this, the loop would never exit
-				close(loopExited)
-				return
-			default:
-				// Continue - simulate waiting for command
-				time.Sleep(10 * time.Millisecond)
-			}
-		}
-	}()
-
-	// Cancel context after 50ms (simulating absolute timeout)
-	time.Sleep(50 * time.Millisecond)
-	cancel()
-
-	// Verify loop exits within reasonable time
+// waitSessionEnd fails the test unless the session ends, and the client sees its
+// connection closed, within bound.
+func waitSessionEnd(t *testing.T, front net.Conn, done <-chan struct{}, bound time.Duration, what string) {
+	t.Helper()
 	select {
-	case <-loopExited:
-		// Success - loop detected cancellation and exited
-		t.Log("Loop correctly exited when context was cancelled")
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("Loop did not exit within 500ms of context cancellation - fix not working!")
+	case <-done:
+	case <-time.After(bound):
+		t.Fatalf("session still running %v after %s", bound, what)
+	}
+	front.SetReadDeadline(time.Now().Add(bound))
+	if _, err := io.Copy(io.Discard, front); err != nil {
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			t.Fatalf("client connection still open %v after %s", bound, what)
+		}
 	}
 }
 
-// TestAbsoluteTimeoutCallsCancel verifies that the timeout mechanism calls cancel()
+// TestContextCancellationDetectedInCommandLoop: cancelling the session context (what
+// server shutdown and the absolute timeout do) ends a session that is waiting in the
+// command loop for the client's next command. The command read has no deadline here
+// (no auth idle timeout), so only the session's context watchdog, which closes the
+// connections, can unblock it.
+func TestContextCancellationDetectedInCommandLoop(t *testing.T) {
+	sess, front, done := startIdleTestSession(t, 0)
+	sess.cancel()
+	waitSessionEnd(t, front, done, 2*time.Second, "the session context was cancelled")
+}
+
+// TestAbsoluteTimeoutCallsCancel: the absolute session timeout ends a session whose
+// client sends nothing after the greeting, by cancelling the session context.
 func TestAbsoluteTimeoutCallsCancel(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	// Simulate the absolute timeout mechanism (lines 82-86)
-	timeoutDuration := 100 * time.Millisecond
-	timeout := time.AfterFunc(timeoutDuration, func() {
-		cancel() // This is what line 84 does
-	})
-	defer timeout.Stop()
-
-	// Wait for timeout to fire
+	const absoluteTimeout = 300 * time.Millisecond
+	sess, front, done := startIdleTestSession(t, absoluteTimeout)
+	start := time.Now()
 	select {
-	case <-ctx.Done():
-		elapsed := timeoutDuration
-		t.Logf("Context cancelled after ~%v (expected)", elapsed)
-	case <-time.After(timeoutDuration + 100*time.Millisecond):
-		t.Fatal("Context was not cancelled by timeout")
+	case <-sess.ctx.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatalf("session context not cancelled 5s into a %v absolute timeout", absoluteTimeout)
+	}
+	waitSessionEnd(t, front, done, 2*time.Second, "the absolute timeout")
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("session ended %v after the greeting; the absolute timeout is %v", elapsed, absoluteTimeout)
 	}
 }

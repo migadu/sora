@@ -1466,8 +1466,10 @@ limits.redirect_rate_window = "1h"       # Time window for redirect rate limitin
                                          # settings (disable the limit with redirect_rate_limit = 0). The cleaner keeps
                                          # the redirect records for [cleanup] grace_period or the longest window of
                                          # the LMTP and Admin API servers on the node that runs it, whichever is
-                                         # longer. A window longer than grace_period needs that window on every
-                                         # node with an imap, pop3 or lmtp server (they all run the cleaner).
+                                         # longer, and each record until the window of the server that charged it
+                                         # has passed. Cluster-wide: use the same window (and redirect_rate_limit)
+                                         # on every lmtp and http_admin_api server of every node, or an account's
+                                         # limit depends on the node that delivers; sora warns when windows or limits differ.
 limits.max_redirect_hops = 2             # Max times one message may be redirected before suppression — mail-loop
                                          # backstop, counted via the X-Sora-Loop header (default: 2; 1 = allow a
                                          # single redirect then stop; 0 = unlimited). Delivered-To loop detection
@@ -2413,7 +2415,7 @@ proxy_protocol_timeout = "5s"
 
 # Sieve redirect limits for /admin/mail/deliver, as on the LMTP server above:
 # limits.redirect_rate_limit = 100      # (default: 100, 0 = unlimited)
-# limits.redirect_rate_window = "1h"    # (default: "1h", must be positive)
+# limits.redirect_rate_window = "1h"    # (default: "1h", must be positive, the same as the LMTP servers')
 # limits.max_redirect_hops = 2          # (default: 2, 0 = unlimited)
 
 # NOTE: Uses global [relay] configuration for /admin/mail/deliver endpoint

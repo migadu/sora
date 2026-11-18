@@ -40,7 +40,7 @@ func (o *dbVacationOracle) CountRedirectsSince(ctx context.Context, accountID in
 	return o.rdb.CountRedirectsSinceWithRetry(ctx, accountID, window)
 }
 
-// RecordRedirect records that a redirect action was performed.
-func (o *dbVacationOracle) RecordRedirect(ctx context.Context, accountID int64) error {
-	return o.rdb.RecordRedirectWithRetry(ctx, accountID)
+// RecordRedirect records that a redirect action was performed under the given window and limit.
+func (o *dbVacationOracle) RecordRedirect(ctx context.Context, accountID int64, window time.Duration, limit int) error {
+	return o.rdb.RecordRedirectWithRetry(ctx, accountID, window, limit)
 }

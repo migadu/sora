@@ -202,6 +202,37 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		return nil, imapErr
 	}
 
+	// RFC 3516 §§4.4, 6: a literal8 may carry binary MIME bodies, but ordinary
+	// BODY and BODYSTRUCTURE must describe a base-IMAP-safe representation.
+	// Normalize before deriving any metadata or content hash so every fetch
+	// item, size, and stored object refers to the same representation.
+	if options.Binary {
+		normalized, releaseNormalized, normalizeErr := s.normalizeBinaryAppend(fullMessageBytes)
+		defer releaseNormalized()
+		if normalizeErr != nil {
+			s.DebugLog("binary APPEND normalization failed", "error", normalizeErr)
+			var imapErr *imap.Error
+			switch {
+			case errors.Is(normalizeErr, errAppendLiteralTooLarge):
+				metrics.SessionMemoryLimitExceeded.WithLabelValues("imap", s.server.name, s.server.hostname).Inc()
+				imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnavailable,
+					Text: "Session memory limit reached, please try again later"}
+			case errors.Is(normalizeErr, errAppendBinaryTooLarge):
+				imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeTooBig,
+					Text: "Encoded binary message exceeds maximum stored message size"}
+			case errors.Is(normalizeErr, helpers.ErrBinaryAppendUnsafe):
+				imapErr = &imap.Error{Type: imap.StatusResponseTypeNo, Code: imap.ResponseCodeUnknownCTE,
+					Text: "Binary message cannot be converted to a safe transfer encoding"}
+			default:
+				imapErr = s.internalError("failed to normalize binary message: %v", normalizeErr)
+			}
+			s.classifyAndTrackError("APPEND", nil, imapErr)
+			recordMetrics(imapErr)
+			return nil, imapErr
+		}
+		fullMessageBytes = normalized
+	}
+
 	// A part holding NUL (a literal8 APPEND of binary content) is stored base64
 	// encoded: FETCH BODY sends ordinary literals, which cannot carry NUL, and
 	// RFC 3516 §4.4 permits a lossless CTE change. BINARY[] decodes it back.
@@ -358,8 +389,8 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 
 	// User.Address is always the primary address (set during LOGIN)
 	// No need to query - it's already cached in the session
-	// Sanitize flags to remove invalid values (e.g., NIL, NULL, empty strings)
-	// This prevents protocol errors like "Keyword used without being in FLAGS: NIL"
+	// Sanitize flags to remove values no IMAP response can encode (empty
+	// strings, non-atom keywords; see helpers.SanitizeFlags)
 	sanitizedFlags := helpers.SanitizeFlags(options.Flags)
 
 	// RFC 3501 §2.3.2: \Recent is a session flag — it must NOT be stored

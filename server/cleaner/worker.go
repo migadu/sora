@@ -129,7 +129,10 @@ func New(rdb *resilient.ResilientDatabase, s3 *storage.S3Storage, cache *cache.C
 	// The redirect rate limit counts redirect_log rows within the window, so they are kept
 	// that long, and never for less than grace_period, which kept them before. The cleaner
 	// runs on whichever node wins the lock, and a node without an LMTP or Admin API server
-	// (an IMAP- or POP3-only backend) knows no window but the 1h default.
+	// (an IMAP- or POP3-only backend) knows no window but the 1h default, so a row also
+	// keeps the end of the window that charged it (redirect_log.expires_at) and
+	// CleanupOldRedirects keeps it until then (#1959). This retention is what applies to a
+	// row without one (an older binary's) and to redirect_deliveries.
 	redirectLogRetention := max(gracePeriod, redirectRateWindow)
 
 	// The orphan sweep starts at a random point rather than at the lowest hash: a node
@@ -521,7 +524,8 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 	// Clean up old redirect-rate-limit log entries: the redirect_log table accumulates
 	// one row per relayed SIEVE redirect, so it must be pruned or it grows unbounded.
 	// The rate limit counts the rows within redirect_rate_window, so they are kept for
-	// the longest window or grace_period, whichever is longer (see New). The same call
+	// the longest window or grace_period, whichever is longer (see New), and a row until
+	// the window it was charged under has passed, whatever this node's config. The same call
 	// prunes redirect_deliveries, which stops a retry of a delivery (an MTA's on LMTP, a
 	// caller's on the Admin API) from being redirected again; a retry after that
 	// retention is redirected again.

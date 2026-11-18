@@ -361,9 +361,10 @@ The first SIGINT or SIGTERM starts a graceful shutdown. Sora logs
      seconds for all of them), then closes its listener.
    - POP3 sends `-ERR Server shutting down, please reconnect`, and ManageSieve sends
      `BYE (TRYLATER) "Server shutting down, please reconnect"`.
-   - LMTP closes its listener and its connections. An LMTP transaction cut off here gets no `250`,
-     so the MTA keeps the message and tries again. A recipient check interrupted by the shutdown is
-     answered `421 4.2.1 service shutting down`.
+   - LMTP closes its listener. A delivery or recipient check interrupted by the shutdown is
+     answered `421 4.2.1 service shutting down`; LMTP waits up to 2 seconds for the transactions
+     under way to be answered, then closes its connections. A transaction cut off gets no `250`,
+     so the MTA keeps the message and tries again.
    - The proxies close their listeners and client connections.
    - The admin API, the user API and the metrics endpoint stop accepting requests and let the
      requests in progress finish, within the time that steps 2 and 3 leave.
