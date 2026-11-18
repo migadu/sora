@@ -187,9 +187,9 @@ Subcommands:
   purge    Clear all cached objects
 
 Examples:
-  sora-admin cache stats
-  sora-admin cache metrics --since 1h
-  sora-admin cache purge
+  sora-admin cache stats --config config.toml
+  sora-admin cache metrics --since 1h --config config.toml
+  sora-admin cache purge --config config.toml
 
 Use 'sora-admin cache <subcommand> --help' for detailed help.
 `)

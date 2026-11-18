@@ -11,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/emersion/go-message"
@@ -322,7 +321,7 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	s.DebugLog("processing rcpt to command", "to", to)
 
-	toAddress, err := server.NewAddress(to)
+	toAddress, err := server.NewForwardPath(to)
 	if err != nil {
 		s.WarnLog("invalid to address", "error", err)
 		recordMetrics("failure")
@@ -1057,7 +1056,12 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		// silently committed (commit ambiguity), in which case the upload
 		// worker still needs the file. Cleanup is the uploader's
 		// cleanupOrphanedFiles job either way.
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		//
+		// Only when the DATA command's own context has ended: the database layer's
+		// per-query timeout (query_timeout) also yields context.DeadlineExceeded, and
+		// while the command is still live that is a slow database, answered with the
+		// temporary failure below, not "service shutting down".
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
 			if filePath != nil {
 				s.DebugLog("keeping file for cleanup job after cancellation", "content_hash", contentHash)
 			}
@@ -1262,7 +1266,7 @@ func (s *LMTPSession) fixedFieldsLog(logFn func(msg string, keysAndValues ...any
 // read-only: RFC 3463 4.3.1 "mail system full" is the reply MTAs understand as "back off,
 // storage", not a server error. It is nil for any other error.
 func spoolFullReply(err error) *smtp.SMTPError {
-	if !errors.Is(err, syscall.ENOSPC) && !errors.Is(err, syscall.EROFS) {
+	if !helpers.IsInsufficientStorage(err) {
 		return nil
 	}
 	return &smtp.SMTPError{

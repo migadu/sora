@@ -248,12 +248,12 @@ Subcommands:
   repair-references  Fill in the stored References of messages that have none
 
 Examples:
-  sora-admin messages list-deleted --email user@example.com
-  sora-admin messages list-deleted --email user@example.com --mailbox INBOX --since 2024-01-01
-  sora-admin messages restore --email user@example.com --mailbox INBOX
-  sora-admin messages restore --email user@example.com --ids 123,456,789
-  sora-admin messages repair-references
-  sora-admin messages repair-references --apply
+  sora-admin messages list-deleted --email user@example.com --config config.toml
+  sora-admin messages list-deleted --email user@example.com --mailbox INBOX --since 2024-01-01 --config config.toml
+  sora-admin messages restore --email user@example.com --mailbox INBOX --config config.toml
+  sora-admin messages restore --email user@example.com --ids 123,456,789 --config config.toml
+  sora-admin messages repair-references --config config.toml
+  sora-admin messages repair-references --apply --config config.toml
 
 Use 'sora-admin messages <subcommand> --help' for detailed help.
 `)

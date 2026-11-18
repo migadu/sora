@@ -578,7 +578,7 @@ Examples:
   sora-admin sieve rename --config config.toml --email user@example.com --old "oldname" --new "newname"
 
 For more information on a subcommand, run:
-  sora-admin sieve <subcommand> --help`)
+  sora-admin sieve <subcommand> --help --config config.toml`)
 }
 
 // validateScriptName validates a Sieve script name

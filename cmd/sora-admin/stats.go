@@ -139,7 +139,7 @@ Subcommands:
 Examples:
   sora-admin stats blocked --config config.toml
   sora-admin stats blocked --config config.toml --protocol imap_proxy
-  sora-admin stats connection --user user@example.com
+  sora-admin stats connection --user user@example.com --config config.toml
 
 Use 'sora-admin stats <subcommand> --help' for detailed help.
 `)

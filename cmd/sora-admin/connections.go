@@ -444,9 +444,9 @@ Subcommands:
   kick   Force disconnect proxy connections
 
 Examples:
-  sora-admin connections list
-  sora-admin connections list --user user@example.com
-  sora-admin connections kick --user user@example.com
+  sora-admin connections list --config config.toml
+  sora-admin connections list --user user@example.com --config config.toml
+  sora-admin connections kick --user user@example.com --config config.toml
 
 Use 'sora-admin connections <subcommand> --help' for detailed help.
 `)

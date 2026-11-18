@@ -378,6 +378,12 @@ func (s *StandardSieveExecutor) sieveFlags(names []string) []imap.Flag {
 // direct relay handler cannot hold a message: its commit sends it. arrivedHops is
 // the redirect hop count of the message before the script's header edits; every
 // outgoing copy is stamped one above it.
+//
+// A target an earlier attempt of the same delivery (recipient.DeliveryHash) already
+// handed over, a caller's retry whose response was lost, maybe on another node, is
+// skipped and counts as held, as on LMTP (#1912). commit records each target after
+// handing it over, so a crash or a failed record errs toward relaying the message
+// again rather than not at all.
 func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient RecipientInfo, result sieveengine.Result, messageBytes []byte, arrivedHops int) (commit func() bool, abort func(), allHeld bool) {
 	type heldRedirect struct {
 		to     string
@@ -393,7 +399,19 @@ func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient Rec
 		// sender-supplied attribution. Aliases still use the account's primary address.
 		relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
 		from := recipient.FromAddress.FullAddress()
+		var queued []string
+		if recipient.DeliveryHash != "" {
+			var err error
+			if queued, err = s.DeliveryCtx.RDB.RedirectedTargetsWithRetry(ctx, recipient.AccountID, recipient.DeliveryHash); err != nil {
+				logger.Warn("Could not check for redirects queued by an earlier attempt, queuing all",
+					"account_id", recipient.AccountID, "error", err)
+			}
+		}
 		for _, redirectTo := range result.RedirectTo {
+			if slices.Contains(queued, redirectTo) {
+				s.DeliveryCtx.Logger.Log("sieve redirect already queued by an earlier attempt of this delivery, skipping redirect_to=%s", redirectTo)
+				continue
+			}
 			if s.RelayQueue == nil {
 				held = append(held, heldRedirect{
 					to:     redirectTo,
@@ -428,6 +446,12 @@ func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient Rec
 			}
 			if s.RelayQueue != nil && s.RelayNotify != nil {
 				s.RelayNotify()
+			}
+			if recipient.DeliveryHash != "" {
+				if err := s.DeliveryCtx.RDB.RecordRedirectDeliveryWithRetry(ctx, recipient.AccountID, recipient.DeliveryHash, h.to); err != nil {
+					logger.Warn("Failed to record a queued redirect, a retry of this delivery would queue it again",
+						"account_id", recipient.AccountID, "redirect_to", h.to, "error", err)
+				}
 			}
 			if result.RecordRedirect != nil {
 				if err := result.RecordRedirect(ctx); err != nil {

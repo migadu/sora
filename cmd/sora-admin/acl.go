@@ -232,16 +232,16 @@ Subcommands:
 
 Examples:
   # Grant read-only access to a user on a shared mailbox
-  sora-admin acl grant --email owner@domain.com --mailbox "Shared/Sales" --user bob@domain.com --rights "lrs"
+  sora-admin acl grant --email owner@domain.com --mailbox "Shared/Sales" --user bob@domain.com --rights "lrs" --config config.toml
 
   # Grant access to everyone in the same domain
-  sora-admin acl grant --email owner@domain.com --mailbox "Shared/Sales" --identifier "anyone" --rights "lr"
+  sora-admin acl grant --email owner@domain.com --mailbox "Shared/Sales" --identifier "anyone" --rights "lr" --config config.toml
 
   # Revoke access from a user
-  sora-admin acl revoke --email owner@domain.com --mailbox "Shared/Sales" --user bob@domain.com
+  sora-admin acl revoke --email owner@domain.com --mailbox "Shared/Sales" --user bob@domain.com --config config.toml
 
   # List all ACL entries for a mailbox
-  sora-admin acl list --email owner@domain.com --mailbox "Shared/Sales"
+  sora-admin acl list --email owner@domain.com --mailbox "Shared/Sales" --config config.toml
 
 ACL Rights:
   l - lookup   (mailbox is visible in listings)
@@ -257,5 +257,5 @@ ACL Rights:
   a - admin    (administer ACL)
 
 For more information on a subcommand, run:
-  sora-admin acl <subcommand> --help`)
+  sora-admin acl <subcommand> --help --config config.toml`)
 }

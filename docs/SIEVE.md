@@ -457,14 +457,15 @@ A redirect is handed to the relay only after the delivery has stored every copy 
 delivery that fails (`451` on LMTP, an error from the Admin API) relays nothing, so the sender's
 retry relays each address once.
 
-An LMTP delivery that succeeded can be delivered again: the MTA retries it when it did not see
-the `250` (the connection was lost after the reply). The stored copy is recognised and not stored
+A delivery that succeeded can be delivered again: the MTA retries an LMTP delivery when it did
+not see the `250` (the connection was lost after the reply), and an Admin API caller retries
+`POST /admin/mail/deliver` when it did not see the response. The stored copy is recognised and not stored
 twice, and so are the redirects: Sora records each address a delivery handed to the relay queue,
 keyed by the account and the message bytes as received, and a later delivery of the same bytes on
 any node skips those addresses (logged as `sieve redirect already queued by an earlier attempt of
 this delivery, skipping`). A different message that shares the `Message-ID` is redirected as
-usual. The records are kept for `[cleanup] grace_period`
-([STORAGE.md](STORAGE.md#11-the-cleanup-cycle)). An address is recorded after it was queued, so
+usual. The records are kept for `[cleanup] grace_period` or the longest `redirect_rate_window`,
+whichever is longer ([STORAGE.md](STORAGE.md#11-the-cleanup-cycle)). An address is recorded after it was queued, so
 a node that stops in between, or a record that cannot be written (logged as a warning), means the
 retry redirects the message again rather than not at all.
 
@@ -665,7 +666,7 @@ in `fields` (for example `sieve.enabled_extensions`). At startup, and in
 | Key | Server types | Default | Meaning |
 |---|---|---|---|
 | `limits.redirect_rate_limit` | `lmtp`, `http_admin_api` | `100` | Redirected addresses allowed per account per window. `0` means no limit. |
-| `limits.redirect_rate_window` | `lmtp`, `http_admin_api` | `"1h"` | The window for the limit above. Zero or a negative value stops startup (use `redirect_rate_limit = 0` to turn the limit off). A value that does not parse falls back to `1h` with a log line. |
+| `limits.redirect_rate_window` | `lmtp`, `http_admin_api` | `"1h"` | The window for the limit above. Zero or a negative value stops startup (use `redirect_rate_limit = 0` to turn the limit off). A value that does not parse falls back to `1h` with a log line. The cleaner keeps redirect records for this window or `[cleanup] grace_period`, whichever is longer ([STORAGE.md](STORAGE.md#11-the-cleanup-cycle)). |
 | `limits.max_redirect_hops` | `lmtp`, `http_admin_api` | `2` | How many times Sora may redirect one message, counted in `X-Sora-Loop`. `1` allows one redirect. `0` means no limit; `Delivered-To` loop detection still applies. |
 | `max_script_size` | `managesieve` | `"16kb"` | Largest script ManageSieve accepts. Reloads on `SIGHUP`. |
 | `supported_extensions` | `managesieve_proxy` | the default set | Extensions the proxy advertises before login. |

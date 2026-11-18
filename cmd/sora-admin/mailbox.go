@@ -1243,14 +1243,20 @@ Examples:
   # Subscribe to a mailbox
   sora-admin mailbox subscribe --config config.toml --email user@example.com --mailbox "Work"
 
+  # Unsubscribe from a mailbox
+  sora-admin mailbox unsubscribe --config config.toml --email user@example.com --mailbox "Work"
+
   # Fix mailbox names with un-decoded Modified UTF-7 (preview)
   sora-admin mailbox fix-utf7 --config config.toml --dry-run
 
   # List mailboxes whose hierarchy disagrees with their name (dry run)
   sora-admin mailbox repair-hierarchy --config config.toml
 
+  # List mailboxes whose cached unseen count is too high (dry run)
+  sora-admin mailbox repair-unseen --config config.toml
+
 For more information on a subcommand, run:
-  sora-admin mailbox <subcommand> --help`)
+  sora-admin mailbox <subcommand> --help --config config.toml`)
 }
 
 // isInboxMailboxName reports whether stored, a mailbox name resolved from the database,
