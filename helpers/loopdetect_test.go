@@ -1,6 +1,7 @@
 package helpers
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -150,5 +151,28 @@ func TestBuildReceivedHeader(t *testing.T) {
 	got2 := BuildReceivedHeader("", "h", "HTTP", "", "", "date")
 	if strings.Contains(got2, "from ") || strings.Contains(got2, "for <") || strings.Contains(got2, " id ") {
 		t.Errorf("empty clauses should be omitted: %q", got2)
+	}
+}
+
+// PrependTrace is PrependRawHeader then PrependHeaderLine(DeliveredToHeader) in
+// one copy, whose exact size reserve gets first.
+func TestPrependTrace(t *testing.T) {
+	msg := []byte("From: a@example.com\r\nSubject: s\r\n\r\nbody\r\n")
+	received := "Received: from mx.example.com\r\n\tby mail.example.com with LMTP; Thu, 1 Jan 2026 00:00:00 +0000"
+	want := PrependHeaderLine(PrependRawHeader(msg, received), DeliveredToHeader, "user@example.com\r\nX-Injected: 1")
+	var reserved int64
+	got, err := PrependTrace(msg, received, "user@example.com\r\nX-Injected: 1", func(size int64) error { reserved = size; return nil })
+	if err != nil || string(got) != string(want) {
+		t.Fatalf("got %q, %v; want %q", got, err, want)
+	}
+	if reserved != int64(len(got)) || cap(got) != len(got) {
+		t.Fatalf("reserved %d for %d bytes in a %d-byte buffer", reserved, len(got), cap(got))
+	}
+	refused := errors.New("over budget")
+	if got, err := PrependTrace(msg, received, "user@example.com", func(int64) error { return refused }); !errors.Is(err, refused) || got != nil {
+		t.Fatalf("refused reservation: %q, %v", got, err)
+	}
+	if got, err := PrependTrace(msg, received, "user@example.com", nil); err != nil || len(got) == 0 {
+		t.Fatalf("nil reserve: %q, %v", got, err)
 	}
 }

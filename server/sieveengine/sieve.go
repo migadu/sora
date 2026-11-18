@@ -772,6 +772,14 @@ func messageBody(msg []byte) []byte {
 // field it does not add or delete and the whole body keep their bytes, so a DKIM
 // signature over them still verifies.
 func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
+	return ApplyHeaderEditsReserved(messageBytes, edits, nil)
+}
+
+// ApplyHeaderEditsReserved is ApplyHeaderEdits that, when reserve is not nil,
+// passes it the size of the edited message before that is allocated, and
+// returns its error with nothing allocated. Only the header's field list is
+// built beforehand.
+func ApplyHeaderEditsReserved(messageBytes []byte, edits []HeaderEdit, reserve func(size int64) error) ([]byte, error) {
 	if len(edits) == 0 {
 		return messageBytes, nil
 	}
@@ -839,12 +847,25 @@ func ApplyHeaderEdits(messageBytes []byte, edits []HeaderEdit) ([]byte, error) {
 		}
 	}
 
-	out := make([]byte, 0, len(messageBytes)+len(edits)*64)
+	// Only the last line of a header with no body can lack a line break; a field
+	// may now follow it.
+	needsEOL := func(i int) bool { return i < len(fields)-1 && !bytes.HasSuffix(fields[i].raw, []byte{'\n'}) }
+	size := len(messageBytes) - end
+	for i, f := range fields {
+		size += len(f.raw)
+		if needsEOL(i) {
+			size += len(eol)
+		}
+	}
+	if reserve != nil {
+		if err := reserve(int64(size)); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]byte, 0, size)
 	for i, f := range fields {
 		out = append(out, f.raw...)
-		// Only the last line of a header with no body can lack a line break; a
-		// field may now follow it.
-		if i < len(fields)-1 && !bytes.HasSuffix(f.raw, []byte{'\n'}) {
+		if needsEOL(i) {
 			out = append(out, eol...)
 		}
 	}

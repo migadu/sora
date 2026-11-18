@@ -102,3 +102,20 @@ func TestReadAllChargedGrowthKeepsOldBufferCharged(t *testing.T) {
 		}
 	})
 }
+
+func TestReserver(t *testing.T) {
+	var charged int64
+	budget := NewSessionMemoryTracker(100)
+	reserve := budget.Reserver(&charged)
+	if err := reserve(60); err != nil || charged != 60 || budget.Current() != 60 {
+		t.Fatalf("first reservation: %v, charged %d, budget %d", err, charged, budget.Current())
+	}
+	if err := reserve(60); !errors.Is(err, ErrMemoryBudgetExhausted) || charged != 60 || budget.Current() != 60 {
+		t.Fatalf("over-budget reservation: %v, charged %d, budget %d", err, charged, budget.Current())
+	}
+	var none int64
+	var nilBudget *SessionMemoryTracker
+	if err := nilBudget.Reserver(&none)(1 << 40); err != nil || none != 0 {
+		t.Fatalf("nil budget: %v, charged %d", err, none)
+	}
+}

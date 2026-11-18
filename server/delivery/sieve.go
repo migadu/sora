@@ -103,6 +103,9 @@ type SieveOutcome struct {
 	// body locally: SaveMessageToMailbox writes a pending_uploads row, and the uploader
 	// treats a pending upload whose local file is missing as permanent content loss.
 	Copies []SieveCopy
+	// memoryCharged is what the executor charged to DeliveryCtx.Memory for the edited
+	// copy in MessageBytes; DeliverMessage frees it when the delivery ends.
+	memoryCharged int64
 	// Resolving can create mailboxes, so the caller invokes this only after the
 	// storable-size check and body staging, with redirect abort already deferred.
 	resolveDestinations func(context.Context) ([]SieveCopy, error)
@@ -281,7 +284,13 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	// describe the edited bytes, and every copy of this delivery - the redirected ones and
 	// every stored one - is made from them.
 	if len(result.HeaderEdits) > 0 {
-		edited, editErr := sieveengine.ApplyHeaderEdits(outcome.MessageBytes, result.HeaderEdits)
+		// The edited copy is charged to the delivery memory budget before it is made. A
+		// refusal fails the delivery as temporary, before any vacation reply or redirect.
+		edited, editErr := sieveengine.ApplyHeaderEditsReserved(outcome.MessageBytes, result.HeaderEdits,
+			s.DeliveryCtx.Memory.Reserver(&outcome.memoryCharged))
+		if errors.Is(editErr, server.ErrMemoryBudgetExhausted) {
+			return nil, editErr // a refused reservation charged nothing
+		}
 		if editErr != nil {
 			s.DeliveryCtx.Logger.Log("Failed to apply Sieve header edits, delivering unmodified: %v", editErr)
 		} else if reparsed, parseErr := server.ParseMessage(bytes.NewReader(edited)); parseErr != nil {

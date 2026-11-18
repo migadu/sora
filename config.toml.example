@@ -1455,7 +1455,9 @@ proxy_protocol_timeout = "5s"
 # server whose limit is below this.
 max_message_size = "50mb"     # Maximum message size (default: 50MB; 0 also means 50MB, there is no unlimited)
 # limits.delivery_memory_limit = "1gb"  # Message bytes all transactions of this server may hold at once: the DATA
-                                        # buffer and the base64 copy of NUL-bearing parts (default: "0" = no limit).
+                                        # buffer and each copy of the message (base64 of NUL-bearing parts, the
+                                        # Received/Delivered-To stamp, a Sieve editheader rewrite), about 3 to 6
+                                        # times a message's size (default: "0" = no limit).
                                         # A transaction that does not fit gets 452 4.3.1 and the MTA retries it.
                                         # Keep it well above max_message_size; not reloaded.
 

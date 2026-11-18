@@ -56,6 +56,23 @@ func ReadAllCharged(r io.Reader, budget *SessionMemoryTracker) ([]byte, int64, e
 	}
 }
 
+// Reserver returns a reserve callback (helpers.EncodeNULParts and the like) that
+// charges t for the size it is passed and adds what it charged to *charged, which
+// the caller frees once done with what was allocated. A refused charge is an
+// error wrapping ErrMemoryBudgetExhausted. A nil t charges nothing.
+func (t *SessionMemoryTracker) Reserver(charged *int64) func(size int64) error {
+	return func(size int64) error {
+		if t == nil {
+			return nil
+		}
+		if err := t.Allocate(size); err != nil {
+			return fmt.Errorf("%w: %v", ErrMemoryBudgetExhausted, err)
+		}
+		*charged += size
+		return nil
+	}
+}
+
 // ChargedReader charges Budget for every octet it reads from R, for a body that a
 // decoder (JSON, multipart) buffers in its own way, so its buffer cannot be
 // reserved ahead. Once a charge is refused, Read fails with an error wrapping

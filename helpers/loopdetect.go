@@ -178,6 +178,27 @@ func BuildReceivedHeader(from, byHost, with, forAddr, id, date string) string {
 	return b.String()
 }
 
+// PrependTrace returns msg with a Delivered-To line and the received field (a
+// complete, already-formatted and sanitized header field) on top, in that order:
+// the bytes PrependRawHeader(msg, received) followed by PrependHeaderLine with
+// DeliveredToHeader would give, in one copy instead of two. When reserve is not
+// nil, it is passed the size of that copy before it is allocated, and its error
+// is returned with nothing allocated.
+func PrependTrace(msg []byte, received, deliveredTo string, reserve func(size int64) error) ([]byte, error) {
+	deliveredToLine := stripCRLF(DeliveredToHeader) + ": " + stripCRLF(deliveredTo) + "\r\n"
+	size := len(deliveredToLine) + len(received) + len("\r\n") + len(msg)
+	if reserve != nil {
+		if err := reserve(int64(size)); err != nil {
+			return nil, err
+		}
+	}
+	out := make([]byte, 0, size)
+	out = append(out, deliveredToLine...)
+	out = append(out, received...)
+	out = append(out, "\r\n"...)
+	return append(out, msg...), nil
+}
+
 // PrependRawHeader prepends a complete, already-formatted (and already-sanitized) header
 // field — which may be folded across continuation lines — to the top of the header block.
 func PrependRawHeader(msg []byte, header string) []byte {

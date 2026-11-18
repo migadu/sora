@@ -1171,8 +1171,10 @@ all, because LMTP answers once per accepted recipient, and there is none (RFC 20
 
 With `limits.delivery_memory_limit` set, the bytes all transactions of the server hold at once are
 bounded too: the `DATA` (or `BDAT`) buffer is charged before each time it grows, the old and the new
-buffer together while it is copied, and the base64 copy of NUL-bearing parts before it is built. A
-transaction that does not fit gets
+buffer together while it is copied, and each copy of the message is charged before it is built: the
+base64 copy of NUL-bearing parts, the copy stamped with `Received` and `Delivered-To`, and the copy a
+Sieve `editheader` script rewrites. Every charge is held until the transaction ends. A transaction
+that does not fit gets
 `452 4.3.1 Delivery memory limit reached, please try again later`, so the MTA retries it later
 ([CONFIGURATION.md](CONFIGURATION.md#95-limits-serverlimits)). The limit is unset (no budget) by
 default.

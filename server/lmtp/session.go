@@ -614,8 +614,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		received := helpers.BuildReceivedHeader(
 			helpers.ReceivedFrom(helo, s.RemoteIP),
 			s.backend.hostname, withProtocol, deliveredTo, idgen.New(), time.Now().Format(time.RFC1123Z))
-		fullMessageBytes = helpers.PrependRawHeader(fullMessageBytes, received)
-		fullMessageBytes = helpers.PrependHeaderLine(fullMessageBytes, helpers.DeliveredToHeader, deliveredTo)
+		// One stamped copy, charged to the delivery memory budget before it is made.
+		var traceCharged int64
+		stamped, err := helpers.PrependTrace(fullMessageBytes, received, deliveredTo, s.backend.deliveryMemory.Reserver(&traceCharged))
+		defer s.backend.freeDeliveryMemory(traceCharged)
+		if err != nil {
+			return s.deliveryMemoryRefusal(recordMetrics, err, len(fullMessageBytes))
+		}
+		fullMessageBytes = stamped
 		if messageContent, err = server.ParseMessage(bytes.NewReader(fullMessageBytes)); err != nil {
 			recordMetrics("failure")
 			return s.InternalError("failed to re-parse message after Delivered-To/Received: %v", err)
@@ -792,7 +798,14 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Apply header edits if any (RFC 5293 - editheader extension)
 	if len(result.HeaderEdits) > 0 {
 		s.DebugLog("applying header edits", "count", len(result.HeaderEdits))
-		modifiedBytes, err := sieveengine.ApplyHeaderEdits(fullMessageBytes, result.HeaderEdits)
+		// The edited copy is charged to the delivery memory budget before it is made;
+		// a refusal comes before any vacation reply or redirect is sent.
+		var editCharged int64
+		modifiedBytes, err := sieveengine.ApplyHeaderEditsReserved(fullMessageBytes, result.HeaderEdits, s.backend.deliveryMemory.Reserver(&editCharged))
+		defer s.backend.freeDeliveryMemory(editCharged)
+		if errors.Is(err, server.ErrMemoryBudgetExhausted) {
+			return s.deliveryMemoryRefusal(recordMetrics, err, len(fullMessageBytes))
+		}
 		if err != nil {
 			s.WarnLog("failed to apply header edits", "error", err)
 			// Continue with original message on error
