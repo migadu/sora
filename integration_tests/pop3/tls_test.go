@@ -303,7 +303,7 @@ func TestPOP3STARTTLS(t *testing.T) {
 	if !strings.Contains(caps, "STLS") {
 		t.Errorf("plaintext CAPA must advertise STLS, got:\n%s", caps)
 	}
-	// Whole lines: "UTF8 USER" is advertised whatever the TLS state.
+	// Whole lines, so a "UTF8 USER" line would not count as USER.
 	if slices.Contains(strings.Split(caps, "\n"), "USER") || strings.Contains(caps, "SASL") {
 		t.Errorf("plaintext CAPA must not advertise USER or SASL with insecure_auth off, got:\n%s", caps)
 	}

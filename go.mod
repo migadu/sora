@@ -21,8 +21,8 @@ require (
 	github.com/k3a/html2text v1.5.1
 	github.com/klauspost/compress v1.20.4
 	github.com/migadu/go-imap v1.2.11
-	github.com/migadu/go-managesieve v0.1.6
-	github.com/migadu/go-pop3 v0.1.7
+	github.com/migadu/go-managesieve v0.1.7
+	github.com/migadu/go-pop3 v0.1.8
 	github.com/migadu/go-sieve v1.5.4
 	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/prometheus/client_golang v1.25.0

@@ -35,7 +35,7 @@ func handleMessagesCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printMessagesUsage()
 	default:
-		fmt.Printf("Unknown messages subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown messages subcommand: %s\n\n", subcommand)
 		printMessagesUsage()
 		os.Exit(1)
 	}
@@ -59,7 +59,7 @@ permanently removed by the cleanup worker. Messages in the grace period
 can be restored using the 'restore' subcommand.
 
 Usage:
-  sora-admin messages list-deleted --email <email> [options]
+  sora-admin --config PATH messages list-deleted --email <email> [options]
 
 Required Options:
   --email string        Email address of the account
@@ -89,7 +89,7 @@ Examples:
 	// Validate required arguments
 	// Validate required flags
 	if *email == "" {
-		fmt.Println("ERROR: --email is required")
+		fmt.Fprintln(os.Stderr, "ERROR: --email is required")
 		fmt.Println()
 		fs.Usage()
 		os.Exit(1)
@@ -150,7 +150,7 @@ You can restore messages by:
   - Messages deleted within a time range (--since/--until)
 
 Usage:
-  sora-admin messages restore --email <email> [options]
+  sora-admin --config PATH messages restore --email <email> [options]
 
 Required Options:
   --email string        Email address of the account
@@ -185,7 +185,7 @@ Examples:
 	// Validate required arguments
 	// Validate required flags
 	if *email == "" {
-		fmt.Println("ERROR: --email is required")
+		fmt.Fprintln(os.Stderr, "ERROR: --email is required")
 		fmt.Println()
 		fs.Usage()
 		os.Exit(1)
@@ -193,7 +193,7 @@ Examples:
 
 	// Validate that at least one filter is provided
 	if *ids == "" && *mailbox == "" && *since == "" && *until == "" {
-		fmt.Println("ERROR: At least one filter option is required (--ids, --mailbox, --since, or --until)")
+		fmt.Fprintln(os.Stderr, "ERROR: At least one filter option is required (--ids, --mailbox, --since, or --until)")
 		fmt.Println()
 		fs.Usage()
 		os.Exit(1)
@@ -240,7 +240,7 @@ func printMessagesUsage() {
 	fmt.Printf(`Message Management
 
 Usage:
-  sora-admin messages <subcommand> [options]
+  sora-admin --config PATH messages <subcommand> [options]
 
 Subcommands:
   list-deleted       List deleted (expunged) messages for an account

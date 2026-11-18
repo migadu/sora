@@ -283,92 +283,23 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 	}
 	rootNodes = pruned
 
-	// 4. Order the threads: REFERENCES by the sent date of each thread's first
-	// message, REFS by the latest INTERNALDATE in each thread, so that the thread
-	// that received mail last comes last.
+	// 4. Order the threads: REFERENCES by the sent date of each thread's root (a
+	// dummy's first child, which step 5 also goes by), REFS by the latest
+	// INTERNALDATE in each thread, so that the thread that received mail last
+	// comes last.
 	if refs {
 		sortByLatestArrival(rootNodes)
 	} else {
-		sortByEarliest(rootNodes)
+		sortThreads(rootNodes)
 	}
 
-	// 5. Subject Grouping (RFC 5256 JWZ algorithm phase 5); REFS ignores Subject.
+	// 5. Merge the threads that share a base subject; REFS ignores Subject.
 	if !refs {
-		subjectTable := make(map[string]*jwzNode)
+		rootNodes = mergeBySubject(rootNodes)
 
-		for _, root := range rootNodes {
-			// Only consider nodes that are still roots (might have been merged in this loop)
-			if root.parent != nil {
-				continue
-			}
-
-			subj := getSubject(root)
-			if subj == "" {
-				continue
-			}
-
-			existing, ok := subjectTable[subj]
-			if !ok || existing == root {
-				subjectTable[subj] = root
-				continue
-			}
-
-			// Merge root and existing
-			if existing.msg == nil && root.msg == nil {
-				// Both are dummies: merge root's children into existing
-				for _, child := range root.children {
-					child.parent = existing
-					existing.children = append(existing.children, child)
-				}
-				root.children = nil // effectively discarded
-			} else if existing.msg == nil || root.msg == nil {
-				// One is dummy: make it the parent of the real one
-				var dummy, real *jwzNode
-				if existing.msg == nil {
-					dummy, real = existing, root
-				} else {
-					dummy, real = root, existing
-					subjectTable[subj] = dummy
-				}
-				real.parent = dummy
-				dummy.children = append(dummy.children, real)
-			} else {
-				// Neither is dummy: create new dummy to parent both
-				newDummy := &jwzNode{}
-				existing.parent = newDummy
-				root.parent = newDummy
-				newDummy.children = append(newDummy.children, existing, root)
-				subjectTable[subj] = newDummy
-			}
-		}
-
-		// Rebuild rootNodes to include any newly created dummies and exclude merged nodes
-		var newRoots []*jwzNode
-		seen := make(map[*jwzNode]bool)
-
-		for _, root := range rootNodes {
-			if root.parent == nil {
-				if root.msg == nil && len(root.children) == 0 {
-					continue // Discarded dummy
-				}
-				if !seen[root] {
-					newRoots = append(newRoots, root)
-					seen[root] = true
-				}
-			}
-		}
-		for _, node := range subjectTable {
-			if node.parent == nil {
-				if !seen[node] {
-					newRoots = append(newRoots, node)
-					seen[node] = true
-				}
-			}
-		}
-		rootNodes = newRoots
-
-		// 6. Grouping made new roots: order them again.
-		sortByEarliest(rootNodes)
+		// 6. Merging made new roots: order them again. Below the roots,
+		// buildThreadData sorts each set of siblings.
+		sortThreads(rootNodes)
 	}
 
 	// 7. Build the ThreadData structure
@@ -382,6 +313,61 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 	return result
 }
 
+// mergeBySubject is step 5 of REFERENCES (RFC 5256 section 3): of the threads
+// in roots, in their step 4 order, it merges those with the same thread subject
+// and returns the threads left.
+func mergeBySubject(roots []*jwzNode) []*jwzNode {
+	// 5.B: the subject table holds one thread per subject: a dummy if there is
+	// one, else a message that is not a reply or forward, else the first reply.
+	table := make(map[string]*jwzNode)
+	for _, root := range roots {
+		subj := getSubject(root)
+		if subj == "" {
+			continue
+		}
+		held, ok := table[subj]
+		if !ok || held.msg != nil && (root.msg == nil || held.msg.ReplyOrForward && !root.msg.ReplyOrForward) {
+			table[subj] = root
+		}
+	}
+
+	// 5.C: merge every other thread into the one in the table. A dummy thread is
+	// in the table whenever there is one, so the current thread is a dummy only
+	// when the one in the table is too.
+	merged := make([]*jwzNode, 0, len(roots))
+	for _, root := range roots {
+		subj := getSubject(root)
+		held := table[subj]
+		if subj == "" || held == root {
+			merged = append(merged, root)
+			continue
+		}
+		switch {
+		case held.msg == nil && root.msg == nil:
+			// "append the current message's children to the children of the
+			// message in the subject table ... and then delete the current message"
+			for _, child := range root.children {
+				linkChild(held, child)
+			}
+			root.children = nil
+		case held.msg == nil, root.msg.ReplyOrForward && !held.msg.ReplyOrForward:
+			// "make the current message a child of the message in the subject table"
+			linkChild(held, root)
+		default:
+			// "create a new dummy message and make both the current message and the
+			// message in the subject table children of the dummy. Then replace the
+			// message in the subject table with the dummy message." The thread in
+			// the table comes earlier in roots, so it is already in merged.
+			dummy := &jwzNode{}
+			merged[slices.Index(merged, held)] = dummy
+			linkChild(dummy, held)
+			linkChild(dummy, root)
+			table[subj] = dummy
+		}
+	}
+	return merged
+}
+
 func (s *IMAPSession) getMessageID(numKind imapserver.NumKind, msg db.ThreadMessageResult) uint32 {
 	if numKind == imapserver.NumKindUID {
 		return uint32(msg.UID)
@@ -389,16 +375,18 @@ func (s *IMAPSession) getMessageID(numKind imapserver.NumKind, msg db.ThreadMess
 	return msg.Seq
 }
 
+// getSubject returns the thread subject of RFC 5256 REFERENCES step 5.B.i: "the
+// base subject from either the current message or its first child if the current
+// message is a dummy". Step 4 put a dummy's children in sent-date order, and an
+// empty subject is the thread's, not a reason to look further (5.B.ii).
 func getSubject(node *jwzNode) string {
-	if node.msg != nil {
-		return node.msg.SubjectSort
+	if node.msg == nil && len(node.children) > 0 {
+		node = node.children[0]
 	}
-	for _, child := range node.children {
-		if s := getSubject(child); s != "" {
-			return s
-		}
+	if node.msg == nil {
+		return ""
 	}
-	return ""
+	return node.msg.SubjectSort
 }
 
 func isAncestor(child, parent *jwzNode) bool {
@@ -461,34 +449,38 @@ func extractIDs(s string) []string {
 	return helpers.SplitMessageIDs(s)
 }
 
-// sortByEarliest orders nodes by the earliest sent date in each subtree, then by
-// the lowest message number in it.
-func sortByEarliest(nodes []*jwzNode) {
-	sort.Slice(nodes, func(i, j int) bool {
-		dateI := getEarliestDate(nodes[i])
-		dateJ := getEarliestDate(nodes[j])
-		if !dateI.Equal(dateJ) {
-			return dateI.Before(dateJ)
+// sortThreads orders threads as RFC 5256 REFERENCES steps 4 and 6 do: a dummy's
+// children first, then the threads, "In the case of a dummy message, sort its
+// children by sent date and then use the first child for the top-level sort."
+func sortThreads(roots []*jwzNode) {
+	for _, root := range roots {
+		if root.msg == nil {
+			sortBySentDate(root.children)
 		}
-		return getEarliestID(nodes[i]) < getEarliestID(nodes[j])
-	})
+	}
+	sortBySentDate(roots)
 }
 
-func getEarliestDate(node *jwzNode) time.Time {
-	var earliest time.Time
-	if node.msg != nil {
-		earliest = node.msg.SentDate
-	}
-
-	for _, child := range node.children {
-		d := getEarliestDate(child)
-		if !d.IsZero() {
-			if earliest.IsZero() || d.Before(earliest) {
-				earliest = d
-			}
+// sortBySentDate orders siblings by sent date, then by mailbox order (RFC 5256
+// section 2.2): a message by its own, a dummy by its first child's, so a dummy's
+// children must be in order already.
+func sortBySentDate(nodes []*jwzNode) {
+	first := func(n *jwzNode) *jwzNode {
+		for n.msg == nil && len(n.children) > 0 {
+			n = n.children[0]
 		}
+		return n
 	}
-	return earliest
+	sort.SliceStable(nodes, func(i, j int) bool {
+		a, b := first(nodes[i]), first(nodes[j])
+		if a.msg == nil || b.msg == nil {
+			return a.msg != nil
+		}
+		if dateA, dateB := a.msg.SentDate, b.msg.SentDate; !dateA.Equal(dateB) {
+			return dateA.Before(dateB)
+		}
+		return a.id < b.id
+	})
 }
 
 // sortByLatestArrival orders nodes by the latest INTERNALDATE in each subtree,
@@ -520,22 +512,6 @@ func getLatestArrival(node *jwzNode) (latest time.Time, id uint32) {
 	return latest, id
 }
 
-func getEarliestID(node *jwzNode) uint32 {
-	var earliest uint32
-	if node.msg != nil {
-		earliest = node.id
-	}
-	for _, child := range node.children {
-		id := getEarliestID(child)
-		if id != 0 {
-			if earliest == 0 || id < earliest {
-				earliest = id
-			}
-		}
-	}
-	return earliest
-}
-
 func buildThreadData(node *jwzNode) *imap.ThreadData {
 	td := &imap.ThreadData{}
 
@@ -555,7 +531,9 @@ func buildThreadData(node *jwzNode) *imap.ThreadData {
 
 	// Add subthreads if there are multiple branches
 	if curr != nil && len(curr.children) > 1 {
-		sortByEarliest(curr.children)
+		// RFC 5256 REFERENCES step 6, which THREAD=REFS shares: each set of
+		// siblings by sent date.
+		sortBySentDate(curr.children)
 
 		for _, child := range curr.children {
 			if sub := buildThreadData(child); sub != nil {

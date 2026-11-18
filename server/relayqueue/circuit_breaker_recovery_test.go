@@ -200,22 +200,22 @@ success:
 	t.Logf("✓ Test completed successfully - circuit breaker auto-recovery working!")
 }
 
-// TestCircuitBreakerStuckOpen tests the ORIGINAL bug where circuit breaker stayed OPEN indefinitely
-// This test should FAIL without the 5-second monitoring ticker fix
-func TestCircuitBreakerWithoutAutoRecovery(t *testing.T) {
-	t.Skip("Skipping test that demonstrates the original bug - would hang indefinitely")
-
-	queue, err := NewDiskQueue(t.TempDir(), 10, nil)
+// TestCircuitBreakerHalfOpenDeliversBeforeNextTick: with a worker interval far longer
+// than the breaker's timeout, the queue is retried as soon as the breaker turns
+// HALF-OPEN (the worker's 5-second breaker check), not at the next interval tick.
+// Without that check the messages wait for the 60-second tick, which in production
+// meant hours with a long worker_interval.
+func TestCircuitBreakerHalfOpenDeliversBeforeNextTick(t *testing.T) {
+	queue, err := NewDiskQueue(t.TempDir(), 10, []time.Duration{100 * time.Millisecond})
 	if err != nil {
 		t.Fatalf("Failed to create queue: %v", err)
 	}
 
-	// Create circuit breaker with short timeout
 	cb := circuitbreaker.NewCircuitBreaker(circuitbreaker.Settings{
-		Name:        "test_relay_stuck",
+		Name:        "test_relay_half_open",
 		MaxRequests: 3,
 		Interval:    10 * time.Second,
-		Timeout:     1 * time.Second, // Very short timeout
+		Timeout:     1 * time.Second,
 		ReadyToTrip: func(counts circuitbreaker.Counts) bool {
 			return counts.ConsecutiveFailures >= 5
 		},
@@ -227,52 +227,39 @@ func TestCircuitBreakerWithoutAutoRecovery(t *testing.T) {
 		},
 	})
 
-	handler := &mockRelayHandlerWithRealCB{
-		cb:               cb,
-		shouldFailAlways: true, // Always fail to keep CB OPEN
+	handler := &mockRelayHandlerWithRealCB{cb: cb, shouldFailAlways: true}
+
+	const messages = 6 // five failures open the breaker; the sixth meets it open
+	for i := 0; i < messages; i++ {
+		if err := queue.Enqueue("sender@example.com", "recipient@example.com", "redirect", []byte("Test")); err != nil {
+			t.Fatalf("Enqueue failed: %v", err)
+		}
 	}
 
-	// Worker with VERY long interval (simulates infrequent processing)
-	// Without the 5-second monitoring ticker, this would never recover
 	worker := NewWorker(queue, handler, 60*time.Second, 10, 5, 1*time.Hour, 168*time.Hour, nil)
-	ctx := context.Background()
-
-	err = queue.Enqueue("sender@example.com", "recipient@example.com", "redirect", []byte("Test"))
-	if err != nil {
-		t.Fatalf("Enqueue failed: %v", err)
-	}
-
-	err = worker.Start(ctx)
-	if err != nil {
+	if err := worker.Start(context.Background()); err != nil {
 		t.Fatalf("Failed to start worker: %v", err)
 	}
 	defer worker.Stop()
 
-	// Wait for CB to open
-	time.Sleep(2 * time.Second)
-
-	if cb.State() != circuitbreaker.StateOpen {
-		t.Fatalf("Expected OPEN, got %s", cb.State())
+	// The worker processes the queue once on start.
+	deadline := time.Now().Add(2 * time.Second)
+	for cb.State() != circuitbreaker.StateOpen && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
 	}
-
-	// Now make the handler succeed
+	if cb.State() != circuitbreaker.StateOpen {
+		t.Fatalf("Expected OPEN after the first pass, got %s (calls: %d)", cb.State(), handler.getCallCount())
+	}
 	handler.setFailAlways(false)
 
-	// Wait for CB timeout to expire
-	time.Sleep(2 * time.Second)
-
-	// With the fix: CB should transition to HALF-OPEN and worker should detect it
-	// Without the fix: CB transitions to HALF-OPEN but worker doesn't know (waits for 60s tick)
-
-	// Check if worker is actively trying deliveries
-	callsBefore := handler.getCallCount()
-	time.Sleep(3 * time.Second) // Wait for 5-second ticker to trigger
-	callsAfter := handler.getCallCount()
-
-	if callsAfter > callsBefore {
-		t.Logf("✓ Worker actively retrying in HALF-OPEN state (calls increased from %d to %d)", callsBefore, callsAfter)
-	} else {
-		t.Errorf("✗ Worker NOT retrying - circuit breaker stuck! (calls stayed at %d)", callsBefore)
+	// HALF-OPEN after 1s, the breaker check within 5s of start: well before the 60s tick.
+	deadline = time.Now().Add(15 * time.Second)
+	for handler.getMessageCount() < messages && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if got := handler.getMessageCount(); got != messages {
+		t.Fatalf("delivered %d of %d messages within 15s of the breaker opening (state %s); "+
+			"the worker did not retry when the breaker turned HALF-OPEN", got, messages, cb.State())
 	}
 }
 

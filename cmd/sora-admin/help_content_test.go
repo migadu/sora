@@ -25,7 +25,7 @@ func TestSubcommandHelpContent(t *testing.T) {
 			if strings.HasPrefix(first, "Usage") {
 				t.Errorf("no description before the usage:\n%s", out)
 			}
-			name := "sora-admin " + strings.Join(run, " ")
+			name := "sora-admin --config PATH " + strings.Join(run, " ")
 			if !strings.Contains(out, "Usage:\n  "+name) {
 				t.Errorf("no %q Usage line:\n%s", name, out)
 			}

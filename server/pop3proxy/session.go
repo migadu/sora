@@ -134,12 +134,6 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		s.username = username
 	}
 
-	// Reject empty passwords immediately - no cache lookup, no rate limiting needed
-	// Empty passwords are never valid under any condition
-	if password == "" {
-		return consts.ErrAuthenticationFailed
-	}
-
 	// Rate-limit key for this attempt. Canonicalised from the submitted username so
 	// that the CanAttemptAuth* check and every RecordAuthAttempt* call below use the
 	// SAME key. Checking the raw string while recording a mix of raw username,
@@ -208,6 +202,19 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 		// Unknown rate limiting error
 		metrics.ProtocolErrors.WithLabelValues("pop3_proxy", "AUTH", "rate_limited", "client_error").Inc()
 		return err
+	}
+
+	// Credentials no account can have: an empty password, or a user name or password
+	// that is not valid UTF-8 (RFC 6856 section 2.2: "The server MUST reject UTF-8
+	// usernames or passwords that fail to comply with the formal syntax in UTF-8").
+	// Refused without a lookup, but, like a user name that does not parse, as a failed
+	// login: recorded and counted, so a client sending garbage is slowed and blocked
+	// like one guessing passwords. Valid UTF-8 is compared as sent, without SASLprep.
+	if password == "" || !utf8.ValidString(username) || !utf8.ValidString(password) {
+		s.InfoLog("login refused: empty password, or user name or password not valid UTF-8")
+		s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, s.clientConn, s.proxyInfo, authKey, false)
+		metrics.AuthenticationAttempts.WithLabelValues("pop3_proxy", s.server.name, s.server.hostname, "failure").Inc()
+		return consts.ErrAuthenticationFailed
 	}
 
 	// Check cache
@@ -1445,15 +1452,6 @@ func (s *POP3ProxySession) Login(ctx context.Context, username, password string)
 	// never unquoted.
 	username = server.UnquoteString(username)
 	password = server.UnquoteString(password)
-	// RFC 6856 section 2.2: "The server MUST reject UTF-8 usernames or passwords
-	// that fail to comply with the formal syntax in UTF-8". No stored credential
-	// can match them, so, like an empty password, they are refused before the
-	// lookup with the wrong-password reply. Valid UTF-8 is checked as sent,
-	// without SASLprep.
-	if !utf8.ValidString(username) || !utf8.ValidString(password) {
-		s.InfoLog("login refused: user name or password is not valid UTF-8")
-		return &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
-	}
 	return s.doLogin(ctx, username, password)
 }
 

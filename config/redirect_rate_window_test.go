@@ -222,3 +222,67 @@ limits.redirect_rate_window = "24h"
 		t.Errorf("one window among the servers that apply the limit: want no warning, got %q", got)
 	}
 }
+
+// The redirect rate limit counts an account's redirects across every server and node, so
+// two servers with different redirect_rate_limit values give the same account two limits:
+// which one applies depends on the server that delivers (#2020). `sora-admin config
+// validate` warns about it, as it does for different windows.
+func TestWarnings_DifferentRedirectRateLimits(t *testing.T) {
+	load := func(t *testing.T, servers string) *Config {
+		t.Helper()
+		var cfg Config
+		if _, err := toml.Decode(servers, &cfg); err != nil {
+			t.Fatal(err)
+		}
+		return &cfg
+	}
+	limitWarnings := func(cfg *Config) []string {
+		var found []string
+		for _, w := range cfg.Warnings() {
+			if strings.Contains(w, "redirect_rate_limit") {
+				found = append(found, w)
+			}
+		}
+		return found
+	}
+
+	differ := load(t, `
+[[server]]
+type = "lmtp"
+name = "lmtp"
+addr = ":2424"
+
+[[server]]
+type = "http_admin_api"
+name = "admin"
+addr = ":8080"
+limits.redirect_rate_limit = 500
+`)
+	if got := limitWarnings(differ); len(got) != 1 || !strings.Contains(got[0], "100") || !strings.Contains(got[0], "500") {
+		t.Errorf("an lmtp server with the default limit 100 and an http_admin_api server with 500: want one warning naming both limits, got %q", got)
+	}
+
+	// The same limit, once by default and once spelled out, and a server with the limit
+	// off (it neither counts nor records redirects) are fine.
+	same := load(t, `
+[[server]]
+type = "lmtp"
+name = "lmtp"
+addr = ":2424"
+limits.redirect_rate_limit = 100
+
+[[server]]
+type = "http_admin_api"
+name = "admin"
+addr = ":8080"
+
+[[server]]
+type = "http_admin_api"
+name = "admin-unlimited"
+addr = ":8081"
+limits.redirect_rate_limit = 0
+`)
+	if got := limitWarnings(same); len(got) != 0 {
+		t.Errorf("one limit among the servers that apply it: want no warning, got %q", got)
+	}
+}

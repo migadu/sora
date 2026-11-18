@@ -33,7 +33,7 @@ func TestCleanupOldRedirects_KeepsRowsUntilTheirWindowEnds(t *testing.T) {
 	// Three redirects, all 2h old: one charged under a 24h window, one under a 1h window,
 	// and one with no window recorded (an older binary).
 	for _, window := range []time.Duration{24 * time.Hour, time.Hour, 0} {
-		inTx(func(tx pgx.Tx) error { return database.RecordRedirect(ctx, tx, accountID, window) })
+		inTx(func(tx pgx.Tx) error { return database.RecordRedirect(ctx, tx, accountID, window, 100) })
 	}
 	_, err := database.GetWritePool().Exec(ctx, `
 		UPDATE redirect_log SET redirect_date = redirect_date - interval '2 hours',

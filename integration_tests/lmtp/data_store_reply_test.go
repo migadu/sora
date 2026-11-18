@@ -4,7 +4,9 @@ package lmtp_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"strings"
 	"testing"
 	"time"
@@ -85,13 +87,31 @@ func TestLMTP_DataCapTimeoutReply(t *testing.T) {
 }
 
 // A shutdown while the store waits on the database answers the message 421 4.2.1
-// "service shutting down", not the 451 of a DATA cap that fired (#1962).
+// "service shutting down", not the 451 of a DATA cap that fired (#1962), and then
+// closes the connection, as a 421 says it does (RFC 5321 section 3.8, #1990).
+// Cancelling the application context is the server's shutdown signal.
 func TestLMTP_DataShutdownReply(t *testing.T) {
+	testDataShutdownReply(t, func(shutdown context.CancelFunc, _ *lmtp.LMTPServerBackend) {
+		shutdown()
+	})
+}
+
+// cmd/sora shuts the server down by cancelling the application context and, from a
+// watcher on it, calling Close straight after. Close must let the session answer the
+// message it is storing before it closes the connection (#1990), which once closed it
+// before the session had written the 421.
+func TestLMTP_DataShutdownReplyBeforeClose(t *testing.T) {
+	testDataShutdownReply(t, func(shutdown context.CancelFunc, backend *lmtp.LMTPServerBackend) {
+		shutdown()
+		backend.Close()
+	})
+}
+
+// testDataShutdownReply stalls a message's store, runs stop, and wants the 421 4.2.1
+// reply followed by the end of the connection.
+func testDataShutdownReply(t *testing.T, stop func(shutdown context.CancelFunc, backend *lmtp.LMTPServerBackend)) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	// Cancelling the application context is the server's shutdown signal. The test
-	// does not close the server, which would close the connection before the reply
-	// could be read.
 	appCtx, shutdown := context.WithCancel(context.Background())
 	defer shutdown()
 	rdb := common.SetupTestDatabase(t)
@@ -128,7 +148,7 @@ func TestLMTP_DataShutdownReply(t *testing.T) {
 		t.Fatalf("send message: %v", err)
 	}
 	waitBlockedBy(t, rdb, holder)
-	shutdown()
+	stop(shutdown, srv.Server.(*lmtp.LMTPServerBackend))
 
 	if err := c.conn.SetReadDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		t.Fatalf("read deadline: %v", err)
@@ -139,5 +159,8 @@ func TestLMTP_DataShutdownReply(t *testing.T) {
 	}
 	if !strings.HasPrefix(response, "421 4.2.1") || !strings.Contains(response, "service shutting down") {
 		t.Fatalf("DATA = %q, want 421 4.2.1 service shutting down", response)
+	}
+	if line, err := c.ReadResponse(); !errors.Is(err, io.EOF) {
+		t.Fatalf("after the 421: read %q, %v; want the connection closed (EOF)", line, err)
 	}
 }

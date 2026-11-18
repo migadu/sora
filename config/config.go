@@ -2477,6 +2477,24 @@ func (c *Config) RedirectRateWindows() []time.Duration {
 	return windows
 }
 
+// RedirectRateLimits returns the distinct redirect_rate_limit values above 0, smallest
+// first, of the enabled lmtp and http_admin_api servers. The limit counts an account's
+// redirects on every server and node, so it is one limit only if every such server, on
+// every node, has the same value (#2020).
+func (c *Config) RedirectRateLimits() []int {
+	var limits []int
+	for _, server := range c.GetAllServers() {
+		if server.Type != "lmtp" && server.Type != "http_admin_api" {
+			continue
+		}
+		if limit := server.GetRedirectRateLimit(); limit > 0 && !slices.Contains(limits, limit) {
+			limits = append(limits, limit)
+		}
+	}
+	slices.Sort(limits)
+	return limits
+}
+
 // GetMaxRedirectHops returns how many times one message may be redirected before
 // further redirects are suppressed (mail-loop backstop). 0 means unlimited.
 func (s *ServerConfig) GetMaxRedirectHops() int {
