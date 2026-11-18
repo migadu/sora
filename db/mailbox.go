@@ -75,10 +75,11 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			UNION ALL
 
 			-- 2. Shared mailboxes where user has direct ACL access (must have at least 'l' lookup right)
+			-- $3: shared mailbox access is on (SetSharedMailboxAccess); it gates 2 and 3.
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, 1 AS priority
 			FROM mailboxes m
 			INNER JOIN mailbox_acls acl ON m.id = acl.mailbox_id
-			WHERE m.is_shared = TRUE
+			WHERE $3::boolean AND m.is_shared = TRUE
 			  AND acl.account_id = $1
 			  AND position('l' IN acl.rights) > 0
 			  AND m.deleted_at IS NULL
@@ -89,7 +90,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 			SELECT m.id, m.name, m.uid_validity, m.path, m.subscribed, m.special_use, m.created_at, m.updated_at, m.account_id, 2 AS priority
 			FROM mailboxes m
 			INNER JOIN mailbox_acls anyone_acl ON m.id = anyone_acl.mailbox_id
-			WHERE m.is_shared = TRUE
+			WHERE $3::boolean AND m.is_shared = TRUE
 			  AND m.owner_domain = $2
 			  AND anyone_acl.identifier = 'anyone'
 			  AND position('l' IN anyone_acl.rights) > 0
@@ -131,7 +132,7 @@ func (db *Database) GetMailboxes(ctx context.Context, AccountID int64, subscribe
 	query += " ORDER BY m.name"
 
 	// Prepare the query to fetch all mailboxes for the given user
-	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, AccountID, ownerDomain)
+	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, query, AccountID, ownerDomain, db.sharedAccess())
 	if err != nil {
 		return nil, err
 	}
@@ -330,7 +331,7 @@ func (db *Database) GetMailboxByName(ctx context.Context, AccountID int64, name 
 	// their own and others' shared with them (issue #161). Their own comes first, and
 	// is looked up on its own, so the common case never evaluates the shared lookups.
 	err = scan(db.GetReadPoolWithContext(ctx).QueryRow(ctx, mailboxByNameOwnedSQL, AccountID, name))
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) && db.sharedAccess() {
 		ownerDomain, fetchErr := db.GetAccountDomain(ctx, AccountID)
 		if fetchErr != nil {
 			// Log the error but don't fail immediately, wait for the actual query execution
@@ -531,7 +532,7 @@ func (db *Database) createMailbox(ctx context.Context, tx pgx.Tx, AccountID int6
 		capture.state.Name = name
 		capture.state.UIDValidity = uidValidity
 		capture.state.OwnerID = AccountID
-		visible, err := lockNotifyMailboxForMutation(ctx, tx, capture.viewer, name)
+		visible, err := lockNotifyMailboxForMutation(ctx, tx, capture.viewer, name, db.sharedAccess())
 		if err != nil {
 			return err
 		}

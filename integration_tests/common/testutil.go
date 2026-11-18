@@ -875,6 +875,8 @@ func SetupIMAPServerWithOptions(t *testing.T, opts *IMAPServerOpts) (*TestServer
 	if opts != nil && opts.SharedMailboxes != nil {
 		testConfig.SharedMailboxes = *opts.SharedMailboxes
 	}
+	// As cmd/sora does: with sharing off, other owners' shared mailboxes are not served.
+	rdb.SetSharedMailboxAccess(testConfig.SharedMailboxes.Enabled)
 
 	server, err := imap.New(
 		context.Background(),

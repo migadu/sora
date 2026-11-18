@@ -81,9 +81,23 @@ SELECT count(*), count(DISTINCT account_id) FROM mailboxes
 
 ### Turning it off again
 
-Sora does not remove shared mailboxes or their ACLs when you set `enabled = false`. `NAMESPACE`
-stops listing the prefix and new folders under it become personal folders, but existing shared
-mailboxes stay visible and usable for the users who have rights on them.
+With `enabled = false` a node serves no mailbox to anyone but its owner. Every grant, to a user or
+to `anyone`, counts for nothing there:
+
+- `LIST`, `NOTIFY` and the User API omit other owners' shared mailboxes, and every command that
+  names one (`SELECT`, `STATUS`, `APPEND`, `COPY`, `DELETE`, `MYRIGHTS`, ...) answers as for a
+  mailbox that does not exist. Delivery and Sieve `fileinto` resolve names the same way.
+- The owner keeps its shared mailboxes. They show as ordinary folders under the prefix, since
+  `NAMESPACE` no longer lists it, and new folders under the prefix are personal folders.
+- The mailboxes and their ACLs stay in the database. Turning sharing back on restores every grant
+  as it was. `sora-admin acl` and the Admin API still list, grant and revoke them, so an operator
+  can clean up before or after.
+
+The setting is per node, but the mailboxes and grants are shared by every node, so **every node must
+use the same setting**. Otherwise a user's folders change with the backend a connection lands on.
+A node starting with sharing off logs a warning when another user or `anyone` holds a grant on a
+shared mailbox:
+`Shared mailboxes are granted to other users, but [shared_mailboxes] enabled = false: ...`.
 
 ---
 
@@ -393,7 +407,7 @@ into a shared folder such as `Shared/Junk` are not reported unless it carries `\
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `false` | Turns sharing on. |
+| `enabled` | bool | `false` | Turns sharing on. Off, a node serves every mailbox to its owner only ([Turning it off again](#turning-it-off-again)). Use the same value on every node. |
 | `namespace_prefix` | string | `"Shared/"` | The prefix of the shared namespace: `Shared/` covers the root `Shared` and the names under `Shared/`. While sharing is on, it must be a mailbox name followed by `/`, and not `INBOX/` ([section 3](#3-the-shared-namespace)). |
 | `allow_user_create` | bool | `false` | Lets users create top-level shared folders over IMAP. Off: only `sora-admin mailbox create` can. |
 | `allow_anyone_identifier` | bool | `false` | Lets rights be granted to `anyone` (every user of the owner's domain). |
@@ -421,6 +435,7 @@ allow_anyone_identifier = false
 | The `has_mailbox_right` SQL function | [db/migrations/000001_initial_schema.up.sql](../db/migrations/000001_initial_schema.up.sql) |
 | Creating shared folders, ACL inheritance, `default_rights` | [db/mailbox.go](../db/mailbox.go) (`CreateMailbox`) |
 | Which folders a user sees | [db/mailbox.go](../db/mailbox.go) (`GetMailboxes`, `GetMailboxByName`) |
+| Serving other owners' mailboxes only with sharing on (`SetSharedMailboxAccess`) | [db/shared_access.go](../db/shared_access.go) |
 | IMAP ACL commands | [server/imap/cmd_acl.go](../server/imap/cmd_acl.go) |
 | Per-flag right checks | [server/imap/acl_flags.go](../server/imap/acl_flags.go) |
 | `NAMESPACE`, `CREATE`, `RENAME`, `SELECT` rules | [server/imap/namespaces.go](../server/imap/namespaces.go), [server/imap/create.go](../server/imap/create.go), [server/imap/rename.go](../server/imap/rename.go), [server/imap/select.go](../server/imap/select.go) |
