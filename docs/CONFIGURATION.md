@@ -613,7 +613,7 @@ See [STORAGE.md](STORAGE.md) and, for `fts_retention`, [SEARCH.md](SEARCH.md).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `grace_period` | duration | `"14d"` | How long expunged messages are kept before they are deleted for good. |
+| `grace_period` | duration | `"14d"` | How long expunged messages stay restorable before the cleaner deletes them for good ([STORAGE.md](STORAGE.md#92-removal-after-the-grace-period)), and how long a soft-deleted account keeps its mailboxes and messages before it is hard-deleted ([STORAGE.md](STORAGE.md#13-deleting-accounts)). Also the minimum age before a message whose body never reached S3 can be reaped ([STORAGE.md](STORAGE.md#10-failed-uploads-and-lost-nodes)), and the shortest time Sieve redirect records are kept ([STORAGE.md](STORAGE.md#11-the-cleanup-cycle), step 6). |
 | `wake_interval` | duration | `"1h"` | How often the cleaner runs. |
 | `max_age_restriction` | duration | none | Expunge messages older than this. Unset means no limit. |
 | `fts_retention` | duration | none | Delete search vectors of messages older than this. Unset keeps them. |
