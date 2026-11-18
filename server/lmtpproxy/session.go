@@ -2536,12 +2536,14 @@ const (
 	// backend that stops draining its socket cannot hold the session goroutine and its
 	// connection slot until the absolute session timeout.
 	relayBackendWriteDeadline = 30 * time.Second
-	// relayEndOfDataTimeout bounds the wait for the backend's end-of-data replies. It
-	// must outlive the backend's own DATA processing cap (60 s) by a wide margin: a
-	// proxy that gives up first leaves the backend free to commit a message the MTA is
-	// told nothing about, which the MTA then re-sends.
-	relayEndOfDataTimeout = 5 * time.Minute
 )
+
+// relayEndOfDataTimeout bounds the wait for the backend's end-of-data replies. It
+// must outlive the backend's own DATA processing cap (60 s) by a wide margin: a
+// proxy that gives up first leaves the backend free to commit a message the MTA is
+// told nothing about, which the MTA then re-sends. A variable only so tests can
+// shorten it.
+var relayEndOfDataTimeout = 5 * time.Minute
 
 // relayMessageData relays one DATA body from the client to the backend, then the
 // backend's end-of-data replies — one final reply line per accepted recipient (RFC 2033
