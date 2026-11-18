@@ -2,10 +2,13 @@ package delivery
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -79,5 +82,46 @@ func testDeliverMessageSpoolFailureHidesPath(t *testing.T, breakSpool func(spool
 	}
 	if strings.Contains(result.ErrorMessage, spool) {
 		t.Fatalf("ErrorMessage exposes the spool path: %q", result.ErrorMessage)
+	}
+}
+
+// A spool disk that is full or read-only is the insufficient-storage condition LMTP
+// answers with 452 4.3.1: for the recipient's own copy and for the copy staged under a
+// shared mailbox's owner, the delivery error wraps ErrInsufficientStorage and the
+// message names that condition, not the spool file (#1931).
+func TestStagingFailureSpoolFullIsInsufficientStorage(t *testing.T) {
+	tmp := "/var/spool/sora/42/0123abcd.0000000000000001.tmp"
+	for _, tc := range []struct {
+		errno syscall.Errno
+		full  bool
+	}{
+		{syscall.ENOSPC, true},
+		{syscall.EROFS, true},
+		{syscall.EACCES, false},
+	} {
+		// Wrapped as stageFrom wraps it, and as resolveOwnedTarget wraps that.
+		own := fmt.Errorf("failed to create file %s: %w", tmp, &fs.PathError{Op: "open", Path: tmp, Err: tc.errno})
+		owner := fmt.Errorf("%w for the owner of mailbox '%s': %w", errStageOwnerCopy, "Shared/Team", own)
+		for name, staged := range map[string]error{"own": own, "owner": owner} {
+			t.Run(tc.errno.Error()+"/"+name, func(t *testing.T) {
+				result := &DeliveryResult{}
+				err := stagingFailure(result, "Failed to save message to disk", staged)
+				if got := errors.Is(err, ErrInsufficientStorage); got != tc.full {
+					t.Errorf("errors.Is(%v, ErrInsufficientStorage) = %v, want %v", err, got, tc.full)
+				}
+				if !errors.Is(err, tc.errno) {
+					t.Errorf("error %v lost its cause %v", err, tc.errno)
+				}
+				if got := strings.HasPrefix(result.ErrorMessage, "Insufficient system storage"); got != tc.full {
+					t.Errorf("ErrorMessage = %q, want insufficient storage %v", result.ErrorMessage, tc.full)
+				}
+				if !tc.full && result.ErrorMessage != "Failed to save message to disk: "+tc.errno.Error() {
+					t.Errorf("ErrorMessage = %q, want the cause only", result.ErrorMessage)
+				}
+				if strings.Contains(result.ErrorMessage, "/var/spool") {
+					t.Errorf("ErrorMessage exposes the spool path: %q", result.ErrorMessage)
+				}
+			})
+		}
 	}
 }
