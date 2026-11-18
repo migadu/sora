@@ -1062,7 +1062,8 @@ func (s *POP3Session) closeWithoutLock() error {
 }
 
 func (s *POP3Session) Close() error {
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	// Not on s.ctx: Server.Close cancels it before the library closes the sessions.
+	acquired, release := s.mutexHelper.AcquireWriteLockForClose()
 	if !acquired {
 		s.WarnLog("failed to acquire write lock within timeout")
 		// Still close the connection even if we can't acquire the lock
