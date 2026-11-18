@@ -90,7 +90,8 @@ func TestIMAP_ExplicitFlagWritesCreateMissingStateOnlyForTargets(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM message_state WHERE message_id = ANY($1)`, []int64{ids[1], ids[2]}).Scan(&untouched))
 	require.Zero(t, untouched)
 	require.Equal(t, 0, statusUnseen())
-	require.Empty(t, search("UNSEEN"))
+	// Messages 2 and 3 have no flags, so SEARCH UNSEEN matches them (#1899).
+	require.Equal(t, []imap.UID{2, 3}, search("UNSEEN"))
 	require.NoError(t, pool.QueryRow(ctx, `SELECT count(*) FROM message_state WHERE message_id = ANY($1)`, []int64{ids[1], ids[2]}).Scan(&untouched))
 	require.Zero(t, untouched, "SEARCH/STATUS must leave historical missing state unchanged")
 
