@@ -48,33 +48,38 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 		if r.GroupEnd {
 			continue
 		}
-		// A group start is an address whose addr-mailbox is the group name (RFC 3501
-		// §7.4.2), so a header that starts with a group has it as its first address:
-		// RFC 5256 §3 sorts FROM/TO/CC by that addr-mailbox, and RFC 5957 §3 sorts
-		// DISPLAYFROM/DISPLAYTO by it too, the group having no addr-name. A later group
-		// start has no name or address of its own, so extra() leaves it out.
-		email := r.EmailAddress
+		// A group start is an address whose addr-mailbox is the group name and whose
+		// addr-host is NIL (RFC 3501 §7.4.2), so a header that starts with a group has it
+		// as its first address. The email column holds addr-mailbox "@" addr-host, which
+		// RFC 5256 §3 FROM/TO/CC split at the last '@' (addrMailboxExpr): for a group it is
+		// the name and a bare "@", so the split gives back the whole name even when the
+		// name holds an '@'. DISPLAYFROM/DISPLAYTO read the name column first, which for a
+		// group holds its name: it has no addr-name, and RFC 5957 §3 then takes the
+		// addr-mailbox. A later group start has no name or address of its own, so extra()
+		// leaves it out.
+		name, email := bound(r.Name), bound(r.EmailAddress)
 		if r.Group != "" {
-			email = r.Group
+			name = helpers.TruncateUTF8Safe(strings.ToLower(r.Group), helpers.MaxSortColumnBytes-1)
+			email = name + "@"
 		}
 		switch r.AddressType {
 		case "from":
 			if fromFound {
 				extra(0, r.Name, r.EmailAddress)
 			} else {
-				fromNameSort, fromEmailSort, fromFound = bound(r.Name), bound(email), true
+				fromNameSort, fromEmailSort, fromFound = name, email, true
 			}
 		case "to":
 			if toFound {
 				extra(1, r.Name, r.EmailAddress)
 			} else {
-				toNameSort, toEmailSort, toFound = bound(r.Name), bound(email), true
+				toNameSort, toEmailSort, toFound = name, email, true
 			}
 		case "cc":
 			if ccFound {
 				extra(2, r.Name, r.EmailAddress)
 			} else {
-				ccEmailSort, ccFound = bound(email), true
+				ccEmailSort, ccFound = email, true
 				extra(2, r.Name)
 			}
 		}
