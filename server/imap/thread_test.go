@@ -61,6 +61,29 @@ func TestThreadOrderedSubject_Shape(t *testing.T) {
 	assert.Equal(t, want, result)
 }
 
+// TestThreadOrderedSubject_EmptyBaseSubject: the empty base subject is a base
+// subject like any other, so messages without one form a single thread
+// (RFC 5256 section 3; Dovecot imaptest thread-orderedsubject, (9 10)).
+func TestThreadOrderedSubject_EmptyBaseSubject(t *testing.T) {
+	session := &IMAPSession{}
+
+	now := time.Now()
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, SubjectSort: "", SentDate: now.Add(-3 * time.Hour)},
+		{UID: 2, Seq: 2, SubjectSort: "hello", SentDate: now.Add(-2 * time.Hour)},
+		{UID: 3, Seq: 3, SubjectSort: "", SentDate: now.Add(-1 * time.Hour)},
+		{UID: 4, Seq: 4, SubjectSort: "", SentDate: now},
+	}
+
+	result := session.threadOrderedSubject(imapserver.NumKindUID, messages)
+
+	want := []imap.ThreadData{
+		{Chain: []uint32{1}, SubThreads: []imap.ThreadData{{Chain: []uint32{3}}, {Chain: []uint32{4}}}},
+		{Chain: []uint32{2}},
+	}
+	assert.Equal(t, want, result)
+}
+
 func TestThreadReferences(t *testing.T) {
 	session := &IMAPSession{}
 
