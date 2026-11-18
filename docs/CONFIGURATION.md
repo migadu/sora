@@ -969,6 +969,7 @@ names it. The same holds for `[[server.client_filters]]`.
 | `append_limit` | size | `"25mb"` | `imap` | Largest message accepted by APPEND. |
 | `max_message_size` | size | `"50mb"` | `lmtp`, `lmtp_proxy`, `http_admin_api` | Largest message accepted for delivery. `0` also means 50 MiB. |
 | `max_script_size` | size | `"16kb"` | `managesieve` | Largest Sieve script. |
+| `strict_utf8_content` | bool | `false` | `pop3` | Answer `RETR` and `TOP` of a message with UTF-8 in its headers with `-ERR [UTF8]` until the client sends `UTF8` (RFC 6856). Behind a `pop3_proxy`, turn on only when the proxy has `remote_use_utf8 = true`, and so does the `[[pool]]` or `[server.remote_lookup]` that routes users here. See [PROTOCOLS.md](PROTOCOLS.md#72-commands). |
 | `supported_extensions` | list of strings | the default set | `managesieve_proxy` | Sieve extensions the proxy advertises. A `managesieve` backend uses `[sieve] enabled_extensions`. |
 | `enable_preview` | bool | `false` | `imap` | Advertise FETCH PREVIEW (RFC 8970). |
 | `disabled_caps` | list of strings | none | `imap` | Capabilities never advertised. Capabilities that depend on a removed one are removed too (for example QRESYNC with CONDSTORE); see [PROTOCOLS.md](PROTOCOLS.md#6-controlling-imap-capabilities). |

@@ -70,7 +70,9 @@ func waitForPOP3Listener(t *testing.T, addr string, errChan <-chan error) {
 	}
 }
 
-func SetupPOP3ServerWithUploader(t *testing.T) (*TDDTestServer, common.TestAccount) {
+// SetupPOP3ServerWithUploader starts a POP3 server whose message bodies come from a
+// working local uploader. Each opt edits the server options before the server is built.
+func SetupPOP3ServerWithUploader(t *testing.T, opts ...func(*pop3.POP3ServerOptions)) (*TDDTestServer, common.TestAccount) {
 	t.Helper()
 
 	// 1. Set up the baseline POP3 server (sets up DB and account)
@@ -133,6 +135,10 @@ func SetupPOP3ServerWithUploader(t *testing.T) (*TDDTestServer, common.TestAccou
 	}
 
 	// 4. Create the new POP3 server configured with the uploader
+	options := pop3.POP3ServerOptions{InsecureAuth: true}
+	for _, opt := range opts {
+		opt(&options)
+	}
 	server, err := pop3.New(
 		context.Background(),
 		"test",
@@ -142,7 +148,7 @@ func SetupPOP3ServerWithUploader(t *testing.T) (*TDDTestServer, common.TestAccou
 		baseServer.ResilientDB,
 		uploadWorker,
 		nil,
-		pop3.POP3ServerOptions{InsecureAuth: true},
+		options,
 	)
 	if err != nil {
 		uploadWorker.Stop()

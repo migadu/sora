@@ -1516,6 +1516,12 @@ tls_verify = false
 # tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for POP3
 proxy_protocol_timeout = "5s"
+strict_utf8_content = false   # true: RETR/TOP of a message with UTF-8 (8-bit) headers gets -ERR [UTF8] until the
+                              # session sends UTF8 (RFC 6856 §2.1). Default false: sent as stored, because a
+                              # client that never saw UTF8 in CAPA could not download it, and classic Outlook
+                              # aborts the whole download on -ERR. Behind a pop3_proxy, enable ONLY when the
+                              # proxy has remote_use_utf8 = true, and so does the [[pool]] or
+                              # [server.remote_lookup] routing users here. Not reloaded on SIGHUP.
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
