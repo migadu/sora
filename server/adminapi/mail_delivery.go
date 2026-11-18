@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"mime"
 	"net/http"
 	"strings"
@@ -85,32 +84,14 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		maxBody = defaultMaxMessageSize
 	}
 	limitedBody := http.MaxBytesReader(w, r.Body, maxBody)
+	r.Body = limitedBody
 
-	// The delivery memory budget (limits.delivery_memory_limit) is charged for the
-	// request body as it is read, for the message buffer delivered from, and (in
-	// DeliverMessage) for the re-encoded copy of NUL-bearing parts. Each branch sets
-	// messageBytes itself without a further copy: req.Message is only the decode
-	// target of a JSON body or a form value. Everything charged here is held until the
-	// request ends, on every path.
-	chargedBody := &server.ChargedReader{R: limitedBody, Budget: s.deliveryMemory}
-	r.Body = struct {
-		io.Reader
-		io.Closer
-	}{chargedBody, limitedBody}
-	var held int64
-	defer func() { s.freeDeliveryMemory(chargedBody.Charged + held) }()
-	// holdCopy charges the message copy of n bytes before it is made.
-	holdCopy := func(n int) bool {
-		if s.deliveryMemory == nil {
-			return true
-		}
-		if err := s.deliveryMemory.Allocate(int64(n)); err != nil {
-			s.refuseDeliveryMemory(w, err)
-			return false
-		}
-		held += int64(n)
-		return true
-	}
+	// The delivery memory budget (limits.delivery_memory_limit) is charged for every
+	// message-sized buffer the request is read into, before it is allocated
+	// (deliverMailReader), and in DeliverMessage for the delivery's own copies. What
+	// the read charged is held until the request ends, on every path.
+	body := &deliverMailReader{budget: s.deliveryMemory}
+	defer body.release()
 
 	// Parse request based on Content-Type
 	var req DeliverMailRequest
@@ -122,69 +103,12 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 
 	switch {
 	case strings.HasPrefix(mediaType, "multipart/form-data"):
-		// Parse multipart form
-		err = r.ParseMultipartForm(32 << 20) // 32MB max
-		if chargedBody.Refused {
-			s.refuseDeliveryMemory(w, err)
-			return
-		}
-		if err != nil {
-			s.writeError(w, http.StatusBadRequest, "Failed to parse multipart form")
-			return
-		}
-
-		// Get message from form field: the form's string is converted once, charged
-		// before the conversion. A file upload is read straight into a buffer charged
-		// before it grows, with no further copy.
-		if r.MultipartForm != nil && len(r.MultipartForm.Value["message"]) > 0 {
-			req.Message = r.MultipartForm.Value["message"][0]
-			if !holdCopy(len(req.Message)) {
-				return
-			}
-			messageBytes = []byte(req.Message)
-		} else if r.MultipartForm != nil && len(r.MultipartForm.File["message"]) > 0 {
-			// Try to read from file upload
-			file, err := r.MultipartForm.File["message"][0].Open()
-			if err == nil {
-				defer file.Close()
-				var charged int64
-				var readErr error
-				messageBytes, charged, readErr = server.ReadAllCharged(file, s.deliveryMemory)
-				held += charged
-				if errors.Is(readErr, server.ErrMemoryBudgetExhausted) {
-					s.refuseDeliveryMemory(w, readErr)
-					return
-				}
-				if readErr != nil {
-					// A truncated upload must not be delivered as if it were the message.
-					s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read uploaded message: %v", readErr))
-					return
-				}
-			}
-		}
-
-		// Get recipients from form
-		if r.MultipartForm != nil && len(r.MultipartForm.Value["recipients"]) > 0 {
-			req.Recipients = r.MultipartForm.Value["recipients"]
-		}
-
-		// Get from address
-		if r.MultipartForm != nil && len(r.MultipartForm.Value["from"]) > 0 {
-			req.From = r.MultipartForm.Value["from"][0]
-		}
+		req, messageBytes, err = body.multipart(r)
 
 	case mediaType == "message/rfc822" || mediaType == "text/plain":
-		// Raw RFC822 message, read into a buffer charged before it grows.
-		var charged int64
-		messageBytes, charged, err = server.ReadAllCharged(limitedBody, s.deliveryMemory)
-		held += charged
-		if errors.Is(err, server.ErrMemoryBudgetExhausted) {
-			s.refuseDeliveryMemory(w, err)
-			return
-		}
-		if err != nil {
-			s.writeError(w, http.StatusBadRequest, "Failed to read message body")
-			return
+		// Raw RFC822 message: the bytes read are the message.
+		if messageBytes, _, err = body.readAll(limitedBody); err != nil && !errors.Is(err, server.ErrMemoryBudgetExhausted) {
+			err = deliverRequestError("Failed to read message body")
 		}
 
 		// Get recipients from query params or headers
@@ -203,22 +127,23 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		}
 
 	case mediaType == "application/json":
-		// JSON request
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			if chargedBody.Refused {
-				s.refuseDeliveryMemory(w, err)
-				return
-			}
-			s.writeError(w, http.StatusBadRequest, "Invalid JSON")
-			return
-		}
-		if !holdCopy(len(req.Message)) {
-			return
-		}
-		messageBytes = []byte(req.Message)
+		req, messageBytes, err = body.json(limitedBody)
 
 	default:
 		s.writeError(w, http.StatusBadRequest, "Unsupported Content-Type. Use application/json, message/rfc822, or multipart/form-data")
+		return
+	}
+	var badRequest deliverRequestError
+	switch {
+	case err == nil:
+	case errors.Is(err, server.ErrMemoryBudgetExhausted):
+		s.refuseDeliveryMemory(w, err)
+		return
+	case errors.As(err, &badRequest):
+		s.writeError(w, http.StatusBadRequest, string(badRequest))
+		return
+	default:
+		s.writeError(w, http.StatusBadRequest, "Failed to read the request")
 		return
 	}
 
@@ -470,13 +395,6 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 
 	status.Accepted = result.Success
 	return status
-}
-
-// freeDeliveryMemory gives back n bytes charged to the delivery memory budget.
-func (s *Server) freeDeliveryMemory(n int64) {
-	if s.deliveryMemory != nil && n > 0 {
-		s.deliveryMemory.Free(n)
-	}
 }
 
 // refuseDeliveryMemory answers a delivery the delivery memory budget

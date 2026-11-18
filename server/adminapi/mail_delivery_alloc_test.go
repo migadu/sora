@@ -92,6 +92,7 @@ func TestDeliverMailCopiesAreCharged(t *testing.T) {
 				charged += budget.TotalAllocated()
 			}
 			allocated, charged = allocated/runs, charged/runs
+			t.Logf("allocated %d, charged %d, uncharged %d", allocated, charged, allocated-charged)
 			if allocated > charged+allowance {
 				t.Errorf("allocated %d bytes for a %d-byte message but charged %d: %d bytes were never charged (allowance %d)",
 					allocated, len(message), charged, allocated-charged, allowance)
