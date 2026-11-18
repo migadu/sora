@@ -52,8 +52,9 @@ enabled = true
 namespace_prefix = "Shared/"
 ```
 
-Restart Sora after changing this section. A reload (`SIGHUP`) logs
-`Config reload: [shared_mailboxes] changed but requires restart to take effect` and changes nothing.
+Restart Sora after changing this section. A reload (`SIGHUP`) changes nothing; it logs
+`Config reload: global settings changed but require restart to take effect` with the changed keys
+in `fields` (for example `shared_mailboxes.enabled`).
 
 With sharing on:
 
@@ -95,9 +96,10 @@ mailboxes stay visible and usable for the users who have rights on them.
   trailing `/` (the root, `Shared`). Case does not matter. A folder such as `SharedNotes` is an
   ordinary personal folder.
 - **The root is a container.** `CREATE Shared` is refused with
-  `NO [CANNOT] Cannot create the shared namespace root directly...`, and `SELECT Shared` with
-  `NO [CANNOT] The shared namespace root cannot be selected...`. When the root exists as a parent
-  and has children, `LIST` marks it `\Noselect`.
+  `NO [CANNOT] Cannot create the shared namespace root directly...`, `SELECT Shared` and
+  `EXAMINE Shared` with `NO [CANNOT] The shared namespace root cannot be selected...`, and
+  `STATUS Shared` with `NO [CANNOT] The shared namespace root cannot be queried with STATUS`.
+  Whenever `LIST` shows the root, it marks it `\Noselect`.
 - **The root holds no messages.** `APPEND`, `COPY` and `MOVE` to it are refused with
   `NO [CANNOT] The shared namespace root holds no messages...`, whether or not it exists. Sieve
   `fileinto` of the root (also through the default script's `user+shared@` filing) and an Admin API
@@ -105,7 +107,12 @@ mailboxes stay visible and usable for the users who have rights on them.
   reports it as missing.
 - **Whether a mailbox is shared is fixed when it is created.** `RENAME` cannot move a mailbox into
   or out of the namespace: `NO [CANNOT] Mailboxes cannot be moved into or out of the shared namespace`.
-  The one exception is a personal folder that already sat under the prefix: it may be renamed out.
+  The rule covers every folder a rename moves, the folders below the renamed one included, so a
+  rename is refused when any of them would cross the boundary. The one exception is a personal
+  folder that already sat under the prefix: it may be renamed out.
+- `ESEARCH` and `NOTIFY` treat a folder as personal by its name: the folders in the shared
+  namespace, and its root, are never part of the `PERSONAL` set, even those the user owns. An
+  `ESEARCH` that names a shared folder as a source can still search it, with the `r` right.
 - A shared mailbox's owner domain is the domain of the owner's primary address when the mailbox is
   created.
 - Names are unique per owner, so a user can see a folder of their own and a shared folder with the
@@ -310,7 +317,11 @@ always allowed.
 | `MYRIGHTS` | none |
 
 `SELECT` opens the folder read-only when the user holds none of `i`, `e`, `s`, `t` and `w`.
-`PERMANENTFLAGS` lists only the flags the user may change.
+`PERMANENTFLAGS` lists only the flags the user may change. `EXAMINE` is always read-only and
+answers `PERMANENTFLAGS ()`, whatever the rights.
+
+A user with `l` but not `r` sees the folder in `LIST`. With `LIST ... RETURN (STATUS)` that
+folder is marked `\Noselect` and gets no `STATUS` line (RFC 5819 section 2).
 
 ---
 
@@ -348,9 +359,20 @@ deletion is described in [STORAGE.md](STORAGE.md).
 A shared folder has no address of its own; LMTP always delivers to a user's account. A user's Sieve
 script can file into a shared folder with `fileinto "Shared/Sales"` if the user has the `i` right.
 Without it, the message goes to the user's own INBOX and Sora logs
-`fileinto denied: no insert right on shared mailbox, delivering to INBOX`. `fileinto :create` with
-an existing shared folder's name files into that folder, exactly as without `:create`
-([SIEVE.md](SIEVE.md#5-what-each-action-does)).
+`Sieve fileinto "<name>" is unavailable or has no insert right; keeping in INBOX`.
+`fileinto :create` with an existing shared folder's name files into that folder, exactly as
+without `:create` ([SIEVE.md](SIEVE.md#5-what-each-action-does)).
+
+A message filed into another owner's folder is stored under the owner, so Sora also stages its
+body for the owner's upload. If it cannot, the delivery fails with a temporary error and the MTA
+retries it later; Sora never stores the message without a body to upload.
+
+### Other interfaces
+
+The User API applies the same rights as IMAP and answers `403` when they are missing, for example
+when deleting a shared folder without `x` ([USER_API.md](USER_API.md)). `sora-admin mailbox delete`
+of a shared folder named through a user other than the owner also needs that user's `x` right,
+and it checks the right before `--purge` expunges anything ([ADMIN_CLI.md](ADMIN_CLI.md)).
 
 ### Search
 

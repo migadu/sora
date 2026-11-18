@@ -9,7 +9,8 @@ This document is the reference for both: every endpoint with its request, respon
 codes, how tokens are issued and checked, and the configuration, as the code on `main`
 implements them. It is for operators who deploy the API and for developers who build clients
 against it. The handlers live in [server/userapi/](../server/userapi/) and the proxy in
-[server/userapiproxy/](../server/userapiproxy/).
+[server/userapiproxy/](../server/userapiproxy/). A machine-readable OpenAPI description of the
+endpoints is kept in [user_api_openapi.yaml](../server/userapi/user_api_openapi.yaml).
 
 1. [Overview](#1-overview)
 2. [Configuration](#2-configuration)
@@ -85,11 +86,15 @@ allowed_origins = ["https://webmail.example.com"]
 | `[server.auth_rate_limit]` | off | Login rate limiting and progressive delays. The keys are in [AUTHENTICATION.md](AUTHENTICATION.md). |
 | `[server.lookup_cache]` | ignored | Accepted for compatibility, with a warning; every login reads the primary credential. |
 
-The User API does not cache password verdicts. Each login reads the password hash and credential
-epoch together from the primary, so a password change cannot pair an old cached verdict with a
-new token epoch. Token refresh also checks the primary. Configuring `[server.lookup_cache]` on
-this backend has no effect and produces a warning. The User API **proxy** can still cache route
-lookups ([section 12](#12-the-user-api-proxy)).
+The User API keeps no login cache. Each login reads the password hash and the credential's
+password version (its epoch, section 3.5) together from the primary database, so a token is
+always issued for the password that was just checked. Token refresh reads the primary too. The
+User API **proxy** can still cache route lookups ([section 12](#12-the-user-api-proxy)).
+
+Keys other server types read have no effect on `http_user_api` and are reported with a
+startup warning: among them `max_message_size`, every `[server.limits]` key (the search rate
+limit included), `max_connections_per_ip`, `max_connections_per_user` and
+`max_connections_per_user_per_ip`.
 
 The HTTP server's limits are fixed: 10 seconds for the request headers, 30 seconds to read
 the request, 30 seconds to write the response (this bounds a `/raw` download), 120 seconds for
@@ -128,15 +133,20 @@ Response `200`:
 }
 ```
 
-`expires_at` is a Unix time in seconds. `email` is the address as you sent it.
+`expires_at` is a Unix time in seconds. `email` is the address in its canonical form:
+trimmed, lower-cased, and with an internationalized domain in its ASCII form
+(`user@xn--bcher-kva.example` for `user@bücher.example`). The token carries the same form.
+
+A successful login also creates the account's default mailboxes if it has none yet, as an IMAP
+or POP3 login does.
 
 | Status | Body `error` | When |
 |---|---|---|
 | 400 | `Invalid request body` | Not JSON. |
 | 400 | `Email and password are required` | A field is missing or empty. |
-| 401 | `Invalid credentials` | Unknown address, deleted account, wrong password, or the client is blocked by the rate limiter. The four look the same on purpose, `WWW-Authenticate: Bearer realm="user-api"` included (section 3.2). |
+| 401 | `Invalid credentials` | Unknown or unparseable address, deleted account, wrong password, or the client is blocked by the rate limiter. These look the same on purpose, `WWW-Authenticate: Bearer realm="user-api"` included (section 3.2). |
 | 429 | `Too many concurrent authentication attempts. Please try again later.` | Too many logins are waiting out a progressive delay at once. |
-| 503 | `Service unavailable` | Database error, a stored password hash that cannot be verified, or the request was cancelled while it waited out a delay. Not counted as a failed login. |
+| 503 | `Service unavailable` | Database error (including a failure to create the default mailboxes), a stored password hash that cannot be verified, or the request was cancelled while it waited out a delay. Not counted as a failed login. |
 | 500 | `Token generation failed` | Signing error. |
 
 With `[server.auth_rate_limit] enabled = true`, failed logins are counted per client address
@@ -177,14 +187,17 @@ expires even if the password is changed or the account is deleted in the meantim
 ```
 
 No `Authorization` header is needed. The token must still be valid (not expired). The server
-then checks the account:
+then checks the account, reading from the primary database:
 
-- the credential must still exist and its account must not be deleted;
-- the credential's password must not have changed since the token was issued.
+1. The credential (the token's `email`) must still exist, and its account must not be deleted.
+2. The credential must still belong to the account in the token's `account_id`. An address
+   that was removed and added to another account is refused.
+3. The credential's password must not have changed since the token was issued. A token
+   without an `auth_epoch` claim is refused too.
 
-If both hold, the answer is a fresh token with a full `token_duration`, in the same shape as
-the login response, with the current `account_id`. Otherwise it is
-`401 {"error":"Invalid or expired token"}` and the client must log in again.
+If all three hold, the answer is a fresh token with a full `token_duration`, in the same shape
+as the login response. Otherwise it is `401 {"error":"Invalid or expired token"}` and the
+client must log in again.
 
 | Status | Body `error` |
 |---|---|
@@ -199,8 +212,9 @@ Refresh before the token expires; an expired token cannot be refreshed.
 
 Tokens are stateless and cannot be revoked one by one. The limits are:
 
-- A password change or an account deletion stops the next refresh. A token already issued
-  stays usable until it expires, so for at most `token_duration` (at most 7 days).
+- A password change, an account deletion, or moving the address to another account stops the
+  next refresh. A token already issued stays usable until it expires, so for at most
+  `token_duration` (at most 7 days).
 - Changing `jwt_secret` and reloading invalidates every token at once.
 - A shorter `token_duration` shortens the window, at the cost of more refreshes.
 
@@ -210,7 +224,7 @@ The token is a standard JWT signed with HS256. Its claims:
 
 | Claim | Meaning |
 |---|---|
-| `email` | The address used to sign in. |
+| `email` | The address used to sign in, in canonical form (3.1). |
 | `account_id` | The account. Every request acts on this account. |
 | `auth_epoch` | The credential's password version at issue time (Unix seconds); used by refresh. |
 | `sub` | The address, again. |
@@ -261,9 +275,9 @@ header listing the methods it does serve; a path no endpoint has is
 | 403 | Client address not in `allowed_hosts`; creating a mailbox in the shared namespace; deleting `INBOX`; or deleting a shared mailbox, changing flags or deleting a message in one without the right. |
 | 404 | Mailbox, message or script not found, or no endpoint has the path. |
 | 405 | Wrong method for the path; `Allow` lists the methods it serves. |
-| 409 | Mailbox already exists, or has child mailboxes. |
+| 409 | Mailbox already exists, or has child mailboxes; the account already has the most Sieve scripts allowed. |
 | 410 | The message body is gone for good. |
-| 413 | Sieve script over 65536 bytes. |
+| 413 | Sieve script over 65536 bytes, or its request body far over that. |
 | 422 | A message would have more than 50 keywords. |
 | 429 | Too many logins waiting on a delay. |
 | 500 | Server error. |
@@ -324,8 +338,10 @@ See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
 ```json
 {
   "mailboxes": [
-    {"name": "INBOX", "path": "INBOX", "subscribed": true, "total": 142, "unseen": 5, "uid_next": 3871},
-    {"name": "Archive/2024", "path": "Archive/2024", "subscribed": false, "total": 980, "unseen": 0, "uid_next": 981}
+    {"name": "INBOX", "path": "INBOX", "subscribed": true, "total": 142, "unseen": 5,
+     "uid_next": 3871, "uid_validity": 1700000000},
+    {"name": "Archive/2024", "path": "Archive/2024", "subscribed": false, "total": 980, "unseen": 0,
+     "uid_next": 981, "uid_validity": 1700000123}
   ],
   "count": 2
 }
@@ -335,11 +351,18 @@ See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
 |---|---|
 | `name`, `path` | The full mailbox name; both fields are the same. |
 | `subscribed` | Whether the account is subscribed to it. |
-| `total`, `unseen` | Messages, and messages without `\Seen`. `0` for a shared mailbox the account may see but not read (no `r` right), and `0` when counting fails. |
+| `total`, `unseen` | Messages, and messages without `\Seen`. |
 | `uid_next` | The UID the next message added to the mailbox gets, as IMAP reports it in `UIDNEXT`. |
+| `uid_validity` | The mailbox's `UIDVALIDITY`, as IMAP reports it. |
 
-The counts are computed per mailbox on each call, so this request costs more with many
-mailboxes.
+These four are what IMAP `STATUS` reports as `MESSAGES`, `UNSEEN`, `UIDNEXT` and
+`UIDVALIDITY`. All four are `0` for a shared mailbox the account may see but not read (no `r`
+right), as in IMAP. When the counts cannot be read, the mailboxes are still listed, with `0`
+counts. The counts of all listed mailboxes are read in one database query on each call.
+
+| Status | Body `error` |
+|---|---|
+| 500 | `Failed to retrieve mailboxes` |
 
 ### 6.2 Create a mailbox
 
@@ -394,7 +417,8 @@ Response `200 {"message":"Mailbox deleted successfully","name":"Projects/Acme"}`
 {"message": "Unsubscribed from mailbox successfully", "name": "Archive/2024", "subscribed": false}
 ```
 
-A mailbox that does not exist gives `404 Mailbox not found`.
+A mailbox that does not exist gives `404 Mailbox not found`; `400 Invalid mailbox name`; `500
+Failed to subscribe to mailbox` or `Failed to unsubscribe from mailbox`.
 
 ---
 
@@ -612,7 +636,8 @@ may have at most 100 scripts.
 {"scripts": [{"name": "main", "active": true, "updated_at": "2026-03-01T09:30:00Z"}], "count": 1}
 ```
 
-The list has no script content and no set order.
+The list has no script content and no set order. `500 Failed to retrieve scripts` when the
+database cannot be read.
 
 ### 9.2 Get a script
 
@@ -622,7 +647,8 @@ The list has no script content and no set order.
 {"name": "main", "script": "require \"fileinto\";\n...", "active": true, "updated_at": "2026-03-01T09:30:00Z"}
 ```
 
-`404 Script not found`.
+`400 Invalid script name`, `400 Script name is required`, `404 Script not found`,
+`500 Failed to retrieve script`.
 
 ### 9.3 Store a script
 
@@ -640,19 +666,19 @@ Response `200`: the stored script, in the shape of 9.2.
 
 | Status | Body `error` |
 |---|---|
-| 400 | `Invalid script name`, `Script name is required`, `Invalid request body` (also for a body far over the size limit), `Script content is required`, `script name contains invalid characters`, `script name too long (max 128 characters)`, `Script validation failed: ...` |
-| 413 | `Script exceeds maximum size` (over 65536 bytes) |
+| 400 | `Invalid script name`, `Script name is required`, `Invalid request body`, `Script content is required`, `script name contains invalid characters`, `script name too long (max 128 characters)`, `Script validation failed: ...` (also for a script with a NUL byte or invalid UTF-8) |
+| 409 | `Too many Sieve scripts (maximum 100); delete one first`: a new script on an account that already has 100. |
+| 413 | `Script exceeds maximum size`: the decoded script is over 65536 bytes. |
+| 413 | `Request body exceeds maximum size`: the request body is over 6 × 65536 + 1024 bytes, the most a 65536-byte script can take with every character JSON-escaped. |
 | 500 | `Failed to save script` |
-
-A new script on an account that already has 100 is refused with a client error that says the
-limit is reached.
 
 ### 9.4 Delete a script
 
 `DELETE /user/filters/{name}`
 
 Response `200 {"message":"Script deleted successfully","name":"main"}`. Deleting the active
-script leaves the account with no active script. `404 Script not found`.
+script leaves the account with no active script. `400 Invalid script name`,
+`404 Script not found`, `500 Failed to delete script`.
 
 ### 9.5 Activate a script
 
@@ -663,7 +689,7 @@ again first, because the enabled extensions may have changed since it was stored
 that no longer compiles is refused with `400 Script validation failed: ...`.
 
 Response `200 {"message":"Script activated successfully","name":"main","active":true}`.
-`404 Script not found`.
+`400 Invalid script name`, `404 Script not found`, `500 Failed to activate script`.
 
 There is no endpoint to deactivate all scripts; delete the active one, or activate another.
 
@@ -805,8 +831,8 @@ remote_use_proxy_protocol = true
 
 2. **Every other request** must carry a valid token, except a CORS preflight (12.3). The proxy
    checks the signature with its own `jwt_secret` and the expiry (not the issuer; the backend
-   checks that), and routes by the token's `email`. A missing or bad token gets
-   `401 Unauthorized` from the proxy.
+   checks that), and routes by the token's `email`. A missing or bad token gets the same `401`
+   from the proxy that a backend would send (12.3).
 3. The backend is chosen by the lookup cache, then the remote lookup (which only routes here:
    it does not check passwords), then the user's pool, then affinity (with `enable_affinity =
    true` and the cluster's affinity store), then a consistent hash of the address. Backends in
@@ -814,6 +840,12 @@ remote_use_proxy_protocol = true
 4. With named pools, routing fails closed. A lookup that fails or names no usable route gets
    `503 Service unavailable`, never a backend of another pool, because backends trust the
    token's `account_id` and another pool's backend would read another tenant's account.
+5. With named pools and `lookup_local_users = true`, a request carrying a token for a user the
+   lookup does not know enters the default pool only when the token names a local account: the
+   proxy asks its own database (the primary) for the active account of the token's `email`,
+   and its id must equal the token's `account_id`. Otherwise the answer is
+   `503 Service unavailable`. This is why a User API proxy with `lookup_local_users = true`
+   needs `[database]`. Logins do not need this check: the backend verifies the password.
 
 Logins and refreshes read affinity but never write it.
 
@@ -876,10 +908,12 @@ call the API through the proxy.
 | `remote_port` | none | Port for backends listed without one. |
 | `remote_tls` | `false` | Speak HTTPS to the backends. |
 | `remote_tls_verify` | `false` | Verify the backends' certificates: a pool member against its pool's `remote_tls_ca_file`, any other backend against this block's `remote_tls_ca_file`, or the system roots when that is unset. |
+| `remote_tls_ca_file` | none | CA certificate for checking backends that are not in a pool. |
 | `remote_use_proxy_protocol` | `false` | Send a PROXY protocol v2 header to the backends (12.2). |
 | `connect_timeout` | `"30s"` | Time to open a backend connection. |
 | `remote_dns_refresh` | `"5m"` | How often backend host names are resolved again. `"0"` keeps the start-up addresses. |
 | `remote_health_checks` | `true` | Check backend health and avoid failing backends. |
+| `enable_affinity` | `false` | Send a user back to the backend they used last. Needs `[cluster.affinity] enabled = true`. |
 | `max_connections` | `0` | Most concurrent client connections on this node. |
 | `max_connections_per_ip` | `0` | Most concurrent connections per client address, on this node. Addresses in `[servers] trusted_networks` are exempt. |
 | `proxy_protocol` | `false` | Expect a PROXY protocol header from a load balancer in `[servers] trusted_networks`. |
@@ -888,16 +922,20 @@ call the API through the proxy.
 | `tls_cert_file`, `tls_key_file` | none | Certificate files. Without them, `tls = true` uses the `[tls]` certificate manager, and fails at start-up if there is none. |
 | `tls_verify` | `false` | Require client certificates. |
 | `tls_default_domain` | none | Certificate name for clients without SNI, with the `[tls]` manager. |
-| `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). |
-| `[server.lookup_cache]` | off | Caches route lookup answers; keys and defaults are described in [CONFIGURATION.md](CONFIGURATION.md#910-lookup-cache-serverlookup_cache). The proxy checks no passwords and warns if `positive_revalidation_window` is set. |
+| `[server.remote_lookup]` | off | Route lookups; see [PROXY.md](PROXY.md). A backend the lookup names is dialed with this block's own `remote_tls`, `remote_tls_verify` and `remote_use_proxy_protocol`; the `remote_lookup.remote_*` keys of the line proxies do not apply here and are reported with a startup warning. |
+| `[server.lookup_cache]` | off | Caches route lookup answers (a pin, a pool, or "not known") for `positive_ttl`, or `negative_ttl` for "not known". Without the table there is no cache; with it the cache is on unless it sets `enabled = false`. It is never used when the remote lookup URL contains `$ip`, since the answer then depends on the client. Keys and defaults are in [CONFIGURATION.md](CONFIGURATION.md#910-lookup-cache-serverlookup_cache). The proxy checks no passwords, so `positive_revalidation_window` does not apply and is reported with a startup warning. |
 | `[server.auth_rate_limit]` | off | Login rate limiting of every login through the proxy (12.1). The keys are in [AUTHENTICATION.md](AUTHENTICATION.md). Blocked clients show at `GET /admin/auth/blocked?protocol=userapi_proxy`. |
 
-`allowed_hosts`, `token_duration` and `token_issuer` have no effect on this proxy; set in its block,
-each is reported with a startup warning. Affinity is
+`allowed_hosts`, `token_duration`, `token_issuer`, `max_connections_per_user`,
+`max_connections_per_user_per_ip` and `remote_tls_use_starttls` have no effect on this proxy
+(it speaks plain HTTP or HTTPS to its backends, with no STARTTLS); set in its block, each is
+reported with a startup warning. To restrict which clients reach the proxy, use a firewall or
+the load balancer in front of it. Affinity is
 used when the block sets `enable_affinity = true` and the cluster runs its affinity store
 (`[cluster.affinity] enabled = true`). The proxy's HTTP
 limits are fixed: 30 seconds to read a request and 30 seconds to write a response (from the end
-of the delay for a login the proxy's rate limit delays), 120 seconds for an idle connection.
+of the delay for a login the proxy's rate limit delays), 120 seconds for an idle connection,
+and 15 seconds to finish open requests at shutdown.
 
 The Admin API shows the proxy's backends under the name `UserAPI-{name}` at
 `GET /admin/proxy/backends` (see [ADMIN_API.md](ADMIN_API.md#13-proxy-backends-and-affinity)).

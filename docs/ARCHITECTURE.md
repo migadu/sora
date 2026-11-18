@@ -226,6 +226,12 @@ See [TLS.md](TLS.md).
 **Relay queue** ([server/relayqueue](../server/relayqueue)). A disk queue for outgoing Sieve
 redirects and vacation replies. See [RELAY.md](RELAY.md).
 
+**Credential changes** ([server/credchanges](../server/credchanges)). Every node with a database
+follows the `credential_changes` table, which database triggers fill whenever a password, an
+address or an account changes or is removed. The node then drops its cached logins for that
+account and, where the change takes the account out of service, ends its open sessions. See
+[AUTHENTICATION.md](AUTHENTICATION.md#121-the-credential-change-feed).
+
 **Auth cache and affinity cache** ([authcache](../authcache), [affinitycache](../affinitycache)).
 Small SQLite files that proxies use to survive restarts without a burst of database lookups.
 See [PROXY.md](PROXY.md).
@@ -248,6 +254,8 @@ safely.
 | Search vectors | PostgreSQL (`messages_fts_v2`) | The only copy: rebuilding needs every body fetched from S3 again. See [SEARCH.md](SEARCH.md). |
 | Sieve scripts, vacation reply records | PostgreSQL | |
 | The upload queue and node heartbeats | PostgreSQL (`pending_uploads`, `instance_heartbeats`) | |
+| Body deletion intents | PostgreSQL (`s3_body_delete_intents`) | A record of every S3 delete in flight. See [STORAGE.md](STORAGE.md#95-how-deletions-are-made-safe). |
+| Credential change feed | PostgreSQL (`credential_changes`) | Tells every node which logins changed, so cached logins and open sessions end everywhere. See [AUTHENTICATION.md](AUTHENTICATION.md#121-the-credential-change-feed). |
 | Message bodies | S3 bucket | Keyed `<domain>/<localpart>/<content hash>`. See [STORAGE.md](STORAGE.md#2-s3-keys). |
 | Bodies not yet uploaded | Local disk of the node that accepted them, `[uploader] path` (default `/var/spool/sora/uploads`) | The only copy until the upload finishes. |
 | Cached bodies | Local disk, `[local_cache] path` (default `/var/cache/sora/cache`) | Disposable. |
@@ -363,7 +371,9 @@ details are in [STORAGE.md](STORAGE.md#7-reading-a-body).
   object is written to S3.
 - **MOVE** inserts the new rows and expunges the old ones in the same transaction.
 - **A copy into another account's shared mailbox** copies the S3 object under the owner's key,
-  because every account's bodies live under its own keys.
+  because every account's bodies live under its own keys. A body still waiting for upload is
+  linked in the staging directory instead and uploaded under the owner's key. One such COPY or
+  MOVE may carry at most 1000 distinct bodies; a larger one is refused with `NO [LIMIT]`.
 
 ### 6.5 Deleting a message
 
@@ -377,6 +387,13 @@ Deletion has two phases, so that a mistake can be undone.
    Once the last expunge of a body in an account is older than `[cleanup] grace_period`
    (default 14 days), and no live message of that account uses the body, it deletes the S3
    object and then the message rows.
+
+Removal deletes data for good, so it is guarded: a lock per body keeps deletes and writes of
+the same body apart, every S3 delete is recorded in PostgreSQL before it is sent, and a delete
+whose outcome is uncertain keeps its body quarantined until an operator resolves it. Removal is
+off until you turn it on with `[s3] body_deletion_protocol = "global-hash-v1"`; until then
+expunged mail and deleted accounts are kept. See
+[STORAGE.md](STORAGE.md#95-how-deletions-are-made-safe).
 
 The cached copy on each node is removed later by the cache's own sweep. The full timeline,
 retention with `max_age_restriction`, and account deletion are in
@@ -401,6 +418,7 @@ that run `imap`, `pop3` or `lmtp`. This document calls those **storage nodes**.
 | Health checks | Every node | 30 to 60 s per check | Checks the database, S3, the cache and other components. See [METRICS.md](METRICS.md). |
 | Metrics collector | Every node with a database | Every 60 s | Updates gauges from the database. See [METRICS.md](METRICS.md). |
 | Backend maintenance poller | Nodes that run a proxy and have a database | Every `[backend_maintenance] poll_interval` (default 5 s) | Re-reads which backends are in maintenance. See [PROXY.md](PROXY.md). |
+| Credential changes | Every node with a database | Every 5 s, and at once after a change on this node | Reads `credential_changes` and drops cached logins and open sessions of changed accounts. See [AUTHENTICATION.md](AUTHENTICATION.md#121-the-credential-change-feed). |
 
 The upload worker is the only one that is tied to a single node by the data itself: a body
 waiting for upload is a file on the disk of the node that accepted it, so only that node can
@@ -460,15 +478,20 @@ At startup `sora` does these steps in order:
 1. Loads and validates the config. Any error stops the start.
 2. Starts logging and logs the version.
 3. Resolves the instance ID and the mail hostname.
-4. On a storage node, creates the S3 client and turns on encryption if configured. Sora does
-   not contact S3 at this point and does not create the bucket.
-5. Connects to PostgreSQL, if the node needs it.
-6. Opens the auth cache, if enabled.
-7. On a storage node, opens the local cache and starts the search indexing, cleanup, purge
+4. On a storage node with the default `[uploader] path`, checks that the old default staging
+   directory `/tmp/sora/uploads` holds no staged bodies, and stops if it does
+   ([OPERATIONS.md](OPERATIONS.md#moving-off-the-old-tmpsora-defaults)).
+5. On a storage node, creates the S3 client and turns on encryption if configured. Sora does
+   not create the bucket, and with `access_key` and `secret_key` set it does not contact S3 at
+   this point. Without them it fetches the credentials from the AWS default chain.
+6. Connects to PostgreSQL, if the node needs it, and applies pending migrations.
+7. Opens the auth cache, if enabled.
+8. On a storage node, opens the local cache and starts the search indexing, cleanup, purge
    and upload workers.
-8. Starts the relay queue, the cluster, the TLS manager, health checks and the metrics
+9. Starts the relay queue, the cluster, the TLS manager, health checks and the metrics
    collector, as configured.
-9. Starts every listener.
+10. Reads the credential change feed once, so that no cached login is served before the node
+    knows which logins changed, and then starts every listener.
 
 On SIGINT or SIGTERM, Sora closes the listeners, waits up to 10 seconds for them to finish,
 waits 3 more seconds for connections to drain, and then stops the workers and closes the
@@ -507,6 +530,7 @@ that need a restart (among them `[cleanup]` and `[metadata]`) are logged as such
 | [server/uploader](../server/uploader) | Upload worker |
 | [server/cleaner](../server/cleaner) | Cleanup worker, account purge, purge worker |
 | [server/fts](../server/fts) | Search indexing worker |
+| [server/credchanges](../server/credchanges) | Credential change feed |
 | [server/idgen](../server/idgen) | Generated IDs |
 | [storage](../storage) | S3 client and encryption |
 | [cache](../cache) | Local body cache |

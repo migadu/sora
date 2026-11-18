@@ -8,7 +8,10 @@ control panel or `sora-admin` can drive it.
 This document is the reference: every endpoint, its request and response, and its status
 codes, as the code on `main` implements them. It is for operators who script against the API
 and for contributors who change it. The handlers live in
-[server/adminapi/](../server/adminapi/).
+[server/adminapi/](../server/adminapi/). A machine-readable OpenAPI description of the same
+endpoints is kept next to them in
+[admin_api_openapi.yaml](../server/adminapi/admin_api_openapi.yaml); a test fails when a route
+is registered without being described there.
 
 1. [Overview](#1-overview)
 2. [Configuration](#2-configuration)
@@ -47,7 +50,8 @@ Things to know before you start:
   inside the `sora` process answering the request. Section 6 lists which endpoints those are.
   Put the Admin API on a node that runs the servers you want to manage, or call it on each
   node.
-- **One API key opens everything.** There is no per-endpoint permission. Treat the key like a
+- **Two keys at most.** `api_key` opens every endpoint. The optional `read_only_api_key` opens
+  only the `GET` endpoints. There is no finer per-endpoint permission. Treat `api_key` like a
   database password, and limit who can reach the port with `allowed_hosts`.
 - **No browser support.** The API sends no CORS headers. Call it from a server or a script.
 
@@ -103,6 +107,10 @@ reloads. When you retire a key, give the slot a fresh value instead of moving a 
 slot. An empty or removed `allowed_hosts` opens the API to every address, as it does at
 start-up. Every other key needs a restart. See [OPERATIONS.md](OPERATIONS.md) for reloads in
 general.
+
+Keys other server types read have no effect here and are reported with a startup warning:
+among them `[server.auth_rate_limit]`, `[server.lookup_cache]`, `allowed_origins`,
+`max_connections_per_ip`, `max_connections_per_user` and `max_connections_per_user_per_ip`.
 
 The full list of server keys and how the file is read is in
 [CONFIGURATION.md](CONFIGURATION.md).
@@ -162,8 +170,10 @@ accepts a raw message or a form upload. The handlers decode the body whatever th
 `Content-Type` header says (mail delivery is the exception). Unknown fields are ignored.
 
 **Email addresses in paths** are written as they are: `/admin/accounts/user@example.com`.
-`%40` for `@` works too. Addresses are matched case-insensitively. An address that does not
-parse gives `400`.
+`%40` for `@` works too. An address is one path segment, so a `/` inside a local part must be
+sent as `%2F`. Addresses are matched case-insensitively, and an internationalized domain
+(`user@bücher.example`) is matched in its ASCII form (`user@xn--bcher-kva.example`). An address
+that does not parse gives `400`, usually with `invalid email address: ...`.
 
 **Responses** are JSON with `Content-Type: application/json`. Most field names are
 snake_case. A few responses encode internal structures directly and use Go field names
@@ -244,6 +254,7 @@ not used by it.
 | GET | `/admin/affinity` | 13.2 | A user's affinity backend. |
 | POST | `/admin/affinity` | 13.2 | Set a user's affinity backend. |
 | DELETE | `/admin/affinity` | 13.2 | Remove a user's affinity. |
+| GET | `/admin/affinity/list` | 13.2 | Every affinity this node holds. |
 | GET | `/admin/affinity/stats` | 13.2 | Affinity table statistics. |
 | GET | `/admin/cache/stats` | 14.1 | This node's local cache. |
 | GET | `/admin/cache/metrics` | 14.2 | Recorded cache hit rates of every node. |
@@ -256,7 +267,10 @@ not used by it.
 | GET | `/admin/health/overview` | 17.1 | Summary of component health. |
 | GET | `/admin/health/servers/{hostname}` | 17.2 | Component health of one host (or all). |
 | GET | `/admin/health/servers/{hostname}/components/{component}` | 17.3 | One component's current state. |
-| GET | `/admin/config` | 18 | Server type and a partial endpoint list. |
+| GET | `/admin/config` | 18 | Server type, enabled features and the endpoint list. |
+
+Every `GET` endpoint accepts `read_only_api_key`; every other method needs `api_key` (see
+[section 3](#3-authentication-and-access-control)).
 
 **Destructive and asynchronous endpoints.** Know these before you script against them:
 
@@ -282,7 +296,7 @@ servers that create them. An endpoint that needs a missing part answers as liste
 |---|---|---|
 | Accounts, credentials, deleted messages, usage, ACLs, health, cache metrics, upload queue | Database only | Always available. |
 | `DELETE /admin/accounts/{email}?purge=true` | Database to record the request; a purge worker on any node with S3 to carry it out | The request is recorded. It waits until a node with S3 runs. |
-| `POST /admin/mail/deliver` | The upload worker: an `imap`, `pop3` or `lmtp` server on this node | Mail delivery is not available on this node. |
+| `POST /admin/mail/deliver` | The upload worker: an `imap`, `pop3` or `lmtp` server on this node | `503 {"error":"Mail delivery not available on this node: no upload worker"}` with `Retry-After: 60`. Sora logs a warning at start-up. |
 | `GET /admin/cache/stats`, `POST /admin/cache/purge` | The local cache: an `imap`, `pop3` or `lmtp` server on this node | `503 {"error":"Cache not available"}` |
 | `/admin/connections*` | Connection trackers | List and stats answer with an empty list and a `note`; kick answers `503`. |
 | `GET /admin/proxy/backends` | Proxy servers on this node | `{"proxies":[]}` |
@@ -320,8 +334,8 @@ With one address:
 | Field | Type | Meaning |
 |---|---|---|
 | `email` | string | The address, which becomes the primary identity. Required. |
-| `password` | string | Hashed with bcrypt at the server's `bcrypt_cost`. |
-| `password_hash` | string | A ready hash, stored exactly as given. It is not checked, so it must be in a scheme Sora verifies (see [AUTHENTICATION.md](AUTHENTICATION.md)), or the account cannot sign in. |
+| `password` | string | Hashed with bcrypt at the server's `bcrypt_cost`. bcrypt reads at most 72 bytes, so a longer password is refused with `400`. |
+| `password_hash` | string | A ready hash, stored as given once Sora has checked that it is in a scheme Sora verifies ([AUTHENTICATION.md](AUTHENTICATION.md#4-password-schemes)). A hash Sora could not check is refused with `400`, so no credential is stored that no password signs in to. |
 
 Give exactly one of `password` and `password_hash`.
 
@@ -842,8 +856,9 @@ Status codes:
 |---|---|
 | 200 | Every recipient accepted. |
 | 207 | Two or more recipients, and at least one failed (also when all failed). |
-| 400 | One recipient, and it failed for a reason in the request (unknown or invalid address); or the request itself is bad: no message, an unparseable message, no recipients, a body over the size limit, a bad form. |
+| 400 | One recipient, and it failed for a reason in the request (unknown or invalid address, or a message too large to store); or the request itself is bad: no message, an unparseable message, no recipients, a body over the size limit, a bad form. |
 | 503 | One recipient, and it failed on the server side. `Retry-After: 30`. |
+| 503 | This node has no upload worker: `{"error":"Mail delivery not available on this node: no upload worker"}` with `Retry-After: 60`. Send the request to a node that runs an `imap`, `pop3` or `lmtp` server. |
 | 503 | This backend is in maintenance: `{"error":"Server in maintenance, try again later"}` with `Retry-After: 60`. See [PROXY.md](PROXY.md) for maintenance mode. |
 
 In-flight deliveries count as this server's sessions while a backend drains for maintenance.
@@ -897,7 +912,9 @@ tracking not available (requires cluster mode or backend server with tracking en
  "source": "in-memory connection tracker"}
 ```
 
-The keys are tracker names. Without trackers the answer has zeros and a `note`.
+The keys are tracker names. The numbers count sessions on this node, not accounts, and leave
+out sessions that other nodes report through gossip. Without trackers the answer has zeros and
+a `note`.
 
 ### 11.3 One account's sessions
 
@@ -905,14 +922,19 @@ The keys are tracker names. Without trackers the answer has zeros and a `note`.
 
 ```json
 {"email": "alice@example.com",
- "connections": [{"protocol": "IMAP-imap", "account_id": 1042, "email": "alice@example.com",
-                  "local_count": 3, "total_count": 3, "last_update": "2026-03-10T08:20:11Z"}],
+ "connections": [{"protocol": "IMAP", "instance": "IMAP-imap", "account_id": 1042,
+                  "email": "alice@example.com", "local_count": 3, "total_count": 3,
+                  "last_update": "2026-03-10T08:20:11Z"}],
  "count": 1, "source": "in-memory connection tracker"}
 ```
 
-The address is matched case-insensitively against the tracked user name. Here `protocol` is
-the full tracker name, and entries with `local_count: 0` (sessions on peers only) are
-included.
+The entries have the same fields as in 11.1. The address is first resolved to its account, so
+any address of the account finds all of the account's entries. Entries created under any of the
+account's addresses are listed too (a proxy keys a session that a remote lookup authenticated
+by the address the lookup answered). An address the database does not know matches the entries
+created under that address, compared case-insensitively. Unlike 11.1, entries with
+`local_count: 0` (sessions on peers only) are included. An address that does not parse gives
+`400`. Without trackers the answer is an empty list with a `note`.
 
 ### 11.4 Kick an account
 
@@ -929,8 +951,10 @@ included.
 
 `server_addr` and `client_addr` are accepted and ignored.
 
-The account id comes from the database. An address the database does not know (an account
-served by a remote lookup) gets the id Sora derives from the address, as the proxies do.
+The address is resolved to every id the account's sessions can be held under: the database's
+account id, and the ids Sora derives from each of the account's addresses, which is how a proxy
+keys a login that a remote lookup authenticated. An address the database does not know (an
+account served only by a remote lookup) gets just the derived id.
 
 For each chosen tracker, the kick closes every session the account has on this node at once
 and drops its cached logins there, so the next login is looked up afresh. In cluster mode it
@@ -955,9 +979,10 @@ Errors:
 
 | Status | Body `error` |
 |---|---|
-| 400 | `Invalid JSON body`, `user_email is required for kick operation` |
+| 400 | `Invalid JSON body`, `user_email is required for kick operation`, `invalid email address: ...` |
 | 404 | `No connection trackers found for protocol: imap` |
 | 503 | `Connection tracking not available (requires cluster mode)`: this node has no tracker. |
+| 500 | `Failed to resolve account`: the database could not be asked. |
 | 500 | `Failed to kick user on any protocol` |
 
 To kick an account everywhere, call the API on a node that has trackers in cluster mode, or on
@@ -1084,7 +1109,10 @@ true`; it is gossiped to every node. See
 **Get:** `GET /admin/affinity?user=alice@example.com&protocol=imap`
 
 Answers with the user's backend for that protocol:
-`200 {"user":"alice@example.com","protocol":"imap","backend":"10.0.0.11:143"}`.
+`200 {"user":"alice@example.com","protocol":"imap","backend":"10.0.0.11:143","found":true}`.
+`protocol` is matched in any case. Both parameters are required
+(`400 user and protocol query parameters are required`). A user without an affinity for that
+protocol answers `404 {"error":"No affinity set for alice@example.com (imap)"}`.
 
 **Set:** `POST /admin/affinity`
 
@@ -1103,13 +1131,38 @@ port. Response `200`:
  "user": "alice@example.com", "protocol": "imap", "backend": "10.0.0.12:143"}
 ```
 
-Errors: `400` for missing fields, another protocol, a backend not configured for it
-(`Backend ... is not configured for protocol imap. Valid backends: [...]`), or a protocol
-without configured backends.
+Errors: `400 Invalid JSON`; `400 user, protocol, and backend are required`;
+`400 protocol must be imap, pop3, or managesieve`; `400` for a backend not configured for the
+protocol (`Backend ... is not configured for protocol imap. Valid backends: [...]`) or a
+protocol without configured backends (`No backends configured for protocol imap`).
 
 **Delete:** `DELETE /admin/affinity?user=alice@example.com&protocol=imap`
 
 `200 {"success":true,"message":"Affinity deleted for alice@example.com (imap) and gossiped to cluster","user":"alice@example.com","protocol":"imap"}`.
+Deleting an affinity that does not exist also answers `200`. Both parameters are required, as
+for get. Get and delete take any protocol name, `userapi` included (the User API proxy's
+affinities); only set is limited to `imap`, `pop3` and `managesieve`.
+
+**List:** `GET /admin/affinity/list?protocol=imap&backend=10.0.0.11:143`
+
+Lists the unexpired affinities this node holds: those it assigned and those it received by
+gossip. Both parameters are optional filters; `protocol` is matched in any case, `backend`
+exactly. Entries are sorted by user, then protocol.
+
+```json
+{
+  "affinities": [
+    {"user": "alice@example.com", "protocol": "imap", "backend": "10.0.0.11:143",
+     "assigned_at": "2026-03-10T08:00:00Z", "expires_at": "2026-03-11T08:00:00Z",
+     "node_id": "node-1"}
+  ],
+  "count": 1
+}
+```
+
+`node_id` is the cluster node that assigned the affinity. Nodes do not exchange their full
+tables, so a node that was down or joined after an affinity was gossiped does not hold it, and
+two nodes can list different affinities.
 
 **Statistics:** `GET /admin/affinity/stats`
 
@@ -1127,6 +1180,8 @@ without configured backends.
 }
 ```
 
+`queue_utilization` is the gossip broadcast queue's fill level as a percentage.
+
 **Without the affinity table** every affinity endpoint answers
 `503 {"error": "Affinity manager not enabled on this server"}`.
 
@@ -1140,8 +1195,15 @@ The local cache keeps message bodies on this node's disk. See [STORAGE.md](STORA
 
 `GET /admin/cache/stats`
 
-This node's cache: its total size in bytes, the number of objects, hits and misses, the hit
-ratio (0 to 1), and uptime. Hits, misses and uptime count from the process start.
+This node's cache. The fields use Go names:
+
+```json
+{"TotalSizeBytes": 5368709120, "ObjectCount": 81234, "Hits": 45678, "Misses": 3421,
+ "HitRatio": 0.93, "Uptime": 86400000000000}
+```
+
+`TotalSizeBytes` is the size on disk in bytes. `HitRatio` is from 0 to 1. `Uptime` is in
+nanoseconds. Hits, misses and uptime count from the process start.
 `503 {"error":"Cache not available"}` on a node without a cache.
 
 ### 14.2 Recorded hit rates
@@ -1252,7 +1314,12 @@ The fields use Go names:
 }
 ```
 
-`InstanceID` is the node that staged the body; only that node can upload it.
+`InstanceID` is the upload identity of the node that staged the body (`[uploader]
+instance_id`, by default its host name); only that node can upload it. `ContentHash` is the
+body's BLAKE3 hash, which also names its S3 object.
+
+In both endpoints a `max_attempts`, `limit` or `failed_limit` that is not a positive number
+means the default.
 
 ---
 
@@ -1371,8 +1438,10 @@ host's components.
 
 `GET /admin/health/servers/{hostname}/components/{component}`
 
-The current row, as one object of the shape above. An unknown component answers
-`404 {"error":"Health status not found"}`; a failed database query answers `500`.
+The current row, as one object of the shape above. Only the current state is kept, so
+`?history=true` answers `400 Health history is not recorded; request the current status without
+history=true`. An unknown component answers `404 {"error":"Health status not found"}`; a failed
+database query answers `500`.
 
 ---
 
@@ -1393,5 +1462,9 @@ The current row, as one object of the shape above. An unknown component answers
 ```
 
 `cache_management` is `false` on a node without a cache; the other flags are always `true`.
-The `endpoints` list is partial: it leaves out mail delivery, ACLs, affinity, proxy backends
-and the auth cache. Section 5 of this document is the complete list.
+The flags say what the API can do, not what this node runs: section 6 lists what each endpoint
+needs. `endpoints` lists every endpoint, grouped as `account_management`, `domain_management`,
+`usage`, `credential_management`, `message_restoration`, `connection_management`,
+`cache_management`, `health_monitoring`, `uploader_monitoring`, `auth_statistics`,
+`proxy_monitoring`, `system_information`, `mail_delivery`, `acl_management` and
+`affinity_management`.

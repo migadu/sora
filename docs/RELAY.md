@@ -68,6 +68,18 @@ mail from Sora.
 | `"http"` | Messages are posted to an HTTP endpoint ([section 3](#3-the-http-relay-request)). |
 | anything else | Sora refuses to start: `unsupported [relay] type "<value>": expected "smtp" or "http"`. |
 
+Sora also refuses to start when the relay has nowhere to send to: an SMTP relay without a usable
+`smtp_host`, or an HTTP relay without a usable `http_url` (details below).
+`sora-admin config validate` reports the same errors. Error messages and log lines show these
+values with any user name, password or query value masked.
+
+At startup Sora warns when the connection to a relay that is not on the local machine is not
+protected:
+
+- `[relay] smtp_tls = false: mail is relayed in plaintext to a non-loopback host`
+- `[relay] smtp_tls_verify = false: the relay's TLS certificate is not verified, so any host on the path can impersonate it`
+- `[relay] http_url is http://: mail and the auth_token are relayed in plaintext to a non-loopback host`
+
 ### SMTP relay
 
 ```toml
@@ -82,10 +94,10 @@ smtp_helo_host = "mail.example.com"
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `smtp_host` | string | none | The relay as `host:port`. Required for `type = "smtp"`. Sora does not check it at startup: without it every send fails and is retried. |
-| `smtp_tls` | bool | — | Use TLS. Set it explicitly; `true` is recommended. With `smtp_tls = false` the connection is plaintext and `smtp_use_starttls` is ignored. |
+| `smtp_host` | string | none | The relay as `host:port`. Required for `type = "smtp"`. There is no default port. Sora refuses to start when it is missing, has no host, or has no valid port (a number from 1 to 65535, or a service name such as `submission`). |
+| `smtp_tls` | bool | `true` | Use TLS. With `smtp_tls = false` the connection is plaintext and `smtp_use_starttls` is ignored. |
 | `smtp_use_starttls` | bool | `false` | With `smtp_tls = true`: connect in plaintext and upgrade with STARTTLS. The attempt fails if the relay does not offer STARTTLS. Without it, TLS starts with the first byte (the port 465 style). |
-| `smtp_tls_verify` | bool | — | Verify the relay's certificate against the system roots and the host name in `smtp_host`. Set it explicitly; `true` is recommended. |
+| `smtp_tls_verify` | bool | `true` | Verify the relay's certificate against the system roots and the host name in `smtp_host`. |
 | `smtp_tls_cert_file` | string | none | Client certificate (PEM) for TLS client authentication. Needs `smtp_tls_key_file` too. |
 | `smtp_tls_key_file` | string | none | The key for `smtp_tls_cert_file`. |
 | `smtp_helo_host` | string | the machine's hostname, or `localhost` if it has none | The name in `EHLO`. Set it to the node's fully qualified name. |
@@ -101,8 +113,9 @@ Things to know:
 - **Sora does not authenticate to the relay.** There is no user name or password setting and no
   SMTP AUTH. Allow the Sora nodes on the relay by IP address, or use a client certificate.
 - TLS needs version 1.2 or later.
-- With STARTTLS, the `EHLO` before the upgrade says `localhost`; `smtp_helo_host` is sent on the
-  `EHLO` after it, which is the one the relay records.
+- With STARTTLS, Sora sends `smtp_helo_host` in both `EHLO` commands: the one before the upgrade
+  and the one after it.
+- Connecting to the relay times out after 30 seconds.
 - If the client certificate or key cannot be loaded, every message fails permanently and goes
   straight to the failed queue.
 - When the envelope or a header line is not ASCII, Sora asks for SMTPUTF8 (RFC 6531). If the relay
@@ -128,7 +141,7 @@ auth_token = "change-me"
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `http_url` | string | none | Where Sora posts each message. Required for `type = "http"`. |
+| `http_url` | string | none | Where Sora posts each message. Required for `type = "http"`. Sora refuses to start unless it is an absolute `http://` or `https://` URL with a host, and a valid port if it names one. |
 | `auth_token` | string | none | Sent as `Authorization: Bearer <token>` when set. |
 
 The request times out after 30 seconds; this is fixed. HTTPS certificates are verified against the
@@ -178,16 +191,20 @@ For each message Sora sends one `POST` to `http_url` with `Content-Type: applica
 | `message` | The complete message (RFC 5322 headers and body) as a string. |
 | `message_base64` | The complete message byte for byte, standard base64 (RFC 4648 section 4). Only present when the message is not valid UTF-8. |
 
-A JSON string holds Unicode text only, so `message` cannot carry a message that is not valid UTF-8
-(8-bit text in another charset, raw 8-bit header values): each such byte in it is replaced with
-U+FFFD. Those messages are also sent in `message_base64`. A relay API takes the message from
-`message_base64` when it is present and from `message` otherwise; either way it gets the message
-byte for byte.
+Why two message fields: a JSON string can hold only Unicode text, so `message` cannot carry a
+message that is not valid UTF-8, such as 8-bit text in another charset or raw 8-bit header values.
+In `message`, each byte that is not valid UTF-8 is replaced with U+FFFD. So for those messages
+Sora also sends `message_base64`, which holds every byte.
 
-Update the receiver to accept and prefer `message_base64` before deploying this field.
-A receiver that ignores it still sees the legacy, lossy `message` for non-UTF-8 mail.
-A receiver that rejects unknown fields can return a 4xx response, which Sora treats as a
-permanent relay failure and moves to the failed queue.
+What the receiver should do:
+
+1. Take the message from `message_base64` when it is present, and from `message` otherwise.
+   Either way it gets the message byte for byte.
+2. Accept fields it does not know. A receiver that answers an unknown field with a `4xx` makes
+   every such message a permanent failure: it goes to the failed queue.
+
+A receiver that ignores `message_base64` still works, but gets the damaged `message` for mail
+that is not valid UTF-8.
 
 Sora reads only the status code of the response.
 
@@ -235,6 +252,19 @@ per attempt.
 
 `type` is `redirect` or `vacation`. Each failed attempt adds one line to `errors`, prefixed with
 its time; a permanent failure is marked `PERMANENT:`.
+
+Besides the message pairs, you may see these hidden files. They are Sora's own bookkeeping; do
+not edit or remove them by hand.
+
+| File | Where | Purpose |
+|---|---|---|
+| `.lease-<id>` | `processing/` | A lock on one message (mode 0600). The worker holds it while it sends the message, and `sora-admin relay` takes it before it changes the message, so the two never act on one message at the same time. The lock ends when its process exits. |
+| `.transaction-<id>.state` | `failed/` | A record of a requeue or delete in progress, so that one interrupted by a crash is finished or rolled back on the next pass. |
+| `.requeue-<id>.staged`, `.requeuing-<id>.json.old`, `.requeuing-<id>.msg.old` | `pending/`, `failed/` | Intermediate files of a requeue. |
+| `.tmp-*` | any | A file being written. |
+
+When `sora-admin` runs as another user than the server (as `root`, for example), the files it
+writes keep the owner of their queue directory, so the server can still read and remove them.
 
 **The queue is local to the node.** It is not shared with other nodes or stored in PostgreSQL. For
 a redirect without `:copy`, the queue file is the only copy of the message. Put the path on
@@ -359,12 +389,16 @@ so run them on the node that owns the queue. They refuse to run when `[relay] ty
 |---|---|
 | `sora-admin relay stats --config FILE` | Counts the messages in each directory. Reports a queue the server has not created yet, and does not create it. |
 | `sora-admin relay list --config FILE [--queue pending\|processing\|failed] [--limit 100]` | Lists messages (default queue `pending`). |
-| `sora-admin relay show --config FILE --id ID [--queue pending]` | Shows one message's metadata. |
+| `sora-admin relay show --config FILE --id ID [--queue pending]` | Shows one message's metadata, its error history and the message itself. |
 | `sora-admin relay delete --config FILE --id ID\|all [--queue failed] --confirm` | Deletes one message or all messages of a queue (default queue `failed`). |
 | `sora-admin relay requeue --config FILE --id ID\|all --confirm` | Moves messages from `failed/` back to `pending/`, due now, with attempts and errors reset. |
 
 `stats` also prints the `max_attempts` and `worker_interval` the server uses, defaults included.
-Full flags are in [ADMIN_CLI.md](ADMIN_CLI.md).
+
+`delete` and `requeue` leave alone a message that the worker is sending at that moment: for one
+message they fail with `relay message <id> is busy`, and with `--id all` they skip it with a
+warning. `delete --id all` also leaves held redirects (`<id>.held`) alone, since their delivery
+is still running. Full flags are in [ADMIN_CLI.md](ADMIN_CLI.md).
 
 ### Log lines
 
@@ -380,7 +414,7 @@ Full flags are in [ADMIN_CLI.md](ADMIN_CLI.md).
 | `Relay: Permanent delivery failure (5xx), dropping message` | error | A permanent failure; the message moved to `failed/`. |
 | `RelayQueue: Message exceeded max attempts, moving to failed` | error | Out of attempts. |
 | `Relay: Circuit breaker preventing delivery, releasing back to queue` | warn | The breaker is open. |
-| `RelayQueue: Recovered orphaned messages from processing directory` | info | Crash recovery at startup. |
+| `Relay: Crash recovery completed` | info | Messages left in `processing/` by a crash were moved back to `pending/` at startup (`recovered_messages`). |
 
 ### Metrics
 
@@ -440,10 +474,17 @@ the User API and Sieve `fileinto` do not trigger training.
 
 ### What is sent
 
-For each moved message, Sora hands a report to a bounded queue served by a fixed number of
-background workers, so a large `MOVE` does not start one S3 download per message at once. A worker
-reads the message from S3 and strips attachments. A message larger than `max_message_size` is
-skipped before its body is downloaded. The `MOVE` answers at once and does not wait.
+For each moved message, Sora puts a report in a queue in memory, and the `MOVE` answers at once
+without waiting. `workers` background workers (default 4) take reports from the queue, so a large
+`MOVE` never starts one download per message at once. The queue holds up to `queue_size` reports
+(default 1000). A message moved while the queue is full is not reported, and Sora logs
+`spam training queue full - messages not submitted` at warning level with the counts.
+
+A message larger than `max_message_size` is skipped before its body is read, and the skip is
+logged at debug level. A worker reads the body from the local cache, the upload staging file or S3,
+in that order, so a message moved before its upload finished is still reported. It then strips
+attachments. One report, from reading the body to the endpoint's answer, may take at most 60
+seconds.
 
 Stripping works like this:
 
@@ -476,7 +517,7 @@ Then Sora posts JSON to `endpoint`, with `Authorization: Bearer <auth_token>` wh
 | `message_base64` | The message after stripping, byte for byte, standard base64 (RFC 4648 section 4). Only present when it is not valid UTF-8. |
 | `user` | The address of the user who moved it. |
 | `source_mailbox`, `dest_mailbox` | The folder names. |
-| `timestamp` | When the report was built (RFC 3339). |
+| `timestamp` | When the `MOVE` queued the report (RFC 3339). |
 
 As in the [HTTP relay request](#3-the-http-relay-request), each byte of `message` that is not valid
 UTF-8 is replaced with U+FFFD; the endpoint takes the message from `message_base64` when it is
@@ -488,15 +529,18 @@ A `2xx` answer is success. Anything else is a failure, a `3xx` too: redirects ar
 ### Failures
 
 Nothing is retried. A report that fails is logged at warning level as
-`Spam training submission failed` (with `type`, `user` and the error) and dropped. A message whose
-body has not reached S3 yet is skipped with `failed to fetch message body from S3 for spam training`.
+`Spam training submission failed` (with `type`, `user` and the error) and dropped. A body that
+cannot be read counts as a failure too.
+
+Every report is counted in `sora_spam_training_messages_total{result}`, with `result` one of
+`submitted`, `failed`, `too_large` (over `max_message_size`) and `dropped` (the queue was full).
 
 Each request may take up to `timeout` (default `10s`). The training client has its own circuit
 breaker:
 
 - It opens after `circuit_breaker.threshold` (default 5) failures in a row. Any failure counts,
   including `4xx` answers.
-- While open, reports fail at once without a request.
+- While open, reports fail at once: Sora neither reads the body nor sends a request.
 - After `circuit_breaker.timeout` (default `30s`) it lets up to `circuit_breaker.max_requests`
   (default 3) through. A success closes it; a failure opens it again.
 - State changes are logged as `Spam training circuit breaker state change`.
@@ -522,7 +566,9 @@ max_requests = 3
 | `endpoint` | string | none | The URL Sora posts to. |
 | `auth_token` | string | none | Bearer token for the request. |
 | `timeout` | duration | `"10s"` | Time limit for one request. An invalid value logs `Failed to initialize spam training client` and leaves training off. |
-| `max_message_size` | size | `"10mb"` | Larger messages are not submitted. |
+| `max_message_size` | size | `"10mb"` | Larger messages are not submitted. The stored size counts, attachments included. A value that is not a positive size leaves training off, as for `timeout`. |
+| `workers` | integer | `4` | Background workers that read and send reports, for the whole process. `0` or less means 4. |
+| `queue_size` | integer | `1000` | Reports that may wait for a worker. `0` or less means 1000. |
 | `circuit_breaker.threshold` | integer | `5` | Failures in a row that open the breaker. `0` or less means 5. |
 | `circuit_breaker.timeout` | duration | `"30s"` | How long the breaker stays open. |
 | `circuit_breaker.max_requests` | integer | `3` | Trial requests while half open. `0` or less means 3. |
@@ -534,8 +580,9 @@ When training starts, Sora logs `Spam training client initialized` with the endp
 ## 8. Startup and reload
 
 - `[relay]`, `[relay.queue]` and `[spam_training]` are read once, at startup. To change them,
-  restart Sora. A reload (`SIGHUP`) reports a change to these sections as needing a restart and
-  applies nothing.
+  restart Sora. A reload (`SIGHUP`) applies nothing; it logs
+  `Config reload: global settings changed but require restart to take effect` with the changed
+  keys in `fields` (for example `relay.smtp_host`).
 - Any node with `[relay] type` set starts a queue and a worker, whatever servers it runs. Set the
   relay on the nodes that deliver mail (the ones with `lmtp` or `http_admin_api` servers).
 - Spam training is used by `imap` servers only.

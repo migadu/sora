@@ -71,54 +71,107 @@ it with `strpos()`, so `%` and `_` in a term are ordinary characters, not wildca
 | `FROM` | address columns | Substring of any From address or display name. |
 | `TO` | address columns | Substring of any To address or display name. |
 | `CC` | address columns | Substring of any Cc address or display name. |
-| `BCC`, `HEADER Reply-To` | `recipients_json` | Substring of any Bcc or Reply-To address. |
-| `HEADER Message-ID` | `message_id` | Equal to the Message-ID, ignoring case. Angle brackets in the term are optional. |
-| `HEADER In-Reply-To` | `in_reply_to` | Substring of the stored message IDs, ignoring case. Angle brackets in the term are optional. |
-| `HEADER References` | `references` | Substring of the stored chain of message IDs, ignoring case. Angle brackets in the term are optional. |
+| `BCC`, `HEADER Bcc`, `HEADER Reply-To`, `HEADER Sender` | `recipients_json` | Substring of any address or display name of that header. |
+| `HEADER Message-ID` | `message_id` | A whole ID in angle brackets (`<id@example.com>`) is matched exactly, ignoring case. Any other term is a substring of the field as written, with its angle brackets. |
+| `HEADER In-Reply-To` | `in_reply_to` | Substring of the stored message IDs, written with their angle brackets, ignoring case. |
+| `HEADER References` | `references` | Substring of the stored chain of message IDs, written with their angle brackets, ignoring case. |
 | `HEADER` with any other name | none | Matches no message. Sora logs `HEADER search on non-indexed header returns no results` at debug level. |
+
+The address columns are the first From, To and Cc name and address (also used by `SORT`), plus
+`extra_addresses`, which holds every further From, To and Cc name and address.
 
 What this means for users:
 
 - **Every address counts.** A message sent to `alice@example.com, bob@example.com` matches both
   `TO alice` and `TO bob`.
 - **Search terms with angle brackets.** `HEADER Message-ID "<id@example.com>"`,
-  `HEADER In-Reply-To "<id@example.com>"` and `HEADER References "<id@example.com>"` all work.
-- **Headers such as `List-Id`, `X-Spam-Flag` or `Sender` are not searchable.** The command
+  `HEADER In-Reply-To "<id@example.com>"` and `HEADER References "<id@example.com>"` all work, as
+  do the same terms without brackets.
+- **Message-ID fields that are not one plain ID.** For a field with comments, an empty or
+  malformed value, a quoted local part, a domain literal, or several `Message-ID:` fields, Sora
+  keeps the field text as written (`message_id_raw`), and `HEADER Message-ID` matches against
+  that text.
+- **Headers such as `List-Id`, `X-Spam-Flag` or `Received` are not searchable.** The command
   succeeds with no matches.
+
+### Testing whether a header is present
+
+An empty term is a substring of every string, so `HEADER <name> ""` asks whether the message has
+that header at all (RFC 9051 §6.4.4). For From, To, Cc, Bcc, Sender, Reply-To, Subject,
+Message-ID, In-Reply-To and References, Sora records at delivery which of these fields the
+message has (`header_presence`), and an empty term matches exactly the messages that have the
+field, even when it is empty. `SUBJECT ""` is the same test for Subject. For a message stored
+before Sora recorded this, an empty term is answered from the stored columns as it was before:
+such a message matches when the column has a value. `FROM ""`, `TO ""` and `CC ""` match a
+message that has at least one address in that header.
+
+### Stored lengths
 
 Stored values are cut to fixed lengths, so only the start of a very long value is searchable:
 
 | Column | Stored length |
 |---|---|
 | `subject` | first 600 bytes |
-| `from_email_sort`, `from_name_sort`, `to_email_sort`, `to_name_sort`, `cc_email_sort` | first 200 bytes, lowercased |
+| `from_email_sort`, `from_name_sort`, `to_email_sort`, `to_name_sort`, `cc_email_sort` | first 200 bytes each, lowercased |
+| `extra_addresses` | what the five columns above leave of 1300 bytes, lowercased |
 | `in_reply_to`, `references` | first 2000 bytes |
 
-Header search reads one index, `idx_messages_mailbox_headers` (migration 000052). It is keyed by
-mailbox and carries every column the header criteria and the search result need, so PostgreSQL
-answers a header search from the index alone, without visiting the table. The cost of a header
-search is therefore proportional to the number of messages in the mailbox, not to the size of the
-whole database. This holds only while autovacuum keeps the table's visibility map current; see
-[DATABASE.md](DATABASE.md#10-maintenance).
+So in a message with very many recipients, the addresses past about 1300 bytes are not
+searchable.
+
+### The covering index
+
+Header search reads one index, `idx_messages_mailbox_headers_v3`. It is keyed by mailbox and
+carries every column the header criteria and the search result need, so PostgreSQL answers a
+header search from the index alone, without visiting the table. The cost of a header search is
+therefore proportional to the number of messages in the mailbox, not to the size of the whole
+database. This holds only while autovacuum keeps the table's visibility map current; see
+[DATABASE.md](DATABASE.md#10-maintenance). `BCC`, `HEADER Sender`, `HEADER Reply-To` and
+`HEADER References` read columns outside the index, so they read the mailbox's rows from the
+table. They are rare searches.
 
 The schema also has trigram indexes on these columns (`idx_messages_*_trgm`) from older
 migrations. The search code does not use them.
 
----
+### Dates
+
+`SINCE`, `ON` and `BEFORE` compare the INTERNALDATE (the arrival time) by its UTC day.
+
+`SENTSINCE`, `SENTON` and `SENTBEFORE` compare the day of the message's `Date:` header in the
+zone the header was written in, as RFC 9051 §6.4.4 asks ("disregarding time and timezone"). A
+message sent `Tue, 31 Dec 2024 20:00:00 -0800` is found by `SENTON 31-Dec-2024`, not by
+`SENTON 1-Jan-2025`. A message without a `Date:` header that parses matches none of the three.
+Messages stored before Sora kept the header's zone are compared by the UTC day, and those stored
+before Sora recorded a missing `Date:` header are compared by the date they were given.
 
 ## 3. Body search
 
 ### What text is indexed
 
-When a message is delivered, Sora extracts one piece of plain text from it:
+When a message is delivered, Sora extracts one piece of plain text from it, after Sieve has run
+(so headers a Sieve script added or removed are taken into account):
 
 1. the first `text/plain` part that is not an attachment, or
 2. if there is none, the first `text/html` part, converted to text. Embedded base64 images
    (`data:` URIs) are removed first, and HTML longer than 1 MB is cut to its first 1 MB before
-   conversion.
+   conversion. Malformed HTML is repaired first, so text after a stray `<` is kept.
 
-Parts marked as attachments are never indexed. Only the first plain-text part is used, so a
-message with several text parts is indexed by the first one.
+Which parts count:
+
+- A part with a `Content-Disposition` other than `inline` (an attachment, or an unknown or
+  malformed disposition) is never indexed.
+- In `multipart/related`, only the root part counts; the others are resources such as images.
+- `multipart/encrypted` and attached messages (`message/rfc822`) are not looked into. Nesting is
+  followed up to 32 levels.
+- A part with a Content-Transfer-Encoding Sora cannot decode is skipped. A part with an unknown
+  charset is still read, without charset conversion.
+- A text part whose `Content-Type` parameters do not parse is used only when the message has no
+  well-formed text part.
+- A broken multipart (a malformed part header or a missing boundary) ends that multipart, but
+  the parts after it in the enclosing one are still read.
+
+Only the first suitable part is used, so a message with several text parts is indexed by the
+first one.
 
 Sora then keeps the first 64 KB of that text (cut at a character boundary) and stages it for
 indexing. When text is cut, Sora logs `Database: truncating text_body for FTS indexing to 64KB
@@ -413,7 +466,6 @@ These are answered with `NO [LIMIT] Search criteria too complex`:
 | Limit | Value |
 |---|---|
 | Length of one search term or header value | 1000 bytes |
-| Length of a `Message-ID` or `In-Reply-To` value | 255 bytes |
 | `BODY` terms in one group | 10 |
 | `TEXT` terms in one group | 10 |
 | `BODY`, `TEXT` and header terms together in one group | 50 |
@@ -424,7 +476,8 @@ These are answered with `NO [LIMIT] Search criteria too complex`:
 
 These are answered with `BAD [CLIENTBUG] Search criteria invalid`:
 
-- a term containing a NUL character;
+- a term, header name or keyword containing a NUL character;
+- a term, header name or keyword that is not valid UTF-8;
 - an empty header name.
 
 Criteria that cannot match, such as `SINCE` later than `BEFORE` or `LARGER` greater than or equal
@@ -566,12 +619,21 @@ limiter logs a refusal at debug level at most once a minute per account.
 ## 11. Other ways to search
 
 - **SORT** uses the same query builder as `SEARCH`, with the same shapes, caps and timeouts. Sort
-  keys use the `*_sort` columns, so sorting by From, To or Cc uses the first address only.
+  keys use the `*_sort` columns, so sorting by From, To or Cc uses the first address only. `FROM`,
+  `TO` and `CC` sort by the address's local part (the part before the last `@`, RFC 5256 §3);
+  `DISPLAYFROM` and `DISPLAYTO` by the display name, or the address when there is none
+  (RFC 5957). A message without a `Date:` header sorts by its INTERNALDATE under `DATE`.
+  Strings are compared with the `i;unicode-casemap` collation (RFC 5256 §7): case is ignored and
+  compatibility characters are decomposed, then the strings are compared byte by byte, never by
+  the database's own collation. Ties are broken by ascending UID, also under `REVERSE`.
 - **THREAD** fetches the matching messages' Message-ID, In-Reply-To and References (and, for the
-  `REFERENCES` and `ORDEREDSUBJECT` algorithms, the subject) and builds threads in memory. Its cap
+  `REFERENCES` and `ORDEREDSUBJECT` algorithms, the subject, compared as `SORT SUBJECT` compares
+  it) and builds threads in memory. Its cap
   is `limits.thread_max_messages`.
 - **Multi-mailbox ESEARCH** (RFC 7377, `ESEARCH IN (...)`) runs one search per mailbox in scope.
-  It skips mailboxes the user may not read (the `r` right).
+  It skips shared mailboxes the user may not read (the `r` right) and the shared namespace root,
+  which holds no messages. The user's own mailboxes need no rights check. `INBOXES` counts as
+  part of `PERSONAL`.
 - **User API search** (`GET /user/mailboxes/{name}/search?q=...`) takes one string and matches it
   like IMAP `TEXT`: a substring of the Subject or of any From, To or Cc address or name, or
   all of its words in the body. It returns the newest 100 matches by arrival time. It is not
@@ -602,6 +664,7 @@ See [METRICS.md](METRICS.md) for the full list.
 | `FTS Worker: generated vectors for messages batch` | A batch committed. |
 | `FTS: batch time budget spent, committing partial progress` | A batch ran out of time and committed part of its work. |
 | `FTS Worker: failed to process batch, backing off briefly` | A batch failed; the worker waits for the next tick. |
+| `FTS: a body in this chunk cannot be tokenised, isolating it` | A group of bodies failed together; the worker retries them one by one to find the bad one. |
 | `FTS: failed to index content_hash, marking poison` | One body could not be parsed and got an empty vector. |
 | `Database: slow message scan detected` | Reading a search result took more than 5 seconds. |
 
@@ -620,17 +683,24 @@ See [METRICS.md](METRICS.md) for the full list.
 
 ### Upgrades that change search
 
-Two migrations change the search tables and can need work before you upgrade a large database:
+Several migrations change the search tables or the header index. On a large database they need
+work by hand before you upgrade, on the primary over a direct connection. Each migration file
+describes the steps in its header comment. The ones that build an index refuse to build it
+themselves on more than 25,000 messages.
 
-- **000050** creates `messages_fts_v2`. It copies the older table `messages_fts` itself only when
-  that table has at most 25,000 rows. On a larger database it refuses to run until the
-  out-of-band backfill in [scripts/fts_v2_backfill.sql](../scripts/fts_v2_backfill.sql) has
-  completed.
-- **000052** builds `idx_messages_mailbox_headers`. Rows whose subject or address columns exceed
-  the stored lengths of [section 2](#2-header-search) make the build fail; fix them first with
-  [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql).
+| Migration | What it adds | Before upgrading a large database |
+|---|---|---|
+| 000050 | `messages_fts_v2`. It copies the older table `messages_fts` itself only when that table has at most 25,000 rows. | Run the out-of-band backfill in [scripts/fts_v2_backfill.sql](../scripts/fts_v2_backfill.sql). |
+| 000052 | `idx_messages_mailbox_headers`, the first covering index for header search. | Fix over-long rows with [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql), then build the index concurrently. |
+| 000059 | `extra_addresses`, so FROM, TO and CC match every address, and the `_v2` covering index. | Add the column, build the new index concurrently and drop the old one. Optionally, once every node runs the new version, fill older rows with [scripts/backfill_extra_addresses.sql](../scripts/backfill_extra_addresses.sql); until then older messages match by their first address only. |
+| 000060, 000061 | `sent_utc_offset` and `sent_date_unknown`, for the SENT* date rules and the `NIL` ENVELOPE date. | Add the columns with a short lock timeout. |
+| 000062 | `idx_messages_mailbox_sent_date_unknown`. | Build the index concurrently. |
+| 000070 | `header_presence` and the `_v3` covering index, which replaces `_v2`. | Add the column and build `_v3` concurrently. A database not yet at 000059 can skip `_v2` and build `_v3` directly. |
+| 000073 | `message_id_raw` and its partial index. | Add the column and build the index concurrently. |
 
-The steps are in [DATABASE.md](DATABASE.md#9-migrations).
+None of these fills in old rows from the stored bodies. Messages stored before an upgrade keep
+the search behaviour they had, as described in [section 2](#2-header-search). The general steps
+are in [DATABASE.md](DATABASE.md#9-migrations).
 
 The older tables `messages_fts` and `message_contents` are still in the schema. Sora does not read
 or write them.
@@ -648,9 +718,9 @@ or write them.
 | What is charged to the rate limit | [server/imap/search_rate_limit.go](../server/imap/search_rate_limit.go) |
 | The token bucket | [server/search_rate_limiter.go](../server/search_rate_limiter.go) |
 | Body text extraction | `ExtractPlaintextBody` in [helpers/message.go](../helpers/message.go) |
-| Header columns at delivery | `sortColumnsFor` and `InsertMessage` in [db/append.go](../db/append.go) |
+| Header columns at delivery | `sortColumnsFor` and `InsertMessage` in [db/append.go](../db/append.go), `HeaderPresenceBit` in [helpers/header_presence.go](../helpers/header_presence.go) |
 | FTS staging | `stageFTS` and `restageFTS` in [db/append.go](../db/append.go) |
 | FTS worker | [server/fts/worker.go](../server/fts/worker.go), `ProcessFTSBatch` in [db/fts.go](../db/fts.go) |
 | Retention and orphan cleanup | `PruneOldMessageVectors`, `GetUnusedFTSKeys` in [db/cleaner.go](../db/cleaner.go), [server/cleaner/worker.go](../server/cleaner/worker.go) |
 | User API search | `SearchMessagesInMailbox` in [db/user_operations.go](../db/user_operations.go) |
-| Schema | [db/migrations/000050_messages_fts_v2.up.sql](../db/migrations/000050_messages_fts_v2.up.sql), [db/migrations/000052_messages_mailbox_headers_index.up.sql](../db/migrations/000052_messages_mailbox_headers_index.up.sql) |
+| Schema | [db/migrations/000050_messages_fts_v2.up.sql](../db/migrations/000050_messages_fts_v2.up.sql), [db/migrations/000052_messages_mailbox_headers_index.up.sql](../db/migrations/000052_messages_mailbox_headers_index.up.sql), [000059](../db/migrations/000059_messages_extra_addresses.up.sql), [000070](../db/migrations/000070_messages_header_presence.up.sql), [000073](../db/migrations/000073_messages_message_id_raw.up.sql) |
