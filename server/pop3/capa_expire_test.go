@@ -32,10 +32,11 @@ func capaExpire(t *testing.T, maxAge string) string {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
+	t.Cleanup(srv.Close)
 
 	client, server := net.Pipe()
 	t.Cleanup(func() { client.Close() })
-	go srv.buildLibServer().ServeConn(server)
+	go srv.pop3libServer.Load().ServeConn(server)
 	client.SetDeadline(time.Now().Add(10 * time.Second))
 
 	reader := bufio.NewReader(client)
@@ -68,8 +69,9 @@ func capaExpire(t *testing.T, maxAge string) string {
 }
 
 // EXPIRE is the minimum retention in whole days, or NEVER (RFC 2449 §6.7).
-// "EXPIRE 0" means the client may not leave mail on the server, so a positive
-// retention shorter than a day must still advertise at least 1 (#1904).
+// "EXPIRE 0" means the client may not leave mail on the server, while "EXPIRE 1"
+// promises at least a day. Neither describes positive sub-day retention, so that
+// policy must omit EXPIRE (#1904).
 func TestCAPAExpireFromMaxAgeRestriction(t *testing.T) {
 	tests := []struct {
 		maxAge string
@@ -77,10 +79,14 @@ func TestCAPAExpireFromMaxAgeRestriction(t *testing.T) {
 	}{
 		{"", "EXPIRE NEVER"},
 		{"0s", "EXPIRE NEVER"},
-		{"1h", "EXPIRE 1"},
-		{"23h59m", "EXPIRE 1"},
+		{"1ns", ""},
+		{"1h", ""},
+		{"23h59m", ""},
+		{"23h59m59.999999999s", ""},
 		{"24h", "EXPIRE 1"},
+		{"24h0m0.000000001s", "EXPIRE 1"},
 		{"47h", "EXPIRE 1"},
+		{"47h59m59.999999999s", "EXPIRE 1"},
 		{"48h", "EXPIRE 2"},
 		{"720h", "EXPIRE 30"},
 	}

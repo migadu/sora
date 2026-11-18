@@ -881,7 +881,7 @@ this order:
 | `SASL PLAIN` | When login is allowed on this connection. |
 | `LANG` | Always. |
 | `UTF8` | Always. |
-| `EXPIRE NEVER` or `EXPIRE <days>` | `<days>` is `[cleanup] max_age_restriction` in whole days, rounded down, and at least 1 (RFC 2449 reads `EXPIRE 0` as "do not leave mail on the server"). |
+| `EXPIRE NEVER` or `EXPIRE <days>` | `NEVER` when `[cleanup] max_age_restriction` is unlimited. For retention of at least 24 hours, `<days>` is whole days rounded down. Omitted for positive retention under 24 hours: RFC 2449 §6.7 cannot express fractional days, `EXPIRE 0` forbids leaving mail on the server, and `EXPIRE 1` would promise a day of retention. |
 | `AUTH-RESP-CODE` | Always. |
 | `IMPLEMENTATION Sora-POP3-Server` | Always. |
 

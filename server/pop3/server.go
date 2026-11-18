@@ -370,13 +370,16 @@ var knownCommands = map[string]bool{
 
 // expireParam is the CAPA EXPIRE argument for a message retention (RFC 2449
 // §6.7): NEVER when messages are kept forever, otherwise the retention in whole
-// days rounded down, but at least 1, since "EXPIRE 0" tells the client it may
-// not leave mail on the server at all.
+// days rounded down. An empty result omits EXPIRE for positive sub-day retention:
+// 0 forbids leaving mail on the server, while 1 promises at least a day.
 func expireParam(maxMessageAge time.Duration) string {
 	if maxMessageAge <= 0 {
 		return "NEVER"
 	}
-	return strconv.Itoa(max(1, int(maxMessageAge/(24*time.Hour))))
+	if maxMessageAge < 24*time.Hour {
+		return ""
+	}
+	return strconv.Itoa(int(maxMessageAge / (24 * time.Hour)))
 }
 
 // buildLibServer constructs the go-pop3 protocol server from the current
@@ -388,7 +391,10 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 
 	// Build custom capabilities based on config. Ephemeral-storage retention
 	// drives the CAPA EXPIRE value (RFC 2449 §6.7).
-	caps := []pop3.Capability{{Name: "EXPIRE", Params: []string{expireParam(s.maxMessageAge)}}}
+	var caps []pop3.Capability
+	if param := expireParam(s.maxMessageAge); param != "" {
+		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{param}})
+	}
 	caps = append(caps, pop3.Capability{Name: "AUTH-RESP-CODE"})
 	caps = append(caps, pop3.Capability{Name: "IMPLEMENTATION", Params: []string{"Sora-POP3-Server"}})
 
