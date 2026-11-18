@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -30,13 +32,52 @@ func TestExtraAddressesBackfillMatchesWriter(t *testing.T) {
 	for i := range 60 {
 		many = append(many, helpers.Recipient{AddressType: "to", Name: fmt.Sprintf("Person Number %d", i), EmailAddress: fmt.Sprintf("person.number.%d@example.com", i)})
 	}
+	// Section shares (#2113): a long To beside a short Cc, and all three sections long, in
+	// two-byte runes so that each section's cut has to back off a split character.
+	longToShortCc := append(slices.Clone(many),
+		helpers.Recipient{AddressType: "cc", Group: "mm-team"}, helpers.Recipient{AddressType: "cc", EmailAddress: "member@example.org"},
+		helpers.Recipient{AddressType: "cc", GroupEnd: true})
+	var allLong []helpers.Recipient
+	for _, kind := range []string{"from", "to", "cc"} {
+		for i := range 40 {
+			allLong = append(allLong, helpers.Recipient{AddressType: kind, Name: fmt.Sprintf("Pérsön %s %d", kind, i), EmailAddress: fmt.Sprintf("%s.%d@example.com", kind, i)})
+		}
+	}
+	// A leading Cc group's name is the CC sort key and is set aside from the shares, cut to
+	// the 200-byte sort-column bound without splitting a character: crowded and uncrowded (#2113).
+	firstLong := []helpers.Recipient{
+		{AddressType: "from", Name: strings.Repeat("f", 200), EmailAddress: strings.Repeat("f", 188) + "@example.com"},
+		{AddressType: "to", Name: strings.Repeat("t", 200), EmailAddress: strings.Repeat("t", 188) + "@example.com"},
+	}
+	ccGroup := func(name string) []helpers.Recipient {
+		return []helpers.Recipient{{AddressType: "cc", Group: name}, {AddressType: "cc", EmailAddress: "member@example.org"}, {AddressType: "cc", GroupEnd: true}}
+	}
+	crowded := slices.Clone(firstLong)
+	for i := range 20 {
+		crowded = append(crowded, helpers.Recipient{AddressType: "from", Name: fmt.Sprintf("Later Sender %d", i), EmailAddress: fmt.Sprintf("later.sender.%d@example.com", i)},
+			helpers.Recipient{AddressType: "to", Name: fmt.Sprintf("Later Recipient %d", i), EmailAddress: fmt.Sprintf("later.recipient.%d@example.com", i)})
+	}
 	fixtures := map[string][]helpers.Recipient{
-		"every":   everyAddressRecipients,
-		"single":  {{AddressType: "from", EmailAddress: "a@example.com"}, {AddressType: "to", Name: "B", EmailAddress: "b@example.com"}},
-		"cc-only": {{AddressType: "cc", Name: "Only Cc", EmailAddress: "cc@example.com"}},
-		"tabbed":  {{AddressType: "to", EmailAddress: "x@example.com"}, {AddressType: "to", Name: "Tab\tAnd\nNewline", EmailAddress: "y@example.com"}},
-		"bounded": many,
-		"empty":   nil,
+		"cc-key-uncrowded":  append(slices.Clone(firstLong), ccGroup(strings.Repeat("g", 180))...),
+		"cc-key-crowded":    append(slices.Clone(crowded), ccGroup(strings.Repeat("g", 180))...),
+		"cc-key-over-bound": append(slices.Clone(crowded), ccGroup(strings.Repeat("h", 250))...),
+		"cc-key-split-rune": append(slices.Clone(crowded), ccGroup(strings.Repeat("€", 80))...),
+		"cc-key-alone":      ccGroup("Team Only"),
+		"long-to-short-cc":  longToShortCc,
+		"all-long":          allLong,
+		"every":             everyAddressRecipients,
+		"single":            {{AddressType: "from", EmailAddress: "a@example.com"}, {AddressType: "to", Name: "B", EmailAddress: "b@example.com"}},
+		"cc-only":           {{AddressType: "cc", Name: "Only Cc", EmailAddress: "cc@example.com"}},
+		"tabbed":            {{AddressType: "to", EmailAddress: "x@example.com"}, {AddressType: "to", Name: "Tab\tAnd\nNewline", EmailAddress: "y@example.com"}},
+		"bounded":           many,
+		"empty":             nil,
+		// A header starting with a group: its start is the first address (#2016); a later
+		// group's name is a further address (#2036).
+		"groups": {
+			{AddressType: "to", Group: "team"}, {AddressType: "to", EmailAddress: "m1@example.com"}, {AddressType: "to", GroupEnd: true},
+			{AddressType: "to", Group: "Second Team"}, {AddressType: "to", GroupEnd: true},
+			{AddressType: "cc", Group: "undisclosed-recipients"}, {AddressType: "cc", GroupEnd: true},
+		},
 	}
 
 	tx, err := db.GetWritePool().Begin(ctx)

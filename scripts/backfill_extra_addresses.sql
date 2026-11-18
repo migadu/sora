@@ -36,6 +36,7 @@
 -- Afterwards: DROP PROCEDURE sora_backfill_extra_addresses(bigint, int, int);
 --             DROP FUNCTION sora_backfill_extra_addresses_batch(bigint, bigint);
 --             DROP FUNCTION sora_extra_addresses(jsonb, text, text, text, text, text);
+--             DROP FUNCTION sora_extra_addresses_shares(int, int, int, int);
 --             DROP FUNCTION sora_trunc_utf8(text, int);   -- unless scripts/fix_oversized_header_columns.sql still needs it
 
 -- UTF-8-safe byte truncation, as helpers.TruncateUTF8Safe (identical to the function in
@@ -59,11 +60,36 @@ BEGIN
 END
 $$;
 
+-- The byte shares of the From, To and Cc sections, as extraAddressesShares in db/append.go:
+-- smallest section first, each gets all of itself or an equal share of what is left,
+-- whichever is less; ties in section order.
+CREATE OR REPLACE FUNCTION sora_extra_addresses_shares(len_from int, len_to int, len_cc int, budget int) RETURNS int[]
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+	lens int[] := ARRAY[len_from, len_to, len_cc];
+	shares int[] := ARRAY[0, 0, 0];
+	ord int[];
+	lft int := greatest(budget, 0);
+	i int;
+BEGIN
+	SELECT array_agg(k ORDER BY lens[k], k) INTO ord FROM generate_series(1, 3) AS k;
+	FOR n IN 1..3 LOOP
+		i := ord[n];
+		shares[i] := least(lens[i], lft / (4 - n));
+		lft := lft - shares[i];
+	END LOOP;
+	RETURN shares;
+END
+$$;
+
 -- The extra_addresses value for a row, from its recipients_json and its five first-address
 -- sort columns: sections From, To, Cc separated by a newline; in each, the lowercased names and
 -- addresses the sort columns do not hold (every address after the first, and the first Cc's
--- name), in header order, separated by a tab; tabs and newlines inside a value become spaces;
--- trailing empty sections dropped; cut to what the sort columns leave of 1300 bytes
+-- name, or its group name when Cc starts with a group; a later group start's address is its
+-- group name, a group end has none), in header order, separated by a tab; tabs and newlines inside a value become spaces;
+-- trailing empty sections dropped; each section cut to its share
+-- (sora_extra_addresses_shares) of what the sort columns, the two section separators and a
+-- leading Cc group's name (cut to 200 bytes, kept whole) leave of 1300 bytes
 -- (helpers.MaxAddressColumnsBytes).
 CREATE OR REPLACE FUNCTION sora_extra_addresses(
 	recipients jsonb, from_name text, from_email text, to_name text, to_email text, cc_email text
@@ -73,7 +99,8 @@ LANGUAGE sql IMMUTABLE AS $$
 		SELECT e->>'type' AS kind, ord,
 		       row_number() OVER (PARTITION BY e->>'type' ORDER BY ord) AS nth,
 		       translate(lower(COALESCE(e->>'name', '')), E'\t\n', '  ') AS name,
-		       translate(lower(COALESCE(e->>'email', '')), E'\t\n', '  ') AS email
+		       translate(lower(COALESCE(NULLIF(e->>'email', ''), e->>'group', '')), E'\t\n', '  ') AS email,
+		       translate(lower(COALESCE(e->>'group', '')), E'\t\n', '  ') AS grp
 		FROM jsonb_array_elements(CASE WHEN jsonb_typeof(recipients) = 'array' THEN recipients ELSE '[]'::jsonb END)
 		     WITH ORDINALITY AS a(e, ord)
 		WHERE e->>'type' IN ('from', 'to', 'cc')
@@ -86,12 +113,18 @@ LANGUAGE sql IMMUTABLE AS $$
 		       COALESCE(string_agg(val, E'\t' ORDER BY ord, part) FILTER (WHERE kind = 'to'), '') AS t,
 		       COALESCE(string_agg(val, E'\t' ORDER BY ord, part) FILTER (WHERE kind = 'cc'), '') AS c
 		FROM v
+	), k AS (
+		-- A leading Cc group's name, the CC sort key: bounded like the sort columns and set
+		-- aside from the shares, so other addresses cannot shorten it.
+		SELECT COALESCE((SELECT sora_trunc_utf8(grp, 200) FROM r WHERE kind = 'cc' AND nth = 1 AND grp <> ''), '') AS key
+	), cc AS (
+		SELECT f, t, key, CASE WHEN key <> '' AND c <> '' THEN E'\t' || c ELSE c END AS c FROM s, k
 	)
-	SELECT sora_trunc_utf8(rtrim(f || E'\n' || t || E'\n' || c, E'\n'),
-	                       greatest(1300 - octet_length(COALESCE(from_name, '')) - octet_length(COALESCE(from_email, ''))
-	                                     - octet_length(COALESCE(to_name, '')) - octet_length(COALESCE(to_email, ''))
-	                                     - octet_length(COALESCE(cc_email, '')), 0))
-	FROM s
+	SELECT rtrim(sora_trunc_utf8(f, sh[1]) || E'\n' || sora_trunc_utf8(t, sh[2]) || E'\n' || key || sora_trunc_utf8(c, sh[3]), E'\n')
+	FROM cc, LATERAL (SELECT sora_extra_addresses_shares(octet_length(f), octet_length(t), octet_length(c),
+	                         1300 - octet_length(COALESCE(from_name, '')) - octet_length(COALESCE(from_email, ''))
+	                              - octet_length(COALESCE(to_name, '')) - octet_length(COALESCE(to_email, ''))
+	                              - octet_length(COALESCE(cc_email, '')) - 2 - octet_length(key)) AS sh) AS budget
 $$;
 
 -- One batch: fill the live rows with ids in [p_lo, p_hi] that are still NULL and have

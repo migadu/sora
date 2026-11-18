@@ -117,7 +117,9 @@ func TestIMAP_HeaderPresenceForwardOnlyRawSyntax(t *testing.T) {
 		for _, tc := range []struct {
 			line string
 			want []int
-		}{{"HEADER " + key + ` ""`, []int{1, 2, 4, 5, 6}}, {"NOT HEADER " + key + ` ""`, []int{3}}, {strings.ToUpper(key) + ` ""`, []int{4, 5}}, {"NOT " + strings.ToUpper(key) + ` ""`, []int{1, 2, 3, 6}}} {
+		}{{"HEADER " + key + ` ""`, []int{1, 2, 4, 5, 6}}, {"NOT HEADER " + key + ` ""`, []int{3}},
+			// UID 1's empty group is an envelope address (its group start, RFC 3501 §7.4.2).
+			{strings.ToUpper(key) + ` ""`, []int{1, 4, 5}}, {"NOT " + strings.ToUpper(key) + ` ""`, []int{2, 3, 6}}} {
 			if got := search(tc.line); !slices.Equal(got, tc.want) {
 				t.Errorf("%s=%v want%v", tc.line, got, tc.want)
 			}

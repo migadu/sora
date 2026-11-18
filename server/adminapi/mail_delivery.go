@@ -14,7 +14,6 @@ import (
 
 	"github.com/migadu/sora/logger"
 
-	"github.com/emersion/go-message"
 	"github.com/emersion/go-message/mail"
 	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/pkg/metrics"
@@ -223,6 +222,17 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The envelope sender the caller named, in its written form (#1970). It is refused
+	// when it does not parse, as LMTP refuses it at MAIL FROM (#1995), rather than
+	// delivered with none; what is checked here is the sender every recipient gets.
+	// "<>" is the null sender. Only the fallback taken from the From: header below may
+	// be dropped.
+	sender, err := explicitSender(req.From)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid sender: %v", err))
+		return
+	}
+
 	// Validate message
 	if len(messageBytes) == 0 {
 		s.writeError(w, http.StatusBadRequest, "Message body is required")
@@ -251,10 +261,14 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Extract sender address if not provided
+	// Without a "from", the first From: address is the sender (#1970). net/mail has
+	// already decoded it, so it is neither trimmed nor decoded again, and one that does
+	// not parse is ignored: the caller did not name it.
 	if req.From == "" {
 		if fromAddrs, err := helpers.ParseAddressList(messageEntity.Header.Get("From")); err == nil && len(fromAddrs) > 0 {
-			req.From = fromAddrs[0].Address
+			if addr, err := server.NewReversePath(fromAddrs[0].Address); err == nil {
+				sender = &addr
+			}
 		}
 	}
 
@@ -283,7 +297,7 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	for _, recipient := range req.Recipients {
-		status := s.deliverToRecipient(ctx, &req, recipient, messageBytes, messageEntity)
+		status := s.deliverToRecipient(ctx, &req, recipient, messageBytes, sender)
 		response.Recipients = append(response.Recipients, status)
 
 		if !status.Accepted {
@@ -333,8 +347,24 @@ func (s *Server) notifyRelayWorker() {
 	}
 }
 
+// explicitSender reads the sender a caller named in "from" (JSON, form, query or X-From).
+// It is in its written form, RFC 5321 §4.1.2 syntax, so it is decoded here, once, by
+// server.NewSerializedReversePath. Whitespace around it is the client's: none can stand
+// outside a quoted local part. An empty value and "<>" are the null sender (nil).
+func explicitSender(from string) (*server.Address, error) {
+	from = strings.TrimSpace(from)
+	if from == "" || from == "<>" {
+		return nil, nil
+	}
+	addr, err := server.NewSerializedReversePath(from)
+	if err != nil {
+		return nil, err
+	}
+	return &addr, nil
+}
+
 // deliverToRecipient delivers a message to a single recipient using the delivery package
-func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest, recipient string, messageBytes []byte, _ *message.Entity) RecipientStatus {
+func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest, recipient string, messageBytes []byte, sender *server.Address) RecipientStatus {
 	status := RecipientStatus{
 		Email:    recipient,
 		Accepted: false,
@@ -383,7 +413,11 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 
 	deliveryCtx.SieveExecutor = sieveExecutor
 
-	logger.Log("starting delivery from=%s size=%d uid=%v", req.From, len(messageBytes), req.UID)
+	from := ""
+	if sender != nil {
+		from = sender.FullAddress()
+	}
+	logger.Log("starting delivery from=%s size=%d uid=%v", from, len(messageBytes), req.UID)
 
 	// Lookup recipient
 	recipientInfo, err := deliveryCtx.LookupRecipient(ctx, recipient)
@@ -398,12 +432,8 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 
 	logger.Log("recipient found AccountID=%d", recipientInfo.AccountID)
 
-	// Set from address if provided
-	if req.From != "" {
-		if addr, parseErr := server.NewAddress(req.From); parseErr == nil {
-			recipientInfo.FromAddress = &addr
-		}
-	}
+	// The envelope sender, parsed once for every recipient by handleDeliverMail.
+	recipientInfo.FromAddress = sender
 
 	// Set preserved UID fields for migration
 	recipientInfo.PreservedUID = req.UID

@@ -304,41 +304,42 @@ var (
 )
 
 // NewReversePath parses the reverse-path of MAIL FROM as go-smtp hands it to a session:
-// the mailbox between the angle brackets, with a quoted local part already unquoted. The
-// null reverse-path ("") is the caller's to handle; it is refused here.
+// the mailbox between the angle brackets, decoded. go-smtp has already unquoted a quoted
+// local part (`"John Doe"@example.com` arrives as "John Doe@example.com"), and net/mail
+// does the same with a From: field. Whatever quote or backslash is left is part of the
+// mailbox and is kept: MAIL FROM:<"\"x\""@example.com> arrives as `"x"@example.com`,
+// which is not the mailbox x@example.com. The null reverse-path ("") is the caller's to
+// handle; it is refused here. A mailbox still in its written form (an Admin API "from")
+// goes through NewSerializedReversePath: decoding it here would decode the go-smtp form
+// a second time.
 //
-// A sender NewAddress accepts without a master-token suffix is returned exactly as
-// NewAddress returns it. The suffix (user@domain@SUFFIX) belongs to login names, not to
-// envelope addresses: a second "@" can only come from a quoted local part, so
-// "a@b.example@example.com" is the sender `"a@b.example"@example.com` (#1938). Otherwise
-// the sender is read as leniently as go-smtp's own parser reads it, which is what Postfix
-// does with strict_rfc821_envelopes = no: leading, trailing and consecutive dots in the
-// local part (older mobile carrier addresses), a quoted local part, a dotless domain and
-// an address literal. Refusing them would bounce mail the MTA was right to send (#1907).
-// Forward-paths stay with NewAddress.
+// The suffix (user@domain@SUFFIX) belongs to login names, not to envelope addresses: a
+// second "@" can only come from a quoted local part, so "a@b.example@example.com" is
+// the sender `"a@b.example"@example.com` (#1938). The sender is read as leniently as
+// go-smtp's own parser reads it, which is what Postfix does with
+// strict_rfc821_envelopes = no: leading, trailing and consecutive dots in the local part
+// (older mobile carrier addresses), a quoted local part, a dotless domain and an address
+// literal. Refusing them would bounce mail the MTA was right to send (#1907). Forward-paths
+// stay with NewAddress.
 //
-// What is returned is safe to write into a command or a header: no control character
-// survives (CR and LF included), the length limits of NewAddress apply to the form
-// returned, and a local part that is not a dot-string is returned quoted (RFC 5321
-// §4.1.2 Quoted-string, with "\" and `"` escaped), so FullAddress is the mailbox in the
-// form a MAIL FROM, RCPT TO or To: field takes it. Like NewAddress, the address is
-// lower-cased and a non-ASCII domain is folded to its A-label.
+// What is returned is the mailbox replies and redirects are sent to, so the local part
+// keeps the case it was sent with (RFC 5321 §2.4: SMTP implementations "MUST take care
+// to preserve the case of mailbox local-parts", #2101); only the domain is lower-cased,
+// and a non-ASCII domain is folded to its A-label. Compare or key senders in lower case.
+// It is safe to write into a command or a header: no control character survives (CR and
+// LF included), the length limits of NewAddress apply to the form returned, and a local
+// part that is not a dot-string is returned quoted once (RFC 5321 §4.1.2 Quoted-string,
+// with "\" and `"` escaped, the minimum quoting possible), so FullAddress is the mailbox
+// in the form a MAIL FROM, RCPT TO or To: field takes it.
 func NewReversePath(input string) (Address, error) {
-	// NewAddress trims the input, which would take the space off a quoted local part
-	// such as `" x"`.
-	if strings.TrimSpace(input) == input {
-		if addr, err := parseAddress(input); err == nil && !addr.HasSuffix() {
-			return addr, nil
-		}
-	}
-	addr, err := parseLenientReversePath(input)
+	addr, err := parseReversePath(input)
 	if err != nil {
 		return Address{}, addressError{err}
 	}
 	return addr, nil
 }
 
-func parseLenientReversePath(input string) (Address, error) {
+func parseReversePath(input string) (Address, error) {
 	if !utf8.ValidString(input) {
 		return Address{}, fmt.Errorf("address is not valid UTF-8: %q", input)
 	}
@@ -353,7 +354,7 @@ func parseLenientReversePath(input string) (Address, error) {
 	if at <= 0 || at == len(input)-1 {
 		return Address{}, fmt.Errorf("invalid email format: %q", input)
 	}
-	localPart := strings.ToLower(input[:at])
+	localPart := input[:at]
 	domain := strings.ToLower(input[at+1:])
 
 	detail := ""
@@ -395,4 +396,65 @@ func parseLenientReversePath(input string) (Address, error) {
 		domain:      domain,
 		detail:      detail,
 	}, nil
+}
+
+// NewSerializedReversePath parses a reverse-path in its written form, RFC 5321 §4.1.2
+// Mailbox syntax as a caller writes it (the Admin API "from"), not as go-smtp hands it
+// over. It decodes the mailbox the way go-smtp decodes MAIL FROM and hands the result
+// to NewReversePath, so the two agree on every mailbox both can carry:
+// `"John Doe"@example.com` here is "John Doe@example.com" there.
+//
+// The input must be valid UTF-8 before anything is unescaped, so that a "\" cannot
+// splice a valid character out of invalid bytes. A local part is then either a
+// Quoted-string, DQUOTE *(qtextSMTP / quoted-pairSMTP) DQUOTE with quoted-pairSMTP =
+// "\" %d32-126 (plus UTF-8 in qtext, RFC 6531 §3.3), followed by "@" and a domain
+// without one; or unquoted, where a `"`, "\", space or other special cannot stand. An
+// unquoted local part is a lenient dot-string, as NewReversePath reads one; a second
+// "@" is read as LMTP reads it (#1938), so "a@b.example@example.com" is still the
+// sender `"a@b.example"@example.com`.
+func NewSerializedReversePath(input string) (Address, error) {
+	decoded, err := decodeSerializedMailbox(input)
+	if err != nil {
+		return Address{}, addressError{err}
+	}
+	return NewReversePath(decoded)
+}
+
+// decodeSerializedMailbox returns the mailbox in input with its local part decoded.
+func decodeSerializedMailbox(input string) (string, error) {
+	if !utf8.ValidString(input) {
+		return "", fmt.Errorf("address is not valid UTF-8: %q", input)
+	}
+	if !strings.HasPrefix(input, `"`) {
+		at := strings.LastIndexByte(input, '@')
+		if at <= 0 {
+			return "", fmt.Errorf("invalid email format: %q", input)
+		}
+		for _, part := range strings.Split(input[:at], "@") {
+			if !lenientDotStringRe.MatchString(part) {
+				return "", fmt.Errorf("local part is neither a dot-string nor a quoted string: %q", input)
+			}
+		}
+		return input, nil
+	}
+	var local strings.Builder
+	for i := 1; i < len(input); i++ {
+		switch c := input[i]; c {
+		case '"':
+			rest := input[i+1:]
+			if !strings.HasPrefix(rest, "@") || strings.Contains(rest[1:], "@") {
+				return "", fmt.Errorf("quoted local part is not followed by @ and a domain: %q", input)
+			}
+			return local.String() + rest, nil
+		case '\\':
+			i++
+			if i == len(input) || input[i] < 0x20 || input[i] > 0x7e {
+				return "", fmt.Errorf("\\ in a quoted local part must quote a printable ASCII character: %q", input)
+			}
+			local.WriteByte(input[i])
+		default:
+			local.WriteByte(c)
+		}
+	}
+	return "", fmt.Errorf("quoted local part does not end: %q", input)
 }

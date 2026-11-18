@@ -59,11 +59,11 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, lookup
 	var timeout time.Duration
 	flags := flag.NewFlagSet("sora-imaptest", flag.ContinueOnError)
 	flags.SetOutput(stderr)
-	flags.StringVar(&cfg.Addr, "addr", "", "running IMAP server address (host:port)")
-	flags.StringVar(&cfg.Username, "user", "", "dedicated test account username")
-	flags.StringVar(&passwordEnv, "password-env", "SORA_IMAPTEST_PASSWORD", "environment variable containing the password")
+	flags.StringVar(&cfg.Addr, "addr", "localhost:143", "running IMAP server address (host:port)")
+	flags.StringVar(&cfg.Username, "user", "alice@example.com", "dedicated test account username")
+	flags.StringVar(&passwordEnv, "password-env", "SORA_IMAPTEST_PASSWORD", "environment variable overriding the seeded password")
 	flags.StringVar(&passwordFile, "password-file", "", "read password from a file instead of the environment (one trailing newline removed)")
-	flags.StringVar(&cfg.TLSMode, "tls", "implicit", "transport: implicit, starttls, or none")
+	flags.StringVar(&cfg.TLSMode, "tls", "none", "transport: implicit, starttls, or none")
 	flags.StringVar(&cfg.CAFile, "ca-file", "", "additional PEM certificate authorities")
 	flags.StringVar(&cfg.ServerName, "server-name", "", "TLS server name (defaults to address host)")
 	flags.BoolVar(&cfg.Insecure, "insecure", false, "disable TLS certificate verification for a test endpoint")
@@ -78,9 +78,10 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, lookup
 	flags.DurationVar(&timeout, "timeout", 15*time.Minute, "maximum suite duration, excluding bounded cleanup")
 	flags.StringVar(&rawlog, "rawlog", "", "write a protocol trace to a new file (authentication is redacted)")
 	flags.Usage = func() {
-		fmt.Fprintln(stderr, "Usage: sora-imaptest -addr host:port -user account [options]")
+		fmt.Fprintln(stderr, "Usage: sora-imaptest [options]")
 		fmt.Fprintln(stderr, "Runs IMAP protocol cases against an existing server using temporary mailboxes.")
 		fmt.Fprintln(stderr, "The account must permit mailbox creation and message deletion.")
+		fmt.Fprintln(stderr, "Defaults: localhost:143, no TLS, alice@example.com, password \"password\".")
 		flags.PrintDefaults()
 	}
 	if err := flags.Parse(args); err != nil {
@@ -134,7 +135,7 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, lookup
 		return 0
 	}
 	if cfg.Addr == "" || cfg.Username == "" {
-		fmt.Fprintln(stderr, "-addr and -user are required; -list needs neither")
+		fmt.Fprintln(stderr, "-addr and -user must not be empty")
 		return 2
 	}
 	if timeout <= 0 || cfg.CommandTimeout <= 0 || cfg.CaseTimeout <= 0 || cfg.FTSTimeout <= 0 {
@@ -162,11 +163,19 @@ func runCLI(ctx context.Context, args []string, stdout, stderr io.Writer, lookup
 			cfg.Password = strings.TrimSuffix(trimmed, "\r")
 		}
 	} else {
-		var present bool
-		cfg.Password, present = lookupEnv(passwordEnv)
-		if !present {
+		passwordEnvExplicit := false
+		flags.Visit(func(f *flag.Flag) {
+			if f.Name == "password-env" {
+				passwordEnvExplicit = true
+			}
+		})
+		if password, present := lookupEnv(passwordEnv); present {
+			cfg.Password = password
+		} else if passwordEnvExplicit {
 			fmt.Fprintf(stderr, "password environment variable %q is not set; use -password-env or -password-file\n", passwordEnv)
 			return 2
+		} else {
+			cfg.Password = "password"
 		}
 	}
 	cfg.RequiredCapabilities = strings.FieldsFunc(required, func(r rune) bool { return r == ',' || unicode.IsSpace(r) })

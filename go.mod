@@ -20,10 +20,10 @@ require (
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/k3a/html2text v1.5.1
 	github.com/klauspost/compress v1.20.4
-	github.com/migadu/go-imap v1.2.10
-	github.com/migadu/go-managesieve v0.1.6
-	github.com/migadu/go-pop3 v0.1.7
-	github.com/migadu/go-sieve v1.5.4
+	github.com/migadu/go-imap v1.2.11
+	github.com/migadu/go-managesieve v0.1.7
+	github.com/migadu/go-pop3 v0.1.8
+	github.com/migadu/go-sieve v1.5.5
 	github.com/pierrec/lz4/v4 v4.1.33
 	github.com/prometheus/client_golang v1.25.0
 	github.com/prometheus/client_model v0.6.3
@@ -38,7 +38,7 @@ require (
 	modernc.org/sqlite v1.62.0
 )
 
-replace github.com/emersion/go-smtp => github.com/migadu/go-smtp v0.24.0-migadu.2
+replace github.com/emersion/go-smtp => github.com/migadu/go-smtp v0.24.0-migadu.3
 
 replace github.com/emersion/go-message => github.com/migadu/go-message v0.19.0
 

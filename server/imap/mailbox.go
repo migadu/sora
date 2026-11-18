@@ -100,34 +100,56 @@ func getDisplayFlagsInSnapshot(ctx context.Context, rdb *resilient.ResilientData
 	return buildDisplayFlags(customFlagsFromDB), nil
 }
 
+// announceNewKeywords writes the FLAGS list of mailbox mailboxID extended by
+// those of keywords the client has not been told the mailbox uses, before the
+// caller writes a response showing them (RFC 3501 §5.2, §7.2.6; #2042). Every
+// writer of message flags calls it first: Poll, FETCH and STORE. announcedMu
+// is held across the write, so a concurrent writer (the NOTIFY pump next to a
+// command) cannot show a keyword between the list growing and the FLAGS
+// response being written. PERMANENTFLAGS lists no keywords (at most \*), so
+// it does not change with them.
+func (s *IMAPSession) announceNewKeywords(mailboxID int64, keywords []string, write func([]imap.Flag) error) error {
+	if len(keywords) == 0 {
+		return nil
+	}
+	s.announcedMu.Lock()
+	defer s.announcedMu.Unlock()
+	if s.announcedFlags == nil || s.announcedMailboxID != mailboxID {
+		return nil
+	}
+	flags := mailboxFlagsWithNewKeywords(s.announcedFlags, keywords)
+	if flags == nil {
+		return nil
+	}
+	if err := write(flags); err != nil {
+		return err
+	}
+	s.announcedFlags = flags
+	return nil
+}
+
 // mailboxFlagsWithNewKeywords returns announced, the FLAGS list the client has,
-// extended by the keywords of the messages in updates that it lacks, or nil
-// when it lacks none. The list only grows: a FLAGS response replaces the
-// client's list, so leaving out a keyword still on a message would tell the
-// client the mailbox no longer has it.
-func mailboxFlagsWithNewKeywords(announced []imap.Flag, updates []db.MessageUpdate) []imap.Flag {
+// extended by the keywords it lacks, or nil when it lacks none. The list only
+// grows: a FLAGS response replaces the client's list, so leaving out a keyword
+// still on a message would tell the client the mailbox no longer has it.
+func mailboxFlagsWithNewKeywords(announced []imap.Flag, keywords []string) []imap.Flag {
 	known := make(map[string]struct{}, len(announced))
 	for _, f := range announced {
 		known[strings.ToLower(string(f))] = struct{}{}
 	}
 	var added []string
-	for _, update := range updates {
-		if update.IsExpunge {
+	for _, kw := range keywords {
+		key := strings.ToLower(kw)
+		if _, ok := known[key]; ok {
 			continue
 		}
-		for _, kw := range update.CustomFlags {
-			key := strings.ToLower(kw)
-			if _, ok := known[key]; ok {
-				continue
-			}
-			// Poll and FETCH drop a keyword that is not an atom, so it is
-			// never shown and must not be announced either.
-			if len(helpers.SanitizeFlags([]imap.Flag{imap.Flag(kw)})) == 0 {
-				continue
-			}
-			known[key] = struct{}{}
-			added = append(added, kw)
+		// Poll and FETCH drop a keyword that is not an atom, so it is never
+		// shown and must not be announced either.
+		if len(helpers.SanitizeFlags([]imap.Flag{imap.Flag(kw)})) == 0 {
+			continue
 		}
+		known[key] = struct{}{}
+		added = append(added, kw)
 	}
 	if len(added) == 0 {
 		return nil

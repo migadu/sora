@@ -71,14 +71,16 @@ it with `strpos()`, so `%` and `_` in a term are ordinary characters, not wildca
 | `FROM` | address columns | Substring of any From address or display name. |
 | `TO` | address columns | Substring of any To address or display name. |
 | `CC` | address columns | Substring of any Cc address or display name. |
-| `BCC`, `HEADER Bcc`, `HEADER Reply-To`, `HEADER Sender` | `recipients_json` | Substring of any address or display name of that header. |
+| `BCC`, `HEADER Bcc`, `HEADER Reply-To`, `HEADER Sender` | `recipients_json` | Substring of any address, display name or group name of that header. |
 | `HEADER Message-ID` | `message_id` | A whole ID in angle brackets (`<id@example.com>`) is matched exactly, ignoring case. Any other term is a substring of the field as written, with its angle brackets. |
 | `HEADER In-Reply-To` | `in_reply_to` | Substring of the stored message IDs, written with their angle brackets, ignoring case. |
 | `HEADER References` | `references` | Substring of the stored chain of message IDs, written with their angle brackets, ignoring case. |
 | `HEADER` with any other name | none | Matches no message. Sora logs `HEADER search on non-indexed header returns no results` at debug level. |
 
 The address columns are the first From, To and Cc name and address (also used by `SORT`), plus
-`extra_addresses`, which holds every further From, To and Cc name and address.
+`extra_addresses`, which holds every further From, To and Cc name and address. A group's name
+counts as an address of its header (RFC 3501 §7.4.2 makes a group start an address), so
+`TO team` matches `To: team: a@example.com;`, and `TO ""` matches `To: undisclosed-recipients:;`.
 
 What this means for users:
 
@@ -116,8 +118,13 @@ Stored values are cut to fixed lengths, so only the start of a very long value i
 | `extra_addresses` | what the five columns above leave of 1300 bytes, lowercased |
 | `in_reply_to`, `references` | first 2000 bytes |
 
-So in a message with very many recipients, the addresses past about 1300 bytes are not
-searchable.
+So in a message with very many recipients, not every address is searchable. The From, To
+and Cc parts of `extra_addresses` share its length: each keeps all of itself or an equal share,
+whichever is less, and what a short part leaves goes to the others. A long To list therefore
+cuts only the end of the To list, never the Cc addresses. A leading Cc group's name, the `CC`
+sort key, is set aside before the parts share the rest: it keeps its first 200 bytes, like the
+other sort columns, however many other addresses the message has. Messages stored before this
+rule keep the value cut at the end.
 
 ### The covering index
 
@@ -622,7 +629,11 @@ limiter logs a refusal at debug level at most once a minute per account.
   keys use the `*_sort` columns, so sorting by From, To or Cc uses the first address only. `FROM`,
   `TO` and `CC` sort by the address's local part (the part before the last `@`, RFC 5256 §3);
   `DISPLAYFROM` and `DISPLAYTO` by the display name, or the address when there is none
-  (RFC 5957). A message without a `Date:` header sorts by its INTERNALDATE under `DATE`.
+  (RFC 5957). When a header starts with a group (`Cc: team: a@example.com;`), its first address
+  is the group start, so the header sorts by the group name, all of it even when it holds an `@`
+  (RFC 3501 §7.4.2). The group start's address column is left empty and its name is stored where
+  the header's first display name goes (for Cc, at the head of its `extra_addresses` section), so
+  SEARCH sees only the name as written. A message without a `Date:` header sorts by its INTERNALDATE under `DATE`.
   Strings are compared with the `i;unicode-casemap` collation (RFC 5256 §7): case is ignored and
   compatibility characters are decomposed, then the strings are compared byte by byte, never by
   the database's own collation. Ties are broken by ascending UID, also under `REVERSE`.

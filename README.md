@@ -91,8 +91,8 @@ database `sora_test_db`. [`docs/TESTING.md`](docs/TESTING.md) explains the test 
 database and the known pitfalls.
 
 To check an already running IMAP endpoint, build `make sora-imaptest` and run
-`./sora-imaptest -addr localhost:993 -user imaptest@example.test` with the password in
-`SORA_IMAPTEST_PASSWORD`. The runner creates and removes temporary test mailboxes through IMAP.
+`./sora-imaptest -clients 4`. Defaults match the local seed: `localhost:143`, no TLS,
+`alice@example.com`, and password `password`. The runner creates and removes temporary test mailboxes through IMAP.
 See [`docs/IMAPTEST.md`](docs/IMAPTEST.md) for TLS modes, case selection and reports.
 
 ## Documentation

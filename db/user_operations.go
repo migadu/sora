@@ -64,7 +64,7 @@ func (msg *DBMessage) setRecipients(recipientsJSON []byte) {
 		logger.Warn("Database: failed to decode recipients JSON", "message_id", msg.ID, "err", err)
 		return
 	}
-	for _, r := range recipients {
+	for _, r := range helpers.DistinctAddresses(recipients) {
 		switch r.AddressType {
 		case "from":
 			if msg.From == "" {

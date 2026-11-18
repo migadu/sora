@@ -483,6 +483,10 @@ func (e *SieveExecutor) Evaluate(evalCtx context.Context, ctx Context) (Result, 
 		// to time.Duration, which would overflow for large Sieve numbers.
 		days := max(1, min(vacation.Days, consts.MaxVacationDays))
 		duration := time.Duration(days) * 24 * time.Hour
+		// The envelope sender keeps the case of its local part (#2101), but the :days
+		// window (RFC 5230 §4.2) is kept per sender compared in lower case, the key
+		// every window was stored under while the sender was lower-cased on the way in.
+		sender = strings.ToLower(sender)
 		allowed, err := execPolicy.VacationResponseAllowed(timeoutCtx, data, sender, vacation.ResponseIdentity, duration)
 		if err != nil || !allowed {
 			// An oracle error must not fail the delivery; it costs this one reply.

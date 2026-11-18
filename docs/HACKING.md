@@ -241,6 +241,22 @@ after the first start, or run `./sora-admin --config config.toml migrate up` fir
 ./sora-admin --config config.toml accounts create --email user@example.com --password devpassword
 ```
 
+For a standard set of test accounts, run `./seed-dev.sh` (or `./seed-dev.sh other.toml`). It
+builds `sora-admin`, migrates the database, and creates these accounts, all with the password
+`password`:
+
+| Account | Use it for |
+|---|---|
+| `alice@example.com`, with the alias `alice.alias@example.com` | logging in by alias |
+| `bob@example.com`, `carol@example.com`, `dave@example.com` | sharing and ACL grants within one domain |
+| `eve@example.org` | cross-domain ACL refusals |
+| `legacy@example.com` | an SSHA512 password hash |
+| `josé@example.com` | a non-ASCII local part (SMTPUTF8, IMAP UTF8) |
+
+Accounts that already exist are skipped, so the script can be run again after every reset. It
+refuses a config whose `[database.write]` hosts are not all `localhost` or loopback. The
+integration tests do not use these accounts: they create their own in the test database.
+
 `./sora-admin --config config.toml config validate` checks a config file without connecting to
 anything.
 

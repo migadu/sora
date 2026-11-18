@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -44,44 +45,103 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 		}
 	}
 	var fromFound, toFound, ccFound bool
+	var ccGroupKey string // a leading Cc group's name, the head of the Cc section
 	for _, r := range recipients {
+		if r.GroupEnd {
+			continue
+		}
+		// A group start is an address whose addr-mailbox is the group name and whose
+		// addr-host is NIL (RFC 3501 §7.4.2), so a header that starts with a group has it
+		// as its first address, and RFC 5256 §3 FROM/TO/CC and RFC 5957 §3
+		// DISPLAYFROM/DISPLAYTO (it has no addr-name) all sort it by that name, whole even
+		// when it holds an '@'. The columns hold only header text, since SEARCH reads them:
+		// the group's email column stays empty, which no address leaves it, and the name
+		// goes where the header's first name goes, the name column for From and To and
+		// the head of the Cc section of extra_addresses for Cc. SORT reads it back from
+		// there (groupAwareAddrMailboxExpr). A later group start goes to extra_addresses
+		// as its name, like any other address, so SEARCH FROM/TO/CC matches every group
+		// name (RFC 9051 §6.4.4 searches the envelope field).
+		name, email := bound(r.Name), bound(r.EmailAddress)
+		if r.Group != "" {
+			name, email = bound(r.Group), ""
+		}
 		switch r.AddressType {
 		case "from":
 			if fromFound {
-				extra(0, r.Name, r.EmailAddress)
+				extra(0, r.Name, r.EmailAddress, r.Group)
 			} else {
-				fromNameSort, fromEmailSort, fromFound = bound(r.Name), bound(r.EmailAddress), true
+				fromNameSort, fromEmailSort, fromFound = name, email, true
 			}
 		case "to":
 			if toFound {
-				extra(1, r.Name, r.EmailAddress)
+				extra(1, r.Name, r.EmailAddress, r.Group)
 			} else {
-				toNameSort, toEmailSort, toFound = bound(r.Name), bound(r.EmailAddress), true
+				toNameSort, toEmailSort, toFound = name, email, true
 			}
 		case "cc":
 			if ccFound {
-				extra(2, r.Name, r.EmailAddress)
+				extra(2, r.Name, r.EmailAddress, r.Group)
 			} else {
-				ccEmailSort, ccFound = bound(r.EmailAddress), true
-				extra(2, r.Name)
+				ccEmailSort, ccFound = email, true
+				if r.Group != "" {
+					// The CC sort key; bounded like the sort columns, and set aside
+					// from the shares below so other addresses cannot shorten it.
+					ccGroupKey = helpers.TruncateUTF8Safe(extraAddressesValue.Replace(strings.ToLower(r.Group)), helpers.MaxSortColumnBytes)
+				} else {
+					extra(2, r.Name)
+				}
 			}
 		}
 	}
-	joined := make([]string, len(sections))
+	var joined [3]string
+	var lengths [3]int
 	for i, values := range sections {
 		joined[i] = strings.Join(values, extraAddressesValueSep)
+		if i == 2 && ccGroupKey != "" && joined[i] != "" {
+			joined[i] = extraAddressesValueSep + joined[i] // after the key
+		}
+		lengths[i] = len(joined[i])
 	}
+	// The sections share what the sort columns, the two section separators and a leading
+	// Cc group's name (the CC sort key, at most helpers.MaxSortColumnBytes) leave of the
+	// budget. Each is cut to its share (extraAddressesShares), never the whole value at the
+	// end, so a long From or To list can neither crowd the Cc addresses out nor change the
+	// CC sort key.
 	budget := helpers.MaxAddressColumnsBytes - len(fromNameSort) - len(fromEmailSort) - len(toNameSort) - len(toEmailSort) - len(ccEmailSort)
-	extraAddresses = helpers.TruncateUTF8Safe(
-		strings.TrimRight(strings.Join(joined, extraAddressesSectionSep), extraAddressesSectionSep), max(budget, 0))
+	shares := extraAddressesShares(lengths, budget-2*len(extraAddressesSectionSep)-len(ccGroupKey))
+	for i := range joined {
+		joined[i] = helpers.TruncateUTF8Safe(joined[i], shares[i])
+	}
+	joined[2] = ccGroupKey + joined[2]
+	extraAddresses = strings.TrimRight(strings.Join(joined[:], extraAddressesSectionSep), extraAddressesSectionSep)
 	return
+}
+
+// extraAddressesShares splits budget bytes between the three extra_addresses sections of
+// the given lengths, smallest first: each gets all of itself or an equal share of what is
+// left, whichever is less, so a section that needs less than a third leaves the rest to the
+// others and none can take another's third (#2113). Ties go in section order. The integer
+// arithmetic is mirrored by sora_extra_addresses_shares in
+// scripts/backfill_extra_addresses.sql (TestExtraAddressesBackfillMatchesWriter).
+func extraAddressesShares(lengths [3]int, budget int) (shares [3]int) {
+	order := []int{0, 1, 2}
+	slices.SortStableFunc(order, func(a, b int) int { return lengths[a] - lengths[b] })
+	left := max(budget, 0)
+	for k, i := range order {
+		shares[i] = min(lengths[i], left/(len(order)-k))
+		left -= shares[i]
+	}
+	return shares
 }
 
 // Layout of messages.extra_addresses: three sections, From, To and Cc in that order,
 // separated by a newline, and inside a section the names and addresses in header order,
 // separated by a tab. A tab or newline inside a name is stored as a space, so a value can
 // never leak into another section (the search splits on the newline, see
-// addressHeaderCond). Trailing empty sections are left out, and a message with nothing to
+// addressHeaderCond). Each section is cut to its share of the byte budget
+// (extraAddressesShares), so a long list in one header does not cut off another's
+// addresses (#2113; rows written before keep the whole value cut at the end). Trailing
+// empty sections are left out, and a message with nothing to
 // add stores the empty string. NULL means the row was written before the column existed, or
 // by a binary that does not write it; the search reads it as empty, so such rows are matched
 // on their first addresses only until scripts/backfill_extra_addresses.sql fills them.
@@ -786,6 +846,8 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			Name:         helpers.SanitizeUTF8(r.Name),
 			EmailAddress: helpers.SanitizeUTF8(r.EmailAddress),
 			AddressType:  r.AddressType,
+			Group:        helpers.SanitizeUTF8(r.Group),
+			GroupEnd:     r.GroupEnd,
 		}
 	}
 
@@ -1174,6 +1236,8 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			Name:         helpers.SanitizeUTF8(r.Name),
 			EmailAddress: helpers.SanitizeUTF8(r.EmailAddress),
 			AddressType:  r.AddressType,
+			Group:        helpers.SanitizeUTF8(r.Group),
+			GroupEnd:     r.GroupEnd,
 		}
 	}
 
@@ -1431,6 +1495,8 @@ func (d *Database) InsertMessagesBatch(
 				Name:         helpers.SanitizeUTF8(r.Name),
 				EmailAddress: helpers.SanitizeUTF8(r.EmailAddress),
 				AddressType:  r.AddressType,
+				Group:        helpers.SanitizeUTF8(r.Group),
+				GroupEnd:     r.GroupEnd,
 			}
 		}
 

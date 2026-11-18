@@ -112,6 +112,9 @@ The regular `search-date` port retains its sent-date/DST/calendar-date assertion
 - FETCH attributes can arrive split across replies and in legal orders. MIME token case,
   equivalent quoted/literal strings, header-name quoting, parameter ordering and optional
   trailing BODYSTRUCTURE fields are handled semantically. Message bytes remain exact.
+- ENVELOPE accepts either the original source route or a NIL addr-adl for obsolete routed
+  addresses (RFC 5322 section 4.4). Mailboxes, hosts, display names, address order, and
+  From/Sender/Reply-To defaults remain required.
 - APPEND/COPY flag and date recommendations are not promoted from SHOULD to MUST.
   Flag preconditions are established with STORE. SORT/THREAD fixtures supply explicit
   mbox-envelope INTERNALDATE values; if the server does not honor this optional date

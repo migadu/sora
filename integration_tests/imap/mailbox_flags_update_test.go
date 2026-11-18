@@ -141,3 +141,87 @@ func TestIMAP_NewKeywordAnnouncedInFlags(t *testing.T) {
 		}
 	})
 }
+
+// TestIMAP_FetchAnnouncesNewKeywordFirst covers #2091: a FETCH that reads a
+// keyword another session added after this session's last poll must announce
+// it in an untagged FLAGS response before the FETCH response that shows it
+// (RFC 3501 §7.2.6; imaptest: "Keyword used without being in FLAGS").
+func TestIMAP_FetchAnnouncesNewKeywordFirst(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	login := func(t *testing.T) *rawIMAP {
+		t.Helper()
+		c := dialRawIMAP(t, server.Address)
+		c.do(fmt.Sprintf("LOGIN %s %s", account.Email, account.Password))
+		return c
+	}
+	msg := "From: sender@example.com\r\nTo: " + account.Email + "\r\nSubject: kw\r\n\r\nbody\r\n"
+
+	writer := login(t)
+	writer.do("CREATE KwFetch")
+	writer.appendMsg("KwFetch", msg)
+	writer.do("SELECT KwFetch")
+
+	reader := login(t)
+	reader.do("SELECT KwFetch")
+
+	writer.do("STORE 1 +FLAGS ($FetchKw2091)")
+
+	// No NOOP: the reader's FETCH is the first command to see the keyword.
+	untagged, _ := reader.do("FETCH 1 FLAGS")
+	fetch := firstLineIndex(untagged, "* 1 FETCH ", "$FetchKw2091")
+	if fetch < 0 {
+		t.Fatalf("FETCH 1 FLAGS does not show $FetchKw2091: %q", untagged)
+	}
+	idx, lists := mailboxFlagsLines(untagged)
+	if len(lists) != 1 || !slices.Contains(lists[0], "$FetchKw2091") {
+		t.Fatalf("want one untagged FLAGS announcing $FetchKw2091, got %q", untagged)
+	}
+	if idx[0] > fetch {
+		t.Errorf("FETCH showed $FetchKw2091 before the FLAGS announcing it: %q", untagged)
+	}
+
+	// Announced once: the following poll does not repeat it.
+	untagged, _ = reader.do("NOOP")
+	if _, lists := mailboxFlagsLines(untagged); len(lists) != 0 {
+		t.Errorf("NOOP announced the keyword again: %q", untagged)
+	}
+}
+
+// TestIMAP_StoreAnnouncesNewKeywordBeforeItsFetch covers #2090: the session
+// issuing a STORE that adds a keyword new to the mailbox gets the FLAGS
+// response announcing it before the STORE's own FETCH response showing it,
+// and the poll after the command does not announce it again.
+func TestIMAP_StoreAnnouncesNewKeywordBeforeItsFetch(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	c := dialRawIMAP(t, server.Address)
+	c.do(fmt.Sprintf("LOGIN %s %s", account.Email, account.Password))
+	c.do("CREATE KwStoreOrder")
+	c.appendMsg("KwStoreOrder", "From: sender@example.com\r\nTo: "+account.Email+"\r\nSubject: kw\r\n\r\nbody\r\n")
+	c.do("SELECT KwStoreOrder")
+
+	untagged, _ := c.do("STORE 1 +FLAGS ($StoreKw2090)")
+	fetch := firstLineIndex(untagged, "* 1 FETCH ", "$StoreKw2090")
+	if fetch < 0 {
+		t.Fatalf("STORE answer does not show $StoreKw2090: %q", untagged)
+	}
+	idx, lists := mailboxFlagsLines(untagged)
+	if len(lists) != 1 || !slices.Contains(lists[0], "$StoreKw2090") {
+		t.Fatalf("want one untagged FLAGS announcing $StoreKw2090, got %q", untagged)
+	}
+	if idx[0] > fetch {
+		t.Errorf("STORE's FETCH showed $StoreKw2090 before the FLAGS announcing it: %q", untagged)
+	}
+
+	untagged, _ = c.do("NOOP")
+	if _, lists := mailboxFlagsLines(untagged); len(lists) != 0 {
+		t.Errorf("NOOP announced the keyword again: %q", untagged)
+	}
+}

@@ -722,7 +722,7 @@ components:
           type: string
           format: email
           example: "sender@example.com"
-          description: "Sender address (optional, extracted from message if not provided)"
+          description: "Envelope sender (optional, extracted from the From header if not provided). \"<>\" is the null sender; any other value that does not parse is refused with 400."
         subject:
           type: string
           example: "Test Message"
@@ -3482,12 +3482,16 @@ paths:
                     message_id: "<12345.67890@sora-http-delivery>"
                     error: "Partial delivery failure"
         '400':
-          description: Bad request - invalid message format or missing recipients
+          description: Bad request - invalid message format, missing recipients, or a from that does not parse
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
               examples:
+                invalid_sender:
+                  summary: The from field, from parameter or X-From header does not parse
+                  value:
+                    error: "Invalid sender: invalid email format: \"not an address\""
                 invalid_message:
                   summary: Invalid RFC822 message
                   value:

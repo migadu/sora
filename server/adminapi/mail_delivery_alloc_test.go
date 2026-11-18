@@ -30,7 +30,9 @@ import (
 // case the parser's allocation for the same body is measured on its own, and
 // only what the handler allocates beyond it has to be charged beyond the octets.
 func TestDeliverMailCopiesAreCharged(t *testing.T) {
-	const allowance = 24 << 10
+	// Include architecture/race-dependent bookkeeping while staying below one full
+	// ~60 KiB message copy. The pre-fix raw/file paths still fail this bound.
+	const allowance = 48 << 10
 	message := "From: sender@example.com\r\nTo: user@example.com\r\nSubject: copies\r\n\r\n" +
 		strings.Repeat("0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop\r\n", (60<<10)/64)
 
