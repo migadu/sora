@@ -90,6 +90,11 @@ can log in from localhost without a password and create databases and extensions
 database `sora_test_db`. [`docs/TESTING.md`](docs/TESTING.md) explains the test tiers, the test
 database and the known pitfalls.
 
+To check an already running IMAP endpoint, build `make sora-imaptest` and run
+`./sora-imaptest -addr localhost:993 -user imaptest@example.test` with the password in
+`SORA_IMAPTEST_PASSWORD`. The runner creates and removes temporary test mailboxes through IMAP.
+See [`docs/IMAPTEST.md`](docs/IMAPTEST.md) for TLS modes, case selection and reports.
+
 ## Documentation
 
 The [wiki](https://github.com/migadu/sora/wiki) is the place to start: it explains Sora, walks
