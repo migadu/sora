@@ -237,7 +237,8 @@ new logins and deliveries ([PROXY.md](PROXY.md)). What clients see:
 On shutdown, IMAP sends `* BYE Server shutting down, please reconnect` to every session, POP3 sends
 `-ERR Server shutting down, please reconnect`, and ManageSieve sends
 `BYE (TRYLATER) "Server shutting down, please reconnect"`. Each then waits up to 30 seconds for
-sessions to end. LMTP answers commands in progress with `421 4.2.1 service shutting down`. The full
+sessions to end. LMTP answers commands in progress with `421 4.2.1 service shutting down`, waits up
+to 2 seconds for the transactions under way to be answered, then closes its connections. The full
 shutdown order is in [OPERATIONS.md](OPERATIONS.md).
 
 ---
