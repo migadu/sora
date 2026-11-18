@@ -28,6 +28,7 @@ import (
 // production). The connect-timeout deadline on the same read is covered by
 // TestConnectToBackendSilentBackendTimesOut.
 func TestHungBackendConnection(t *testing.T) {
+	expectGoroutinesExit(t)
 	const (
 		absoluteTimeout = 2 * time.Second
 		connectTimeout  = 30 * time.Second // the read deadline must not be what ends the session
@@ -125,6 +126,7 @@ func TestHungBackendConnection(t *testing.T) {
 // the absolute session timeout (none here). The proxy never invents an end-of-data
 // reply, so the client sees its connection closed without one.
 func TestReadDeadlineDetectsStaleConnection(t *testing.T) {
+	expectGoroutinesExit(t)
 	const bound = 10 * time.Second
 	saved := relayEndOfDataTimeout
 	relayEndOfDataTimeout = time.Second

@@ -64,6 +64,7 @@ func TestBackendClosesConnectionAbruptly(t *testing.T) {
 }
 
 func testBackendClosesAfterGreeting(t *testing.T, reset bool) {
+	expectGoroutinesExit(t)
 	const connectTimeout = 30 * time.Second
 	addr := serveOneBackend(t, func(conn net.Conn) {
 		io.WriteString(conn, "220 backend.example.com LMTP Service Ready\r\n")
@@ -99,6 +100,7 @@ func testBackendClosesAfterGreeting(t *testing.T, reset bool) {
 // the handshake as a whole. A backend that takes most of the connect timeout for its
 // greeting and again for its LHLO reply is still connected to.
 func TestBackendSlowButResponding(t *testing.T) {
+	expectGoroutinesExit(t)
 	const connectTimeout, delay = time.Second, 700 * time.Millisecond
 	addr := serveOneBackend(t, func(conn net.Conn) {
 		time.Sleep(delay)
@@ -137,6 +139,7 @@ func TestBackendSlowButResponding(t *testing.T) {
 // connect timeout, which readBackendLine applies to every handshake reply. A backend
 // silent from the start is TestConnectToBackendSilentBackendTimesOut.
 func TestBackendStopsResponding(t *testing.T) {
+	expectGoroutinesExit(t)
 	const connectTimeout = 500 * time.Millisecond
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
