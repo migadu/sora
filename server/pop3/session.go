@@ -59,7 +59,6 @@ type POP3Session struct {
 	ctx              context.Context    // Context for this session
 	cancel           context.CancelFunc // Function to cancel the session's context
 	language         string             // Current language for responses (default "en")
-	utf8Mode         atomic.Bool        // UTF8 mode enabled for this session
 	xclientApplied   bool               // Whether a trusted XCLIENT has already been accepted (pre-auth, at most once)
 	releaseConn      func()             // Function to release connection from limiter
 	useMasterDB      atomic.Bool        // Pin session to master DB after a write to ensure consistency
@@ -963,9 +962,26 @@ func (s *POP3Session) ListLanguages(ctx context.Context) ([]pop3server.LanguageI
 	}, nil
 }
 
+// EnableUTF8 accepts the UTF8 command (RFC 6856) and changes nothing else,
+// so the session keeps no UTF-8 mode. DELIBERATE, pinned by
+// integration_tests/pop3/utf8_mode_test.go:
+//
+//   - USER and PASS take UTF-8 in either mode. RFC 6856 section 2.2 ties
+//     UTF-8 credentials to the capability, not to the command, and lets a
+//     client use them before UTF8.
+//   - Reply texts are ASCII, so they are valid in either mode.
+//   - RETR and TOP send the stored message as it is in either mode. Section
+//     2.1 says a client that did not send UTF8 must get a surrogate or
+//     -ERR [UTF8] for a message with UTF-8 in it; Sora does neither. The POP3
+//     proxy hides UTF8 from CAPA by default (remote_use_utf8, because classic
+//     Outlook sends UTF8 after login when it is advertised), so most clients
+//     can never enable it: a refusal would make those messages impossible to
+//     download, and classic Outlook aborts the whole download on an -ERR.
+//
+// The library also routes a UTF8 sent after login here and answers +OK, for
+// classic Outlook, although section 2 allows the command only before login.
 func (s *POP3Session) EnableUTF8(ctx context.Context) error {
-	s.utf8Mode.Store(true)
-	s.DebugLog("utf8 mode enabled")
+	s.DebugLog("utf8 command accepted")
 	return nil
 }
 
