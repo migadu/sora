@@ -17,7 +17,10 @@ func TestParseMessageMetadataHeaderPresence(t *testing.T) {
 	}
 	bit, _ := helpers.HeaderPresenceBit("subject")
 	require.Zero(t, *m.headerPresence&bit)
-	require.Empty(t, m.recipients, "presence must not be inferred from valid addresses")
+	// "To: undisclosed:;" holds no address, only the empty group's start and end.
+	for _, r := range m.recipients {
+		require.True(t, r.IsGroupMarker(), "presence must not be inferred from valid addresses: %+v", r)
+	}
 	require.Nil(t, m.messageIDRaw)
 }
 
