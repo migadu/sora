@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	msieve "github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-managesieve/managesieveserver"
@@ -393,6 +394,18 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 				// state isn't an observable oracle. (security-audit M14)
 				return errAuthFailed
 			}
+		}
+
+		// RFC 4616 section 2: every field of a PLAIN message is UTF-8 ("SAFE = ...
+		// any UTF-8 encoded Unicode character except NUL"). A field that is not names
+		// no account: refused before anything is looked up, but as a failed login,
+		// recorded and counted like a name that does not parse (below).
+		if !utf8.ValidString(authzID) || !utf8.ValidString(authnID) || !utf8.ValidString(password) {
+			s.InfoLog("authentication refused: SASL PLAIN field not valid UTF-8")
+			if s.server.authLimiter != nil {
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+			}
+			return errAuthFailed
 		}
 
 		address, err := server.NewAddress(authnID)

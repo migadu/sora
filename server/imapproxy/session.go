@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/consts"
@@ -1153,12 +1154,19 @@ func (s *Session) authorizeIdentity(authzID, username, resolvedEmail, method str
 	return nil
 }
 
-// authenticateUser authenticates the user against the database.
+// authenticateUser authenticates a LOGIN.
 func (s *Session) authenticateUser(username, password string) error {
-	return s.authenticateUserWithAuthzID("", username, password)
+	return s.authenticateCredentials("", username, password, false)
 }
 
-func (s *Session) authenticateUserWithAuthzID(authzID, username, password string) (retErr error) {
+// authenticateUserWithAuthzID authenticates an AUTHENTICATE PLAIN message.
+func (s *Session) authenticateUserWithAuthzID(authzID, username, password string) error {
+	return s.authenticateCredentials(authzID, username, password, true)
+}
+
+// authenticateCredentials checks the credentials of a login; saslPlain says they
+// came in a SASL PLAIN message, whose fields RFC 4616 defines as UTF-8.
+func (s *Session) authenticateCredentials(authzID, username, password string, saslPlain bool) (retErr error) {
 	s.authSessionGeneration = s.server.connTracker.SessionGeneration()
 	cacheGeneration := s.server.lookupCache.Generation()
 
@@ -1264,6 +1272,17 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 		// Unknown rate limiting error (shouldn't happen, but handle gracefully)
 		metrics.ProtocolErrors.WithLabelValues("imap_proxy", "AUTH", "rate_limited", "client_error").Inc()
 		return err
+	}
+
+	// RFC 4616 section 2: every field of a PLAIN message is UTF-8 ("SAFE = ... any
+	// UTF-8 encoded Unicode character except NUL"). A field that is not names no
+	// account: refused without a lookup, but as a failed login, recorded and counted
+	// like a name that does not parse.
+	if saslPlain && (!utf8.ValidString(authzID) || !utf8.ValidString(username) || !utf8.ValidString(password)) {
+		s.InfoLog("authentication refused: SASL PLAIN field not valid UTF-8")
+		s.server.authLimiter.RecordAuthAttemptWithProxy(s.ctx, s.clientConn, s.proxyInfo, authKey, false)
+		metrics.AuthenticationAttempts.WithLabelValues("imap_proxy", s.server.name, s.server.hostname, "failure").Inc()
+		return consts.ErrAuthenticationFailed
 	}
 
 	// Check cache

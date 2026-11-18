@@ -60,6 +60,12 @@ func TestMalformedCredentialsAreFailedLogins(t *testing.T) {
 		{"USER_PASS/empty password", func(s *POP3Session) error {
 			return s.Login(ctx, "user@example.com", `""`) // unquoted to ""
 		}},
+		{"AUTH_PLAIN/authorization identity not UTF-8", func(s *POP3Session) error {
+			return s.AuthenticatePlain(ctx, "jos\xe9@example.com", "user@example.com", "secret")
+		}},
+		{"AUTH_PLAIN/authentication identity not UTF-8", func(s *POP3Session) error {
+			return s.AuthenticatePlain(ctx, "", "jos\xe9@example.com", "secret")
+		}},
 		{"AUTH_PLAIN/password not UTF-8", func(s *POP3Session) error {
 			return s.AuthenticatePlain(ctx, "", "user@example.com", "secret\x80")
 		}},

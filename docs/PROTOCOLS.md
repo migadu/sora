@@ -963,10 +963,11 @@ User names and passwords are UTF-8, as `UTF8 USER` says, and a client may use th
 user name or password that is not valid UTF-8 (RFC 3629) is refused, as RFC 6856 §2.2 requires.
 
 An empty password and a user name or password that is not valid UTF-8, with `USER`/`PASS` or
-`AUTH PLAIN`, are credentials no account can have. They are refused without being looked up, but
-otherwise like an address that does not parse: after the rate-limit check, and counted as a failed
-login ([AUTHENTICATION.md](AUTHENTICATION.md#3-how-a-login-name-is-read)). The POP3 proxy follows
-the same rule.
+`AUTH PLAIN` (whose authorization identity must be UTF-8 too, RFC 4616), are credentials no account
+can have. They are refused without being looked up, but otherwise like an address that does not
+parse: after the rate-limit check, and counted as a failed login
+([AUTHENTICATION.md](AUTHENTICATION.md#3-how-a-login-name-is-read)). The POP3 proxy follows the
+same rule.
 
 The library closes a session after 4 errors (failed logins included), with
 `-ERR Too many errors, closing connection`. Each error adds a delay of 3 seconds times the error
