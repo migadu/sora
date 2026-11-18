@@ -303,42 +303,42 @@ var (
 	addressLiteralRe   = regexp.MustCompile(`^\[[\x21-\x5a\x5e-\x7e]+\]$`)
 )
 
-// NewReversePath parses the reverse-path of MAIL FROM as go-smtp hands it to a session:
-// the mailbox between the angle brackets, with a quoted local part already unquoted. The
-// null reverse-path ("") is the caller's to handle; it is refused here.
+// NewReversePath parses the reverse-path of MAIL FROM: the mailbox between the angle
+// brackets. The null reverse-path ("") is the caller's to handle; it is refused here.
 //
-// A sender NewAddress accepts without a master-token suffix is returned exactly as
-// NewAddress returns it. The suffix (user@domain@SUFFIX) belongs to login names, not to
-// envelope addresses: a second "@" can only come from a quoted local part, so
-// "a@b.example@example.com" is the sender `"a@b.example"@example.com` (#1938). Otherwise
-// the sender is read as leniently as go-smtp's own parser reads it, which is what Postfix
-// does with strict_rfc821_envelopes = no: leading, trailing and consecutive dots in the
-// local part (older mobile carrier addresses), a quoted local part, a dotless domain and
-// an address literal. Refusing them would bounce mail the MTA was right to send (#1907).
-// Forward-paths stay with NewAddress.
+// A quoted local part is read in either of its forms: as go-smtp hands it to a session,
+// already unquoted ("john doe@example.com"), or as written (`"john doe"@example.com`,
+// which is how the Admin API passes it on). A local part that is one whole Quoted-string
+// is read as one, the way go-smtp reads it; the rare go-smtp mailbox whose unquoted
+// local part is itself such a string is read the same way.
 //
-// What is returned is safe to write into a command or a header: no control character
-// survives (CR and LF included), the length limits of NewAddress apply to the form
-// returned, and a local part that is not a dot-string is returned quoted (RFC 5321
-// §4.1.2 Quoted-string, with "\" and `"` escaped), so FullAddress is the mailbox in the
-// form a MAIL FROM, RCPT TO or To: field takes it. Like NewAddress, the address is
-// lower-cased and a non-ASCII domain is folded to its A-label.
+// The suffix (user@domain@SUFFIX) belongs to login names, not to envelope addresses: a
+// second "@" can only come from a quoted local part, so "a@b.example@example.com" is
+// the sender `"a@b.example"@example.com` (#1938). The sender is read as leniently as
+// go-smtp's own parser reads it, which is what Postfix does with
+// strict_rfc821_envelopes = no: leading, trailing and consecutive dots in the local part
+// (older mobile carrier addresses), a quoted local part, a dotless domain and an address
+// literal. Refusing them would bounce mail the MTA was right to send (#1907). Forward-paths
+// stay with NewAddress.
+//
+// What is returned is the mailbox replies and redirects are sent to, so the local part
+// keeps the case it was sent with (RFC 5321 §2.4: SMTP implementations "MUST take care
+// to preserve the case of mailbox local-parts", #2101); only the domain is lower-cased,
+// and a non-ASCII domain is folded to its A-label. Compare or key senders in lower case.
+// It is safe to write into a command or a header: no control character survives (CR and
+// LF included), the length limits of NewAddress apply to the form returned, and a local
+// part that is not a dot-string is returned quoted once (RFC 5321 §4.1.2 Quoted-string,
+// with "\" and `"` escaped, the minimum quoting possible), so FullAddress is the mailbox
+// in the form a MAIL FROM, RCPT TO or To: field takes it.
 func NewReversePath(input string) (Address, error) {
-	// NewAddress trims the input, which would take the space off a quoted local part
-	// such as `" x"`.
-	if strings.TrimSpace(input) == input {
-		if addr, err := parseAddress(input); err == nil && !addr.HasSuffix() {
-			return addr, nil
-		}
-	}
-	addr, err := parseLenientReversePath(input)
+	addr, err := parseReversePath(input)
 	if err != nil {
 		return Address{}, addressError{err}
 	}
 	return addr, nil
 }
 
-func parseLenientReversePath(input string) (Address, error) {
+func parseReversePath(input string) (Address, error) {
 	if !utf8.ValidString(input) {
 		return Address{}, fmt.Errorf("address is not valid UTF-8: %q", input)
 	}
@@ -353,7 +353,10 @@ func parseLenientReversePath(input string) (Address, error) {
 	if at <= 0 || at == len(input)-1 {
 		return Address{}, fmt.Errorf("invalid email format: %q", input)
 	}
-	localPart := strings.ToLower(input[:at])
+	localPart := input[:at]
+	if unquoted, ok := unquoteLocalPart(localPart); ok {
+		localPart = unquoted
+	}
 	domain := strings.ToLower(input[at+1:])
 
 	detail := ""
@@ -395,4 +398,31 @@ func parseLenientReversePath(input string) (Address, error) {
 		domain:      domain,
 		detail:      detail,
 	}, nil
+}
+
+// unquoteLocalPart returns the content of s when s is one non-empty quoted string as
+// go-smtp reads a quoted local part: between the double quotes, "\" quotes the next
+// character and a bare `"` cannot stand (RFC 5321 §4.1.2 Quoted-string).
+func unquoteLocalPart(s string) (string, bool) {
+	if len(s) < 3 || s[0] != '"' || s[len(s)-1] != '"' {
+		return "", false
+	}
+	inner := s[1 : len(s)-1]
+	var b strings.Builder
+	for i := 0; i < len(inner); i++ {
+		c := inner[i]
+		switch c {
+		case '"':
+			return "", false
+		case '\\':
+			i++
+			if i == len(inner) {
+				// The closing quote is escaped: the string does not end.
+				return "", false
+			}
+			c = inner[i]
+		}
+		b.WriteByte(c)
+	}
+	return b.String(), true
 }
