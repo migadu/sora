@@ -267,10 +267,11 @@ func (rd *ResilientDatabase) CountRedirectsSinceWithRetry(ctx context.Context, A
 	return result.(int), nil
 }
 
-// RecordRedirectWithRetry records that a redirect action was performed with retry logic
-func (rd *ResilientDatabase) RecordRedirectWithRetry(ctx context.Context, AccountID int64) error {
+// RecordRedirectWithRetry records that a redirect action was performed, charged against a
+// redirect rate limit of the given window, with retry logic
+func (rd *ResilientDatabase) RecordRedirectWithRetry(ctx context.Context, AccountID int64, window time.Duration) error {
 	op := func(ctx context.Context, tx pgx.Tx) (any, error) {
-		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordRedirect(ctx, tx, AccountID)
+		return nil, rd.getOperationalDatabaseForOperation(ctx, true).RecordRedirect(ctx, tx, AccountID, window)
 	}
 
 	_, err := rd.executeWriteInTxWithRetry(ctx, sieveWriteRetryConfig, timeoutWrite, op)
