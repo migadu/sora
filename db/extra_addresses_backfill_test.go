@@ -37,9 +37,11 @@ func TestExtraAddressesBackfillMatchesWriter(t *testing.T) {
 		"tabbed":  {{AddressType: "to", EmailAddress: "x@example.com"}, {AddressType: "to", Name: "Tab\tAnd\nNewline", EmailAddress: "y@example.com"}},
 		"bounded": many,
 		"empty":   nil,
-		// A header starting with a group: its start is the first address (#2016).
+		// A header starting with a group: its start is the first address (#2016); a later
+		// group's name is a further address (#2036).
 		"groups": {
 			{AddressType: "to", Group: "team"}, {AddressType: "to", EmailAddress: "m1@example.com"}, {AddressType: "to", GroupEnd: true},
+			{AddressType: "to", Group: "Second Team"}, {AddressType: "to", GroupEnd: true},
 			{AddressType: "cc", Group: "undisclosed-recipients"}, {AddressType: "cc", GroupEnd: true},
 		},
 	}

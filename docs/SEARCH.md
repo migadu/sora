@@ -71,14 +71,16 @@ it with `strpos()`, so `%` and `_` in a term are ordinary characters, not wildca
 | `FROM` | address columns | Substring of any From address or display name. |
 | `TO` | address columns | Substring of any To address or display name. |
 | `CC` | address columns | Substring of any Cc address or display name. |
-| `BCC`, `HEADER Bcc`, `HEADER Reply-To`, `HEADER Sender` | `recipients_json` | Substring of any address or display name of that header. |
+| `BCC`, `HEADER Bcc`, `HEADER Reply-To`, `HEADER Sender` | `recipients_json` | Substring of any address, display name or group name of that header. |
 | `HEADER Message-ID` | `message_id` | A whole ID in angle brackets (`<id@example.com>`) is matched exactly, ignoring case. Any other term is a substring of the field as written, with its angle brackets. |
 | `HEADER In-Reply-To` | `in_reply_to` | Substring of the stored message IDs, written with their angle brackets, ignoring case. |
 | `HEADER References` | `references` | Substring of the stored chain of message IDs, written with their angle brackets, ignoring case. |
 | `HEADER` with any other name | none | Matches no message. Sora logs `HEADER search on non-indexed header returns no results` at debug level. |
 
 The address columns are the first From, To and Cc name and address (also used by `SORT`), plus
-`extra_addresses`, which holds every further From, To and Cc name and address.
+`extra_addresses`, which holds every further From, To and Cc name and address. A group's name
+counts as an address of its header (RFC 3501 §7.4.2 makes a group start an address), so
+`TO team` matches `To: team: a@example.com;`, and `TO ""` matches `To: undisclosed-recipients:;`.
 
 What this means for users:
 

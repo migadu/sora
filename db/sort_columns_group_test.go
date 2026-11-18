@@ -18,7 +18,7 @@ func TestSortColumnsFirstAddressIsGroup(t *testing.T) {
 	hdr := mail.HeaderFromMap(map[string][]string{
 		"From": {"Team: Sender <sender@example.com>;"},
 		"To":   {`"Ops@Example": a@example.com;`},
-		"Cc":   {"user2: blah@domain1.org;, other@example.com"},
+		"Cc":   {"user2: blah@domain1.org;, other@example.com, Later Group:;"},
 	})
 	_, fromName, fromEmail, toName, toEmail, ccEmail, extra := sortColumnsFor("", helpers.ExtractRecipients(hdr.Header))
 	for _, c := range []struct{ column, got, want string }{
@@ -33,8 +33,8 @@ func TestSortColumnsFirstAddressIsGroup(t *testing.T) {
 			t.Errorf("%s = %q, want %q", c.column, c.got, c.want)
 		}
 	}
-	// The group members are addresses after the first, still searchable.
-	for _, v := range []string{"sender", "sender@example.com", "a@example.com", "blah@domain1.org", "other@example.com"} {
+	// The group members and a later group's name are addresses after the first (#2036).
+	for _, v := range []string{"sender", "sender@example.com", "a@example.com", "blah@domain1.org", "other@example.com", "later group"} {
 		if !strings.Contains(extra, v) {
 			t.Errorf("extra_addresses %q lacks %q", extra, v)
 		}

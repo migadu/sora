@@ -56,8 +56,9 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 		// the group's email column stays empty, which no address leaves it, and the name
 		// goes where the header's first name goes, the name column for From and To and
 		// the head of the Cc section of extra_addresses for Cc. SORT reads it back from
-		// there (groupAwareAddrMailboxExpr). A later group start has no name or address
-		// of its own, so extra() leaves it out.
+		// there (groupAwareAddrMailboxExpr). A later group start goes to extra_addresses
+		// as its name, like any other address, so SEARCH FROM/TO/CC matches every group
+		// name (RFC 9051 §6.4.4 searches the envelope field).
 		name, email := bound(r.Name), bound(r.EmailAddress)
 		if r.Group != "" {
 			name, email = bound(r.Group), ""
@@ -65,19 +66,19 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 		switch r.AddressType {
 		case "from":
 			if fromFound {
-				extra(0, r.Name, r.EmailAddress)
+				extra(0, r.Name, r.EmailAddress, r.Group)
 			} else {
 				fromNameSort, fromEmailSort, fromFound = name, email, true
 			}
 		case "to":
 			if toFound {
-				extra(1, r.Name, r.EmailAddress)
+				extra(1, r.Name, r.EmailAddress, r.Group)
 			} else {
 				toNameSort, toEmailSort, toFound = name, email, true
 			}
 		case "cc":
 			if ccFound {
-				extra(2, r.Name, r.EmailAddress)
+				extra(2, r.Name, r.EmailAddress, r.Group)
 			} else {
 				ccEmailSort, ccFound = email, true
 				extra(2, r.Name, r.Group)

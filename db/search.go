@@ -326,8 +326,8 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 		case "bcc", "reply-to", "sender":
 			// No dedicated columns: recipients_json holds every address of these
 			// headers, typed by header name and in its original case. The term is a
-			// substring of one address or display name of that header, compared
-			// case-insensitively. JSONB containment compared the whole address,
+			// substring of one address, display name or group name of that header,
+			// compared case-insensitively. JSONB containment compared the whole address,
 			// case-sensitively. These are rare searches; like References they are
 			// filtered from the mailbox's rows (recipients_json is deliberately
 			// not in idx_messages_mailbox_headers_v2).
@@ -336,10 +336,11 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			param := nextParam()
 			args[param] = lowerValue
 			conditions = append(conditions, fmt.Sprintf(
-				"EXISTS (SELECT 1 FROM jsonb_array_elements(%srecipients_json) r WHERE r->>'type' = @%s AND (%s OR %s))",
+				"EXISTS (SELECT 1 FROM jsonb_array_elements(%srecipients_json) r WHERE r->>'type' = @%s AND (%s OR %s OR %s))",
 				datePrefix, typeParam,
 				substringCond("LOWER(r->>'email')", "@"+param),
-				substringCond("LOWER(r->>'name')", "@"+param)))
+				substringCond("LOWER(r->>'name')", "@"+param),
+				substringCond("LOWER(r->>'group')", "@"+param)))
 		default:
 			// HEADER search on a header without a dedicated, indexed column
 			// (e.g. List-ID, X-*). Sora stores no raw-header representation to

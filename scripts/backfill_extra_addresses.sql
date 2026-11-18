@@ -62,7 +62,8 @@ $$;
 -- The extra_addresses value for a row, from its recipients_json and its five first-address
 -- sort columns: sections From, To, Cc separated by a newline; in each, the lowercased names and
 -- addresses the sort columns do not hold (every address after the first, and the first Cc's
--- name, or its group name when Cc starts with a group), in header order, separated by a tab; tabs and newlines inside a value become spaces;
+-- name, or its group name when Cc starts with a group; a later group start's address is its
+-- group name, a group end has none), in header order, separated by a tab; tabs and newlines inside a value become spaces;
 -- trailing empty sections dropped; cut to what the sort columns leave of 1300 bytes
 -- (helpers.MaxAddressColumnsBytes).
 CREATE OR REPLACE FUNCTION sora_extra_addresses(
@@ -73,7 +74,7 @@ LANGUAGE sql IMMUTABLE AS $$
 		SELECT e->>'type' AS kind, ord,
 		       row_number() OVER (PARTITION BY e->>'type' ORDER BY ord) AS nth,
 		       translate(lower(COALESCE(e->>'name', '')), E'\t\n', '  ') AS name,
-		       translate(lower(COALESCE(e->>'email', '')), E'\t\n', '  ') AS email,
+		       translate(lower(COALESCE(NULLIF(e->>'email', ''), e->>'group', '')), E'\t\n', '  ') AS email,
 		       translate(lower(COALESCE(e->>'group', '')), E'\t\n', '  ') AS grp
 		FROM jsonb_array_elements(CASE WHEN jsonb_typeof(recipients) = 'array' THEN recipients ELSE '[]'::jsonb END)
 		     WITH ORDINALITY AS a(e, ord)
