@@ -148,6 +148,7 @@ type ServerOptions struct {
 	ProxyProtocolTimeout        string   // Timeout for reading PROXY protocol headers (e.g., "5s")
 	ProxyProtocolTrustedProxies []string // CIDR blocks for PROXY protocol validation (defaults to trusted_networks if empty)
 	TrustedNetworks             []string // CIDR blocks for trusted networks (for PROXY protocol validation)
+	DeliveryMemoryLimit         int64    // Message bytes all /admin/mail/deliver requests under way may hold at once (limits.delivery_memory_limit; 0 = no limit)
 }
 
 // AffinityManager interface for managing user-to-backend affinity
