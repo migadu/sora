@@ -41,23 +41,21 @@ func (r Recipient) IsGroupMarker() bool {
 	return r.Group != "" || r.GroupEnd
 }
 
+// ExtractRecipients returns the address headers' lists as written, the source of the
+// ENVELOPE (RFC 3501 §7.4.2): an address that repeats, in one group or across groups and
+// headers of one type, is listed each time. DistinctAddresses gives each address once.
 func ExtractRecipients(header message.Header) []Recipient {
 	recipients := make([]Recipient, 0)
-	uniquePairs := make(map[string]struct{})
 
 	extractAddresses := func(key string) {
 		addressType := strings.ToLower(key)
 		addAddresses := func(addresses []*mail.Address) {
 			for _, addr := range addresses {
-				uniqueKey := addr.Address + "|" + addressType
-				if _, exists := uniquePairs[uniqueKey]; !exists {
-					recipients = append(recipients, Recipient{
-						EmailAddress: SanitizeUTF8(addr.Address),
-						AddressType:  addressType,
-						Name:         SanitizeUTF8(addr.Name),
-					})
-					uniquePairs[uniqueKey] = struct{}{}
-				}
+				recipients = append(recipients, Recipient{
+					EmailAddress: SanitizeUTF8(addr.Address),
+					AddressType:  addressType,
+					Name:         SanitizeUTF8(addr.Name),
+				})
 			}
 		}
 		for _, value := range header.Values(key) {
@@ -88,6 +86,25 @@ func ExtractRecipients(header message.Header) []Recipient {
 	extractAddresses("Reply-To")
 
 	return recipients
+}
+
+// DistinctAddresses returns the addresses of recipients without the group markers, each
+// address once per header type (the first occurrence, in order): the recipients of a
+// message rather than its headers as written.
+func DistinctAddresses(recipients []Recipient) []Recipient {
+	seen := make(map[string]struct{}, len(recipients))
+	distinct := make([]Recipient, 0, len(recipients))
+	for _, r := range recipients {
+		if r.IsGroupMarker() {
+			continue
+		}
+		key := r.EmailAddress + "|" + r.AddressType
+		if _, ok := seen[key]; !ok {
+			seen[key] = struct{}{}
+			distinct = append(distinct, r)
+		}
+	}
+	return distinct
 }
 
 // addressListPart is a run of an address-list header value: plain addresses (group ""),

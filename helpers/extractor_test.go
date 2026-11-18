@@ -64,11 +64,12 @@ func TestExtractRecipientsAddressGroups(t *testing.T) {
 			want:  []Recipient{addr("to", "a@example.com", "Re: x"), addr("to", "b@example.com", "c: d")},
 		},
 		{
-			name:  "an address in two groups is listed once",
+			// The list is the header as written (#2079): each group keeps its members.
+			name:  "an address in two groups is in both",
 			value: "g: a@example.com;, h: a@example.com;",
 			want: []Recipient{
 				groupStart("to", "g"), addr("to", "a@example.com", ""), groupEnd("to"),
-				groupStart("to", "h"), groupEnd("to"),
+				groupStart("to", "h"), addr("to", "a@example.com", ""), groupEnd("to"),
 			},
 		},
 	} {
@@ -109,5 +110,20 @@ func TestExtractRecipientsMalformedGroupsParseFlat(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestDistinctAddresses checks that the recipients list drops group markers and lists
+// each address once per header type, as ExtractRecipients did before it kept the
+// headers as written (#2079).
+func TestDistinctAddresses(t *testing.T) {
+	hdr := mail.HeaderFromMap(map[string][]string{
+		"To": {"g: a@example.com;, h: a@example.com, b@example.com;", "a@example.com"},
+		"Cc": {"a@example.com"},
+	})
+	got := DistinctAddresses(ExtractRecipients(hdr.Header))
+	want := []Recipient{addr("to", "a@example.com", ""), addr("to", "b@example.com", ""), addr("cc", "a@example.com", "")}
+	if !slices.Equal(got, want) {
+		t.Errorf("DistinctAddresses = %+v, want %+v", got, want)
 	}
 }
