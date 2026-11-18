@@ -663,7 +663,10 @@ max_staging_size = "100gb"    # Maximum size of this node's own upload staging b
 # messages according to configured retention policies.
 
 [cleanup]
-grace_period = "14d"              # Recovery window for accidentally deleted messages before permanent removal.
+grace_period = "14d"              # How long expunged messages stay restorable before permanent removal, and how
+                                  # long a soft-deleted account keeps its data before hard delete. Also the minimum
+                                  # age before unuploaded mail can be reaped, and the shortest time Sieve redirect
+                                  # records are kept. See docs/STORAGE.md (sections 9-11 and 13).
 wake_interval = "1h"              # How often the cleanup worker runs.
 purge_poll_interval = "30s"       # How often the purge worker looks for accounts marked for purging
                                   # (DELETE /admin/accounts/{email}?purge=true). Runs on nodes with
