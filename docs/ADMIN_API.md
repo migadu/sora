@@ -798,7 +798,7 @@ The `Content-Type` header picks the format.
 |---|---|
 | `message` | The whole RFC 5322 message. Required. |
 | `recipients` | Addresses to deliver to. When empty, the `To`, `Cc` and `Bcc` header addresses are used, each once (`From`, `Sender` and `Reply-To` are not recipients). |
-| `from` | Envelope sender, as Sieve and vacation see it. When empty, the first `From` header address. An address that does not parse is ignored. |
+| `from` | Envelope sender, as Sieve and vacation see it, written as it would be between the angle brackets of `MAIL FROM` (RFC 5321 section 4.1.2). It is read as LMTP reads `MAIL FROM` ([PROTOCOLS.md section 8.3](PROTOCOLS.md#83-envelope)): `first..last@example.com` is accepted, `a@b.example@example.com` is the sender `"a@b.example"@example.com` (not a master login suffix), and a quoted local part is decoded once, so `"John Doe"@example.com` is that mailbox and `"\"Sender\""@example.com` keeps its inner quotes. Whitespace around the value is ignored. A `"` or space outside one whole quoted string (`Sen"der@example.com`, `John Doe@example.com`), a quoted string that does not end, or invalid UTF-8 does not parse. When `from` is empty, the first `From` header address is the sender, as the header names it (its quotes already decoded, nothing trimmed). A sender that does not parse is ignored. |
 | `mailbox` | Deliver straight into this mailbox. Sieve does not run, and no `Received:` or `Delivered-To:` header is added. A mailbox that does not exist means `INBOX`. |
 | `uid`, `uid_validity` | Keep these IMAP values, for migrations. |
 

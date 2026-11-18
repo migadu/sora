@@ -55,9 +55,9 @@ func TestVacationKeyedByLowerCasedSender(t *testing.T) {
 }
 
 // A sender that is one of the script's own :addresses gets no reply, whatever the case
-// of either (#2101): the sender now keeps the case it was sent with, and go-sieve skips
-// only a sender equal to an address byte for byte (migadu/go-sieve#61), so
-// Me@example.com must still be the user's own me@example.com.
+// of either (#2101): the sender now keeps the case it was sent with, so go-sieve must
+// compare it with :addresses without case (v1.5.5, migadu/go-sieve#61), and
+// Me@example.com is still the user's own me@example.com.
 func TestVacationOwnAddressesIgnoreCase(t *testing.T) {
 	for _, tt := range []struct {
 		from      string
