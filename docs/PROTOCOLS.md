@@ -545,8 +545,11 @@ Other rules for FETCH:
   (and `MODSEQ` once CONDSTORE is enabled).
 - **ENVELOPE.** The date is the message's `Date:` header in the zone it was written in, and
   `NIL` when the message has no `Date:` header that parses (SORT and THREAD then use the
-  INTERNALDATE). The message ID is `NIL` when the message has no `Message-ID:` header. Messages
-  stored by versions before these rules report what they reported before.
+  INTERNALDATE). The message ID is `NIL` when the message has no `Message-ID:` header. An address
+  with an obsolete source route, `<@first,@second:user@example.com>`, reports the route in the
+  address's second field (addr-adl, RFC 9051 §7.5.2) as `"@first,@second"`; the route is not part
+  of the address for SEARCH, SORT, delivery or replies. Messages stored by versions before these
+  rules report what they reported before.
 - **BINARY.** A `BINARY` or `BINARY.SIZE` section whose Content-Transfer-Encoding Sora cannot
   decode gets `NO [UNKNOWN-CTE]` (RFC 9051 §7.5.2).
 - **NUL octets in BODY sections.** `BODY[...]` (and `RFC822`, `RFC822.HEADER`, `RFC822.TEXT`) is
