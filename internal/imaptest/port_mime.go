@@ -410,7 +410,7 @@ func portMIMEEnvelope(s *Session) error {
 				if err != nil {
 					return err
 				}
-				if err := Check(portMIMEValueEqual(got, expected), "ENVELOPE for sequence %d differs: got %s, want %s", i+1, got.String(), expected.String()); err != nil {
+				if err := Check(portMIMEEnvelopeEqual(got, expected), "ENVELOPE for sequence %d differs: got %s, want %s", i+1, got.String(), expected.String()); err != nil {
 					return err
 				}
 				found = true
@@ -422,6 +422,42 @@ func portMIMEEnvelope(s *Session) error {
 		}
 	}
 	return nil
+}
+
+// RFC 5322 section 4.4 recommends ignoring obsolete source routes. Accept NIL
+// for an expected addr-adl, while still requiring every address and its mailbox,
+// host, display name, and position in the envelope.
+func portMIMEEnvelopeEqual(got, want Value) bool {
+	if !got.IsList || !want.IsList || len(got.List) != 10 || len(want.List) != 10 {
+		return false
+	}
+	for field, expected := range want.List {
+		actual := got.List[field]
+		if field < 2 || field > 7 || expected.IsNil {
+			if !portMIMEValueEqual(actual, expected) {
+				return false
+			}
+			continue
+		}
+		if !actual.IsList || !expected.IsList || len(actual.List) != len(expected.List) {
+			return false
+		}
+		for i, address := range expected.List {
+			peerAddress := actual.List[i]
+			if !address.IsList || !peerAddress.IsList || len(address.List) != 4 || len(peerAddress.List) != 4 {
+				return false
+			}
+			for part, value := range address.List {
+				if part == 1 && !value.IsList && !value.IsNil && strings.HasPrefix(value.Text, "@") && peerAddress.List[part].IsNil {
+					continue
+				}
+				if !portMIMEValueEqual(peerAddress.List[part], value) {
+					return false
+				}
+			}
+		}
+	}
+	return true
 }
 
 func portMIMENil(s *Session) error {

@@ -10,12 +10,18 @@ import (
 
 // ParseAddressList parses the value of an address header field (From, To, Cc, ...) as
 // go-message's mail.ParseAddressList does, encoded-word display names included. net/mail
-// rejects comments and white space inside an addr-spec, which RFC 5322 allows (see
-// stripAddressCFWS), so a value it rejects is parsed once more without them rather than
-// lost. Use it for every address header of a message, so search, ENVELOPE, vacation and
-// delivery agree on the addresses.
+// rejects obsolete source routes and comments inside an addr-spec, which RFC 5322
+// requires receivers to interpret. A failed value is retried without source routes
+// (section 4.4 says to ignore them), then without addr-spec CFWS. Use it for every
+// address header so search, ENVELOPE, vacation and delivery agree on the addresses.
 func ParseAddressList(value string) ([]*mail.Address, error) {
 	addresses, err := mail.ParseAddressList(value)
+	if err != nil {
+		if normalized := stripAddressRoutes(value); normalized != value {
+			value = normalized
+			addresses, err = mail.ParseAddressList(value)
+		}
+	}
 	if err != nil {
 		addresses, err = mail.ParseAddressList(stripAddressCFWS(value))
 	}
@@ -244,6 +250,10 @@ func skipAngleAddr(s string, i int) int {
 		switch s[j] {
 		case '"':
 			j = skipQuotedString(s, j)
+		case '(':
+			j = skipComment(s, j)
+		case '[':
+			j = skipDomainLiteral(s, j)
 		case '>':
 			return j
 		}
@@ -376,6 +386,168 @@ func stripAddressCFWS(value string) string {
 
 func isAddressWSP(ch byte) bool {
 	return ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n'
+}
+
+// stripAddressRoutes removes only a syntactically valid obs-route at the start of
+// an angle-addr. Colons in display names, comments, local parts and domain literals
+// are not route separators. The normal parser still validates the final mailbox.
+func stripAddressRoutes(value string) string {
+	var out strings.Builder
+	start := 0
+	for i := 0; i < len(value); i++ {
+		switch value[i] {
+		case '"':
+			i = skipQuotedString(value, i)
+		case '(':
+			i = skipComment(value, i)
+		case '[':
+			i = skipDomainLiteral(value, i)
+		case '<':
+			if end, ok := addressRouteEnd(value, i+1); ok {
+				out.WriteString(value[start : i+1])
+				start, i = end, end-1
+			} else {
+				i = skipAngleAddr(value, i)
+			}
+		}
+	}
+	if start == 0 {
+		return value
+	}
+	out.WriteString(value[start:])
+	return out.String()
+}
+
+// addressRouteEnd recognizes RFC 5322 section 4.4 obs-domain-list ":" and returns
+// the first byte of its final addr-spec. Empty route-list entries are permitted,
+// but at least one @domain is required and every nonempty hop must be valid.
+func addressRouteEnd(value string, i int) (int, bool) {
+	var ok bool
+	i, ok = addressCFWSEnd(value, i)
+	for ok && i < len(value) && value[i] == ',' {
+		i, ok = addressCFWSEnd(value, i+1)
+	}
+	if !ok || i == len(value) || value[i] != '@' {
+		return 0, false
+	}
+	for {
+		i, ok = addressRouteDomainEnd(value, i+1)
+		if !ok || i == len(value) {
+			return 0, false
+		}
+		if value[i] == ':' {
+			return i + 1, true
+		}
+		if value[i] != ',' {
+			return 0, false
+		}
+		for value[i] == ',' {
+			i, ok = addressCFWSEnd(value, i+1)
+			if !ok || i == len(value) {
+				return 0, false
+			}
+		}
+		if value[i] == ':' {
+			return i + 1, true
+		}
+		if value[i] != '@' {
+			return 0, false
+		}
+	}
+}
+
+// addressRouteDomainEnd validates a route hop's domain, including obsolete CFWS
+// between its dot-separated atoms and domain literals containing colons.
+func addressRouteDomainEnd(value string, i int) (int, bool) {
+	i, ok := addressCFWSEnd(value, i)
+	if !ok || i == len(value) {
+		return 0, false
+	}
+	if value[i] == '[' {
+		for i++; i < len(value); i++ {
+			switch ch := value[i]; ch {
+			case ']':
+				return addressCFWSEnd(value, i+1)
+			case '\\':
+				i++
+				if i == len(value) || value[i] == 0 || value[i] == '\r' || value[i] == '\n' {
+					return 0, false
+				}
+			case '\r':
+				if i+2 >= len(value) || value[i+1] != '\n' || (value[i+2] != ' ' && value[i+2] != '\t') {
+					return 0, false
+				}
+				i++
+			case '[', '\n', 0:
+				return 0, false
+			default:
+				if ch > 127 {
+					return 0, false
+				}
+			}
+		}
+		return 0, false
+	}
+	for {
+		start := i
+		for i < len(value) && (value[i] >= 'a' && value[i] <= 'z' || value[i] >= 'A' && value[i] <= 'Z' || value[i] >= '0' && value[i] <= '9' || strings.IndexByte("!#$%&'*+-/=?^_`{|}~", value[i]) >= 0) {
+			i++
+		}
+		if start == i {
+			return 0, false
+		}
+		i, ok = addressCFWSEnd(value, i)
+		if !ok || i == len(value) || value[i] != '.' {
+			return i, ok
+		}
+		i, ok = addressCFWSEnd(value, i+1)
+		if !ok {
+			return 0, false
+		}
+	}
+}
+
+// addressCFWSEnd validates balanced comments and folding whitespace before an
+// obsolete route token. Malformed text must not disappear with a stripped route.
+func addressCFWSEnd(value string, i int) (int, bool) {
+	depth := 0
+	for i < len(value) {
+		switch value[i] {
+		case ' ', '\t':
+			i++
+		case '\r':
+			if i+2 >= len(value) || value[i+1] != '\n' || (value[i+2] != ' ' && value[i+2] != '\t') {
+				return 0, false
+			}
+			i += 2
+		case '(', ')':
+			if value[i] == '(' {
+				depth++
+			} else if depth == 0 {
+				return i, true
+			} else {
+				depth--
+			}
+			i++
+		case '\\':
+			if depth == 0 {
+				return i, true
+			}
+			i++
+			if i == len(value) || value[i] == 0 || value[i] == '\r' || value[i] == '\n' {
+				return 0, false
+			}
+			i++
+		case '\n', 0:
+			return 0, false
+		default:
+			if depth == 0 {
+				return i, true
+			}
+			i++
+		}
+	}
+	return i, depth == 0
 }
 
 // ExtractEnvelopeRecipients returns the addresses a message is sent to: its To, Cc and
