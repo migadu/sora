@@ -279,27 +279,23 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 	}
 	rootNodes = pruned
 
-	// 4. Order the threads: REFERENCES by the sent date of each thread's first
-	// message, REFS by the latest INTERNALDATE in each thread, so that the thread
-	// that received mail last comes last. A dummy's children are put in sent-date
-	// order first, so that step 5 finds its first child.
+	// 4. Order the threads: REFERENCES by the sent date of each thread's root (a
+	// dummy's first child, which step 5 also goes by), REFS by the latest
+	// INTERNALDATE in each thread, so that the thread that received mail last
+	// comes last.
 	if refs {
 		sortByLatestArrival(rootNodes)
 	} else {
-		for _, root := range rootNodes {
-			if root.msg == nil {
-				sortBySentDate(root.children)
-			}
-		}
-		sortByEarliest(rootNodes)
+		sortThreads(rootNodes)
 	}
 
 	// 5. Merge the threads that share a base subject; REFS ignores Subject.
 	if !refs {
 		rootNodes = mergeBySubject(rootNodes)
 
-		// 6. Merging made new roots: order them again.
-		sortByEarliest(rootNodes)
+		// 6. Merging made new roots: order them again. Below the roots,
+		// buildThreadData sorts each set of siblings.
+		sortThreads(rootNodes)
 	}
 
 	// 7. Build the ThreadData structure
@@ -449,48 +445,38 @@ func extractIDs(s string) []string {
 	return helpers.SplitMessageIDs(s)
 }
 
-// sortByEarliest orders nodes by the earliest sent date in each subtree, then by
-// the lowest message number in it.
-func sortByEarliest(nodes []*jwzNode) {
-	sort.Slice(nodes, func(i, j int) bool {
-		dateI := getEarliestDate(nodes[i])
-		dateJ := getEarliestDate(nodes[j])
-		if !dateI.Equal(dateJ) {
-			return dateI.Before(dateJ)
+// sortThreads orders threads as RFC 5256 REFERENCES steps 4 and 6 do: a dummy's
+// children first, then the threads, "In the case of a dummy message, sort its
+// children by sent date and then use the first child for the top-level sort."
+func sortThreads(roots []*jwzNode) {
+	for _, root := range roots {
+		if root.msg == nil {
+			sortBySentDate(root.children)
 		}
-		return getEarliestID(nodes[i]) < getEarliestID(nodes[j])
-	})
+	}
+	sortBySentDate(roots)
 }
 
-// sortBySentDate orders message nodes by their own sent date, then by mailbox
-// order (RFC 5256 section 2.2).
+// sortBySentDate orders siblings by sent date, then by mailbox order (RFC 5256
+// section 2.2): a message by its own, a dummy by its first child's, so a dummy's
+// children must be in order already.
 func sortBySentDate(nodes []*jwzNode) {
+	first := func(n *jwzNode) *jwzNode {
+		for n.msg == nil && len(n.children) > 0 {
+			n = n.children[0]
+		}
+		return n
+	}
 	sort.SliceStable(nodes, func(i, j int) bool {
-		if nodes[i].msg == nil || nodes[j].msg == nil {
-			return nodes[i].msg != nil
+		a, b := first(nodes[i]), first(nodes[j])
+		if a.msg == nil || b.msg == nil {
+			return a.msg != nil
 		}
-		if dateI, dateJ := nodes[i].msg.SentDate, nodes[j].msg.SentDate; !dateI.Equal(dateJ) {
-			return dateI.Before(dateJ)
+		if dateA, dateB := a.msg.SentDate, b.msg.SentDate; !dateA.Equal(dateB) {
+			return dateA.Before(dateB)
 		}
-		return nodes[i].id < nodes[j].id
+		return a.id < b.id
 	})
-}
-
-func getEarliestDate(node *jwzNode) time.Time {
-	var earliest time.Time
-	if node.msg != nil {
-		earliest = node.msg.SentDate
-	}
-
-	for _, child := range node.children {
-		d := getEarliestDate(child)
-		if !d.IsZero() {
-			if earliest.IsZero() || d.Before(earliest) {
-				earliest = d
-			}
-		}
-	}
-	return earliest
 }
 
 // sortByLatestArrival orders nodes by the latest INTERNALDATE in each subtree,
@@ -522,22 +508,6 @@ func getLatestArrival(node *jwzNode) (latest time.Time, id uint32) {
 	return latest, id
 }
 
-func getEarliestID(node *jwzNode) uint32 {
-	var earliest uint32
-	if node.msg != nil {
-		earliest = node.id
-	}
-	for _, child := range node.children {
-		id := getEarliestID(child)
-		if id != 0 {
-			if earliest == 0 || id < earliest {
-				earliest = id
-			}
-		}
-	}
-	return earliest
-}
-
 func buildThreadData(node *jwzNode) *imap.ThreadData {
 	td := &imap.ThreadData{}
 
@@ -557,7 +527,9 @@ func buildThreadData(node *jwzNode) *imap.ThreadData {
 
 	// Add subthreads if there are multiple branches
 	if curr != nil && len(curr.children) > 1 {
-		sortByEarliest(curr.children)
+		// RFC 5256 REFERENCES step 6, which THREAD=REFS shares: each set of
+		// siblings by sent date.
+		sortBySentDate(curr.children)
 
 		for _, child := range curr.children {
 			if sub := buildThreadData(child); sub != nil {
