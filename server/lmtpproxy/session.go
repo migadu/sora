@@ -172,11 +172,20 @@ func (s *Session) handleConnection() {
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
 	if s.settings.absoluteSessionTimeout > 0 {
+		// The timer goroutine only cancels: logging there read the session's
+		// username/account fields while the session goroutine wrote them. The
+		// session goroutine logs it on the way out instead.
+		var timedOut atomic.Bool
 		timeout := time.AfterFunc(s.settings.absoluteSessionTimeout, func() {
-			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.settings.absoluteSessionTimeout)
+			timedOut.Store(true)
 			s.cancel() // Force cancel context to unblock any stuck I/O
 		})
-		defer timeout.Stop()
+		defer func() {
+			if timeout.Stop() || !timedOut.Load() {
+				return // ended before the timeout
+			}
+			s.InfoLog("Absolute session timeout reached - force closed", "duration", s.settings.absoluteSessionTimeout)
+		}()
 	}
 
 	// Log connection at INFO level
