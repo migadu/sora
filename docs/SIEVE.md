@@ -431,7 +431,9 @@ redirect is skipped and the message is kept, as if the line were not there:
 4. The account is under its redirect rate limit: at most `redirect_rate_limit` redirected
    addresses (default 100) per `redirect_rate_window` (default `1h`). `0` turns the limit off.
    Only addresses that were actually handed to the relay queue count. If the database check
-   fails, the redirect is skipped.
+   fails, the redirect is skipped. The count covers the account's redirects on every node, so
+   both keys are cluster-wide settings: give every `lmtp` and `http_admin_api` server of every
+   node the same values, or the account's limit depends on the node that delivers.
 5. A relay is configured (`[relay] type` set). Sora checks this after the script has run.
    Without a relay, the message is stored as when the relay queue cannot take a redirect (see
    below): where the rest of the script puts it, or in INBOX.
@@ -665,7 +667,7 @@ in `fields` (for example `sieve.enabled_extensions`). At startup, and in
 | Key | Server types | Default | Meaning |
 |---|---|---|---|
 | `limits.redirect_rate_limit` | `lmtp`, `http_admin_api` | `100` | Redirected addresses allowed per account per window. `0` means no limit. |
-| `limits.redirect_rate_window` | `lmtp`, `http_admin_api` | `"1h"` | The window for the limit above. Zero or a negative value stops startup (use `redirect_rate_limit = 0` to turn the limit off). A value that does not parse falls back to `1h` with a log line. |
+| `limits.redirect_rate_window` | `lmtp`, `http_admin_api` | `"1h"` | The window for the limit above. Zero or a negative value stops startup (use `redirect_rate_limit = 0` to turn the limit off). A value that does not parse falls back to `1h` with a log line. Must be the same on every server that applies the limit, on every node: a redirect is kept until the window of the server that charged it has passed, so a server with a longer window may not count redirects a shorter one charged. Startup and `sora-admin config validate` warn about servers of one file with different windows, and each node logs a warning at startup and hourly while redirects charged under another node's window are still inside it (as expected while a changed window rolls out). |
 | `limits.max_redirect_hops` | `lmtp`, `http_admin_api` | `2` | How many times Sora may redirect one message, counted in `X-Sora-Loop`. `1` allows one redirect. `0` means no limit; `Delivered-To` loop detection still applies. |
 | `max_script_size` | `managesieve` | `"16kb"` | Largest script ManageSieve accepts. Reloads on `SIGHUP`. |
 | `supported_extensions` | `managesieve_proxy` | the default set | Extensions the proxy advertises before login. |

@@ -701,6 +701,9 @@ func initializeServices(ctx context.Context, cfg config.Config, errorHandler *er
 		deps.resilientDB.StartPoolMetrics(ctx)
 		deps.resilientDB.StartPoolHealthMonitoring(ctx)
 		logger.Info("Database resilience features initialized: failover, circuit breakers, pool monitoring")
+		// The redirect rate limit is one limit only with one redirect_rate_window on every
+		// node: warn about this node's and about the windows other nodes charge (#1994).
+		go delivery.WatchRedirectRateWindows(ctx, deps.resilientDB, cfg.RedirectRateWindows(), time.Hour)
 	}
 
 	// Initialize persistent auth cache if enabled (survives restarts, prevents thundering herd)
