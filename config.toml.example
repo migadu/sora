@@ -1570,7 +1570,7 @@ proxy_protocol_timeout = "5s"
 # auth_rate_limit.enabled = false
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve)
+timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve; "0" also means the default)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = disabled, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers (NOOP every N seconds) and silent sessions are unaffected.
 
