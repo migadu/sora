@@ -34,8 +34,8 @@ func (db *Database) CountRedirectsSince(ctx context.Context, accountID int64, wi
 
 // RedirectedTargets returns the redirect targets the account's delivery of the message
 // identified by deliveryHash (see InsertMessageOptions.DeliveryHash) has already handed to
-// the relay queue. It reads the primary: the retry of a delivery can follow it within
-// seconds, before a replica has the row.
+// the relay, on LMTP or the Admin API. It reads the primary: the retry of a delivery can
+// follow it within seconds, before a replica has the row.
 func (db *Database) RedirectedTargets(ctx context.Context, accountID int64, deliveryHash string) ([]string, error) {
 	rows, err := db.GetWritePool().Query(ctx, `
 		SELECT redirect_to FROM redirect_deliveries
@@ -48,7 +48,7 @@ func (db *Database) RedirectedTargets(ctx context.Context, accountID int64, deli
 }
 
 // RecordRedirectDelivery records that the account's delivery of the message identified by
-// deliveryHash has handed its redirect to redirectTo to the relay queue, so a retry of that
+// deliveryHash has handed its redirect to redirectTo to the relay, so a retry of that
 // delivery does not queue it again.
 func (db *Database) RecordRedirectDelivery(ctx context.Context, tx pgx.Tx, accountID int64, deliveryHash, redirectTo string) error {
 	_, err := tx.Exec(ctx, `
