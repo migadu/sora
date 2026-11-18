@@ -276,6 +276,22 @@ func IsASCII(s string) bool {
 	return true
 }
 
+// NewForwardPath parses the forward-path of RCPT TO as go-smtp hands it to a session.
+// It is NewAddress without the master-token suffix: a recipient is an envelope address,
+// not a login name, and a second "@" in it comes from a quoted local part such as
+// `"a@b.example"@example.com` (go-smtp unquotes it), which no account here has. Read
+// with the suffix rule it would be delivered to a@b.example (#1938).
+func NewForwardPath(input string) (Address, error) {
+	addr, err := NewAddress(input)
+	if err != nil {
+		return Address{}, err
+	}
+	if addr.HasSuffix() {
+		return Address{}, addressError{fmt.Errorf("recipient has more than one @: %q", input)}
+	}
+	return addr, nil
+}
+
 // Reverse-path syntax that NewReversePath accepts beyond NewAddress. A lenient dot-string
 // is atext and dots in any arrangement (go-smtp's dot-string, which takes leading,
 // trailing and consecutive dots on purpose). A lenient domain is a name of one or more
@@ -291,8 +307,11 @@ var (
 // the mailbox between the angle brackets, with a quoted local part already unquoted. The
 // null reverse-path ("") is the caller's to handle; it is refused here.
 //
-// A sender NewAddress accepts is returned exactly as NewAddress returns it. Otherwise the
-// sender is read as leniently as go-smtp's own parser reads it, which is what Postfix
+// A sender NewAddress accepts without a master-token suffix is returned exactly as
+// NewAddress returns it. The suffix (user@domain@SUFFIX) belongs to login names, not to
+// envelope addresses: a second "@" can only come from a quoted local part, so
+// "a@b.example@example.com" is the sender `"a@b.example"@example.com` (#1938). Otherwise
+// the sender is read as leniently as go-smtp's own parser reads it, which is what Postfix
 // does with strict_rfc821_envelopes = no: leading, trailing and consecutive dots in the
 // local part (older mobile carrier addresses), a quoted local part, a dotless domain and
 // an address literal. Refusing them would bounce mail the MTA was right to send (#1907).
@@ -308,7 +327,7 @@ func NewReversePath(input string) (Address, error) {
 	// NewAddress trims the input, which would take the space off a quoted local part
 	// such as `" x"`.
 	if strings.TrimSpace(input) == input {
-		if addr, err := parseAddress(input); err == nil {
+		if addr, err := parseAddress(input); err == nil && !addr.HasSuffix() {
 			return addr, nil
 		}
 	}

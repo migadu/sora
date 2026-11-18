@@ -322,7 +322,7 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 
 	s.DebugLog("processing rcpt to command", "to", to)
 
-	toAddress, err := server.NewAddress(to)
+	toAddress, err := server.NewForwardPath(to)
 	if err != nil {
 		s.WarnLog("invalid to address", "error", err)
 		recordMetrics("failure")

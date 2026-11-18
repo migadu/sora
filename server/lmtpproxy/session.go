@@ -1250,7 +1250,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 	s.rcptSessionGeneration = s.server.connTracker.SessionGeneration()
 	cacheGeneration := s.server.lookupCache.Generation()
 
-	address, err := server.NewAddress(to)
+	address, err := server.NewForwardPath(to)
 	if err != nil {
 		s.InfoLog("rejecting recipient - invalid address format",
 			"to", to,
