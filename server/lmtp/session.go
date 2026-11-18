@@ -205,9 +205,9 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 		fromAddress = server.Address{} // Empty address for null sender
 		s.DebugLog("null sender accepted (bounce message)")
 	} else {
-		// Normal sender - validate address
+		// Normal sender - validate address, as leniently as go-smtp parsed it (#1907)
 		var err error
-		fromAddress, err = server.NewAddress(from)
+		fromAddress, err = server.NewReversePath(from)
 		if err != nil {
 			s.WarnLog("invalid from address", "from", from, "error", err)
 			recordMetrics("failure")

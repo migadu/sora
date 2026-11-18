@@ -17,7 +17,11 @@ func TestUnreadableReversePathRefused(t *testing.T) {
 	for _, tt := range []struct{ name, from string }{
 		{"no closing bracket", "<foo"},
 		{"one character", "x"},
-		{"quoted local part with space", `<"john doe"@example.org>`},
+		// A space inside a quoted local part is read (TestLenientReversePathForwarded),
+		// one outside it is not.
+		{"space after quoted local part", `<"john doe" @example.org>`},
+		{"space in domain after quoted local part", `<"john doe"@exa mple.org>`},
+		{"quoted local part without domain", `<"john doe">`},
 		{"spaces inside brackets", "< a@example.org >"},
 		// Not "<>": a quoted string is a local part (section 4.1.2), and this one has
 		// no domain. A sora backend answers it as the other cases here.
@@ -144,4 +148,49 @@ func TestUnreadableReversePathRefused(t *testing.T) {
 			t.Errorf("backend was sent %q for refused RCPT", cmd)
 		}
 	})
+}
+
+// A reverse-path go-smtp reads, and a sora backend accepts, is not refused by the proxy
+// either (#1907): a quoted local part holding a space, and the dot-strings and domains
+// go-smtp is lenient about. Each reaches the backend as the client wrote it, inside its
+// angle brackets. A forward-path with a quoted space stays refused: recipients are
+// checked strictly.
+func TestLenientReversePathForwarded(t *testing.T) {
+	for _, from := range []string{
+		`"john doe"@example.org`,
+		`"john \"jd\" doe"@example.org`,
+		"first..last@example.org",
+		".lead@example.org",
+		"trail.@example.org",
+		"user@localhost",
+	} {
+		t.Run(from, func(t *testing.T) {
+			backend := startNestedMailBackend(t)
+			conn, reader, _ := startNestedMailProxySession(t, backend.addr)
+			send := func(cmd string) string {
+				t.Helper()
+				if _, err := io.WriteString(conn, cmd+"\r\n"); err != nil {
+					t.Fatalf("writing %q: %v", cmd, err)
+				}
+				return readReply(t, reader)
+			}
+
+			if got := send("LHLO client.example.com"); !strings.HasPrefix(got, "250 ") {
+				t.Fatalf("LHLO: %q, want 250", got)
+			}
+			if got := send("MAIL FROM:<" + from + "> SIZE=10"); !strings.HasPrefix(got, "250 ") {
+				t.Fatalf("MAIL FROM:<%s>: %q, want 250", from, got)
+			}
+			if got := send(`RCPT TO:<"john doe"@example.com>`); got != "501 5.1.3 Bad recipient address syntax" {
+				t.Errorf("quoted RCPT: %q, want 501 5.1.3", got)
+			}
+			if got := send("RCPT TO:<a@example.com>"); !strings.HasPrefix(got, "250 ") {
+				t.Fatalf("RCPT: %q, want 250", got)
+			}
+			cmds := backend.commands()
+			if len(cmds) == 0 || !strings.HasPrefix(cmds[0], "#1 MAIL FROM:<"+from+">") {
+				t.Errorf("backend commands = %q, want MAIL FROM:<%s> first", cmds, from)
+			}
+		})
+	}
 }

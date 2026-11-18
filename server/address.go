@@ -275,3 +275,105 @@ func IsASCII(s string) bool {
 	}
 	return true
 }
+
+// Reverse-path syntax that NewReversePath accepts beyond NewAddress. A lenient dot-string
+// is atext and dots in any arrangement (go-smtp's dot-string, which takes leading,
+// trailing and consecutive dots on purpose). A lenient domain is a name of one or more
+// labels, so a dotless one such as "localhost" too, or an RFC 5321 §4.1.3 address
+// literal: "[" 1*dcontent "]" with dcontent = %d33-90 / %d94-126.
+var (
+	lenientDotStringRe = regexp.MustCompile(`^(?i)[.` + atextClass + `]+$`)
+	lenientDomainRe    = regexp.MustCompile(`^(?i)(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)*[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$`)
+	addressLiteralRe   = regexp.MustCompile(`^\[[\x21-\x5a\x5e-\x7e]+\]$`)
+)
+
+// NewReversePath parses the reverse-path of MAIL FROM as go-smtp hands it to a session:
+// the mailbox between the angle brackets, with a quoted local part already unquoted. The
+// null reverse-path ("") is the caller's to handle; it is refused here.
+//
+// A sender NewAddress accepts is returned exactly as NewAddress returns it. Otherwise the
+// sender is read as leniently as go-smtp's own parser reads it, which is what Postfix
+// does with strict_rfc821_envelopes = no: leading, trailing and consecutive dots in the
+// local part (older mobile carrier addresses), a quoted local part, a dotless domain and
+// an address literal. Refusing them would bounce mail the MTA was right to send (#1907).
+// Forward-paths stay with NewAddress.
+//
+// What is returned is safe to write into a command or a header: no control character
+// survives (CR and LF included), the length limits of NewAddress apply to the form
+// returned, and a local part that is not a dot-string is returned quoted (RFC 5321
+// §4.1.2 Quoted-string, with "\" and `"` escaped), so FullAddress is the mailbox in the
+// form a MAIL FROM, RCPT TO or To: field takes it. Like NewAddress, the address is
+// lower-cased and a non-ASCII domain is folded to its A-label.
+func NewReversePath(input string) (Address, error) {
+	// NewAddress trims the input, which would take the space off a quoted local part
+	// such as `" x"`.
+	if strings.TrimSpace(input) == input {
+		if addr, err := parseAddress(input); err == nil {
+			return addr, nil
+		}
+	}
+	addr, err := parseLenientReversePath(input)
+	if err != nil {
+		return Address{}, addressError{err}
+	}
+	return addr, nil
+}
+
+func parseLenientReversePath(input string) (Address, error) {
+	if !utf8.ValidString(input) {
+		return Address{}, fmt.Errorf("address is not valid UTF-8: %q", input)
+	}
+	for _, r := range input {
+		if r < 0x20 || r == 0x7f {
+			return Address{}, fmt.Errorf("address contains a control character: %q", input)
+		}
+	}
+
+	// A quoted local part may hold "@"; a domain never does.
+	at := strings.LastIndexByte(input, '@')
+	if at <= 0 || at == len(input)-1 {
+		return Address{}, fmt.Errorf("invalid email format: %q", input)
+	}
+	localPart := strings.ToLower(input[:at])
+	domain := strings.ToLower(input[at+1:])
+
+	detail := ""
+	if lenientDotStringRe.MatchString(localPart) {
+		if plusIndex := strings.Index(localPart, "+"); plusIndex != -1 {
+			detail = localPart[plusIndex+1:]
+		}
+	} else {
+		// Every printable character may stand in a quoted string once "\" and `"` are
+		// escaped (RFC 5321 §4.1.2 qtextSMTP and quoted-pairSMTP; UTF8-non-ascii by RFC
+		// 6531 §3.3). A quoted local part has no detail.
+		localPart = `"` + strings.NewReplacer(`\`, `\\`, `"`, `\"`).Replace(localPart) + `"`
+	}
+	if len(localPart) > MaxLocalPartLength {
+		return Address{}, fmt.Errorf("local part exceeds maximum length of %d characters: %q", MaxLocalPartLength, localPart)
+	}
+
+	if !IsASCII(domain) {
+		ascii, err := idna.Lookup.ToASCII(domain)
+		if err != nil {
+			return Address{}, fmt.Errorf("unacceptable domain: %q: %w", domain, err)
+		}
+		domain = ascii
+	}
+	if len(domain) > MaxDomainLength {
+		return Address{}, fmt.Errorf("domain exceeds maximum length of %d characters: %q", MaxDomainLength, domain)
+	}
+	if !lenientDomainRe.MatchString(domain) && !addressLiteralRe.MatchString(domain) {
+		return Address{}, fmt.Errorf("unacceptable domain: %q", domain)
+	}
+
+	fullAddress := localPart + "@" + domain
+	if len(fullAddress) > MaxAddressLength {
+		return Address{}, fmt.Errorf("email address exceeds maximum length of %d characters (got %d): %q", MaxAddressLength, len(fullAddress), fullAddress)
+	}
+	return Address{
+		fullAddress: fullAddress,
+		localPart:   localPart,
+		domain:      domain,
+		detail:      detail,
+	}, nil
+}
