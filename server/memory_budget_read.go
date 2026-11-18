@@ -15,11 +15,13 @@ var ErrMemoryBudgetExhausted = errors.New("memory budget exhausted")
 // smallest growth: most messages are smaller, so most reads allocate once.
 const readAllChargedMinGrow = 32 << 10
 
-// ReadAllCharged reads r to EOF into memory. Each time its buffer must grow, it
-// first charges budget (nil: no budget) for the added capacity, so the budget
-// holds at least the buffer's whole capacity before that capacity is allocated.
-// A refused charge ends the read with an error wrapping ErrMemoryBudgetExhausted,
-// without reading r any further.
+// ReadAllCharged reads r to EOF into memory. Its buffer starts at 32 KiB and
+// doubles. Each time it must grow, the whole new capacity is charged to budget
+// (nil: no budget) BEFORE it is allocated, while the old buffer is still charged:
+// both are live during the copy. The old buffer's charge is dropped once the new
+// one has replaced it, so after the read the charge is the buffer's capacity. A
+// refused charge ends the read with an error wrapping ErrMemoryBudgetExhausted,
+// without reading r any further; the old buffer and its charge are returned.
 //
 // It returns the bytes read, the bytes charged and the first error. The caller
 // frees what was charged (budget.Free) once it is done with the bytes, on every
@@ -29,16 +31,19 @@ func ReadAllCharged(r io.Reader, budget *SessionMemoryTracker) ([]byte, int64, e
 	var charged int64
 	for {
 		if len(buf) == cap(buf) {
-			grow := max(cap(buf), readAllChargedMinGrow)
+			newCap := cap(buf) + max(cap(buf), readAllChargedMinGrow)
 			if budget != nil {
-				if err := budget.Allocate(int64(grow)); err != nil {
+				if err := budget.Allocate(int64(newCap)); err != nil {
 					return buf, charged, fmt.Errorf("%w: %v", ErrMemoryBudgetExhausted, err)
 				}
-				charged += int64(grow)
 			}
-			next := make([]byte, len(buf), cap(buf)+grow)
+			next := make([]byte, len(buf), newCap)
 			copy(next, buf)
 			buf = next
+			if budget != nil {
+				budget.Free(charged) // the old buffer is garbage now
+				charged = int64(newCap)
+			}
 		}
 		n, err := r.Read(buf[len(buf):cap(buf)])
 		buf = buf[:len(buf)+n]

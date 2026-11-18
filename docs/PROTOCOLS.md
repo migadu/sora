@@ -1170,8 +1170,9 @@ all, because LMTP answers once per accepted recipient, and there is none (RFC 20
    chunk is thrown away and the transaction reset.
 
 With `limits.delivery_memory_limit` set, the bytes all transactions of the server hold at once are
-bounded too: the `DATA` (or `BDAT`) buffer is charged as it grows, and the base64 copy of NUL-bearing
-parts before it is built. A transaction that does not fit gets
+bounded too: the `DATA` (or `BDAT`) buffer is charged before each time it grows, the old and the new
+buffer together while it is copied, and the base64 copy of NUL-bearing parts before it is built. A
+transaction that does not fit gets
 `452 4.3.1 Delivery memory limit reached, please try again later`, so the MTA retries it later
 ([CONFIGURATION.md](CONFIGURATION.md#95-limits-serverlimits)). The limit is unset (no budget) by
 default.
