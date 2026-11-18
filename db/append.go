@@ -50,17 +50,17 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 		}
 		// A group start is an address whose addr-mailbox is the group name and whose
 		// addr-host is NIL (RFC 3501 §7.4.2), so a header that starts with a group has it
-		// as its first address. The email column holds addr-mailbox "@" addr-host, which
-		// RFC 5256 §3 FROM/TO/CC split at the last '@' (addrMailboxExpr): for a group it is
-		// the name and a bare "@", so the split gives back the whole name even when the
-		// name holds an '@'. DISPLAYFROM/DISPLAYTO read the name column first, which for a
-		// group holds its name: it has no addr-name, and RFC 5957 §3 then takes the
-		// addr-mailbox. A later group start has no name or address of its own, so extra()
-		// leaves it out.
+		// as its first address, and RFC 5256 §3 FROM/TO/CC and RFC 5957 §3
+		// DISPLAYFROM/DISPLAYTO (it has no addr-name) all sort it by that name, whole even
+		// when it holds an '@'. The columns hold only header text, since SEARCH reads them:
+		// the group's email column stays empty, which no address leaves it, and the name
+		// goes where the header's first name goes, the name column for From and To and
+		// the head of the Cc section of extra_addresses for Cc. SORT reads it back from
+		// there (groupAwareAddrMailboxExpr). A later group start has no name or address
+		// of its own, so extra() leaves it out.
 		name, email := bound(r.Name), bound(r.EmailAddress)
 		if r.Group != "" {
-			name = helpers.TruncateUTF8Safe(strings.ToLower(r.Group), helpers.MaxSortColumnBytes-1)
-			email = name + "@"
+			name, email = bound(r.Group), ""
 		}
 		switch r.AddressType {
 		case "from":
@@ -80,7 +80,7 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 				extra(2, r.Name, r.EmailAddress)
 			} else {
 				ccEmailSort, ccFound = email, true
-				extra(2, r.Name)
+				extra(2, r.Name, r.Group)
 			}
 		}
 	}

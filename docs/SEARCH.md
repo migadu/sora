@@ -624,7 +624,9 @@ limiter logs a refusal at debug level at most once a minute per account.
   `DISPLAYFROM` and `DISPLAYTO` by the display name, or the address when there is none
   (RFC 5957). When a header starts with a group (`Cc: team: a@example.com;`), its first address
   is the group start, so the header sorts by the group name, all of it even when it holds an `@`
-  (RFC 3501 §7.4.2). A message without a `Date:` header sorts by its INTERNALDATE under `DATE`.
+  (RFC 3501 §7.4.2). The group start's address column is left empty and its name is stored where
+  the header's first display name goes (for Cc, at the head of its `extra_addresses` section), so
+  SEARCH sees only the name as written. A message without a `Date:` header sorts by its INTERNALDATE under `DATE`.
   Strings are compared with the `i;unicode-casemap` collation (RFC 5256 §7): case is ignored and
   compatibility characters are decomposed, then the strings are compared byte by byte, never by
   the database's own collation. Ties are broken by ascending UID, also under `REVERSE`.

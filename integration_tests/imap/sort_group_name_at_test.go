@@ -78,7 +78,19 @@ func TestIMAP_Sort_GroupNameWithAt(t *testing.T) {
 			t.Errorf("SORT (%s) ALL = %v, want %v", tc.key, res.SeqNums, tc.want)
 		}
 	}
-	// The delimiter used only for SORT must not leak into SEARCH. Keep one
+	// SORT over a single TEXT term takes the TEXT UNION query, which sorts a CTE of the
+	// carried columns: the Cc group name has to come along (5 has no '@' anywhere).
+	res, err := c.Sort(&imapclient.SortOptions{
+		SearchCriteria: &imap.SearchCriteria{Text: []string{"@"}},
+		SortCriteria:   []imap.SortCriterion{{Key: imap.SortKeyCc}},
+	}).Wait()
+	if err != nil {
+		t.Fatalf("SORT (CC) TEXT: %v", err)
+	}
+	if want := []uint32{4, 2, 1, 3}; !slices.Equal(res.SeqNums, want) {
+		t.Errorf("SORT (CC) TEXT \"@\" = %v, want %v", res.SeqNums, want)
+	}
+	// SEARCH sees the header text only, nothing SORT needs. Keep one
 	// literal terminal '@' in a group name, and every '@' of a real mailbox.
 	for _, key := range []string{"From", "To", "Cc"} {
 		for _, tc := range []struct {

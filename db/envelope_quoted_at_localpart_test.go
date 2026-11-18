@@ -165,8 +165,8 @@ func TestSortOrderClauseQuotedAtLocalPart(t *testing.T) {
 		t.Helper()
 		orderBy := db.buildSortOrderClause([]imap.SortCriterion{{Key: key}})
 		query := `
-			WITH m(uid, from_email_sort, to_email_sort, cc_email_sort) AS (
-				SELECT ord::bigint, val, val, val
+			WITH m(uid, from_email_sort, to_email_sort, cc_email_sort, from_name_sort, to_name_sort, extra_addresses) AS (
+				SELECT ord::bigint, val, val, val, '', '', NULL::text
 				FROM unnest($1::text[]) WITH ORDINALITY AS u(val, ord)
 			)
 			SELECT m.uid FROM m ` + orderBy
