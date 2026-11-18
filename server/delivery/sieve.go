@@ -256,6 +256,15 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		},
 	}
 
+	// A user script that could not be read is not "no script": delivering with the
+	// default script alone would skip the user's own rules, so the delivery fails and
+	// the caller answers it as a transient error.
+	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.AccountID)
+	if err != nil && !errors.Is(err, consts.ErrDBNotFound) {
+		s.DeliveryCtx.Logger.Log("Failed to get the active Sieve script: %v", err)
+		return nil, fmt.Errorf("failed to get the active Sieve script: %w", err)
+	}
+
 	// The built-in default script runs first, as on LMTP, and the user's script then
 	// takes the message over or keeps the default's filing (MergeSieveResults). A
 	// script that fails to compile or run leaves the result before it standing.
@@ -264,10 +273,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	if err != nil {
 		return nil, err
 	}
-	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.AccountID)
-	if err != nil && err != consts.ErrDBNotFound {
-		s.DeliveryCtx.Logger.Log("Failed to get the active Sieve script, using the default script's result: %v", err)
-	} else if activeScript != nil {
+	if activeScript != nil {
 		userResult := s.evaluate(ctx, recipient, sieveCtx, activeScript.Script, "user")
 		result, _ = MergeSieveResults(result, userResult)
 	}

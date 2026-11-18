@@ -697,6 +697,33 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	}
 
 	activeScript, err := s.backend.rdb.GetActiveScriptWithRetry(readCtx, s.AccountID())
+	if err != nil && !errors.Is(err, consts.ErrDBNotFound) {
+		// A script that could not be read is not "no script": delivering with the
+		// default script alone would skip the user's fileinto, redirect, vacation and
+		// discard. Defer the message so the MTA retries once the database answers.
+		recordMetrics("failure")
+		if ctx.Err() != nil {
+			// The DATA cap fired, or the client went away / the server is shutting
+			// down: the same replies as a cancelled message save.
+			if commandTimedOut(ctx) {
+				s.WarnLog("active sieve script load timed out", "cap", "data")
+				return &smtp.SMTPError{
+					Code:         451,
+					EnhancedCode: smtp.EnhancedCode{4, 3, 0},
+					Message:      "Message processing timed out, please try again later",
+				}
+			}
+			s.InfoLog("active sieve script load cancelled due to server shutdown")
+			return &smtp.SMTPError{
+				Code:         421,
+				EnhancedCode: smtp.EnhancedCode{4, 2, 1},
+				Message:      "service shutting down",
+			}
+		}
+		// The reply text reaches the sender in a delay notice: the error stays in the log.
+		s.WarnLog("failed to get active sieve script", "error", err)
+		return s.InternalError("failed to load the recipient's Sieve script")
+	}
 	var result sieveengine.Result
 
 	// Create an adapter for the VacationOracle interface
@@ -807,11 +834,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 			}
 		}
 	} else {
-		if err != nil && err != consts.ErrDBNotFound {
-			s.DebugLog("failed to get active sieve script", "error", err)
-		} else {
-			s.DebugLog("no active script found, using default script result")
-		}
+		s.DebugLog("no active script found, using default script result")
 	}
 
 	// Apply header edits if any (RFC 5293 - editheader extension)

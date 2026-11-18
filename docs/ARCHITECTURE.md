@@ -314,7 +314,8 @@ sequenceDiagram
    side effects.
 5. **Sieve runs.** The server-wide default script runs first, then the user's active script.
    A script can file the message into a folder, discard it, redirect it, send a vacation
-   reply, set flags or edit headers. A discarded message stops here. See
+   reply, set flags or edit headers. A discarded message stops here. If the user's active
+   script cannot be read from the database, Sora answers `451 4.3.0` and the MTA retries. See
    [SIEVE.md](SIEVE.md).
 6. **The body is hashed.** Sora computes a BLAKE3 hash of the final bytes, after any header
    edits. This *content hash* names the body from now on.
