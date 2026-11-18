@@ -20,7 +20,8 @@ import (
 // can only come from a quoted local part, never from a master-token suffix (#1938). The
 // script answers only when Sieve sees the expected envelope sender, and the vacation
 // reply is addressed to it. Whitespace around "from" is trimmed, as NewAddress did, not
-// read as a quoted local part.
+// read as a quoted local part. A quoted local part is accepted quoted or not, and the
+// reply goes to the sender with its local part as written (#2101).
 func TestAdminAPI_DeliverMail_SenderReadAsReversePath(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -37,6 +38,11 @@ func TestAdminAPI_DeliverMail_SenderReadAsReversePath(t *testing.T) {
 		{name: "consecutive dots", from: "first..last@example.com", want: "first..last@example.com"},
 		{name: "second at sign", from: "a@b.example@example.com", want: `"a@b.example"@example.com`},
 		{name: "surrounding whitespace", from: " sender@example.org ", want: "sender@example.org"},
+		// The sender as written and as net/mail reads a From: field both name the mailbox
+		// `"John Doe"@example.com`, quoted once, in its case (#2101).
+		{name: "quoted local part", from: `"John Doe"@example.com`, want: `"John Doe"@example.com`},
+		{name: "unquoted quoted local part", from: `John Doe@example.com`, want: `"John Doe"@example.com`},
+		{name: "local part case", from: `John.Doe@Example.com`, want: `John.Doe@example.com`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			marker := fmt.Sprintf("sender-%d", time.Now().UnixNano())
