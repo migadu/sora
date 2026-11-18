@@ -457,14 +457,11 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 	// per-route in connectToBackend).
 	// When advertised, UTF8 carries the USER argument (RFC 6856 section 2.2):
 	// the proxy checks the credentials itself and accepts UTF-8 user names and
-	// passwords. The library's bare UTF8 line is suppressed and replaced; the
-	// name carries the argument because SuppressedCaps would also hide a "UTF8"
-	// Capability.
-	suppressedCaps := []string{"UTF8"}
-	if s.remoteUseUTF8 {
-		caps = append([]pop3.Capability{{Name: "UTF8 USER"}}, caps...)
-	} else {
-		suppressedCaps = append(suppressedCaps, "LANG")
+	// passwords (UTF8User). The library leaves the argument out where USER is
+	// not offered (plaintext before STLS without insecure_auth).
+	var suppressedCaps []string
+	if !s.remoteUseUTF8 {
+		suppressedCaps = []string{"UTF8", "LANG"}
 	}
 
 	opts := pop3server.Options{
@@ -487,6 +484,7 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 		Caps:                            caps,
 		Greeting:                        "Sora-POP3-Proxy ready",
 		SuppressedCaps:                  suppressedCaps,
+		UTF8User:                        s.remoteUseUTF8,
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
 			netConn := c.NetConn()
 			endInitialization := s.sessions.GuardInitialization(s.appCtx, netConn)

@@ -192,7 +192,7 @@ carries its own copy and these server keys are not used for pool members (except
 | `remote_use_proxy_protocol` | bool | `false` | all | Send a PROXY protocol v2 header with the client's address at the start of each backend connection. |
 | `remote_use_id_command` | bool | `false` | IMAP | Send an IMAP `ID` command with the client's address before logging in. |
 | `remote_use_xclient` | bool | `false` | POP3, LMTP | Send an `XCLIENT` command with the client's address. |
-| `remote_use_utf8` | bool | `false` | POP3 | Advertise `UTF8 USER` and `LANG` before login, and repeat a client's pre-login `UTF8` to the backend. Turn on only when every backend is Sora. |
+| `remote_use_utf8` | bool | `false` | POP3 | Advertise `UTF8 USER` (plain `UTF8` where login is not yet offered, before `STLS`) and `LANG` before login, and repeat a client's pre-login `UTF8` to the backend. Turn on only when every backend is Sora. |
 | `remote_skip_forwarding_with_proxy_protocol` | bool | `false` | IMAP, POP3 | Leave out the `ID` or `XCLIENT` command on a connection that already starts with a PROXY header. See [section 8.8](#88-leaving-out-id-and-xclient-next-to-proxy). |
 
 ### Listener, limits and timeouts

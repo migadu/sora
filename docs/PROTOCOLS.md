@@ -880,7 +880,7 @@ this order:
 | `STLS` | On a STARTTLS listener, before the upgrade. |
 | `SASL PLAIN` | When login is allowed on this connection. |
 | `LANG` | Always. |
-| `UTF8 USER` | Always. `USER` says that user names and passwords may be UTF-8 (RFC 6856 §2.2). |
+| `UTF8 USER` | When login is allowed on this connection; `UTF8` without `USER` otherwise. `USER` says that user names and passwords may be UTF-8 (RFC 6856 §2.2), so it is offered only with the `USER` command. |
 | `EXPIRE NEVER` or `EXPIRE <days>` | `NEVER` when `[cleanup] max_age_restriction` is unlimited. For retention of at least 24 hours, `<days>` is whole days rounded down. Omitted for positive retention under 24 hours: RFC 2449 §6.7 cannot express fractional days, `EXPIRE 0` forbids leaving mail on the server, and `EXPIRE 1` would promise a day of retention. |
 | `AUTH-RESP-CODE` | Always. |
 | `IMPLEMENTATION Sora-POP3-Server` | Always. |
