@@ -269,6 +269,13 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
+// warnDeliveryFailed logs a delivery that failed on the server side with its full
+// error. The response carries only the cause: a spool error names local files
+// (delivery.DeliveryResult.ErrorMessage).
+func warnDeliveryFailed(name, recipient string, err error) {
+	logger.Warn("HTTP API: Mail delivery failed", "name", name, "to", recipient, "error", err)
+}
+
 // notifyRelayWorker wakes the relay worker so a redirect or vacation reply a delivery
 // queued goes out at once, as on LMTP, instead of on the worker's next pass.
 func (s *Server) notifyRelayWorker() {
@@ -364,6 +371,9 @@ func (s *Server) deliverToRecipient(ctx context.Context, req *DeliverMailRequest
 		// by dropping the message. A message too large to store never lands, so that
 		// one is the request's fault, as a body above max_message_size is.
 		status.Transient = !errors.Is(err, delivery.ErrMessageTooLarge)
+		if status.Transient {
+			warnDeliveryFailed(s.name, recipient, err)
+		}
 		return status
 	}
 

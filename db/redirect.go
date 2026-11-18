@@ -32,7 +32,35 @@ func (db *Database) CountRedirectsSince(ctx context.Context, accountID int64, wi
 	return count, err
 }
 
-// CleanupOldRedirects removes redirect log records older than the specified duration.
+// RedirectedTargets returns the redirect targets the account's delivery of the message
+// identified by deliveryHash (see InsertMessageOptions.DeliveryHash) has already handed to
+// the relay, on LMTP or the Admin API. It reads the primary: the retry of a delivery can
+// follow it within seconds, before a replica has the row.
+func (db *Database) RedirectedTargets(ctx context.Context, accountID int64, deliveryHash string) ([]string, error) {
+	rows, err := db.GetWritePool().Query(ctx, `
+		SELECT redirect_to FROM redirect_deliveries
+		WHERE account_id = $1 AND delivery_hash = $2
+	`, accountID, deliveryHash)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.CollectRows(rows, pgx.RowTo[string])
+}
+
+// RecordRedirectDelivery records that the account's delivery of the message identified by
+// deliveryHash has handed its redirect to redirectTo to the relay, so a retry of that
+// delivery does not queue it again.
+func (db *Database) RecordRedirectDelivery(ctx context.Context, tx pgx.Tx, accountID int64, deliveryHash, redirectTo string) error {
+	_, err := tx.Exec(ctx, `
+		INSERT INTO redirect_deliveries (account_id, delivery_hash, redirect_to)
+		VALUES ($1, $2, $3)
+		ON CONFLICT DO NOTHING
+	`, accountID, deliveryHash, redirectTo)
+	return err
+}
+
+// CleanupOldRedirects removes redirect log records, and the records of which deliveries
+// were redirected (RecordRedirectDelivery), older than the specified duration.
 func (db *Database) CleanupOldRedirects(ctx context.Context, tx pgx.Tx, olderThan time.Duration) (int64, error) {
 	cutoffTime := time.Now().Add(-olderThan)
 
@@ -45,5 +73,13 @@ func (db *Database) CleanupOldRedirects(ctx context.Context, tx pgx.Tx, olderTha
 		return 0, err
 	}
 
-	return result.RowsAffected(), nil
+	deliveries, err := tx.Exec(ctx, `
+		DELETE FROM redirect_deliveries
+		WHERE created_at < $1
+	`, cutoffTime)
+	if err != nil {
+		return 0, err
+	}
+
+	return result.RowsAffected() + deliveries.RowsAffected(), nil
 }

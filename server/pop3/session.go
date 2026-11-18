@@ -60,7 +60,7 @@ type POP3Session struct {
 	ctx              context.Context    // Context for this session
 	cancel           context.CancelFunc // Function to cancel the session's context
 	language         string             // Current language for responses (default "en")
-	utf8Mode         atomic.Bool        // UTF8 mode enabled for this session
+	utf8Enabled      atomic.Bool        // The client issued UTF8 (RFC 6856); read by refuseUTF8Content
 	xclientApplied   bool               // Whether a trusted XCLIENT has already been accepted (pre-auth, at most once)
 	releaseConn      func()             // Function to release connection from limiter
 	useMasterDB      atomic.Bool        // Pin session to master DB after a write to ensure consistency
@@ -92,6 +92,9 @@ var (
 	errMessageDeleted  = &pop3server.Error{Message: "Message already deleted"}
 	errMsgNotAvailable = &pop3server.Error{Message: "Message not available"}
 	errEmptyBody       = &pop3server.Error{Message: "Message body is empty"}
+	// errUTF8Content refuses a message with UTF-8 headers to a session that has
+	// not issued UTF8, under strict_utf8_content (RFC 6856 sections 2.1 and 5).
+	errUTF8Content = &pop3server.Error{Code: "UTF8", Message: "Message has UTF-8 headers, issue UTF8 to retrieve it"}
 	// errAuthFailed is the single reply for EVERY authentication rejection —
 	// wrong password, unknown user, AND rate-limited attempts (see the
 	// authLimiter check in authenticate). Keeping them byte-identical is
@@ -744,6 +747,9 @@ func (s *POP3Session) Retr(ctx context.Context, msgNum int) (io.ReadCloser, erro
 		s.freeBodyMem(int64(len(bodyData)))
 		return nil, errEmptyBody
 	}
+	if err := s.refuseUTF8Content(msg.UID, bodyData); err != nil {
+		return nil, err
+	}
 
 	// Byte metrics use the announced (CRLF-normalized) octet count — the bytes
 	// the client reconstructs — rather than the stored msg.Size, which
@@ -820,6 +826,10 @@ func (s *POP3Session) Top(ctx context.Context, msgNum int, lines int) (io.ReadCl
 			return nil, perr
 		}
 		return nil, errTempUnavailable
+	}
+
+	if err := s.refuseUTF8Content(msg.UID, bodyData); err != nil {
+		return nil, err
 	}
 
 	truncated := truncateToTop(bodyData, lines)
@@ -972,10 +982,65 @@ func (s *POP3Session) ListLanguages(ctx context.Context) ([]pop3server.LanguageI
 	}, nil
 }
 
+// EnableUTF8 accepts the UTF8 command (RFC 6856) and records it. Only
+// strict_utf8_content reads the mode; DELIBERATE, pinned by
+// integration_tests/pop3/utf8_mode_test.go:
+//
+//   - USER and PASS take UTF-8 in either mode. RFC 6856 section 2.2 ties
+//     UTF-8 credentials to the capability, not to the command, and lets a
+//     client use them before UTF8.
+//   - Reply texts are ASCII, so they are valid in either mode.
+//   - By default RETR and TOP send the stored message as it is in either
+//     mode. Section 2.1 says a client that did not send UTF8 must get a
+//     surrogate or -ERR [UTF8] for a message with UTF-8 in it. The POP3 proxy
+//     hides UTF8 from CAPA by default (remote_use_utf8, because classic
+//     Outlook sends UTF8 after login when it is advertised), so most clients
+//     can never enable it: a refusal would make those messages impossible to
+//     download, and classic Outlook aborts the whole download on an -ERR.
+//     strict_utf8_content opts in to the refusal (refuseUTF8Content).
+//
+// The library also routes a UTF8 sent after login here and answers +OK, for
+// classic Outlook, although section 2 allows the command only before login;
+// it lifts the refusal like a UTF8 before login (section 5: the client may
+// reissue the command after entering UTF-8 mode).
 func (s *POP3Session) EnableUTF8(ctx context.Context) error {
-	s.utf8Mode.Store(true)
-	s.DebugLog("utf8 mode enabled")
+	s.utf8Enabled.Store(true)
+	s.DebugLog("utf8 command accepted")
 	return nil
+}
+
+// refuseUTF8Content returns -ERR [UTF8] for a message with raw UTF-8 in its
+// header section when strict_utf8_content is set and the session has not
+// issued UTF8 (RFC 6856 sections 2.1 and 5), and frees the body's memory
+// charge; otherwise nil. The check is only fair to a client that could have
+// issued UTF8: this server advertises UTF8 in every CAPA, and behind a
+// pop3_proxy the client sees it, and the proxy passes it on, only with
+// remote_use_utf8 on the proxy and on the route, which the setting's
+// documentation requires. 8bit bodies (RFC 6152) predate RFC
+// 6856 and are sent in either mode; no surrogate is built.
+func (s *POP3Session) refuseUTF8Content(uid imap.UID, body []byte) error {
+	if !s.server.strictUTF8 || s.utf8Enabled.Load() || !headerHasNonASCII(body) {
+		return nil
+	}
+	s.freeBodyMem(int64(len(body)))
+	s.InfoLog("refused message with UTF-8 headers to a session without UTF8", "uid", uid)
+	return errUTF8Content
+}
+
+// headerHasNonASCII reports whether msg's header section, the lines before the
+// first empty line (or all of msg without one), has an octet above 0x7F.
+func headerHasNonASCII(msg []byte) bool {
+	lineStart := true
+	for i, c := range msg {
+		if lineStart && (c == '\n' || c == '\r' && i+1 < len(msg) && msg[i+1] == '\n') {
+			return false
+		}
+		if c >= utf8.RuneSelf {
+			return true
+		}
+		lineStart = c == '\n'
+	}
+	return false
 }
 
 func (s *POP3Session) closeWithoutLock() error {
@@ -1055,7 +1120,8 @@ func (s *POP3Session) closeWithoutLock() error {
 }
 
 func (s *POP3Session) Close() error {
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	// Not on s.ctx: Server.Close cancels it before the library closes the sessions.
+	acquired, release := s.mutexHelper.AcquireWriteLockForClose()
 	if !acquired {
 		s.WarnLog("failed to acquire write lock within timeout")
 		// Still close the connection even if we can't acquire the lock

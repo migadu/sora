@@ -273,12 +273,24 @@ func main() {
 		}
 	}
 
+	// Help needs no config: without a file that loads, a help flag prints the usage of the
+	// command named before it. A file that loads keeps the line as given, so a "--help"
+	// that is a flag's value stays that value.
+	help := helpRequested(newArgs[1:])
+	loaded := false
 	if configPath == "" {
-		logger.Fatalf("ERROR: --config flag is required")
+		if !help {
+			logger.Fatalf("ERROR: --config flag is required")
+		}
+	} else if err := loadAdminConfig(configPath, &globalConfig); err != nil {
+		if !help {
+			logger.Fatalf("Failed to load configuration file '%s': %v", configPath, err)
+		}
+	} else {
+		loaded = true
 	}
-
-	if err := loadAdminConfig(configPath, &globalConfig); err != nil {
-		logger.Fatalf("Failed to load configuration file '%s': %v", configPath, err)
+	if !loaded {
+		newArgs = helpArgs(newArgs)
 	}
 
 	// Replace os.Args with filtered args (without --config)
@@ -336,6 +348,36 @@ func main() {
 	}
 }
 
+// helpRequested reports whether args (the line without the program name and --config)
+// hold a flag the flag package answers with the usage. Arguments after "--" are not flags.
+func helpRequested(args []string) bool {
+	for _, arg := range args {
+		switch arg {
+		case "--":
+			return false
+		case "-h", "--h", "-help", "--help":
+			return true
+		}
+	}
+	return false
+}
+
+// helpArgs reduces args (program name first, --config removed) to the command and
+// subcommand named before the first flag, followed by --help. Every subcommand parses its
+// flags right after its name, so it prints its usage and exits before using the config,
+// which is not loaded; the flags and arguments the line had, a "--help" given as a value
+// among them, can then never make it run.
+func helpArgs(args []string) []string {
+	out := []string{args[0]}
+	for _, arg := range args[1:] {
+		if strings.HasPrefix(arg, "-") || len(out) == 3 {
+			break
+		}
+		out = append(out, arg)
+	}
+	return append(out, "--help")
+}
+
 func printVersion() {
 	fmt.Printf("sora-admin version %s (commit: %s, built at: %s)\n", version, commit, date)
 }
@@ -388,8 +430,8 @@ Examples:
   sora-admin --config config.toml sieve list --email user@example.com
   sora-admin --config config.toml sieve put --email user@example.com --name myscript --file script.sieve
 
-Use 'sora-admin --config PATH <command> --help' for more information about a command group.
-Use 'sora-admin --config PATH <command> <subcommand> --help' for detailed help on specific commands.
+Use 'sora-admin <command> --help' for more information about a command group.
+Use 'sora-admin <command> <subcommand> --help' for detailed help on specific commands.
 `)
 }
 

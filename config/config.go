@@ -1719,6 +1719,15 @@ type ServerConfig struct {
 	// LMTP specific
 	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
+	// POP3 specific
+	// StrictUTF8Content refuses RETR/TOP of a message with raw UTF-8 (8-bit) in its
+	// header section with -ERR [UTF8] to a session that has not issued UTF8 (RFC 6856
+	// sections 2.1 and 5). Default false: such messages are sent as stored. Enable
+	// only when every client of this server can see UTF8 in CAPA and the proxy
+	// passes it on: behind a pop3_proxy, only when that proxy sets remote_use_utf8
+	// = true, and so does the [[pool]] or [server.remote_lookup] routing to it.
+	StrictUTF8Content bool `toml:"strict_utf8_content,omitempty"`
+
 	// Auth security
 	// InsecureAuth allows plaintext authentication over non-TLS connections (default:
 	// false). Without tls = true it is allowed regardless: the IMAP, POP3 and ManageSieve
@@ -2559,7 +2568,7 @@ func (s *ServerConfig) defaultCommandTimeout() time.Duration {
 		// gets to send its BYE.
 		return 30 * time.Minute
 	case "managesieve", "managesieve_proxy":
-		return 3 * time.Minute // 3 minutes for ManageSieve
+		return 3 * time.Minute // 3 minutes for ManageSieve; a managesieve backend also gives "0" this value (managesieve.DefaultIdleTimeout)
 	case "lmtp":
 		// RFC 5321 §4.5.3.2.7: "An SMTP server SHOULD have a timeout of at least
 		// 5 minutes while it is awaiting the next command from the sender", and
@@ -3471,6 +3480,7 @@ var serverTypeKeys = []struct {
 	{"remote_skip_forwarding_with_proxy_protocol", func(s *ServerConfig) bool { return s.RemoteSkipForwardingWithProxyProtocol }, []string{"imap_proxy", "pop3_proxy"}},
 	{"remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteUseXCLIENT }, []string{"pop3_proxy", "lmtp_proxy"}},
 	{"remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteUseUTF8 }, []string{"pop3_proxy"}},
+	{"strict_utf8_content", func(s *ServerConfig) bool { return s.StrictUTF8Content }, []string{"pop3"}},
 	// Size limits, and the Sieve extensions the ManageSieve proxy advertises (a
 	// ManageSieve backend advertises the [sieve] enabled_extensions).
 	{"max_message_size", func(s *ServerConfig) bool { return s.MaxMessageSize != "" }, []string{"lmtp", "lmtp_proxy", "http_admin_api"}},

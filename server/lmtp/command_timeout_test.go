@@ -100,3 +100,20 @@ func TestCommandTimeoutsOverrides(t *testing.T) {
 		t.Errorf("Rcpt = %v, want 0 (disabled by override)", timeouts.Rcpt)
 	}
 }
+
+// TestRcptContextErrorNeedsEndedCommand verifies an RCPT step's context error is
+// answered as a timeout or shutdown only when the command's own context has ended: the
+// database layer's per-query timeout firing under a live command is a database failure
+// for the step's own reply, not "service shutting down".
+func TestRcptContextErrorNeedsEndedCommand(t *testing.T) {
+	s := newLogoutTestSession(t)
+	if reply := s.rcptContextError(context.Background(), context.DeadlineExceeded, "user lookup"); reply != nil {
+		t.Fatalf("live command context: reply = %v, want nil", reply)
+	}
+	expired, cancel := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancel()
+	<-expired.Done()
+	if reply := s.rcptContextError(expired, errors.New("not a context error"), "user lookup"); reply != nil {
+		t.Fatalf("non-context error: reply = %v, want nil", reply)
+	}
+}

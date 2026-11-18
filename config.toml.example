@@ -663,7 +663,10 @@ max_staging_size = "100gb"    # Maximum size of this node's own upload staging b
 # messages according to configured retention policies.
 
 [cleanup]
-grace_period = "14d"              # Recovery window for accidentally deleted messages before permanent removal.
+grace_period = "14d"              # How long expunged messages stay restorable before permanent removal, and how
+                                  # long a soft-deleted account keeps its data before hard delete. Also the minimum
+                                  # age before unuploaded mail can be reaped, and the shortest time Sieve redirect
+                                  # records are kept. See docs/STORAGE.md (sections 9-11 and 13).
 wake_interval = "1h"              # How often the cleanup worker runs.
 purge_poll_interval = "30s"       # How often the purge worker looks for accounts marked for purging
                                   # (DELETE /admin/accounts/{email}?purge=true). Runs on nodes with
@@ -822,7 +825,8 @@ max_total_size = 1048576       # Maximum total metadata size per account (1MB). 
 #      AND (LOWER(name) = 'shared' OR LOWER(name) LIKE 'shared/%');
 
 [shared_mailboxes]
-enabled = false                  # Enable shared mailbox functionality (default: false)
+enabled = false                  # Enable shared mailbox functionality (default: false). Off, users see only their own mailboxes,
+                                # whatever the ACLs grant. Use the same value on every node.
 namespace_prefix = "Shared/"     # IMAP namespace prefix (e.g., "Shared/" or "#shared/"); must be a mailbox name followed by "/", and not "INBOX/"
 allow_user_create = false        # Allow users to create shared mailboxes over IMAP (false = admin-only: sora-admin mailbox create)
 allow_anyone_identifier = false  # Allow granting rights to "anyone" (every user in the owner's domain); existing grants stay until revoked
@@ -1512,6 +1516,12 @@ tls_verify = false
 # tls_default_domain = "pop3.example.com"   # [OPTIONAL] Override global default_domain for SNI-less connections on this server.
 proxy_protocol = false        # Enable PROXY protocol support for POP3
 proxy_protocol_timeout = "5s"
+strict_utf8_content = false   # true: RETR/TOP of a message with UTF-8 (8-bit) headers gets -ERR [UTF8] until the
+                              # session sends UTF8 (RFC 6856 §2.1). Default false: sent as stored, because a
+                              # client that never saw UTF8 in CAPA could not download it, and classic Outlook
+                              # aborts the whole download on -ERR. Behind a pop3_proxy, enable ONLY when the
+                              # proxy has remote_use_utf8 = true, and so does the [[pool]] or
+                              # [server.remote_lookup] routing users here. Not reloaded on SIGHUP.
 
 # --- AUTHENTICATION RATE LIMITING ---
 # Same configuration available as shown in IMAP example above
@@ -1570,7 +1580,7 @@ proxy_protocol_timeout = "5s"
 # auth_rate_limit.enabled = false
 
 # --- TIMEOUT CONFIGURATION ---
-timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve)
+timeouts.command_timeout = "3m"             # Maximum idle time before disconnection (default: 3 minutes for ManageSieve; "0" also means the default)
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration (default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = disabled, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers (NOOP every N seconds) and silent sessions are unaffected.
 

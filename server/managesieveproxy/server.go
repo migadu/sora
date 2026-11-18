@@ -372,6 +372,18 @@ func New(appCtx context.Context, rdb *resilient.ResilientDatabase, hostname stri
 	return s, nil
 }
 
+// libIdleTimeout is the go-managesieve IdleTimeout for a command_timeout value.
+// On the proxy 0 turns the idle timer off, but the library would turn an
+// IdleTimeout of 0 into its own 30-minute default, which applies before login
+// when auth_idle_timeout is also 0; a negative value disables it there. After
+// login the relay owns the connection and the library timer no longer applies.
+func libIdleTimeout(commandTimeout time.Duration) time.Duration {
+	if commandTimeout == 0 {
+		return -1
+	}
+	return commandTimeout
+}
+
 // buildLibServer constructs the go-managesieve protocol server from the
 // current runtime settings. It is called at startup and again from
 // ReloadConfig so SIGHUP-reloaded settings apply to new connections.
@@ -400,7 +412,7 @@ func (s *Server) buildLibServer() *managesieveserver.Server {
 		GreetingStartTLSHint:   false, // pre-migration parity: the proxy greeting carried no (STARTTLS) hint
 		SieveExtensions:        managesieve.GetSieveCapabilities(s.supportedExtensions),
 		MaxLineLength:          8192,
-		IdleTimeout:            settings.commandTimeout,
+		IdleTimeout:            libIdleTimeout(settings.commandTimeout),
 		AuthIdleTimeout:        settings.authIdleTimeout,
 		AbsoluteSessionTimeout: settings.absoluteSessionTimeout,
 		InsecureAuth:           s.insecureAuth,

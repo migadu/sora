@@ -25,7 +25,8 @@ func (db *Database) GetMailboxByNameForRight(ctx context.Context, accountID int6
 		return nil, consts.ErrMailboxNotFound
 	}
 	mailbox, err := db.GetMailboxByName(ctx, accountID, name)
-	if !errors.Is(err, consts.ErrMailboxNotFound) {
+	if !errors.Is(err, consts.ErrMailboxNotFound) || !db.sharedAccess() {
+		// With shared access off, no other owner's mailbox is a candidate.
 		return mailbox, err
 	}
 	domain, err := db.GetAccountDomain(ctx, accountID)
@@ -86,23 +87,25 @@ func (db *Database) GetSharedMailboxByNameForRight(ctx context.Context, accountI
 			WHERE m.is_shared = TRUE AND m.deleted_at IS NULL
 			  AND LOWER(m.name) = LOWER($2) AND m.account_id = $1
 			UNION ALL
+			-- $5: shared mailbox access is on (SetSharedMailboxAccess); it gates the
+			-- other owners' mailboxes below, never the account's own above.
 			SELECT m.id, m.name, m.uid_validity, m.account_id, m.path,
 				CASE WHEN position('l' IN acl.rights) > 0 THEN 1 ELSE 3 END AS priority
 			FROM mailboxes m JOIN mailbox_acls acl ON acl.mailbox_id = m.id
-			WHERE m.is_shared = TRUE AND m.deleted_at IS NULL
+			WHERE $5::boolean AND m.is_shared = TRUE AND m.deleted_at IS NULL
 			  AND LOWER(m.name) = LOWER($2) AND m.account_id != $1 AND acl.account_id = $1
 			  AND (position('l' IN acl.rights) > 0 OR position($4 IN acl.rights) > 0)
 			UNION ALL
 			SELECT m.id, m.name, m.uid_validity, m.account_id, m.path,
 				CASE WHEN position('l' IN acl.rights) > 0 THEN 2 ELSE 4 END AS priority
 			FROM mailboxes m JOIN mailbox_acls acl ON acl.mailbox_id = m.id
-			WHERE m.is_shared = TRUE AND m.deleted_at IS NULL
+			WHERE $5::boolean AND m.is_shared = TRUE AND m.deleted_at IS NULL
 			  AND LOWER(m.name) = LOWER($2) AND m.account_id != $1 AND m.owner_domain = $3
 			  AND acl.identifier = 'anyone'
 			  AND (position('l' IN acl.rights) > 0 OR position($4 IN acl.rights) > 0)
 		) candidates
 		ORDER BY priority, id LIMIT 1
-	`, accountID, name, domain, string(right)).Scan(&result.ID, &result.Name, &result.UIDValidity, &result.AccountID, &result.Path)
+	`, accountID, name, domain, string(right), db.sharedAccess()).Scan(&result.ID, &result.Name, &result.UIDValidity, &result.AccountID, &result.Path)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, consts.ErrMailboxNotFound
 	}

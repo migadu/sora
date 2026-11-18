@@ -75,3 +75,39 @@ func TestFileErrorCause(t *testing.T) {
 		t.Errorf("opaque filesystem leaf exposed the path: %v", got)
 	}
 }
+
+func TestIsInsufficientStorage(t *testing.T) {
+	path := "/var/spool/sora/42/0123abcd"
+	for _, tc := range []struct {
+		errno syscall.Errno
+		want  bool
+	}{
+		{syscall.ENOSPC, true},
+		{syscall.EROFS, true},
+		{syscall.EACCES, false},
+		{syscall.EIO, false},
+		{syscall.ENOENT, false},
+	} {
+		t.Run(tc.errno.Error(), func(t *testing.T) {
+			staged := fmt.Errorf("failed to create file %s: %w", path, &fs.PathError{Op: "open", Path: path, Err: tc.errno})
+			moved := fmt.Errorf("failed to move %s into place: %w", path, &os.LinkError{Op: "rename", Old: path + ".tmp", New: path, Err: tc.errno})
+			for name, err := range map[string]error{
+				"errno":        tc.errno,
+				"path error":   staged,
+				"link error":   moved,
+				"display only": FileErrorCause(staged),
+				"joined":       errors.Join(errors.New("cleanup failed"), staged),
+			} {
+				if got := IsInsufficientStorage(err); got != tc.want {
+					t.Errorf("%s: IsInsufficientStorage(%v) = %v, want %v", name, err, got, tc.want)
+				}
+			}
+		})
+	}
+	if IsInsufficientStorage(nil) {
+		t.Error("IsInsufficientStorage(nil) = true")
+	}
+	if IsInsufficientStorage(errors.New("no space left on device")) {
+		t.Error("IsInsufficientStorage matched an error by its text")
+	}
+}

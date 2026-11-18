@@ -63,11 +63,11 @@ Subcommands:
   force     Force the database to a specific version (for fixing dirty states)
 
 Examples:
-  sora-admin migrate up
-  sora-admin migrate down --limit 2
-  sora-admin migrate down --all
-  sora-admin migrate version
-  sora-admin migrate force 1
+  sora-admin migrate up --config config.toml
+  sora-admin migrate down --limit 2 --config config.toml
+  sora-admin migrate down --all --config config.toml
+  sora-admin migrate version --config config.toml
+  sora-admin migrate force 1 --config config.toml
 
 Use 'sora-admin migrate <subcommand> --help' for detailed help.
 `)

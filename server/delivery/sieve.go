@@ -256,6 +256,15 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 		},
 	}
 
+	// A user script that could not be read is not "no script": delivering with the
+	// default script alone would skip the user's own rules, so the delivery fails and
+	// the caller answers it as a transient error.
+	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.AccountID)
+	if err != nil && !errors.Is(err, consts.ErrDBNotFound) {
+		s.DeliveryCtx.Logger.Log("Failed to get the active Sieve script: %v", err)
+		return nil, fmt.Errorf("failed to get the active Sieve script: %w", err)
+	}
+
 	// The built-in default script runs first, as on LMTP, and the user's script then
 	// takes the message over or keeps the default's filing (MergeSieveResults). A
 	// script that fails to compile or run leaves the result before it standing.
@@ -264,10 +273,7 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	if err != nil {
 		return nil, err
 	}
-	activeScript, err := s.DeliveryCtx.RDB.GetActiveScriptWithRetry(ctx, recipient.AccountID)
-	if err != nil && err != consts.ErrDBNotFound {
-		s.DeliveryCtx.Logger.Log("Failed to get the active Sieve script, using the default script's result: %v", err)
-	} else if activeScript != nil {
+	if activeScript != nil {
 		userResult := s.evaluate(ctx, recipient, sieveCtx, activeScript.Script, "user")
 		result, _ = MergeSieveResults(result, userResult)
 	}
@@ -372,6 +378,12 @@ func (s *StandardSieveExecutor) sieveFlags(names []string) []imap.Flag {
 // direct relay handler cannot hold a message: its commit sends it. arrivedHops is
 // the redirect hop count of the message before the script's header edits; every
 // outgoing copy is stamped one above it.
+//
+// A target an earlier attempt of the same delivery (recipient.DeliveryHash) already
+// handed over, a caller's retry whose response was lost, maybe on another node, is
+// skipped and counts as held, as on LMTP (#1912). commit records each target after
+// handing it over, so a crash or a failed record errs toward relaying the message
+// again rather than not at all.
 func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient RecipientInfo, result sieveengine.Result, messageBytes []byte, arrivedHops int) (commit func() bool, abort func(), allHeld bool) {
 	type heldRedirect struct {
 		to     string
@@ -387,7 +399,19 @@ func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient Rec
 		// sender-supplied attribution. Aliases still use the account's primary address.
 		relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
 		from := recipient.FromAddress.FullAddress()
+		var queued []string
+		if recipient.DeliveryHash != "" {
+			var err error
+			if queued, err = s.DeliveryCtx.RDB.RedirectedTargetsWithRetry(ctx, recipient.AccountID, recipient.DeliveryHash); err != nil {
+				logger.Warn("Could not check for redirects queued by an earlier attempt, queuing all",
+					"account_id", recipient.AccountID, "error", err)
+			}
+		}
 		for _, redirectTo := range result.RedirectTo {
+			if slices.Contains(queued, redirectTo) {
+				s.DeliveryCtx.Logger.Log("sieve redirect already queued by an earlier attempt of this delivery, skipping redirect_to=%s", redirectTo)
+				continue
+			}
 			if s.RelayQueue == nil {
 				held = append(held, heldRedirect{
 					to:     redirectTo,
@@ -422,6 +446,12 @@ func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient Rec
 			}
 			if s.RelayQueue != nil && s.RelayNotify != nil {
 				s.RelayNotify()
+			}
+			if recipient.DeliveryHash != "" {
+				if err := s.DeliveryCtx.RDB.RecordRedirectDeliveryWithRetry(ctx, recipient.AccountID, recipient.DeliveryHash, h.to); err != nil {
+					logger.Warn("Failed to record a queued redirect, a retry of this delivery would queue it again",
+						"account_id", recipient.AccountID, "redirect_to", h.to, "error", err)
+				}
 			}
 			if result.RecordRedirect != nil {
 				if err := result.RecordRedirect(ctx); err != nil {

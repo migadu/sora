@@ -98,6 +98,7 @@ type POP3Server struct {
 
 	// Auth security
 	insecureAuth bool // Allow PLAIN auth over non-TLS connections
+	strictUTF8   bool // strict_utf8_content: see POP3ServerOptions.StrictUTF8Content and refuseUTF8Content
 
 	// Command timeout and throughput enforcement
 	authIdleTimeout time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
@@ -163,6 +164,7 @@ type POP3ServerOptions struct {
 	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-pop3 enforces it)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = disabled)
 	InsecureAuth                bool                      // Allow plaintext authentication over non-TLS connections
+	StrictUTF8Content           bool                      // Refuse RETR/TOP of a message with UTF-8 headers with -ERR [UTF8] until the session issues UTF8 (RFC 6856 §2.1)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
 }
 
@@ -249,7 +251,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		logger.Info("POP3: Using default idle timeout (RFC 1939 §3)", "name", name, "timeout", commandTimeout)
 	}
 
-	// Ephemeral-storage retention drives the CAPA EXPIRE value (RFC 2449 §5.1);
+	// Ephemeral-storage retention drives the CAPA EXPIRE value (RFC 2449 §6.7);
 	// 0 means messages are kept forever (EXPIRE NEVER).
 	var maxMessageAge time.Duration
 	if options.Config != nil {
@@ -277,6 +279,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		authIdleTimeout: options.AuthIdleTimeout,
 		commandTimeouts: defaultCommandTimeouts(),
 		insecureAuth:    options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured; cmd/sora warns on a public address
+		strictUTF8:      options.StrictUTF8Content,
 		maxMessageAge:   maxMessageAge,
 		activeSessions:  make(map[*POP3Session]struct{}),
 	}
@@ -368,6 +371,20 @@ var knownCommands = map[string]bool{
 	"UTF8": true, "LANG": true, "LAST": true, "XCLIENT": true,
 }
 
+// expireParam is the CAPA EXPIRE argument for a message retention (RFC 2449
+// §6.7): NEVER when messages are kept forever, otherwise the retention in whole
+// days rounded down. An empty result omits EXPIRE for positive sub-day retention:
+// 0 forbids leaving mail on the server, while 1 promises at least a day.
+func expireParam(maxMessageAge time.Duration) string {
+	if maxMessageAge <= 0 {
+		return "NEVER"
+	}
+	if maxMessageAge < 24*time.Hour {
+		return ""
+	}
+	return strconv.Itoa(int(maxMessageAge / (24 * time.Hour)))
+}
+
 // buildLibServer constructs the go-pop3 protocol server from the current
 // runtime settings. It is called at startup and again from ReloadConfig so
 // SIGHUP-reloaded timeouts apply to new connections (existing connections keep
@@ -376,16 +393,14 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 	settings := s.settings.Load()
 
 	// Build custom capabilities based on config. Ephemeral-storage retention
-	// drives the CAPA EXPIRE value (RFC 2449 §5.1).
+	// drives the CAPA EXPIRE value (RFC 2449 §6.7).
 	// UTF8 with the USER argument (RFC 6856 section 2.2): login accepts UTF-8
 	// user names and passwords. The library advertises a bare UTF8, so that
 	// line is suppressed and this one takes its place; the name carries the
 	// argument because SuppressedCaps would also hide a "UTF8" Capability.
 	caps := []pop3.Capability{{Name: "UTF8 USER"}}
-	if s.maxMessageAge <= 0 {
-		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{"NEVER"}})
-	} else {
-		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{strconv.Itoa(int(s.maxMessageAge.Hours() / 24))}})
+	if param := expireParam(s.maxMessageAge); param != "" {
+		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{param}})
 	}
 	caps = append(caps, pop3.Capability{Name: "AUTH-RESP-CODE"})
 	caps = append(caps, pop3.Capability{Name: "IMPLEMENTATION", Params: []string{"Sora-POP3-Server"}})

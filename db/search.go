@@ -218,14 +218,19 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			conditions = append(conditions, fmt.Sprintf("%scustom_flags @> jsonb_build_array(@%s::text)", statePrefix, param))
 		}
 	}
+	// message_state is LEFT JOINed, and a message an older build left without a state row
+	// has no flags and no keywords (every read returns it as COALESCE(ms.flags, 0)), so the
+	// negated forms must match it: a bare (ms.flags & N) = 0 is NULL for it and would drop
+	// the message (#1899). The positive forms stay strict, NULL acting as FALSE in WHERE,
+	// and the NOT below turns a NULL operand into FALSE before negating it.
 	for _, flag := range criteria.NotFlag {
 		bitwise := FlagToBitwise(flag)
 		if bitwise != 0 {
-			conditions = append(conditions, fmt.Sprintf("(%sflags & %d) = 0", statePrefix, bitwise))
+			conditions = append(conditions, fmt.Sprintf("(%[1]sflags IS NULL OR (%[1]sflags & %[2]d) = 0)", statePrefix, bitwise))
 		} else {
 			param := nextParam()
 			args[param] = string(flag)
-			conditions = append(conditions, fmt.Sprintf("NOT (%scustom_flags @> jsonb_build_array(@%s::text))", statePrefix, param))
+			conditions = append(conditions, fmt.Sprintf("(%[1]scustom_flags IS NULL OR NOT (%[1]scustom_flags @> jsonb_build_array(@%[2]s::text)))", statePrefix, param))
 		}
 	}
 
@@ -354,7 +359,10 @@ func (db *Database) buildSearchCriteriaTree(criteria *imap.SearchCriteria, param
 			return "", nil, err
 		}
 		maps.Copy(args, subArgs)
-		conditions = append(conditions, fmt.Sprintf("NOT (%s)", subCond))
+		// A criterion is matched or not: a leaf that is NULL for a message (a flag of a
+		// message without a state row, an absent header) does not match it, so NOT must
+		// match it rather than propagate the NULL.
+		conditions = append(conditions, fmt.Sprintf("NOT COALESCE((%s), FALSE)", subCond))
 	}
 
 	// Recursive OR

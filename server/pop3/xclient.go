@@ -52,13 +52,20 @@ func (s *POP3Session) handleXCLIENT(args string) (bool, string) {
 
 	// Update session's RemoteIP if forwarding parameters provide it
 	if forwardingParams.OriginatingIP != "" {
+		// Without a PROXY header RemoteIP is still the socket peer, the forwarder:
+		// keep it as ProxyIP, as the IMAP ID forwarding does, so that the auth rate
+		// limiter charges the forwarded client, as the progressive delay does.
+		if s.ProxyIP == "" && s.RemoteIP != "" {
+			s.ProxyIP = s.RemoteIP
+		}
 		s.RemoteIP = forwardingParams.OriginatingIP
 		s.DebugLog("updated client ip from xclient forwarding parameters", "client_ip", forwardingParams.OriginatingIP)
 	}
 
 	// The proxy might also send its own source IP. Let's check for that.
 	if proxySourceIP, ok := forwardingParams.Variables["proxy-source-ip"]; ok {
-		// If PROXY protocol wasn't used, this is our best source for the proxy's IP.
+		// If neither a PROXY header nor ADDR set ProxyIP, this is our best source for
+		// the proxy's IP.
 		if s.ProxyIP == "" {
 			s.ProxyIP = proxySourceIP
 		}

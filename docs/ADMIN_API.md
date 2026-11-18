@@ -827,6 +827,11 @@ for the lookup), the default mailboxes are created if missing, Sieve runs, and t
 stored. A duplicate of a message already delivered counts as delivered. A message the script
 discards counts as accepted.
 
+A recipient is read as LMTP reads `RCPT TO`. One that is not a valid address fails with
+`invalid recipient address: ...` (not transient). That includes an address with more than one
+`@`, such as `user@example.com@SUFFIX`: the master-login suffix has no meaning in a recipient,
+and the message is not delivered to `user@example.com`.
+
 ### Response
 
 ```json
@@ -845,7 +850,7 @@ discards counts as accepted.
 |---|---|
 | `success` | `true` when every recipient was accepted. |
 | `recipients[].accepted` | This recipient's outcome. |
-| `recipients[].error` | Why it failed, or `Message discarded by Sieve filter` on an accepted discard. |
+| `recipients[].error` | Why it failed, or `Message discarded by Sieve filter` on an accepted discard. A node with no room to stage the message answers `Insufficient system storage (staging limit reached)` or `Insufficient system storage (spool disk full or read-only)`, the condition LMTP answers with `452 4.3.1`. Local file paths are never included; the server log has the full error. |
 | `recipients[].transient` | `true` when the failure was on the server side (database, storage, staging space): retry later; the message may even be stored already. |
 | `message_id` | The message's `Message-ID` header, or a generated `<{nanoseconds}.http-delivery@{hostname}>` when it has none. The generated value is not written into the message. |
 | `error` | `Partial delivery failure` when several recipients were given and any failed. |
