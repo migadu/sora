@@ -6,8 +6,12 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/pkg/circuitbreaker"
 )
 
 // TestHTTPRemoteLookupErrorTypes verifies that the HTTP remotelookup client returns
@@ -390,36 +394,48 @@ func TestHTTPRemoteLookupCircuitBreaker(t *testing.T) {
 	t.Logf("  Total requests made: %d, Circuit breaker state: %s", failCount, client.breaker.State())
 }
 
-// TestHTTPRemoteLookupCircuitBreakerHalfOpen verifies that ErrTooManyRequests in half-open state
-// is properly wrapped as ErrRemoteLookupTransient
+// TestHTTPRemoteLookupCircuitBreakerHalfOpen: once the open timeout has passed, the breaker
+// lets exactly MaxRequests lookups through to the service at a time and refuses the rest
+// as temporarily unavailable (ErrTooManyRequests wrapped as ErrRemoteLookupTransient). A
+// successful probe closes it; a failed probe opens it again at once, so the next lookup is
+// refused without reaching the service.
 func TestHTTPRemoteLookupCircuitBreakerHalfOpen(t *testing.T) {
-	// The default settings with a short open timeout, so the breaker goes half-open
-	// without the test sleeping through the default.
-	const openTimeout = 500 * time.Millisecond
-	requestCount := 0
+	const (
+		maxRequests = 3
+		openTimeout = 300 * time.Millisecond
+	)
+	var (
+		failing atomic.Bool // answer 500 instead of holding and answering 200
+		hits    atomic.Int32
+		arrived = make(chan struct{}, 16)
+		release = make(chan struct{})
+	)
+	failing.Store(true)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		requestCount++
-		// First 5 requests fail to open the circuit breaker
-		// Then one request succeeds to move to half-open
-		// Then requests should be rate-limited in half-open state
-		if requestCount <= 5 {
+		hits.Add(1)
+		if failing.Load() {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		} else {
-			// Return success to allow half-open transition
-			w.Header().Set("Content-Type", "application/json")
-			json.NewEncoder(w).Encode(map[string]any{
-				"address":       "user@example.com",
-				"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
-				"server":        "backend:143",
-			})
+			return
 		}
+		arrived <- struct{}{}
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"address":       "user@example.com",
+			"password_hash": "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy",
+			"server":        "backend:143",
+		})
 	}))
 	defer server.Close()
+	var releaseOnce sync.Once
+	releaseProbes := func() { releaseOnce.Do(func() { close(release) }) }
+	defer releaseProbes() // before server.Close, which waits for held handlers
 
-	// Create remotelookup client with MaxRequests=1 in half-open state
+	// The default settings with a short open timeout.
 	client := NewHTTPRemoteLookupClient(
 		server.URL+"/lookup?email=$email",
-		5*time.Second,
+		30*time.Second, // outlasts the test's own waits, so a held probe never times out
+
 		"test-token",
 		143,
 		false, // remoteTLS
@@ -429,34 +445,91 @@ func TestHTTPRemoteLookupCircuitBreakerHalfOpen(t *testing.T) {
 		false, // remoteUseIDCommand
 		false, // remoteUseXCLIENT
 		false, // remoteUseUTF8
-		&CircuitBreakerSettings{MaxRequests: 3, Timeout: openTimeout, FailureRatio: 0.6, MinRequests: 3},
+		&CircuitBreakerSettings{MaxRequests: maxRequests, Timeout: openTimeout, FailureRatio: 0.6, MinRequests: 3},
 		nil, // transport settings (use defaults)
 	)
-
 	ctx := context.Background()
-
-	// Trigger circuit breaker to open
-	for i := 0; i < 5; i++ {
-		client.LookupUserRoute(ctx, "test@example.com", "testpassword")
-		time.Sleep(10 * time.Millisecond)
+	lookup := func() error {
+		_, _, err := client.LookupUserRouteWithOptions(ctx, "user@example.com", "", true)
+		return err
 	}
-
-	// Wait for circuit breaker to transition to half-open
-	time.Sleep(openTimeout + 100*time.Millisecond)
-
-	// First request in half-open should go through
-	_, _, err1 := client.LookupUserRoute(ctx, "test@example.com", "password") // Will fail auth but succeed request
-	if err1 != nil && !errors.Is(err1, ErrRemoteLookupTransient) {
-		// If it errors due to rate limiting, it should be transient
-		if client.breaker.State().String() == "HALF_OPEN" {
-			if !errors.Is(err1, ErrRemoteLookupTransient) {
-				t.Errorf("Expected ErrRemoteLookupTransient in half-open state, got: %v", err1)
+	// openBreaker fails lookups until the breaker opens, then waits out the open timeout.
+	openBreaker := func(phase string) {
+		t.Helper()
+		failing.Store(true)
+		for i := 0; client.breaker.State() != circuitbreaker.StateOpen; i++ {
+			if i == 10 {
+				t.Fatalf("%s: breaker still %s after %d failed lookups", phase, client.breaker.State(), i)
 			}
+			lookup()
+		}
+		before := hits.Load()
+		if err := lookup(); !errors.Is(err, ErrRemoteLookupTransient) {
+			t.Fatalf("%s: lookup with the breaker open: got %v, want ErrRemoteLookupTransient", phase, err)
+		}
+		if hits.Load() != before {
+			t.Fatalf("%s: a lookup reached the service while the breaker was open", phase)
+		}
+		deadline := time.Now().Add(openTimeout + 2*time.Second)
+		for client.breaker.State() != circuitbreaker.StateHalfOpen {
+			if time.Now().After(deadline) {
+				t.Fatalf("%s: breaker still %s %v after it opened (open timeout %v)", phase, client.breaker.State(), openTimeout+2*time.Second, openTimeout)
+			}
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 
-	t.Logf("✓ Circuit breaker half-open state correctly returns ErrRemoteLookupTransient for rate-limited requests")
-	t.Logf("  Final state: %s", client.breaker.State())
+	// Half-open admits exactly maxRequests concurrent probes; the others are refused.
+	openBreaker("first outage")
+	failing.Store(false)
+	hitsBefore := hits.Load()
+	const extra = 2
+	results := make(chan error, maxRequests+extra)
+	for i := 0; i < maxRequests+extra; i++ {
+		go func() { results <- lookup() }()
+	}
+	for i := 0; i < extra; i++ {
+		select {
+		case err := <-results:
+			if !errors.Is(err, ErrRemoteLookupTransient) {
+				t.Fatalf("lookup beyond the %d half-open probes: got %v, want ErrRemoteLookupTransient", maxRequests, err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of %d lookups beyond the half-open probes were refused", i, extra)
+		}
+	}
+	for i := 0; i < maxRequests; i++ {
+		select {
+		case <-arrived:
+		case <-time.After(5 * time.Second):
+			t.Fatalf("%d of %d half-open probes reached the service", i, maxRequests)
+		}
+	}
+	if n := hits.Load() - hitsBefore; n != maxRequests {
+		t.Fatalf("%d half-open probes reached the service, want %d", n, maxRequests)
+	}
+	releaseProbes()
+	for i := 0; i < maxRequests; i++ {
+		if err := <-results; err != nil {
+			t.Fatalf("half-open probe %d: %v", i+1, err)
+		}
+	}
+	if s := client.breaker.State(); s != circuitbreaker.StateClosed {
+		t.Fatalf("breaker %s after successful half-open probes, want CLOSED", s)
+	}
+
+	// A failed half-open probe opens the breaker again at once.
+	openBreaker("second outage")
+	if err := lookup(); !errors.Is(err, ErrRemoteLookupTransient) {
+		t.Fatalf("failed half-open probe: got %v, want ErrRemoteLookupTransient", err)
+	}
+	if s := client.breaker.State(); s != circuitbreaker.StateOpen {
+		t.Fatalf("breaker %s after a failed half-open probe, want OPEN", s)
+	}
+	before := hits.Load()
+	if err := lookup(); !errors.Is(err, ErrRemoteLookupTransient) || hits.Load() != before {
+		t.Fatalf("lookup after a failed half-open probe: got %v and %d service hits, want ErrRemoteLookupTransient and none", err, hits.Load()-before)
+	}
 }
 
 // TestHTTPRemoteLookupInvalidEmail verifies that invalid email addresses are rejected early
