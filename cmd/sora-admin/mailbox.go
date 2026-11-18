@@ -608,10 +608,6 @@ Examples:
   # Preview changes for all accounts
   sora-admin mailbox fix-utf7 --config config.toml --dry-run
 
-  # Report mailboxes whose cached unseen count is too high (dry run), then repair them
-  sora-admin mailbox repair-unseen --config config.toml
-  sora-admin mailbox repair-unseen --config config.toml --apply
-
   # Fix all accounts
   sora-admin mailbox fix-utf7 --config config.toml
 
