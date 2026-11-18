@@ -1191,7 +1191,7 @@ Temporary failures, all of which make the MTA retry:
 | `451 4.3.0 Message processing timed out, please try again later` | The DATA timeout ran out. |
 | `452 4.3.1 Insufficient system storage` | The upload spool is over its size limit. |
 | `452 4.3.1 Insufficient system storage, please try again later` | The spool disk is full or read-only. |
-| `421 4.4.5 Server busy, try again later` | A lock could not be taken in time. |
+| `451 4.4.5 Server busy, try again later` | A lock could not be taken in time. |
 | `421 4.4.2 Error reading message data` | The data could not be read from the connection. |
 | `421 4.2.1 service shutting down` | The server is shutting down. |
 | `451 4.3.0 <text>` | Another internal error, for example `failed to save message` or `failed to save message to disk: <cause>`. The text names the cause, never the spool path. |

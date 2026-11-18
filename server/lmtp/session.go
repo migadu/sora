@@ -111,6 +111,17 @@ func (s *LMTPSession) ErrorLog(msg string, keysAndValues ...any) {
 	s.Session.ErrorLog(msg, s.withTrace(keysAndValues)...)
 }
 
+// errSessionBusy answers a command that could not take the session lock in time. It is a
+// temporary failure the session carries on after, not 421: a 421 announces that the server
+// closes the connection (RFC 5321 sections 3.8 and 4.2.2), and go-smtp does not close it
+// after a reply of the backend. RFC 5321 section 4.3.2 lists 451 for MAIL, RCPT and the
+// end of DATA.
+var errSessionBusy = &smtp.SMTPError{
+	Code:         451,
+	EnhancedCode: smtp.EnhancedCode{4, 4, 5},
+	Message:      "Server busy, try again later",
+}
+
 func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	start := time.Now()
 	recordMetrics := func(status string) {
@@ -148,11 +159,7 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "MAIL")
 		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         421,
-			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
-			Message:      "Server busy, try again later",
-		}
+		return errSessionBusy
 	}
 	defer release()
 
@@ -328,11 +335,7 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "RCPT")
 		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         421,
-			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
-			Message:      "Server busy, try again later",
-		}
+		return errSessionBusy
 	}
 	defer release()
 
@@ -416,11 +419,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "DATA")
 		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         421,
-			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
-			Message:      "Server busy, try again later",
-		}
+		return errSessionBusy
 	}
 	defer release()
 
