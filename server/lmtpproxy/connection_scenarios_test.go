@@ -5,8 +5,10 @@ package lmtpproxy
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 )
@@ -232,142 +234,63 @@ func TestBackendSlowButResponding(t *testing.T) {
 	}
 }
 
-// TestBackendStopsResponding tests backend that starts responding then goes silent
-// This simulates the production issue: backend hangs mid-transfer
+// TestBackendStopsResponding: a backend that sends its greeting and then goes silent
+// (it reads LHLO but never answers) must fail connectToBackend within about the
+// connect timeout, which readBackendLine applies to every handshake reply. A backend
+// silent from the start is TestConnectToBackendSilentBackendTimesOut.
 func TestBackendStopsResponding(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	const connectTimeout = 500 * time.Millisecond
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("Failed to create listener: %v", err)
+		t.Fatal(err)
 	}
-	defer listener.Close()
-
-	backendAddr := listener.Addr().String()
-	t.Logf("Backend listening on %s", backendAddr)
-
-	// Backend that sends some data then goes completely silent (no FIN, no RST, no data)
+	t.Cleanup(func() { ln.Close() })
+	gotLHLO := make(chan struct{}, 1)
 	go func() {
-		conn, err := listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		defer conn.Close()
-
-		t.Logf("Backend accepted connection, sending initial data")
-		conn.Write([]byte("220 backend.example.com LMTP Service Ready\r\n"))
-		conn.Write([]byte("DATA CHUNK 0\r\n"))
-
-		// Now go silent - simulate backend hanging mid-transfer
-		t.Logf("Backend going silent (simulating hung process)")
-		time.Sleep(10 * time.Minute) // Stay silent to simulate hung backend
+		io.WriteString(conn, "220 backend.example.com LMTP Service Ready\r\n")
+		r := bufio.NewReader(conn)
+		if line, err := r.ReadString('\n'); err == nil && strings.HasPrefix(strings.ToUpper(line), "LHLO") {
+			gotLHLO <- struct{}{}
+		}
+		io.Copy(io.Discard, r) // silent until the proxy closes
 	}()
 
-	// Connect to backend
-	backendConn, err := net.Dial("tcp", backendAddr)
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
+	srv := &Server{
+		name:        "test",
+		hostname:    "test-host",
+		connManager: newLMTPTestConnManager(t, ln.Addr().String(), connectTimeout),
 	}
-	defer backendConn.Close()
-
-	backendReader := bufio.NewReader(backendConn)
-
-	// Read greeting
-	greeting, err := backendReader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Failed to read greeting: %v", err)
-	}
-	t.Logf("Received greeting: %s", greeting)
-
-	// Read first chunk
-	chunk1, err := backendReader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Failed to read chunk 1: %v", err)
-	}
-	t.Logf("Received chunk 1: %s", chunk1)
-
-	// Now try to read more - backend is silent
-	// With read deadline (THE FIX), this should timeout quickly
-	const readDeadline = 2 * time.Second // Short timeout for test
-
-	t.Logf("Attempting to read after backend went silent...")
-	startTime := time.Now()
-
-	// Set read deadline (simulating the fix)
-	if err := backendConn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
-		t.Fatalf("Failed to set read deadline: %v", err)
+	clientA, clientB := net.Pipe()
+	t.Cleanup(func() { clientA.Close(); clientB.Close() })
+	sess := &Session{
+		server:          srv,
+		clientConn:      clientA,
+		originalAddress: "user@example.com",
+		ctx:             context.Background(),
 	}
 
-	buf := make([]byte, 1024)
-	nr, err := backendReader.Read(buf)
-	elapsed := time.Since(startTime)
-
-	if err == nil {
-		t.Errorf("Expected timeout, got %d bytes: %s", nr, buf[:nr])
-	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		t.Logf("SUCCESS: Detected stale backend in %v (expected ~%v)", elapsed, readDeadline)
-		if elapsed > readDeadline+500*time.Millisecond {
-			t.Errorf("Detection took too long: %v (expected ~%v)", elapsed, readDeadline)
+	done := make(chan error, 1)
+	start := time.Now()
+	go func() { done <- sess.connectToBackend() }()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("connectToBackend succeeded against a backend that never answers LHLO")
 		}
-		t.Logf("This confirms the read deadline fix will detect hung backends in production")
-	} else {
-		t.Errorf("Expected timeout error, got: %v", err)
-	}
-}
-
-// TestBackendNeverResponds tests backend that accepts connection but never sends anything
-// This is different from TestBackendStopsResponding - backend is silent from the start
-func TestBackendNeverResponds(t *testing.T) {
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create listener: %v", err)
-	}
-	defer listener.Close()
-
-	backendAddr := listener.Addr().String()
-	t.Logf("Backend listening on %s", backendAddr)
-
-	// Backend that accepts connection but never sends anything (not even greeting)
-	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("connectToBackend took %v; must fail within about the connect timeout %v", elapsed, connectTimeout)
 		}
-		defer conn.Close()
-
-		t.Logf("Backend accepted connection but going silent (no greeting)")
-		// Stay silent forever - simulate completely hung backend
-		time.Sleep(10 * time.Minute)
-	}()
-
-	// Connect to backend
-	backendConn, err := net.Dial("tcp", backendAddr)
-	if err != nil {
-		t.Fatalf("Failed to connect: %v", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("connectToBackend hung on a backend that went silent after its greeting")
 	}
-	defer backendConn.Close()
-
-	backendReader := bufio.NewReader(backendConn)
-
-	// Try to read greeting - should timeout with read deadline
-	const readDeadline = 2 * time.Second
-	t.Logf("Attempting to read greeting from silent backend...")
-	startTime := time.Now()
-
-	// Set read deadline
-	if err := backendConn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
-		t.Fatalf("Failed to set read deadline: %v", err)
-	}
-
-	_, err = backendReader.ReadString('\n')
-	elapsed := time.Since(startTime)
-
-	if err == nil {
-		t.Errorf("Expected timeout, got greeting from silent backend")
-	} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-		t.Logf("SUCCESS: Detected silent backend in %v (expected ~%v)", elapsed, readDeadline)
-		if elapsed > readDeadline+500*time.Millisecond {
-			t.Errorf("Detection took too long: %v (expected ~%v)", elapsed, readDeadline)
-		}
-	} else {
-		t.Errorf("Expected timeout error, got: %v", err)
+	select {
+	case <-gotLHLO:
+	default:
+		t.Error("precondition: the backend never received LHLO, so the silence was not after the greeting")
 	}
 }
