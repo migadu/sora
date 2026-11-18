@@ -1052,10 +1052,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		}
 		metrics.MessageThroughput.WithLabelValues("lmtp", "delivered", "failure").Inc()
 		recordMetrics("failure")
-		// The reply text reaches the sender in a delay or bounce notice: the folder the
-		// recipient's script files into and the database error stay in the log.
-		s.WarnLog("failed to save message", "mailbox", mailbox, "error", err)
-		return s.InternalError("failed to save message")
+		return s.saveFailedReply(mailbox, err)
 	}
 	resolvedDestinations, resolveErr := delivery.ResolveSieveDestinations(ctx, s.backend.rdb, s.backend.sharedMailboxes, s.AccountID(), result, redirectFailed, func(format string, args ...any) {
 		s.WarnLog(fmt.Sprintf(format, args...))
@@ -1220,6 +1217,14 @@ func (s *LMTPSession) fixedFieldsLog(logFn func(msg string, keysAndValues ...any
 	return func(msg string, keysAndValues ...any) {
 		logFn(msg, append([]any{"protocol", protocol, "session", s.Id}, keysAndValues...)...)
 	}
+}
+
+// saveFailedReply is the reply for a message that could not be stored in mailbox.
+func (s *LMTPSession) saveFailedReply(mailbox string, err error) error {
+	// The reply text reaches the sender in a delay or bounce notice: the folder the
+	// recipient's script files into and the database error stay in the log.
+	s.WarnLog("failed to save message", "mailbox", mailbox, "error", err)
+	return s.InternalError("failed to save message")
 }
 
 // InternalError is the reply for a server-side failure while handling ONE message: a
