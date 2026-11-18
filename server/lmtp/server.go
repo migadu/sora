@@ -236,6 +236,12 @@ type LMTPServerBackend struct {
 	transactionsOpen atomic.Int64
 	maintenanceGate  *server.MaintenanceGate
 
+	// shutdown runs once, for Close and for Start; shutdownErr is its result. closeCalled
+	// makes a repeated Close answer smtp.ErrServerClosed, as smtp.Server.Close does.
+	shutdownOnce sync.Once
+	shutdownErr  error
+	closeCalled  atomic.Bool
+
 	// Connection limiting
 	limiter *server.ConnectionLimiter
 
@@ -714,7 +720,14 @@ func (b *LMTPServerBackend) Start(errChan chan error) {
 		trusted:  b.isTrustedPeer,
 	}
 
-	if err := b.server.Serve(limitedListener); err != nil {
+	err = b.server.Serve(limitedListener)
+	if b.appCtx.Err() != nil {
+		// A shutdown, whether Close or only the context gave the signal: return once it
+		// has closed the connections, so the process does not release the database while
+		// the sessions still answer.
+		b.shutdown()
+	}
+	if err != nil {
 		// Check if the error is due to context cancellation (graceful shutdown)
 		if b.appCtx.Err() != nil {
 			logger.Info("lmtp server stopped gracefully", "name", b.name)
@@ -750,20 +763,49 @@ func (b *LMTPServerBackend) ReloadConfig(cfg config.ServerConfig) error {
 	return nil
 }
 
+// shutdownReplyGrace is how long a shutdown lets the transactions under way answer before
+// it closes their connections. A delivery the shutdown cancels answers 421 4.2.1 within
+// milliseconds; the bound is for a transaction that does not end by itself (a client that
+// stalls in DATA). It stays well inside the 10 seconds cmd/sora waits for its servers to stop.
+const shutdownReplyGrace = 2 * time.Second
+
 func (b *LMTPServerBackend) Close() error {
 	if b.cancel != nil {
 		b.cancel()
 	}
-	if b.server != nil {
+	err := b.shutdown()
+	if b.closeCalled.Swap(true) {
+		return smtp.ErrServerClosed
+	}
+	return err
+}
+
+// shutdown closes the server once its context is cancelled. It first lets the transactions
+// under way end, up to shutdownReplyGrace: the cancelled context makes a transaction answer
+// 421 4.2.1 "service shutting down", which closing the sockets straight away would lose.
+// Then it closes the listeners and every connection, as a 421 says the server does
+// (RFC 5321 section 3.8). A transaction ends after its reply is written: go-smtp resets
+// the session after the DATA reply.
+//
+// It runs once; a second caller waits for the first and gets the same result.
+func (b *LMTPServerBackend) shutdown() error {
+	b.shutdownOnce.Do(func() {
+		if b.server == nil {
+			return
+		}
+		deadline := time.Now().Add(shutdownReplyGrace)
+		for b.transactionsOpen.Load() > 0 && time.Now().Before(deadline) {
+			time.Sleep(10 * time.Millisecond)
+		}
 		err := b.server.Close()
 		// Start's context watcher can close the listener before go-smtp's
 		// registered-listener loop reaches it. That is a completed shutdown.
 		if errors.Is(err, net.ErrClosed) {
-			return nil
+			err = nil
 		}
-		return err
-	}
-	return nil
+		b.shutdownErr = err
+	})
+	return b.shutdownErr
 }
 
 // GetTotalConnections returns the cumulative total of all connections ever made
