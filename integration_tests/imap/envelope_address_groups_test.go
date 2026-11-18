@@ -61,13 +61,16 @@ func TestIMAP_EnvelopeAddressGroups(t *testing.T) {
 		"Cc: undisclosed-recipients:;\r\n" +
 		"\r\n" +
 		"body\r\n")
+	// IPv6 colons in bare domain literals must not consume group boundaries.
+	uid3 := appendRaw("From: user@example.com\r\n" +
+		"To: outside@[2001:db8::1], team: inside@[2001:db8::2];\r\n\r\nbody\r\n")
 
 	if _, err := c.Select("INBOX", nil).Wait(); err != nil {
 		t.Fatalf("SELECT failed: %v", err)
 	}
 
 	var set imap.UIDSet
-	set.AddNum(uid1, uid2)
+	set.AddNum(uid1, uid2, uid3)
 	msgs, err := c.Fetch(set, &imap.FetchOptions{UID: true, Envelope: true}).Collect()
 	if err != nil {
 		t.Fatalf("FETCH ENVELOPE failed: %v", err)
@@ -118,6 +121,17 @@ func TestIMAP_EnvelopeAddressGroups(t *testing.T) {
 				groupEnd,
 			},
 			describe: "address before a group, undisclosed-recipients",
+		},
+		{
+			uid:  uid3,
+			from: []imap.Address{{Mailbox: "user", Host: "example.com"}},
+			to: []imap.Address{
+				{Mailbox: "outside", Host: "[2001:db8::1]"},
+				{Mailbox: "team"},
+				{Mailbox: "inside", Host: "[2001:db8::2]"},
+				groupEnd,
+			},
+			describe: "bare IPv6 literal before and inside a group",
 		},
 	} {
 		env := byUID[tc.uid]

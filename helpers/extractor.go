@@ -127,6 +127,8 @@ func parseAddressGroups(value string) (parts []addressListPart, ok bool) {
 			i = skipQuotedString(value, i)
 		case '(':
 			i = skipComment(value, i)
+		case '[':
+			i = skipDomainLiteral(value, i)
 		case '<':
 			i = skipAngleAddr(value, i)
 		case ',':
@@ -198,6 +200,21 @@ func skipComment(s string, i int) int {
 			if depth--; depth == 0 {
 				return j
 			}
+		}
+	}
+	return len(s) - 1
+}
+
+// skipDomainLiteral returns the closing ']' of the domain literal opened at i.
+// Its colons, as in a bare IPv6 address, are not group delimiters. Quoted-pairs
+// cannot close the literal; the address parser still validates its contents.
+func skipDomainLiteral(s string, i int) int {
+	for j := i + 1; j < len(s); j++ {
+		switch s[j] {
+		case '\\':
+			j++
+		case ']':
+			return j
 		}
 	}
 	return len(s) - 1
