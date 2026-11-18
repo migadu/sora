@@ -280,6 +280,33 @@ func handleImportS3(ctx context.Context) {
 	continuationToken := fs.String("continuation-token", "", "S3 continuation token to resume from")
 	ftsRetention := fs.String("fts-retention", "", "Index for body search only messages sent within this window, e.g. 180d (default: [cleanup] fts_retention; unset = index all)")
 
+	fs.Usage = func() {
+		fmt.Printf(`Import messages from S3 objects that have no database row (recovery)
+
+Usage:
+  sora-admin import s3 [options]
+
+Options:
+  --email string               Email address to import messages for (required)
+  --dry-run                    Show what would be imported without making changes
+  --workers int                Number of concurrent workers (default: 5)
+  --max-objects int            Maximum number of objects to process (default: 0 = unlimited)
+  --batch-size int             Number of S3 objects to process in each batch (default: 1000)
+  --continuation-token string  S3 continuation token to resume from
+  --force-reimport             Import into INBOX even when another mailbox of the account holds the message
+  --import-delay duration      Delay between imports to control rate (e.g. 200ms)
+  --cleanup-db                 Cleanup temporary database when done (default: true)
+  --fts-retention string       Index for body search only messages sent within this window, e.g. 180d
+                               (default: [cleanup] fts_retention from the config; unset = index all)
+
+Messages are imported into INBOX: S3 holds no folder information.
+
+Examples:
+  sora-admin --config config.toml import s3 --email user@example.com --dry-run
+  sora-admin --config config.toml import s3 --email user@example.com --workers 10
+`)
+	}
+
 	// Parse the flags
 	if err := fs.Parse(os.Args[3:]); err != nil {
 		logger.Fatalf("Failed to parse flags: %v", err)
