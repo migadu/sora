@@ -222,3 +222,49 @@ func TestIMAP_StatusRecent_SelectedMailboxMatchesSelect(t *testing.T) {
 		t.Errorf("STATUS from another connection after the read-write SELECT: RECENT %d, want 0", got)
 	}
 }
+
+// TestIMAP_MultiSearchRecentMatchesStatus: in a mailbox that is not selected,
+// multimailbox SEARCH RECENT and OLD (RFC 7377, which sets no rule of its own
+// for \Recent) answer from the same messages STATUS (RECENT) counts: those
+// above the last read-write SELECT, all of them before the first one.
+func TestIMAP_MultiSearchRecentMatchesStatus(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	conn, r := esearchDialLogin(t, server, account.Email, account.Password)
+	defer conn.Close()
+	esearchCreate(t, conn, r, "c1", "other")
+	esearchAppend(t, conn, r, "a1", "other", "one")
+	esearchAppend(t, conn, r, "a2", "other", "two")
+	esearchCmdOK(t, conn, r, "c2", "SELECT INBOX")
+
+	check := func(step string, wantRecent int, recentUIDs, oldUIDs string) {
+		t.Helper()
+		resp := strings.Join(esearchCmdOK(t, conn, r, "s"+step, "STATUS other (RECENT)"), "\n")
+		if got := h3ParseStatusItem(t, resp, "RECENT"); got != wantRecent {
+			t.Errorf("%s: STATUS other RECENT %d, want %d", step, got, wantRecent)
+		}
+		for _, tc := range []struct{ key, want string }{{"RECENT", recentUIDs}, {"OLD", oldUIDs}} {
+			lines := esearchCmdOK(t, conn, r, "q"+step+tc.key, `ESEARCH IN (mailboxes "other") RETURN (ALL) `+tc.key)
+			line := esearchLine(lines, "other")
+			if tc.want == "" {
+				if line != "" {
+					t.Errorf("%s: ESEARCH IN (mailboxes other) %s: want no result, got %q", step, tc.key, line)
+				}
+			} else if !strings.HasSuffix(line, " ALL "+tc.want) {
+				t.Errorf("%s: ESEARCH IN (mailboxes other) %s: want ALL %s, got %q", step, tc.key, tc.want, lines)
+			}
+		}
+	}
+	check("1", 2, "1:2", "")
+
+	// Another connection selects it read-write: both are old now, and a later
+	// delivery is the one recent message.
+	other, r2 := esearchDialLogin(t, server, account.Email, account.Password)
+	defer other.Close()
+	esearchCmdOK(t, other, r2, "o1", "SELECT other")
+	esearchCmdOK(t, other, r2, "o2", "CLOSE")
+	esearchAppend(t, conn, r, "a3", "other", "three")
+	check("2", 1, "3", "1:2")
+}
