@@ -943,7 +943,7 @@ at the moment, gets `-ERR [SYS/TEMP] Session memory limit reached, please try ag
 | Situation | Reply |
 |---|---|
 | Wrong address or password, an address that does not parse, or rate-limited | `-ERR [AUTH] Authentication failed` |
-| `USER`/`PASS` with a user name or password that is not valid UTF-8 | `-ERR [AUTH] Authentication failed` |
+| An empty password, or a user name or password that is not valid UTF-8 | `-ERR [AUTH] Authentication failed` |
 | Login before TLS on a STARTTLS port with `insecure_auth = false` | `-ERR Authentication requires TLS. Use STLS first` |
 | Too many logins waiting in the delay queue | `-ERR [SYS/TEMP] Too many concurrent authentication attempts. Please try again later.` |
 | The database cannot be reached | `-ERR [SYS/TEMP] Service temporarily unavailable, please try again later` |
@@ -959,9 +959,13 @@ not tell a guessed name from a real one.
 User names and passwords are UTF-8, as `UTF8 USER` says, and a client may use them without sending
 `UTF8` first. They are compared as sent: Sora does not apply SASLprep (RFC 4013), which RFC 6856
 §2.2 recommends, because the stored password hashes were made from the passwords as typed. A
-user name or password that is not valid UTF-8 (RFC 3629) is refused, as RFC 6856 §2.2 requires,
-before its credentials are looked up; no stored password can match it, so the attempt is not
-counted by the rate limiter.
+user name or password that is not valid UTF-8 (RFC 3629) is refused, as RFC 6856 §2.2 requires.
+
+An empty password and a user name or password that is not valid UTF-8, with `USER`/`PASS` or
+`AUTH PLAIN`, are credentials no account can have. They are refused without being looked up, but
+otherwise like an address that does not parse: after the rate-limit check, and counted as a failed
+login ([AUTHENTICATION.md](AUTHENTICATION.md#3-how-a-login-name-is-read)). The POP3 proxy follows
+the same rule.
 
 The library closes a session after 4 errors (failed logins included), with
 `-ERR Too many errors, closing connection`. Each error adds a delay of 3 seconds times the error
