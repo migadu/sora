@@ -10,22 +10,22 @@ import (
 )
 
 // The vacation reply and the MAIL FROM of a relayed redirect go to the sender exactly as
-// it sent the message (#2101). LMTP and the Admin API both hand this package a sender
-// parsed by server.NewReversePath: go-smtp unquotes a quoted local part, the Admin API
-// passes it as written. Either way the reply goes to `"John Doe"@example.com`, once
-// quoted and with its case, not to `"john doe"@example.com` (another mailbox, RFC 5321
-// §2.4) or to `"\"john doe\""@example.com`.
+// it sent the message (#2101). This package gets the sender from server.NewReversePath,
+// which reads the mailbox already decoded (go-smtp unquotes MAIL FROM, net/mail a From:
+// field): the reply goes to `"John Doe"@example.com`, once quoted and with its case, not
+// to `"john doe"@example.com` (another mailbox, RFC 5321 §2.4). Quote characters that
+// are part of the decoded local part stay in it.
 func TestQuotedSenderGetsReplyAndRedirectAtExactAddress(t *testing.T) {
 	const owner = "jane@example.com"
-	const want = `"John Doe"@example.com`
-	for _, in := range []string{
-		`"John Doe"@example.com`, // Admin API "from"
-		`John Doe@example.com`,   // LMTP, as go-smtp hands MAIL FROM over
+	for _, tc := range []struct{ in, want string }{
+		{`John Doe@example.com`, `"John Doe"@example.com`},       // MAIL FROM:<"John Doe"@example.com>
+		{`"John Doe"@example.com`, `"\"John Doe\""@example.com`}, // MAIL FROM:<"\"John Doe\""@example.com>
 	} {
-		t.Run(in, func(t *testing.T) {
-			sender, err := server.NewReversePath(in)
+		t.Run(tc.in, func(t *testing.T) {
+			want := tc.want
+			sender, err := server.NewReversePath(tc.in)
 			if err != nil {
-				t.Fatalf("NewReversePath(%q): %v", in, err)
+				t.Fatalf("NewReversePath(%q): %v", tc.in, err)
 			}
 			ownerAddr := vacAddr(t, owner)
 

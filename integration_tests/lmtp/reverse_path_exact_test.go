@@ -41,6 +41,13 @@ func TestLMTP_VacationAndRedirectKeepSenderLocalPart(t *testing.T) {
 		{name: "quoted dot-string", deliveries: []delivery{
 			{mailFrom: `"John.Doe"@example.com`, want: `John.Doe@example.com`, reply: true},
 		}},
+		// go-smtp decodes the quoted string once; the quotes left are the mailbox's own.
+		{name: "literal surrounding quotes", deliveries: []delivery{
+			{mailFrom: `"\"Sender\""@example.com`, want: `"\"Sender\""@example.com`, reply: true},
+		}},
+		{name: "literal quotes around at sign", deliveries: []delivery{
+			{mailFrom: `"\"A@B\""@example.com`, want: `"\"A@B\""@example.com`, reply: true},
+		}},
 		{name: "dot-string and a days window blind to case", deliveries: []delivery{
 			{mailFrom: `John.Doe@Example.com`, want: `John.Doe@example.com`, reply: true},
 			{mailFrom: `JOHN.DOE@example.com`, want: `JOHN.DOE@example.com`, reply: false},
