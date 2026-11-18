@@ -325,7 +325,9 @@ func (s *IMAPSession) Select(ctx context.Context, mboxName string, options *imap
 	s.selectedExamined.Store(examined)
 	s.mailboxTracker = imapserver.NewMailboxTracker(s.currentNumMessages.Load())
 	s.sessionTracker = s.mailboxTracker.NewSession()
-	s.announcedFlags = displayFlags
+	s.announcedMu.Lock()
+	s.announcedFlags, s.announcedMailboxID = displayFlags, mailbox.ID
+	s.announcedMu.Unlock()
 	s.savedSearchUIDs = nil // RFC 5182: the "$" saved result is reset on mailbox change
 
 	// Track domain and user command activity
