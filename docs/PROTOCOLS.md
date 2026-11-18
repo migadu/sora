@@ -439,6 +439,22 @@ start a cache warm-up that copies the newest INBOX messages from S3 to the local
 - An empty message is refused: `NO empty message rejected: a message must contain at least headers`.
 - A missing target mailbox gets `NO [TRYCREATE]`.
 - An APPEND without a date-time gets the current time as its INTERNALDATE (RFC 9051 §6.3.12).
+- A `~{n}` (literal8, RFC 3516) APPEND has its `binary` MIME leaf bodies, and identity-encoded
+  leaf bodies holding NUL, stored base64-encoded with their `Content-Transfer-Encoding` changed to
+  match. A message that cannot be converted safely gets `NO [UNKNOWN-CTE]`.
+- Any other APPEND (an ordinary literal, or the `UTF8 (~{n})` literal8 of RFC 6855) has only its
+  leaf parts that hold a NUL octet under an identity Content-Transfer-Encoding (none, `7bit`,
+  `8bit` or `binary`) stored base64-encoded. A part it cannot locate is kept as sent.
+- In both cases `BODY[...]` and `BODYSTRUCTURE` describe the stored form, which an ordinary
+  literal can carry, and `BINARY[...]` returns the original octets (RFC 3516 §4.4 allows a
+  lossless CTE change). Every other byte, and every message that needs no conversion, is stored
+  exactly as sent. `RFC822.SIZE` is the stored size.
+- `append_limit` (`APPENDLIMIT`) applies to the literal as the client sends it, not to the
+  converted message, which may be larger: the client cannot know what the server will rewrite.
+  The converted message must still be at most 2147483647 octets (`NO [TOOBIG] Encoded message
+  exceeds maximum stored message size`), and while it is built the literal and the converted copy
+  are both charged to the session memory limit; when they do not fit together the APPEND gets
+  the memory-limit reply below and nothing is stored.
 - When the session memory limit cannot hold the message:
   `NO [UNAVAILABLE] Session memory limit reached, please try again later`.
 - When this node's upload spool is over its size limit:
