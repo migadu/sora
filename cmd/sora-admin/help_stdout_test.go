@@ -102,7 +102,7 @@ func TestUsageErrorStreams(t *testing.T) {
 			if !strings.Contains(stderr, "Error: "+tc.missing) || strings.Contains(stderr, "Usage") {
 				t.Errorf("stderr does not hold just the %s error:\n%s", tc.missing, stderr)
 			}
-			if !strings.Contains(stdout, "Usage:\n  sora-admin "+strings.Join(tc.args[:2], " ")) || strings.Contains(stdout, "Error") {
+			if !strings.Contains(stdout, "Usage:\n  sora-admin --config PATH "+strings.Join(tc.args[:2], " ")) || strings.Contains(stdout, "Error") {
 				t.Errorf("stdout does not hold just the usage:\n%s", stdout)
 			}
 		})
