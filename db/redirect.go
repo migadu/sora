@@ -7,13 +7,21 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-// RecordRedirect records that a redirect action was performed for the given account.
-func (db *Database) RecordRedirect(ctx context.Context, tx pgx.Tx, accountID int64) error {
+// RecordRedirect records that a redirect action was performed for the given account,
+// charged against a redirect rate limit of the given window. The row keeps the end of
+// that window (expires_at), so CleanupOldRedirects keeps it while the limit that charged
+// it still counts it, on whichever node the cleaner runs.
+func (db *Database) RecordRedirect(ctx context.Context, tx pgx.Tx, accountID int64, window time.Duration) error {
 	now := time.Now()
+	var expiresAt *time.Time
+	if window > 0 {
+		t := now.Add(window)
+		expiresAt = &t
+	}
 	_, err := tx.Exec(ctx, `
-		INSERT INTO redirect_log (account_id, redirect_date, created_at)
-		VALUES ($1, $2, $3)
-	`, accountID, now, now)
+		INSERT INTO redirect_log (account_id, redirect_date, created_at, expires_at)
+		VALUES ($1, $2, $3, $4)
+	`, accountID, now, now, expiresAt)
 
 	return err
 }
@@ -60,14 +68,19 @@ func (db *Database) RecordRedirectDelivery(ctx context.Context, tx pgx.Tx, accou
 }
 
 // CleanupOldRedirects removes redirect log records, and the records of which deliveries
-// were redirected (RecordRedirectDelivery), older than the specified duration.
+// were redirected (RecordRedirectDelivery), older than the specified duration. A redirect
+// log record is also kept until the end of the window it was charged under (expires_at),
+// which another node's config may have set beyond olderThan; a record without one, written
+// before migration 75 or by an older binary, goes at olderThan.
 func (db *Database) CleanupOldRedirects(ctx context.Context, tx pgx.Tx, olderThan time.Duration) (int64, error) {
-	cutoffTime := time.Now().Add(-olderThan)
+	now := time.Now()
+	cutoffTime := now.Add(-olderThan)
 
 	result, err := tx.Exec(ctx, `
 		DELETE FROM redirect_log
 		WHERE redirect_date < $1
-	`, cutoffTime)
+		AND (expires_at IS NULL OR expires_at < $2)
+	`, cutoffTime, now)
 
 	if err != nil {
 		return 0, err

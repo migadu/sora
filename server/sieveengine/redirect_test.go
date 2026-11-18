@@ -23,7 +23,7 @@ func (m *configurableRedirectOracle) CountRedirectsSince(ctx context.Context, ac
 	return m.count, m.countErr
 }
 
-func (m *configurableRedirectOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+func (m *configurableRedirectOracle) RecordRedirect(ctx context.Context, accountID int64, window time.Duration) error {
 	m.recordedN++
 	return m.recordErr
 }
@@ -278,7 +278,7 @@ func (o *countingRedirectOracle) CountRedirectsSince(ctx context.Context, accoun
 	return o.recorded, nil
 }
 
-func (o *countingRedirectOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+func (o *countingRedirectOracle) RecordRedirect(ctx context.Context, accountID int64, window time.Duration) error {
 	o.recorded++
 	return nil
 }

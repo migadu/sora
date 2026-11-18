@@ -296,7 +296,7 @@ func (m *mockVacationOracle) CountRedirectsSince(ctx context.Context, accountID 
 	return 0, nil
 }
 
-func (m *mockVacationOracle) RecordRedirect(ctx context.Context, accountID int64) error {
+func (m *mockVacationOracle) RecordRedirect(ctx context.Context, accountID int64, window time.Duration) error {
 	return nil
 }
 
