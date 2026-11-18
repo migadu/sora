@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -130,4 +131,80 @@ func h3ParseStatusItem(t *testing.T, resp, item string) int {
 		t.Fatalf("bad %s value %q: %v", item, m[1], err)
 	}
 	return n
+}
+
+// TestIMAP_StatusRecent_AfterExamineAndClose replays imaptest's "select" test
+// (dovecot/imaptest src/tests/select, fixture select.mbox): STATUS (RECENT) must
+// report what an EXAMINE of the mailbox reports (RFC 3501 §6.3.10 calls STATUS
+// the alternative to an EXAMINE on a second connection). EXAMINE and CLOSE keep
+// \Recent (§6.3.2); a read-write SELECT consumes it for later sessions
+// (§2.3.2), and mail delivered after that is Recent again. LIST RETURN (STATUS)
+// answers the same items (RFC 5819 §2).
+func TestIMAP_StatusRecent_AfterExamineAndClose(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+
+	conn, r := esearchDialLogin(t, server, account.Email, account.Password)
+	defer conn.Close()
+	const mbox = "test-mailbox"
+	esearchCreate(t, conn, r, "c1", mbox)
+	appendRaw := func(tag, msg string) {
+		t.Helper()
+		if _, err := fmt.Fprintf(conn, "%s APPEND %q {%d+}\r\n%s\r\n", tag, mbox, len(msg), msg); err != nil {
+			t.Fatalf("APPEND write: %v", err)
+		}
+		if line := h3ReadTagged(t, r, tag); !strings.Contains(line, tag+" OK") {
+			t.Fatalf("APPEND not OK:\n%s", line)
+		}
+	}
+	appendRaw("a1", "Date: Sat, 24 Mar 2007 23:00:00 +0200\r\n\r\nbody\r\n")
+	appendRaw("a2", "Date: Sat, 24 Mar 2007 23:00:00 +0200\r\n\r\nbody2\r\n")
+
+	status := func(tag, items string) string {
+		t.Helper()
+		lines := esearchCmdOK(t, conn, r, tag, "STATUS "+esearchQuote(mbox)+" ("+items+")")
+		return strings.Join(lines, "\n")
+	}
+	listStatusRecent := func(tag string) int {
+		t.Helper()
+		lines := esearchCmdOK(t, conn, r, tag, `LIST "" `+esearchQuote(mbox)+` RETURN (STATUS (RECENT))`)
+		return h3ParseStatusItem(t, strings.Join(lines, "\n"), "RECENT")
+	}
+
+	// First open read-only so the Recent flags are not lost.
+	lines, tagged := esearchExec(t, conn, r, "e1", "EXAMINE "+esearchQuote(mbox))
+	if !strings.Contains(tagged, "OK [READ-ONLY]") || !slices.Contains(lines, "* 2 RECENT") {
+		t.Fatalf("EXAMINE: want * 2 RECENT and OK [READ-ONLY], got %q / %q", lines, tagged)
+	}
+	esearchCmdOK(t, conn, r, "e2", "CLOSE")
+
+	resp := status("s1", "MESSAGES RECENT UIDNEXT UIDVALIDITY UNSEEN")
+	for item, want := range map[string]int{"MESSAGES": 2, "RECENT": 2, "UIDNEXT": 3, "UNSEEN": 2} {
+		if got := h3ParseStatusItem(t, resp, item); got != want {
+			t.Errorf("STATUS after EXAMINE and CLOSE: %s %d, want %d (%s)", item, got, want, resp)
+		}
+	}
+	if got := listStatusRecent("l1"); got != 2 {
+		t.Errorf("LIST RETURN (STATUS (RECENT)) after EXAMINE and CLOSE: RECENT %d, want 2", got)
+	}
+
+	// Then read-write: SELECT still sees both, and consumes them.
+	lines, tagged = esearchExec(t, conn, r, "w1", "SELECT "+esearchQuote(mbox))
+	if !strings.Contains(tagged, "OK [READ-WRITE]") || !slices.Contains(lines, "* 2 RECENT") {
+		t.Fatalf("SELECT: want * 2 RECENT and OK [READ-WRITE], got %q / %q", lines, tagged)
+	}
+	esearchCmdOK(t, conn, r, "w2", "CLOSE")
+	if got := h3ParseStatusItem(t, status("s2", "RECENT"), "RECENT"); got != 0 {
+		t.Errorf("STATUS after read-write SELECT: RECENT %d, want 0", got)
+	}
+
+	// A message delivered after that SELECT is Recent again.
+	appendRaw("a3", "Date: Sat, 24 Mar 2007 23:00:00 +0200\r\n\r\nbody3\r\n")
+	if got := h3ParseStatusItem(t, status("s3", "RECENT"), "RECENT"); got != 1 {
+		t.Errorf("STATUS after a new delivery: RECENT %d, want 1", got)
+	}
+	if got := listStatusRecent("l2"); got != 1 {
+		t.Errorf("LIST RETURN (STATUS (RECENT)) after a new delivery: RECENT %d, want 1", got)
+	}
 }
