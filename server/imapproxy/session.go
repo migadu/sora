@@ -123,7 +123,14 @@ func (s *Session) handleConnection() {
 		if s.clientConn != nil {
 			s.clientConn.Close()
 		}
+		backend := s.backendConn
 		s.mu.Unlock()
+		// The backend too: closing the client does not unblock a read on the backend
+		// (a greeting or login reply that never comes), which would hold the session
+		// until the connect timeout. Raw socket first, outside the mutex: a TLS
+		// close_notify can wait for its peer. connectToBackend refuses to install a
+		// connection once the context has ended, so none is missed here.
+		closeMaintenanceTransport(backend)
 	}()
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
@@ -1837,6 +1844,13 @@ func (s *Session) connectToBackend() error {
 	metrics.ProxyBackendConnections.WithLabelValues("imap", "success").Inc()
 
 	s.mu.Lock()
+	if err := s.ctx.Err(); err != nil {
+		// The context watchdog has already run (it takes mu after ctx.Done) and
+		// would not close a connection installed now.
+		s.mu.Unlock()
+		backendConn.Close()
+		return fmt.Errorf("session ended while connecting to the backend: %w", err)
+	}
 	s.backendConn = backendConn
 	s.backendReader = bufio.NewReader(backendConn)
 	s.backendWriter = bufio.NewWriter(backendConn)
