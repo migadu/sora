@@ -49,7 +49,8 @@ func (s *LMTPSession) XCLIENT(session smtp.Session, attrs map[string]string) err
 //
 // The attributes need no validation here: go-smtp passes only ADDR, PORT, PROTO, HELO, LOGIN
 // and NAME, each with a value it checked, and refuses anything else (TTL included) with 501
-// before the hook runs and before it records anything.
+// before the hook runs and before it records anything. So the switch below handles exactly
+// those six and has no branch for any other name.
 func (s *LMTPSession) applyXCLIENTAttrs(attrs map[string]string) {
 	// Initialize forwarding parameters if not already present
 	if s.ForwardingParams == nil {
@@ -102,10 +103,6 @@ func (s *LMTPSession) applyXCLIENTAttrs(attrs map[string]string) {
 		case "NAME":
 			// Store client hostname in variables
 			s.ForwardingParams.Variables["client-hostname"] = value
-
-		default:
-			// Store unknown attributes in variables with xclient- prefix
-			s.ForwardingParams.Variables["xclient-"+strings.ToLower(name)] = value
 		}
 	}
 }
