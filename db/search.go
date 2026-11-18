@@ -1387,24 +1387,11 @@ func rewriteSeqNumCriteria(c *imap.SearchCriteria, uidBySeq map[uint32]imap.UID,
 	// UID '*' denotes the last live UID in the mailbox (RFC 9051 §6.4.4, §9), not
 	// the session view's last slot and not MaxUint32. Resolve it before appending
 	// sequence rewrites, whose UID 0 sentinel deliberately matches none.
+	if !hasLiveLast {
+		liveLastUID = 0
+	}
 	for i, set := range c.UID {
-		var resolved imap.UIDSet
-		for _, r := range set {
-			if r.Start == 0 || r.Stop == 0 {
-				if !hasLiveLast {
-					continue // an empty mailbox has no wildcard endpoint
-				}
-				if r.Start == 0 {
-					r.Start = liveLastUID
-				}
-				if r.Stop == 0 {
-					r.Stop = liveLastUID
-				}
-				r.Start, r.Stop = min(r.Start, r.Stop), max(r.Start, r.Stop)
-			}
-			resolved = append(resolved, r)
-		}
-		c.UID[i] = resolved
+		c.UID[i] = resolveUIDSetWildcards(set, liveLastUID)
 	}
 
 	for _, seqSet := range c.SeqNum {

@@ -225,6 +225,17 @@ func (db *Database) GetMessagesByNumSet(ctx context.Context, mailboxID int64, nu
 }
 
 func streamMessagesByUIDSet(ctx context.Context, run MessageStreamDBRunner, mailboxID int64, uidSet imap.UIDSet, cb MessageStreamCallback, includeBodyStructure bool) error {
+	if uidSet.Dynamic() {
+		var resolved imap.UIDSet
+		if err := run(ctx, func(stepCtx context.Context, db *Database) error {
+			var err error
+			resolved, err = db.resolveUIDSet(stepCtx, mailboxID, uidSet)
+			return err
+		}); err != nil {
+			return err
+		}
+		uidSet = resolved
+	}
 	if len(uidSet) == 0 {
 		return nil
 	}
@@ -622,7 +633,23 @@ type MessageUIDSeq struct {
 // GetDeletedMessageUIDsAndSeqs efficiently retrieves only UIDs and sequence numbers
 // for messages with the \Deleted flag, optimized for EXPUNGE operations.
 // This avoids fetching unnecessary columns like body_structure and recipients_json.
-func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID int64) ([]MessageUIDSeq, error) {
+// An optional UID set restricts UID EXPUNGE. Its wildcards use the highest live UID
+// from the same snapshot as the deleted messages, including an undeleted tail.
+func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID int64, uidSets ...imap.UIDSet) ([]MessageUIDSeq, error) {
+	var uidSet imap.UIDSet
+	if len(uidSets) > 0 {
+		uidSet = uidSets[0]
+		if len(uidSet) == 0 {
+			return nil, nil
+		}
+	}
+	dynamic := uidSet.Dynamic()
+	lastUIDCol := ""
+	if dynamic {
+		lastUIDCol = `, (SELECT uid FROM messages
+			WHERE mailbox_id = $1 AND expunged_at IS NULL
+			ORDER BY uid DESC LIMIT 1)`
+	}
 	// Use unified ROW_NUMBER() CTE instead of a correlated subquery for sequence mapping
 	// to prevent massive O(N^2) timeouts if a user attempts to bulk-delete thousands of messages.
 	rows, err := db.GetReadPoolWithContext(ctx).Query(ctx, `
@@ -631,7 +658,7 @@ func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID 
 			FROM messages
 			WHERE mailbox_id = $1 AND expunged_at IS NULL
 		)
-		SELECT m.uid, n.seqnum
+		SELECT m.uid, n.seqnum`+lastUIDCol+`
 		FROM messages m
 		JOIN numbered n ON m.uid = n.uid
 		LEFT JOIN message_state ms ON ms.message_id = m.id AND ms.mailbox_id = m.mailbox_id
@@ -644,10 +671,25 @@ func (db *Database) GetDeletedMessageUIDsAndSeqs(ctx context.Context, mailboxID 
 	defer rows.Close()
 
 	var results []MessageUIDSeq
+	resolved := false
 	for rows.Next() {
 		var entry MessageUIDSeq
-		if err := rows.Scan(&entry.UID, &entry.Seq); err != nil {
+		var err error
+		if dynamic {
+			var lastUID imap.UID
+			err = rows.Scan(&entry.UID, &entry.Seq, &lastUID)
+			if err == nil && !resolved {
+				uidSet = resolveUIDSetWildcards(uidSet, lastUID)
+				resolved = true
+			}
+		} else {
+			err = rows.Scan(&entry.UID, &entry.Seq)
+		}
+		if err != nil {
 			return nil, err
+		}
+		if len(uidSets) > 0 && !uidSet.Contains(entry.UID) {
+			continue
 		}
 		results = append(results, entry)
 	}
