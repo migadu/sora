@@ -1119,20 +1119,12 @@ func (s *LMTPSession) Logout() error {
 	// go-smtp also logs a session out from Server.Close, on the closing goroutine, while this
 	// connection's goroutine may be inside a command writing the user, the trace id or the
 	// remote address. Those are written under the session lock and read here only with it.
-	var acquired bool
-	release := func() {}
-	if s.ctx.Err() != nil {
-		// Server.Close cancelled the session. Take the lock only if it is free, never wait
-		// for it: go-smtp closes the connections one by one and each socket only after its
-		// Logout, so a DATA still reading the body would hold the lock, and the shutdown,
-		// for the whole MutexTimeout. Without the lock Logout touches only what NewSession
-		// fixed, atomics and the transaction count (under txMu).
-		if acquired = s.mutex.TryLock(); acquired {
-			release = s.mutex.Unlock
-		}
-	} else {
-		acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-	}
+	// Server.Close cancels the session context first: the helper still takes a free lock,
+	// but gives up at once on a held one rather than wait MutexTimeout, since go-smtp closes
+	// the connections one by one and a DATA still reading the body would stall the shutdown.
+	// Without the lock Logout touches only what NewSession fixed, atomics and the
+	// transaction count (under txMu).
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	debugLog, infoLog := s.DebugLog, s.InfoLog
 	if acquired {
 		defer release()
