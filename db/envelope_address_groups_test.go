@@ -63,10 +63,23 @@ func TestBuildEnvelopeAddressGroups(t *testing.T) {
 }
 
 // TestUserAPIRecipientsSkipGroupMarkers checks that the User API's address lists carry
-// only addresses: a group boundary is no recipient.
+// only addresses: a group boundary is no recipient, and an address in two groups is one
+// recipient (#2079).
 func TestUserAPIRecipientsSkipGroupMarkers(t *testing.T) {
+	var recipients []helpers.Recipient
+	if err := json.Unmarshal(groupHeaderRecipients(t), &recipients); err != nil {
+		t.Fatalf("unmarshal recipients: %v", err)
+	}
+	recipients = append(recipients,
+		helpers.Recipient{AddressType: "to", Group: "again"},
+		helpers.Recipient{AddressType: "to", EmailAddress: "g1@d1.org"},
+		helpers.Recipient{AddressType: "to", GroupEnd: true})
+	raw, err := json.Marshal(recipients)
+	if err != nil {
+		t.Fatalf("marshal recipients: %v", err)
+	}
 	msg := &DBMessage{}
-	msg.setRecipients(groupHeaderRecipients(t))
+	msg.setRecipients(raw)
 	if want := []string{"g1@d1.org", "g2@d2.org", "g3@d3.org"}; !slices.Equal(msg.To, want) {
 		t.Errorf("To = %q, want %q", msg.To, want)
 	}

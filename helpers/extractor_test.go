@@ -112,3 +112,18 @@ func TestExtractRecipientsMalformedGroupsParseFlat(t *testing.T) {
 		})
 	}
 }
+
+// TestDistinctAddresses checks that the recipients list drops group markers and lists
+// each address once per header type, as ExtractRecipients did before it kept the
+// headers as written (#2079).
+func TestDistinctAddresses(t *testing.T) {
+	hdr := mail.HeaderFromMap(map[string][]string{
+		"To": {"g: a@example.com;, h: a@example.com, b@example.com;", "a@example.com"},
+		"Cc": {"a@example.com"},
+	})
+	got := DistinctAddresses(ExtractRecipients(hdr.Header))
+	want := []Recipient{addr("to", "a@example.com", ""), addr("to", "b@example.com", ""), addr("cc", "a@example.com", "")}
+	if !slices.Equal(got, want) {
+		t.Errorf("DistinctAddresses = %+v, want %+v", got, want)
+	}
+}

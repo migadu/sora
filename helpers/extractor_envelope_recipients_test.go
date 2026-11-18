@@ -57,17 +57,26 @@ func TestExtractEnvelopeRecipientsSkipsGroupMarkers(t *testing.T) {
 }
 
 // TestExtractRecipientsKeepsEveryAddressHeader: the recipients metadata still covers
-// From, Sender and Reply-To, once per address and header.
+// From, Sender and Reply-To. It lists each header as written, a repeated address each
+// time (the ENVELOPE does, #2079); DistinctAddresses gives each once per header.
 func TestExtractRecipientsKeepsEveryAddressHeader(t *testing.T) {
 	h := parseEnvelopeRecipientHeader(t, "From: alice@example.com\r\nSender: alice@example.com\r\n"+
 		"Reply-To: alice@example.com\r\nTo: bob@example.com, bob@example.com\r\nCc: bob@example.com\r\n")
 
-	var got []string
-	for _, r := range ExtractRecipients(h) {
-		got = append(got, r.AddressType+":"+r.EmailAddress)
+	list := func(recipients []Recipient) []string {
+		var got []string
+		for _, r := range recipients {
+			got = append(got, r.AddressType+":"+r.EmailAddress)
+		}
+		return got
 	}
-	want := []string{"to:bob@example.com", "cc:bob@example.com", "from:alice@example.com", "sender:alice@example.com", "reply-to:alice@example.com"}
-	if !slices.Equal(got, want) {
+	all := ExtractRecipients(h)
+	want := []string{"to:bob@example.com", "to:bob@example.com", "cc:bob@example.com", "from:alice@example.com", "sender:alice@example.com", "reply-to:alice@example.com"}
+	if got := list(all); !slices.Equal(got, want) {
 		t.Errorf("ExtractRecipients = %v, want %v", got, want)
+	}
+	want = slices.Delete(want, 1, 2)
+	if got := list(DistinctAddresses(all)); !slices.Equal(got, want) {
+		t.Errorf("DistinctAddresses = %v, want %v", got, want)
 	}
 }
