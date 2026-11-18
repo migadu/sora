@@ -63,18 +63,14 @@ func TestUserAPILoginDuringDatabaseOutage(t *testing.T) {
 	}
 }
 
-// TestUserAPIDatabaseOutageDropsCachedLogin: a login in the lookup cache is accepted
-// during a database outage while it is younger than positive_revalidation_window (30s
-// by default). A password that misses it goes to the database, which gives no
-// verdict, so the guess is not counted. The cached login must be dropped then, or
-// every later guess is checked against the cached password, uncounted, until the entry
-// is older than the window. Once the database is back, the user logs in: the guesses
-// were not counted.
-//
-// The token of a login needs the database too (its password epoch), so during the
-// outage every login is answered 503, cached or not. The log line says where the
-// password was checked.
-func TestUserAPIDatabaseOutageDropsCachedLogin(t *testing.T) {
+// TestUserAPIDatabaseOutageIgnoresLookupCache: the User API does not cache logins (a
+// configured lookup_cache is ignored with a warning). Each login reads the hash and the
+// token epoch together from the database, since a cached password verdict cannot supply
+// the epoch of that same hash. So during a database outage a login is 503 whether its
+// password logged in a moment ago or is a guess. The database gave no verdict, so none
+// of them is counted, and the user logs in once the database is back. A login cache that
+// came back and checked the guesses against the cached password, uncounted, fails here.
+func TestUserAPIDatabaseOutageIgnoresLookupCache(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
 	rdb, outage := common.SetupTestDatabaseWithOutage(t)
@@ -87,28 +83,23 @@ func TestUserAPIDatabaseOutageDropsCachedLogin(t *testing.T) {
 	}
 
 	outage.Begin()
-	// Before any guess the cached login is accepted, and only its token fails.
+	// The password that just logged in is asked of the database too: no cache answers it.
 	logs := common.CaptureLogs(t)
 	if code := login(account.Email, account.Password); code != http.StatusServiceUnavailable {
-		t.Errorf("login with the cached password during the outage, before any guess: %d, want %d", code, http.StatusServiceUnavailable)
+		t.Errorf("login with the password that just logged in, during the outage: %d, want %d", code, http.StatusServiceUnavailable)
 	}
-	logs.WaitForLine(t, "Error fetching credential epoch")
+	logs.WaitForLine(t, "Error retrieving credentials")
 
+	// More guesses than the rate limit allows (common.DBOutageAuthRateLimit blocks
+	// after two failures), so the login after the outage fails if any was counted.
 	for i := 1; i <= 3; i++ {
 		if code := login(account.Email, fmt.Sprintf("guess-%d", i)); code != http.StatusServiceUnavailable {
 			t.Errorf("login with guess %d during the outage: %d, want %d", i, code, http.StatusServiceUnavailable)
 		}
 	}
-	logs = common.CaptureLogs(t)
-	if code := login(account.Email, account.Password); code != http.StatusServiceUnavailable {
-		t.Errorf("login with the cached password after the guesses: %d, want %d", code, http.StatusServiceUnavailable)
-	}
-	// The credentials were asked of the database, not accepted from the cache: the
-	// uncounted guesses were not checked against the cached login.
-	logs.WaitForLine(t, "Error retrieving credentials")
 	outage.End()
 
 	if code := login(account.Email, account.Password); code != http.StatusOK {
-		t.Errorf("login after the outage: %d, want %d (the guesses were counted as failed logins)", code, http.StatusOK)
+		t.Errorf("login after the outage: %d, want %d (the outage logins were counted as failed logins)", code, http.StatusOK)
 	}
 }
