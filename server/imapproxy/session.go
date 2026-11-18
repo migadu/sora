@@ -424,13 +424,8 @@ func (s *Session) handleConnection() {
 
 			// A missing argument above is BAD ("arguments invalid", RFC 9051
 			// §6.2.3); an empty user name or password given as a string is a
-			// well-formed LOGIN whose credentials are rejected: NO.
-			if username == "" || password == "" {
-				if s.handleAuthError(fmt.Sprintf("%s NO LOGIN requires username and password", tag)) {
-					return
-				}
-				continue
-			}
+			// well-formed LOGIN whose credentials no account has: refused by
+			// authenticateUser like any other failed login, same reply and count.
 
 			if err := s.authenticateUser(username, password); err != nil {
 				s.DebugLog("authentication failed", "error", err)

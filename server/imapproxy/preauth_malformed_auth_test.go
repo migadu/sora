@@ -140,9 +140,9 @@ func TestPreAuthMalformedLoginAndAuthenticateAnswerBAD(t *testing.T) {
 			{"a3 LOGIN user@example.com \rsecret", "a3 BAD Invalid LOGIN arguments"},
 		}},
 
-		// Still NO: the command is well formed and fails.
+		// Still NO: the command is well formed and fails, like any failed login (#2068).
 		{"LOGIN with empty quoted credentials", []step{
-			{`a4 LOGIN "" ""`, "a4 NO LOGIN requires username and password"},
+			{`a4 LOGIN "" ""`, "a4 NO Authentication failed"},
 		}},
 		{"AUTHENTICATE with an unsupported mechanism", []step{
 			{"a5 AUTHENTICATE CRAM-MD5", "a5 NO AUTHENTICATE PLAIN is the only supported mechanism"},
