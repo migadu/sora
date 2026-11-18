@@ -45,6 +45,10 @@ func TestIMAP_AppendBinaryCTE(t *testing.T) {
 		innerPreamble + "--inner\r\n" + binaryHeader)
 	nested = append(nested, payload...)
 	nested = append(nested, []byte("\r\n--inner--\r\n"+innerEpilogue+"--outer--\r\n"+outerEpilogue)...)
+	embedded := []byte(top + "Content-Type: multipart/mixed; boundary=embedded\r\n\r\n--embedded\r\n" +
+		"Content-Type: message/rfc822\r\n\r\nFrom: inner@example.com\r\nSubject: embedded binary\r\nMIME-Version: 1.0\r\n" + binaryHeader)
+	embedded = append(embedded, payload...)
+	embedded = append(embedded, []byte("\r\n--embedded--\r\n")...)
 	latin1 := []byte{0xe4, 0, 0xf6, '\r', '\n'}
 
 	for n, tc := range []struct {
@@ -55,6 +59,7 @@ func TestIMAP_AppendBinaryCTE(t *testing.T) {
 	}{
 		{"octet stream", append([]byte(top+binaryHeader), payload...), []int{1}, payload},
 		{"nested multipart", nested, []int{2, 1}, payload},
+		{"embedded message", embedded, []int{1, 1}, payload},
 		{"non UTF8 text", append([]byte(top+"Content-Type: text/plain; charset=iso-8859-1\r\nContent-Transfer-Encoding: binary\r\n\r\n"), latin1...), []int{1}, latin1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -128,6 +133,62 @@ func TestIMAP_AppendBinaryCTE(t *testing.T) {
 	})
 }
 
+// Failure to produce a legal ordinary BODY representation must refuse APPEND
+// before allocating a UID or storing a message, without losing command framing.
+func TestIMAP_AppendBinaryCTERefusal(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	require.NoError(t, err)
+	defer c.Close()
+	require.NoError(t, c.Login(account.Email, account.Password).Wait())
+
+	for n, tc := range []struct{ name, raw string }{
+		{"NUL in header", "Subject: invalid\x00header\r\n\r\nbody\r\n"},
+		{"unknown CTE with NUL", "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: x-unknown\r\n\r\nraw\x00data"},
+		{"NUL in multipart preamble", "Content-Type: multipart/mixed; boundary=invalid\r\n\r\npreamble\x00data\r\n--invalid\r\nContent-Type: text/plain\r\n\r\nsafe\r\n--invalid--\r\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			box := fmt.Sprintf("BinaryRefused%d", n)
+			require.NoError(t, c.Create(box, nil).Wait())
+			before, err := c.Status(box, &imap.StatusOptions{UIDNext: true, NumMessages: true}).Wait()
+			require.NoError(t, err)
+			command := c.Append(box, int64(len(tc.raw)), &imap.AppendOptions{Binary: true})
+			_, err = command.Write([]byte(tc.raw))
+			require.NoError(t, err)
+			require.NoError(t, command.Close())
+			_, err = command.Wait()
+			var imapErr *imap.Error
+			if assert.ErrorAs(t, err, &imapErr) {
+				assert.Equal(t, imap.StatusResponseTypeNo, imapErr.Type)
+				assert.Equal(t, imap.ResponseCodeUnknownCTE, imapErr.Code)
+			}
+			require.NoError(t, c.Noop().Wait(), "connection must remain usable after the refusal")
+			after, err := c.Status(box, &imap.StatusOptions{UIDNext: true, NumMessages: true}).Wait()
+			require.NoError(t, err)
+			require.NotNil(t, after.NumMessages)
+			assert.Zero(t, *after.NumMessages, "refused APPEND must store no message")
+			assert.Equal(t, before.UIDNext, after.UIDNext, "refused APPEND must not consume a UID")
+		})
+	}
+}
+
+func TestIMAP_AppendNonBinaryPreservesSafeOctets(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	server, account := common.SetupIMAPServer(t)
+	defer server.Close()
+	c, err := imapclient.DialInsecure(server.Address, nil)
+	require.NoError(t, err)
+	defer c.Close()
+	require.NoError(t, c.Login(account.Email, account.Password).Wait())
+	const raw = "From: sender@example.com\r\nSubject: =?us-ascii?Q?untouched?=\r\nX-Spacing: keep \t\r\n\tfolded value\r\nContent-Type: application/octet-stream\r\nContent-Transfer-Encoding: 8bit\r\n\r\nraw\xe4\xff\r\n"
+	uid := appendMessage(t, c, raw)
+	_, err = c.Select("INBOX", nil).Wait()
+	require.NoError(t, err)
+	assert.Equal(t, []byte(raw), fetchBodySection(t, c, uid, &imap.FetchItemBodySection{Peek: true}))
+}
+
 func appendBinaryCTE(t *testing.T, c *imapclient.Client, box string, raw []byte) imap.UID {
 	t.Helper()
 	command := c.Append(box, int64(len(raw)), &imap.AppendOptions{Binary: true})
@@ -167,6 +228,10 @@ func binaryAppendStructurePart(t *testing.T, structure imap.BodyStructure, path 
 			require.LessOrEqual(t, path[0], len(current.Children))
 			structure, path = current.Children[path[0]-1], path[1:]
 		case *imap.BodyStructureSinglePart:
+			if current.MessageRFC822 != nil {
+				structure = current.MessageRFC822.BodyStructure
+				continue
+			}
 			require.Equal(t, []int{1}, path)
 			return current
 		default:
