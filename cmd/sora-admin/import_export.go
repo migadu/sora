@@ -30,10 +30,10 @@ func handleImportCommand(ctx context.Context) {
 		handleImportS3(ctx)
 	case "rekey":
 		handleImportRekey(ctx)
-	case "--help", "-h":
+	case "help", "--help", "-h":
 		printImportUsage()
 	default:
-		fmt.Printf("Unknown import subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown import subcommand: %s\n\n", subcommand)
 		printImportUsage()
 		os.Exit(1)
 	}
@@ -66,7 +66,7 @@ func handleImportMaildir(ctx context.Context) {
 		fmt.Printf(`Import maildir from a given path
 
 Usage:
-  sora-admin import maildir [options]
+  sora-admin --config PATH import maildir [options]
 
 Options:
   --email string          Email address for the account to import mail to (required)
@@ -104,34 +104,34 @@ custom IMAP keywords/flags, and maintain original UIDs from dovecot-uidlist file
 
 Examples:
   # Import all mail (correct path points to maildir root)
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/example.com/user/Maildir --config config.toml
 
   # Incremental import (skip already imported messages based on SQLite cache)
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --incremental
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --incremental --config config.toml
 
   # Dry run to preview (note: correct maildir path)
-  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
+  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run --config config.toml
 
   # Import only INBOX and Sent folders
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --mailbox-filter INBOX,Sent
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --mailbox-filter INBOX,Sent --config config.toml
 
   # Import messages from 2023
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --start-date 2023-01-01 --end-date 2023-12-31 --config config.toml
 
   # Import from specific paths file
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --paths-file failed_paths.txt
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --paths-file failed_paths.txt --config config.toml
 
   # Import with cleanup (removes the SQLite database after a successful import)
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --cleanup-db --config config.toml
 
   # Import from Dovecot with subscriptions and custom keywords
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot --config config.toml
 
   # Import with Sieve script
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --sieve /path/to/user.sieve
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --sieve /path/to/user.sieve --config config.toml
 
   # Import everything, but make only the last 6 months searchable by body
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --fts-retention 180d
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --fts-retention 180d --config config.toml
 `)
 	}
 
@@ -142,24 +142,24 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *maildirPath == "" {
-		fmt.Printf("Error: --maildir-path is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --maildir-path is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *jobs < 1 {
-		fmt.Printf("Error: --jobs must be at least 1\n")
+		fmt.Fprintf(os.Stderr, "Error: --jobs must be at least 1\n")
 		os.Exit(1)
 	}
 
 	if *batchSize < 1 {
-		fmt.Printf("Error: --batch-size must be at least 1\n")
+		fmt.Fprintf(os.Stderr, "Error: --batch-size must be at least 1\n")
 		os.Exit(1)
 	}
 
@@ -168,7 +168,7 @@ Examples:
 	if *startDate != "" {
 		t, err := time.Parse("2006-01-02", *startDate)
 		if err != nil {
-			fmt.Printf("Error: Invalid start date format. Use YYYY-MM-DD\n")
+			fmt.Fprintf(os.Stderr, "Error: Invalid start date format. Use YYYY-MM-DD\n")
 			os.Exit(1)
 		}
 		startDateParsed = &t
@@ -176,7 +176,7 @@ Examples:
 	if *endDate != "" {
 		t, err := time.Parse("2006-01-02", *endDate)
 		if err != nil {
-			fmt.Printf("Error: Invalid end date format. Use YYYY-MM-DD\n")
+			fmt.Fprintf(os.Stderr, "Error: Invalid end date format. Use YYYY-MM-DD\n")
 			os.Exit(1)
 		}
 		// Add 23:59:59 to include the entire end date
@@ -195,7 +195,7 @@ Examples:
 
 	ftsRetentionParsed, err := resolveImportFTSRetention(*ftsRetention)
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -280,6 +280,33 @@ func handleImportS3(ctx context.Context) {
 	continuationToken := fs.String("continuation-token", "", "S3 continuation token to resume from")
 	ftsRetention := fs.String("fts-retention", "", "Index for body search only messages sent within this window, e.g. 180d (default: [cleanup] fts_retention; unset = index all)")
 
+	fs.Usage = func() {
+		fmt.Printf(`Import messages from S3 objects that have no database row (recovery)
+
+Usage:
+  sora-admin --config PATH import s3 [options]
+
+Options:
+  --email string               Email address to import messages for (required)
+  --dry-run                    Show what would be imported without making changes
+  --workers int                Number of concurrent workers (default: 5)
+  --max-objects int            Maximum number of objects to process (default: 0 = unlimited)
+  --batch-size int             Number of S3 objects to process in each batch (default: 1000)
+  --continuation-token string  S3 continuation token to resume from
+  --force-reimport             Import into INBOX even when another mailbox of the account holds the message
+  --import-delay duration      Delay between imports to control rate (e.g. 200ms)
+  --cleanup-db                 Cleanup temporary database when done (default: true)
+  --fts-retention string       Index for body search only messages sent within this window, e.g. 180d
+                               (default: [cleanup] fts_retention from the config; unset = index all)
+
+Messages are imported into INBOX: S3 holds no folder information.
+
+Examples:
+  sora-admin --config config.toml import s3 --email user@example.com --dry-run
+  sora-admin --config config.toml import s3 --email user@example.com --workers 10
+`)
+	}
+
 	// Parse the flags
 	if err := fs.Parse(os.Args[3:]); err != nil {
 		logger.Fatalf("Failed to parse flags: %v", err)
@@ -358,10 +385,10 @@ func handleExportCommand(ctx context.Context) {
 	switch subcommand {
 	case "maildir":
 		handleExportMaildir(ctx)
-	case "--help", "-h":
+	case "help", "--help", "-h":
 		printExportUsage()
 	default:
-		fmt.Printf("Unknown export subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown export subcommand: %s\n\n", subcommand)
 		printExportUsage()
 		os.Exit(1)
 	}
@@ -387,7 +414,7 @@ func handleExportMaildir(ctx context.Context) {
 		fmt.Printf(`Export messages to maildir format
 
 Usage:
-  sora-admin export maildir [options]
+  sora-admin --config PATH export maildir [options]
 
 Options:
   --email string          Email address for the account to export mail from (required)
@@ -410,19 +437,19 @@ existing maildir, messages with the same content hash will be skipped unless
 
 Examples:
   # Export all mail to a new maildir
-  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir
+  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir --config config.toml
 
   # Export only INBOX and Sent folders
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent --config config.toml
 
   # Export with Dovecot metadata (includes dovecot-uidlist files)
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot --config config.toml
   
   # Export with only dovecot-uidlist files (no subscriptions)
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --export-dovecot-uidlist
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --export-dovecot-uidlist --config config.toml
 
   # Update flags on existing messages
-  sora-admin export maildir --email user@example.com --maildir-path /existing/maildir --overwrite-flags
+  sora-admin export maildir --email user@example.com --maildir-path /existing/maildir --overwrite-flags --config config.toml
 `)
 	}
 
@@ -433,19 +460,19 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *maildirPath == "" {
-		fmt.Printf("Error: --maildir-path is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --maildir-path is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *jobs < 1 {
-		fmt.Printf("Error: --jobs must be at least 1\n")
+		fmt.Fprintf(os.Stderr, "Error: --jobs must be at least 1\n")
 		os.Exit(1)
 	}
 
@@ -454,7 +481,7 @@ Examples:
 	if *startDate != "" {
 		t, err := time.Parse("2006-01-02", *startDate)
 		if err != nil {
-			fmt.Printf("Error: Invalid start date format. Use YYYY-MM-DD\n")
+			fmt.Fprintf(os.Stderr, "Error: Invalid start date format. Use YYYY-MM-DD\n")
 			os.Exit(1)
 		}
 		startDateParsed = &t
@@ -462,7 +489,7 @@ Examples:
 	if *endDate != "" {
 		t, err := time.Parse("2006-01-02", *endDate)
 		if err != nil {
-			fmt.Printf("Error: Invalid end date format. Use YYYY-MM-DD\n")
+			fmt.Fprintf(os.Stderr, "Error: Invalid end date format. Use YYYY-MM-DD\n")
 			os.Exit(1)
 		}
 		// Add 23:59:59 to include the entire end date
@@ -531,7 +558,7 @@ func printImportUsage() {
 	fmt.Printf(`Import Management
 
 Usage:
-  sora-admin import <subcommand> [options]
+  sora-admin --config PATH import <subcommand> [options]
 
 Subcommands:
   maildir        Import maildir data
@@ -539,12 +566,12 @@ Subcommands:
   rekey          Re-key bodies an older import stored under their SHA-256 digest
 
 Examples:
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir
-  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run
-  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot
-  sora-admin import s3 --email user@example.com --dry-run
-  sora-admin import s3 --email user@example.com --workers 5 --batch-size 500
-  sora-admin import rekey --email user@example.com --dry-run
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --config config.toml
+  sora-admin import maildir --email user@example.com --maildir-path /home/user/Maildir --dry-run --config config.toml
+  sora-admin import maildir --email user@example.com --maildir-path /var/vmail/user/Maildir --dovecot --config config.toml
+  sora-admin import s3 --email user@example.com --dry-run --config config.toml
+  sora-admin import s3 --email user@example.com --workers 5 --batch-size 500 --config config.toml
+  sora-admin import rekey --email user@example.com --dry-run --config config.toml
 
 Use 'sora-admin import <subcommand> --help' for detailed help.
 `)
@@ -554,15 +581,15 @@ func printExportUsage() {
 	fmt.Printf(`Export Management
 
 Usage:
-  sora-admin export <subcommand> [options]
+  sora-admin --config PATH export <subcommand> [options]
 
 Subcommands:
   maildir  Export messages to maildir format
 
 Examples:
-  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent
-  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot
+  sora-admin export maildir --email user@example.com --maildir-path /var/backup/user/Maildir --config config.toml
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --mailbox-filter INBOX,Sent --config config.toml
+  sora-admin export maildir --email user@example.com --maildir-path /backup/maildir --dovecot --config config.toml
 
 Use 'sora-admin export <subcommand> --help' for detailed help.
 `)

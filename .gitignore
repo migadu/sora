@@ -6,6 +6,7 @@ reset-db.sh
 config.toml
 sora
 sora-admin
+/sora-imaptest
 !sora/
 !sora-admin/
 integration_tests/sora-admin

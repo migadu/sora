@@ -172,11 +172,20 @@ func (s *Session) handleConnection() {
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
 	if s.settings.absoluteSessionTimeout > 0 {
+		// The timer goroutine only cancels: logging there read the session's
+		// username/account fields while the session goroutine wrote them. The
+		// session goroutine logs it on the way out instead.
+		var timedOut atomic.Bool
 		timeout := time.AfterFunc(s.settings.absoluteSessionTimeout, func() {
-			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.settings.absoluteSessionTimeout)
+			timedOut.Store(true)
 			s.cancel() // Force cancel context to unblock any stuck I/O
 		})
-		defer timeout.Stop()
+		defer func() {
+			if timeout.Stop() || !timedOut.Load() {
+				return // ended before the timeout
+			}
+			s.InfoLog("Absolute session timeout reached - force closed", "duration", s.settings.absoluteSessionTimeout)
+		}()
 	}
 
 	// Log connection at INFO level
@@ -1148,11 +1157,13 @@ func extractAddressString(param string) (address string, ok bool) {
 }
 
 // extractReversePath is extractAddress for the reverse-path of MAIL. It also reads a
-// path in angle brackets whose quoted local part holds a space, `<"john doe"@example.org>`,
-// which go-smtp reads and a sora backend accepts (server.NewReversePath, #1907); forwarded
-// between its angle brackets, go-smtp on the backend reads the quoted string to its
-// closing quote. A space anywhere else, an angle bracket inside the path, and every other
-// refusal of extractAddress stand. A forward-path is read by extractAddress alone.
+// path in angle brackets whose quoted local part holds a space or an angle bracket,
+// `<"john doe"@example.org>` or `<"alice@x>"@example.org>`, which go-smtp reads and a sora
+// backend accepts (server.NewReversePath, #1907, #1948). It is forwarded byte for byte
+// between its angle brackets, and go-smtp on the backend reads the quoted string to its
+// closing quote, so a ">" inside it cannot end the path early or put text after the path
+// (#1853). A space or an angle bracket outside the quotes, and every other refusal of
+// extractAddress, stand. A forward-path is read by extractAddress alone.
 func extractReversePath(param string) (address string, ok bool) {
 	if address, ok := extractAddressString(param); ok {
 		return address, true
@@ -1162,7 +1173,7 @@ func extractReversePath(param string) (address string, ok bool) {
 		return "", false
 	}
 	address = param[1 : len(param)-1]
-	if address[0] != '"' || strings.ContainsAny(address, "<>") {
+	if address[0] != '"' {
 		return "", false
 	}
 	escaped := false
@@ -1174,7 +1185,7 @@ func extractReversePath(param string) (address string, ok bool) {
 			escaped = true
 		case address[i] == '"':
 			domain, found := strings.CutPrefix(address[i+1:], "@")
-			if !found || domain == "" || strings.ContainsAny(domain, ` "`) {
+			if !found || domain == "" || strings.ContainsAny(domain, ` "<>`) {
 				return "", false
 			}
 			return address, true
@@ -2525,12 +2536,14 @@ const (
 	// backend that stops draining its socket cannot hold the session goroutine and its
 	// connection slot until the absolute session timeout.
 	relayBackendWriteDeadline = 30 * time.Second
-	// relayEndOfDataTimeout bounds the wait for the backend's end-of-data replies. It
-	// must outlive the backend's own DATA processing cap (60 s) by a wide margin: a
-	// proxy that gives up first leaves the backend free to commit a message the MTA is
-	// told nothing about, which the MTA then re-sends.
-	relayEndOfDataTimeout = 5 * time.Minute
 )
+
+// relayEndOfDataTimeout bounds the wait for the backend's end-of-data replies. It
+// must outlive the backend's own DATA processing cap (60 s) by a wide margin: a
+// proxy that gives up first leaves the backend free to commit a message the MTA is
+// told nothing about, which the MTA then re-sends. A variable only so tests can
+// shorten it.
+var relayEndOfDataTimeout = 5 * time.Minute
 
 // relayMessageData relays one DATA body from the client to the backend, then the
 // backend's end-of-data replies — one final reply line per accepted recipient (RFC 2033

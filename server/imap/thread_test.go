@@ -61,6 +61,29 @@ func TestThreadOrderedSubject_Shape(t *testing.T) {
 	assert.Equal(t, want, result)
 }
 
+// TestThreadOrderedSubject_EmptyBaseSubject: the empty base subject is a base
+// subject like any other, so messages without one form a single thread
+// (RFC 5256 section 3; Dovecot imaptest thread-orderedsubject, (9 10)).
+func TestThreadOrderedSubject_EmptyBaseSubject(t *testing.T) {
+	session := &IMAPSession{}
+
+	now := time.Now()
+	messages := []db.ThreadMessageResult{
+		{UID: 1, Seq: 1, SubjectSort: "", SentDate: now.Add(-3 * time.Hour)},
+		{UID: 2, Seq: 2, SubjectSort: "hello", SentDate: now.Add(-2 * time.Hour)},
+		{UID: 3, Seq: 3, SubjectSort: "", SentDate: now.Add(-1 * time.Hour)},
+		{UID: 4, Seq: 4, SubjectSort: "", SentDate: now},
+	}
+
+	result := session.threadOrderedSubject(imapserver.NumKindUID, messages)
+
+	want := []imap.ThreadData{
+		{Chain: []uint32{1}, SubThreads: []imap.ThreadData{{Chain: []uint32{3}}, {Chain: []uint32{4}}}},
+		{Chain: []uint32{2}},
+	}
+	assert.Equal(t, want, result)
+}
+
 func TestThreadReferences(t *testing.T) {
 	session := &IMAPSession{}
 
@@ -133,6 +156,190 @@ func TestThreadReferences_SubjectGrouping(t *testing.T) {
 	// Now verify that skipSubjectGrouping=true bypasses this (THREAD=REFS behavior)
 	resultRefs := session.threadReferences(imapserver.NumKindUID, messages, true)
 	assert.Len(t, resultRefs, 4, "REFS should not group by subject, leaving 4 isolated root nodes")
+}
+
+// TestThreadReferences_SubjectMergeRules pins RFC 5256 REFERENCES step 5: the
+// subject table prefers a dummy, then a message that is not a reply or forward
+// (5.B); a reply or forward merges under a non-reply, and anything else gets a new
+// dummy over both (5.C).
+func TestThreadReferences_SubjectMergeRules(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		messages []db.ThreadMessageResult
+		want     []imap.ThreadData
+	}{
+		{
+			// Dovecot imaptest thread3/thread4.
+			name: "reply under the original",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "FOO", SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "b@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{1, 2}}},
+		},
+		{
+			// 5.B replaces the earlier reply with the original in the table.
+			name: "reply sent before the original",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "b@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "a@b", SubjectSort: "FOO", SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{2, 1}}},
+		},
+		{
+			name: "two replies",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "b@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}}}},
+		},
+		{
+			// 2 and 3 answer a message not in the mailbox, so they stay under its
+			// dummy, which the table prefers: the original joins them there.
+			name: "dummy thread takes the original",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "FOO", SentDate: now.Add(-3 * time.Hour)},
+				{UID: 2, MessageID: "b@b", References: "gone@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 3, MessageID: "c@b", References: "gone@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}, {Chain: []uint32{3}}}}},
+		},
+		{
+			// A third message lands under the dummy the first two got.
+			name: "three originals",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "FOO", SentDate: now.Add(-3 * time.Hour)},
+				{UID: 2, MessageID: "b@b", SubjectSort: "FOO", SentDate: now.Add(-2 * time.Hour)},
+				{UID: 3, MessageID: "c@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}, {Chain: []uint32{3}}}}},
+		},
+		{
+			// An empty thread subject is never merged (5.B.ii, 5.C.ii).
+			name: "empty subjects",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "b@b", ReplyOrForward: true, SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, session.threadReferences(imapserver.NumKindUID, tt.messages, false))
+		})
+	}
+}
+
+// TestThreadReferences_DummyThreadSubject pins the subject a dummy thread merges
+// by in RFC 5256 REFERENCES step 5.B.i: "the base subject from either the current
+// message or its first child if the current message is a dummy", the children in
+// sent-date order (step 4); and 5.B.ii: "If the thread subject is empty, skip
+// this message". UIDs 1 and 2 answer a message not in the mailbox, so they are
+// the children of its dummy, linked in UID order.
+func TestThreadReferences_DummyThreadSubject(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+
+	tests := []struct {
+		name     string
+		messages []db.ThreadMessageResult
+		want     []imap.ThreadData
+	}{
+		{
+			// UID 2 is linked second but sent first, so the thread subject is
+			// FOO, and UID 3 joins the dummy.
+			name: "first child by sent date",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", References: "gone@b", SubjectSort: "BAR", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 2, MessageID: "b@b", References: "gone@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-3 * time.Hour)},
+				{UID: 3, MessageID: "c@b", SubjectSort: "FOO", SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{{SubThreads: []imap.ThreadData{{Chain: []uint32{2}}, {Chain: []uint32{1}}, {Chain: []uint32{3}}}}},
+		},
+		{
+			// The first child has no subject, so the dummy thread has none and
+			// is not merged, though its second child shares UID 3's.
+			name: "first child without a subject",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", References: "gone@b", SentDate: now.Add(-3 * time.Hour)},
+				{UID: 2, MessageID: "b@b", References: "gone@b", SubjectSort: "FOO", ReplyOrForward: true, SentDate: now.Add(-2 * time.Hour)},
+				{UID: 3, MessageID: "c@b", SubjectSort: "FOO", SentDate: now.Add(-1 * time.Hour)},
+			},
+			want: []imap.ThreadData{
+				{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2}}}},
+				{Chain: []uint32{3}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, session.threadReferences(imapserver.NumKindUID, tt.messages, false))
+		})
+	}
+}
+
+// TestThreadReferences_SentDateOrder pins the ordering of RFC 5256 REFERENCES
+// steps 4 and 6: threads and siblings sort by a message's own sent date, and a
+// dummy by its first child's ("use the first child for the top-level sort"),
+// not by the earliest date anywhere below them. The cases differ from that only
+// when a reply is dated before the message it answers.
+func TestThreadReferences_SentDateOrder(t *testing.T) {
+	session := &IMAPSession{}
+	now := time.Now()
+	at := func(hoursAgo int) time.Time { return now.Add(-time.Duration(hoursAgo) * time.Hour) }
+
+	tests := []struct {
+		name     string
+		messages []db.ThreadMessageResult
+		want     []imap.ThreadData
+	}{
+		{
+			// UID 2 answers UID 1 but is dated earlier than both 1 and 3.
+			name: "threads by their root's date",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "a@b", SubjectSort: "ALPHA", SentDate: at(3)},
+				{UID: 2, MessageID: "b@b", References: "a@b", SubjectSort: "ALPHA", ReplyOrForward: true, SentDate: at(5)},
+				{UID: 3, MessageID: "c@b", SubjectSort: "BETA", SentDate: at(4)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{3}}, {Chain: []uint32{1, 2}}},
+		},
+		{
+			// UID 4 answers UID 2 and is dated before everything else.
+			name: "siblings by their own date",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "p@b", SentDate: at(6)},
+				{UID: 2, MessageID: "c1@b", References: "p@b", SentDate: at(1)},
+				{UID: 3, MessageID: "c2@b", References: "p@b", SentDate: at(2)},
+				{UID: 4, MessageID: "g@b", References: "p@b c1@b", SentDate: at(10)},
+			},
+			want: []imap.ThreadData{{Chain: []uint32{1}, SubThreads: []imap.ThreadData{{Chain: []uint32{3}}, {Chain: []uint32{2, 4}}}}},
+		},
+		{
+			// UIDs 1 and 2 answer a message not in the mailbox; the dummy sorts by
+			// UID 1, its first child, though UID 3 below UID 2 is the oldest.
+			name: "dummy by its first child's date",
+			messages: []db.ThreadMessageResult{
+				{UID: 1, MessageID: "x@b", References: "gone@b", SentDate: at(2)},
+				{UID: 2, MessageID: "y@b", References: "gone@b", SentDate: at(1)},
+				{UID: 3, MessageID: "z@b", References: "gone@b y@b", SentDate: at(9)},
+				{UID: 4, MessageID: "w@b", SubjectSort: "W", SentDate: at(5)},
+			},
+			want: []imap.ThreadData{
+				{Chain: []uint32{4}},
+				{SubThreads: []imap.ThreadData{{Chain: []uint32{1}}, {Chain: []uint32{2, 3}}}},
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, session.threadReferences(imapserver.NumKindUID, tt.messages, false))
+		})
+	}
 }
 
 // The ids below are written the way the messages table holds them: without angle

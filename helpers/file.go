@@ -8,6 +8,16 @@ import (
 	"syscall"
 )
 
+// IsInsufficientStorage reports whether err, a failure to write to the local spool,
+// means the spool has no room for the message: its disk is full (ENOSPC) or read-only
+// (EROFS). That is a condition the operator clears, so every protocol answers it as
+// temporary (LMTP 452 4.3.1, IMAP NO [UNAVAILABLE], the Admin API's insufficient
+// storage) rather than as a server error. It looks through wrappers, including the
+// one FileErrorCause returns.
+func IsInsufficientStorage(err error) bool {
+	return errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS)
+}
+
 // FileErrorCause displays a filesystem error's underlying cause without its file names.
 // Filesystem and ordinary wrappers beneath it are stripped from the displayed text.
 // Known errno/filesystem causes are shown; an opaque filesystem cause gets a generic

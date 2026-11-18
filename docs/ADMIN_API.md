@@ -827,6 +827,11 @@ for the lookup), the default mailboxes are created if missing, Sieve runs, and t
 stored. A duplicate of a message already delivered counts as delivered. A message the script
 discards counts as accepted.
 
+A recipient is read as LMTP reads `RCPT TO`. One that is not a valid address fails with
+`invalid recipient address: ...` (not transient). That includes an address with more than one
+`@`, such as `user@example.com@SUFFIX`: the master-login suffix has no meaning in a recipient,
+and the message is not delivered to `user@example.com`.
+
 ### Response
 
 ```json

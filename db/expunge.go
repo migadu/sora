@@ -150,6 +150,8 @@ func expungeLiveMessages(ctx context.Context, tx pgx.Tx, mailboxIDs []int64, con
 // the expunge trigger takes them out of message_count, unseen_count and total_size
 // under the mailbox lock, and deletes only rows that are then not live. One that still
 // is came into a mailbox the delete did not lock, and is left for later.
+// TestHardDeletesOfMessagesSkipLiveRows fails on a DELETE FROM messages that does not
+// keep to such rows (#2023).
 const notLiveInMailbox = `(m.expunged_at IS NOT NULL OR m.mailbox_id IS NULL)`
 
 // hardDeleteMessages deletes the messages that match cond (as for

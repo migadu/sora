@@ -200,8 +200,7 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 
 	// Extract sender address if not provided
 	if req.From == "" {
-		mailHeader := mail.Header{Header: messageEntity.Header}
-		if fromAddrs, err := mailHeader.AddressList("From"); err == nil && len(fromAddrs) > 0 {
+		if fromAddrs, err := helpers.ParseAddressList(messageEntity.Header.Get("From")); err == nil && len(fromAddrs) > 0 {
 			req.From = fromAddrs[0].Address
 		}
 	}

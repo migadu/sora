@@ -1719,6 +1719,15 @@ type ServerConfig struct {
 	// LMTP specific
 	MaxMessageSize string `toml:"max_message_size,omitempty"` // Maximum size for incoming LMTP messages
 
+	// POP3 specific
+	// StrictUTF8Content refuses RETR/TOP of a message with raw UTF-8 (8-bit) in its
+	// header section with -ERR [UTF8] to a session that has not issued UTF8 (RFC 6856
+	// sections 2.1 and 5). Default false: such messages are sent as stored. Enable
+	// only when every client of this server can see UTF8 in CAPA and the proxy
+	// passes it on: behind a pop3_proxy, only when that proxy sets remote_use_utf8
+	// = true, and so does the [[pool]] or [server.remote_lookup] routing to it.
+	StrictUTF8Content bool `toml:"strict_utf8_content,omitempty"`
+
 	// Auth security
 	// InsecureAuth allows plaintext authentication over non-TLS connections (default:
 	// false). Without tls = true it is allowed regardless: the IMAP, POP3 and ManageSieve
@@ -2429,7 +2438,8 @@ func (s *ServerConfig) GetRedirectRateWindow() (time.Duration, error) {
 // servers that apply the Sieve redirect rate limit, LMTP and the Admin API, and at
 // least the default (1h), which a server also uses for a window that does not parse.
 // The limit counts redirect_log rows within the window, so the cleaner keeps them at
-// least this long.
+// least this long; each row also keeps the end of the window that charged it, which
+// holds it on a node whose own servers have a shorter window.
 func (c *Config) LongestRedirectRateWindow() time.Duration {
 	longest := time.Hour
 	for _, server := range c.GetAllServers() {
@@ -2441,6 +2451,48 @@ func (c *Config) LongestRedirectRateWindow() time.Duration {
 		}
 	}
 	return longest
+}
+
+// RedirectRateWindows returns the distinct redirect_rate_window values, shortest first, of
+// the enabled servers that apply the Sieve redirect rate limit: lmtp and http_admin_api
+// servers with a redirect_rate_limit above 0, with the 1h default for a window that does
+// not parse, as start-up uses. The limit counts an account's redirects within the window
+// of the server that delivers, so it is one limit only if every such server, on every
+// node, has the same window (#1994).
+func (c *Config) RedirectRateWindows() []time.Duration {
+	var windows []time.Duration
+	for _, server := range c.GetAllServers() {
+		if (server.Type != "lmtp" && server.Type != "http_admin_api") || server.GetRedirectRateLimit() <= 0 {
+			continue
+		}
+		window, err := server.GetRedirectRateWindow()
+		if err != nil {
+			window = time.Hour
+		}
+		if !slices.Contains(windows, window) {
+			windows = append(windows, window)
+		}
+	}
+	slices.Sort(windows)
+	return windows
+}
+
+// RedirectRateLimits returns the distinct redirect_rate_limit values above 0, smallest
+// first, of the enabled lmtp and http_admin_api servers. The limit counts an account's
+// redirects on every server and node, so it is one limit only if every such server, on
+// every node, has the same value (#2020).
+func (c *Config) RedirectRateLimits() []int {
+	var limits []int
+	for _, server := range c.GetAllServers() {
+		if server.Type != "lmtp" && server.Type != "http_admin_api" {
+			continue
+		}
+		if limit := server.GetRedirectRateLimit(); limit > 0 && !slices.Contains(limits, limit) {
+			limits = append(limits, limit)
+		}
+	}
+	slices.Sort(limits)
+	return limits
 }
 
 // GetMaxRedirectHops returns how many times one message may be redirected before
@@ -3471,6 +3523,7 @@ var serverTypeKeys = []struct {
 	{"remote_skip_forwarding_with_proxy_protocol", func(s *ServerConfig) bool { return s.RemoteSkipForwardingWithProxyProtocol }, []string{"imap_proxy", "pop3_proxy"}},
 	{"remote_use_xclient", func(s *ServerConfig) bool { return s.RemoteUseXCLIENT }, []string{"pop3_proxy", "lmtp_proxy"}},
 	{"remote_use_utf8", func(s *ServerConfig) bool { return s.RemoteUseUTF8 }, []string{"pop3_proxy"}},
+	{"strict_utf8_content", func(s *ServerConfig) bool { return s.StrictUTF8Content }, []string{"pop3"}},
 	// Size limits, and the Sieve extensions the ManageSieve proxy advertises (a
 	// ManageSieve backend advertises the [sieve] enabled_extensions).
 	{"max_message_size", func(s *ServerConfig) bool { return s.MaxMessageSize != "" }, []string{"lmtp", "lmtp_proxy", "http_admin_api"}},

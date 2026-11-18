@@ -37,10 +37,17 @@ func NewMutexTimeoutHelper(mutex *sync.RWMutex, ctx context.Context, name string
 // The caller MUST call the returned release function to unlock the mutex.
 //
 // The cmdCtx parameter is the context for the current command/operation.
-// The lock attempt is cancelled by whichever fires first: the command context,
-// the session context (h.ctx), or the MutexTimeout.
+// A free lock is always taken, even when a context is already cancelled. Otherwise
+// the wait is cancelled by whichever fires first: the command context, the session
+// context (h.ctx), or the MutexTimeout.
 func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout(cmdCtx context.Context) (bool, func()) {
 	start := time.Now()
+	// A free lock is taken at once, whatever the contexts say: teardown passes a cancelled
+	// one, and a free lock is never a timeout (#2004).
+	if h.mutex.TryRLock() {
+		metrics.SessionLockDuration.WithLabelValues(h.name, "read", "success").Observe(time.Since(start).Seconds())
+		return true, h.mutex.RUnlock
+	}
 	// Merge session and command contexts: cancel on whichever fires first.
 	merged, mergedCancel := context.WithCancel(cmdCtx)
 	go func() {
@@ -65,6 +72,14 @@ func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout(cmdCtx context.Context) 
 		metrics.SessionLockDuration.WithLabelValues(h.name, "read", "success").Observe(time.Since(start).Seconds())
 		return true, h.mutex.RUnlock
 	case <-ctx.Done():
+		// Both cases are ready when the lock came free as the wait ended, and select picks
+		// either; a lock the attempt got is not a timeout.
+		select {
+		case <-lockChan:
+			metrics.SessionLockDuration.WithLabelValues(h.name, "read", "success").Observe(time.Since(start).Seconds())
+			return true, h.mutex.RUnlock
+		default:
+		}
 		metrics.SessionLockTimeouts.WithLabelValues(h.name, "read").Inc()
 		metrics.SessionLockDuration.WithLabelValues(h.name, "read", "timeout").Observe(time.Since(start).Seconds())
 		go func() {
@@ -82,10 +97,10 @@ func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout(cmdCtx context.Context) 
 // The caller MUST call the returned release function to unlock the mutex.
 //
 // The cmdCtx parameter is the context for the current command/operation.
-// The lock attempt is cancelled by whichever fires first: the command context,
-// the session context (h.ctx), or the MutexTimeout.
+// A free lock is always taken, even when a context is already cancelled. Otherwise
+// the wait is cancelled by whichever fires first: the command context, the session
+// context (h.ctx), or the MutexTimeout.
 func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout(cmdCtx context.Context) (bool, func()) {
-	start := time.Now()
 	// Merge session and command contexts: cancel on whichever fires first.
 	merged, mergedCancel := context.WithCancel(cmdCtx)
 	go func() {
@@ -95,9 +110,31 @@ func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout(cmdCtx context.Context)
 		case <-merged.Done():
 		}
 	}()
-	ctx, cancel := context.WithTimeout(merged, MutexTimeout)
-	defer cancel()
 	defer mergedCancel()
+	return h.acquireWriteLock(merged)
+}
+
+// AcquireWriteLockForClose acquires the write lock for a session's teardown. It waits
+// up to MutexTimeout and, unlike AcquireWriteLockWithTimeout, is not cancelled by the
+// session context: a server shutdown cancels that context before the sessions are
+// closed, and the close must still wait for a command that holds the lock rather than
+// clear the state that command is using.
+func (h *MutexTimeoutHelper) AcquireWriteLockForClose() (bool, func()) {
+	return h.acquireWriteLock(context.Background())
+}
+
+// acquireWriteLock takes a free write lock at once, else waits for it until parent is
+// done or MutexTimeout passes.
+func (h *MutexTimeoutHelper) acquireWriteLock(parent context.Context) (bool, func()) {
+	start := time.Now()
+	// A free lock is taken at once, whatever the contexts say: teardown passes a cancelled
+	// one, and a free lock is never a timeout (#2004).
+	if h.mutex.TryLock() {
+		metrics.SessionLockDuration.WithLabelValues(h.name, "write", "success").Observe(time.Since(start).Seconds())
+		return true, h.mutex.Unlock
+	}
+	ctx, cancel := context.WithTimeout(parent, MutexTimeout)
+	defer cancel()
 
 	lockChan := make(chan struct{}, 1)
 	go func() {
@@ -110,6 +147,14 @@ func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout(cmdCtx context.Context)
 		metrics.SessionLockDuration.WithLabelValues(h.name, "write", "success").Observe(time.Since(start).Seconds())
 		return true, h.mutex.Unlock
 	case <-ctx.Done():
+		// Both cases are ready when the lock came free as the wait ended, and select picks
+		// either; a lock the attempt got is not a timeout.
+		select {
+		case <-lockChan:
+			metrics.SessionLockDuration.WithLabelValues(h.name, "write", "success").Observe(time.Since(start).Seconds())
+			return true, h.mutex.Unlock
+		default:
+		}
 		metrics.SessionLockTimeouts.WithLabelValues(h.name, "write").Inc()
 		metrics.SessionLockDuration.WithLabelValues(h.name, "write", "timeout").Observe(time.Since(start).Seconds())
 		go func() {

@@ -57,9 +57,10 @@ go build -o sora-admin ./cmd/sora-admin
 sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
 ```
 
-- `--config PATH` is **required** for every command except `help` and `version`. There is no
-  default path. The flag may appear anywhere on the line, and `--config=PATH` works too. Use two
-  dashes: `-config` is not recognised and the tool stops with `--config flag is required`.
+- `--config PATH` is **required** for every command except `help`, `version` and `--help` (see
+  below). There is no default path. The flag may appear anywhere on the line, and `--config=PATH`
+  works too. Use two dashes: `-config` is not recognised; after the command the tool stops with
+  `--config flag is required`, before it with the error below.
 - `sora-admin` reads the same TOML file as the server. It loads it with the server's loader, so
   unknown keys and duplicate keys produce the same warnings, and a file the server cannot load
   stops the tool. Settings the file leaves out take the server's defaults, so a command that
@@ -69,22 +70,31 @@ sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
   `[shared_mailboxes]`, `[tls]`, `[admin_cli]`, `[relay]`, `[sieve]`, the `[[server]]` blocks and
   the top-level `bcrypt_cost`. The tool stops at once if `[s3] body_deletion_protocol`,
   `[shared_mailboxes]`, `[cleanup]` or `[uploader]` holds a value the server would refuse.
-- The config file is loaded before anything else, so even `sora-admin --config PATH accounts
-  --help` needs a file that loads. Only `sora-admin help`, `sora-admin --help`, `sora-admin -h`,
-  `sora-admin version`, `sora-admin -v`, `sora-admin --version` and `sora-admin config --help`
-  work without one.
 - Flags of a subcommand come **after** the subcommand. They are parsed with Go's `flag` package,
   so `--flag value`, `--flag=value` and `-flag value` all work. A boolean flag that defaults to
   `true` is turned off with `--flag=false`.
+- Before the command only `--config PATH` / `--config=PATH` may appear, and the tool-wide
+  `--help`, `-h`, `-help`, `--version` and `-v`, which print the tool's usage or version and exit
+  `0`. Any other flag there stops the tool with `unexpected flag ... before the command` and exit
+  status `1`, and nothing runs.
 - Worker counts (`--jobs`, `--workers`) must be at least `1`. So must the batch sizes and limits
   this document marks "at least 1"; a smaller value stops the command with an error.
 - `sora-admin <command> --help` lists the subcommands. `sora-admin <command> <subcommand> --help`
-  prints the subcommand's flags.
+  prints the subcommand's flags. `-h` and `-help` do the same, and so does `help` given as the
+  subcommand (`sora-admin accounts help`); anywhere else on the line `help` is an ordinary
+  argument or value. Help needs no config file: without `--config`, or with a file that does not
+  load, a line with a help flag, or with `help` as the subcommand, prints the usage of the
+  command and subcommand named before the first flag, exits `0` and runs nothing, whatever else
+  the line holds. With a file that loads, the line is parsed as written, so `--help` given as a
+  flag's value (`--email --help`) is that value.
 
 ### Output, logs and exit status
 
-- Reports and tables go to standard output. Log lines (`INFO`, `WARN`, `ERROR`, with a
-  timestamp) go to standard error. `sora-admin` does not use the `[logging]` section.
+- Reports and tables go to standard output, and so does the usage `--help` prints, so
+  `sora-admin <command> <subcommand> --help | less` works. Log lines (`INFO`, `WARN`, `ERROR`, with a
+  timestamp) go to standard error, and so do error messages (`Error: --email is required`,
+  `Unknown command: ...`, `Failed to ...`). The usage printed after a usage error goes to
+  standard output, as for `--help`. `sora-admin` does not use the `[logging]` section.
 - The exit status is `0` on success and `1` on error. A few commands report problems but still
   exit `0`; this is noted where it applies (for example `verify s3`).
 - Ctrl+C (SIGINT) or SIGTERM cancels the running operation. Long operations such as imports stop
@@ -447,6 +457,11 @@ shared mailbox, whatever `allow_user_create` says. See [SHARED_MAILBOXES.md](SHA
 
 ### mailbox list
 
+```sh
+sora-admin --config config.toml mailbox list --email user@example.com
+sora-admin --config config.toml mailbox list --email user@example.com --subscribed
+```
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--subscribed` | `false` | List only subscribed mailboxes. |
@@ -481,6 +496,11 @@ sora-admin --config config.toml mailbox delete --email user@example.com --mailbo
 
 Renames or moves a mailbox, with its children.
 
+```sh
+sora-admin --config config.toml mailbox rename --email user@example.com --old-name "Work" --new-name "Business"
+sora-admin --config config.toml mailbox rename --email user@example.com --old-name "Projects/2024" --new-name "Archive/Projects/2024"
+```
+
 | Flag | Default | Meaning |
 |---|---|---|
 | `--old-name` | | Current name (required). |
@@ -495,6 +515,11 @@ Refused, with nothing changed, when:
   across the shared namespace boundary.
 
 ### mailbox subscribe and mailbox unsubscribe
+
+```sh
+sora-admin --config config.toml mailbox subscribe --email user@example.com --mailbox "Work"
+sora-admin --config config.toml mailbox unsubscribe --email user@example.com --mailbox "Work"
+```
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -575,11 +600,13 @@ fails; `MANUAL` and `REPORT` lines do not change it.
 
 ### mailbox repair-unseen
 
-Finds mailboxes whose cached unseen count (served by STATUS, LIST and NOTIFY) is higher than
-the number of unseen messages they hold, and with `--apply` recomputes it. Older builds left
-such counts when the failed-upload cleanup, `uploader resolve` or an importer rollback
-hard-deleted an unseen message. A count that has gone negative is repaired by the server
-itself.
+Finds mailboxes whose cached unseen count (served by STATUS, LIST, NOTIFY and the User API
+mailbox list) differs from the number of unseen messages they hold, and with `--apply`
+recomputes it. Older builds left counts too high when the failed-upload cleanup,
+`uploader resolve` or an importer rollback hard-deleted an unseen message, and counts too low
+in mailboxes holding messages without a flag state row: such a message has no flags, so it is
+unseen, but builds before migration 000076 did not count it. A count that has gone negative is
+repaired by the server itself.
 
 ```sh
 sora-admin --config config.toml mailbox repair-unseen

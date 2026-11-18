@@ -7,11 +7,8 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"slices"
-	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/emersion/go-message"
@@ -35,98 +32,6 @@ import (
 // so a test can replace it before New compiles it.
 var defaultSieveScript = delivery.DefaultSieveScript
 
-// holdRedirects writes the message to the relay queue for every redirect without
-// handing it to the relay worker, and reports whether every target was held. commit
-// hands over every redirect still held, charges each one handed over against the rate
-// limit, and reports whether all of them went; abort drops the ones still held.
-// arrivedHops is the redirect hop count of the message before the script's header
-// edits; every outgoing copy is stamped one above it.
-//
-// deliveryHash identifies the upstream submission (InsertMessageOptions.DeliveryHash).
-// A target an earlier attempt of the same delivery already handed over (an MTA retry
-// whose 250 was lost, maybe on another node) is skipped and counts as held, the way
-// the stored copy of such a retry is absorbed; commit records each target it hands
-// over, after handing it over, so a crash or a failed record errs toward relaying the
-// message again rather than not at all.
-func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Result, arrivedHops int, fullMessageBytes []byte, deliveryHash string) (commit func() bool, abort func(), allHeld bool) {
-	type heldRedirect struct {
-		to     string
-		commit func() error
-		abort  func()
-	}
-	var held []heldRedirect
-	allHeld = true
-	if len(result.RedirectTo) > 0 {
-		if result.Copy {
-			s.DebugLog("sieve redirect :copy action", "redirect_to", result.RedirectTo)
-		} else {
-			s.DebugLog("sieve redirect action", "redirect_to", result.RedirectTo)
-		}
-
-		if s.backend.relayQueue != nil {
-			// Stamp the outgoing copy with an incremented hop count (loop backstop).
-			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(arrivedHops+1))
-			// User.Address is the script owner's primary address, even for aliases.
-			// Replace earlier or sender-supplied attribution on the outgoing copy only.
-			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
-			queued, err := s.backend.rdb.RedirectedTargetsWithRetry(ctx, s.AccountID(), deliveryHash)
-			if err != nil {
-				s.WarnLog("could not check for redirects queued by an earlier attempt, queuing all", "error", err)
-			}
-			for _, redirectTo := range result.RedirectTo {
-				if slices.Contains(queued, redirectTo) {
-					s.InfoLog("sieve redirect already queued by an earlier attempt of this delivery, skipping", "redirect_to", redirectTo)
-					continue
-				}
-				commit, abort, err := s.backend.relayQueue.Hold(s.sender.FullAddress(), redirectTo, "redirect", relayBytes)
-				if err != nil {
-					// Delivery goes on: the message is kept in INBOX unless a fileinto
-					// stores it (Result.Destinations). Say so where an operator will see
-					// it, as the Admin API path does: the user's redirect did not happen.
-					s.WarnLog("sieve redirect could not be queued", "redirect_to", redirectTo, "error", err)
-					allHeld = false
-					continue
-				}
-				held = append(held, heldRedirect{to: redirectTo, commit: commit, abort: abort})
-			}
-		} else {
-			s.DebugLog("redirect requested but external relay not configured")
-			allHeld = false
-		}
-	}
-
-	commit = func() bool {
-		ok := true
-		for _, h := range held {
-			if err := h.commit(); err != nil {
-				s.WarnLog("sieve redirect could not be queued", "redirect_to", h.to, "error", err)
-				ok = false
-				continue
-			}
-			s.DebugLog("successfully queued message for relay delivery", "redirect_to", h.to)
-			s.notifyRelayWorker()
-			if err := s.backend.rdb.RecordRedirectDeliveryWithRetry(ctx, s.AccountID(), deliveryHash, h.to); err != nil {
-				s.WarnLog("failed to record a queued redirect, a retry of this delivery would queue it again", "redirect_to", h.to, "error", err)
-			}
-			// Only a queued redirect counts against the rate limit.
-			if result.RecordRedirect != nil {
-				if err := result.RecordRedirect(ctx); err != nil {
-					s.WarnLog("failed to charge redirect against the rate limit", "redirect_to", h.to, "error", err)
-				}
-			}
-		}
-		held = nil
-		return ok
-	}
-	abort = func() {
-		for _, h := range held {
-			h.abort()
-		}
-		held = nil
-	}
-	return commit, abort, allHeld
-}
-
 // LMTPSession represents a single LMTP session.
 type LMTPSession struct {
 	server.Session
@@ -142,8 +47,7 @@ type LMTPSession struct {
 	ownerResolver *resilient.OwnerResolver
 	mutex         sync.RWMutex
 	mutexHelper   *server.MutexTimeoutHelper
-	releaseConn   func() // Function to release connection from limiter
-	useMasterDB   bool   // Pin session to master DB after a write to ensure consistency
+	useMasterDB   bool // Pin session to master DB after a write to ensure consistency
 	startTime     time.Time
 	traceID       string // X-Mizu-Trace-ID of the message in this transaction; "" until DATA has parsed it
 
@@ -207,6 +111,17 @@ func (s *LMTPSession) ErrorLog(msg string, keysAndValues ...any) {
 	s.Session.ErrorLog(msg, s.withTrace(keysAndValues)...)
 }
 
+// errSessionBusy answers a command that could not take the session lock in time. It is a
+// temporary failure the session carries on after, not 421: a 421 announces that the server
+// closes the connection (RFC 5321 sections 3.8 and 4.2.2), and go-smtp does not close it
+// after a reply of the backend. RFC 5321 section 4.3.2 lists 451 for MAIL, RCPT and the
+// end of DATA.
+var errSessionBusy = &smtp.SMTPError{
+	Code:         451,
+	EnhancedCode: smtp.EnhancedCode{4, 4, 5},
+	Message:      "Server busy, try again later",
+}
+
 func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	start := time.Now()
 	recordMetrics := func(status string) {
@@ -244,11 +159,7 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "MAIL")
 		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         421,
-			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
-			Message:      "Server busy, try again later",
-		}
+		return errSessionBusy
 	}
 	defer release()
 
@@ -424,11 +335,7 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "RCPT")
 		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         421,
-			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
-			Message:      "Server busy, try again later",
-		}
+		return errSessionBusy
 	}
 	defer release()
 
@@ -512,11 +419,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "DATA")
 		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         421,
-			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
-			Message:      "Server busy, try again later",
-		}
+		return errSessionBusy
 	}
 	defer release()
 
@@ -908,7 +811,18 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// (RFC 5293 §6 leaves which fields it may delete to local policy), and a count read
 	// after its edits would restart on every pass and never reach max_redirect_hops.
 	arrivedHops := helpers.RedirectHopCount(helpers.HeaderGetter(sieveCtx.Header))
-	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, arrivedHops, fullMessageBytes, deliveryHash)
+	commitRedirects, abortRedirects, allHeld := delivery.RedirectHold{
+		Records:      s.backend.rdb,
+		Queue:        s.backend.relayQueue,
+		Notify:       s.notifyRelayWorker,
+		Log:          s,
+		AccountID:    s.AccountID(),
+		DeliveryHash: deliveryHash,
+		From:         s.sender,
+		Owner:        &s.User.Address,
+		MessageBytes: fullMessageBytes,
+		ArrivedHops:  arrivedHops,
+	}.Hold(ctx, result)
 	defer abortRedirects()
 	redirectFailed := !allHeld
 	destinations := result.Destinations(redirectFailed)
@@ -1022,7 +936,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Flags set by the Sieve script via imap4flags (RFC 5232) belong to one stored
 	// copy, the one its keep or fileinto stores (Destination.Flags). storedFlags
 	// turns them into the flags that copy is stored with, next to the attachment
-	// keyword classified above. Sanitize to drop NIL/empty values and anything
+	// keyword classified above. Sanitize to drop empty values and anything
 	// that is not a valid IMAP flag-keyword -- a Sieve script is the one flag
 	// source that never passes an IMAP parser, so this is where an unencodable
 	// keyword would otherwise enter the system.
@@ -1204,14 +1118,18 @@ func (s *LMTPSession) Logout() error {
 	// go-smtp also logs a session out from Server.Close, on the closing goroutine, while this
 	// connection's goroutine may be inside a command writing the user, the trace id or the
 	// remote address. Those are written under the session lock and read here only with it.
+	// Server.Close cancels the session context first: the helper still takes a free lock,
+	// but gives up at once on a held one rather than wait MutexTimeout, since go-smtp closes
+	// the connections one by one and a DATA still reading the body would stall the shutdown.
+	// Without the lock Logout touches only what NewSession fixed, atomics and the
+	// transaction count (under txMu).
 	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	debugLog, infoLog := s.DebugLog, s.InfoLog
 	if acquired {
 		defer release()
 	} else {
-		// Continue with logout even if we can't get the lock. The command holding it may still
-		// be writing (go-smtp cancels the session context at Server.Close, and a cancelled
-		// session does not wait for the lock), so log only what was fixed at session creation.
+		// Continue with logout without the lock. The command holding it may still be
+		// writing, so log only what was fixed at session creation.
 		debugLog, infoLog = s.fixedFieldsLog(logger.Debug), s.fixedFieldsLog(logger.Info)
 		s.fixedFieldsLog(logger.Warn)("failed to acquire write lock", "command", "LOGOUT")
 	}
@@ -1223,11 +1141,8 @@ func (s *LMTPSession) Logout() error {
 		debugLog("client dropped connection")
 	}
 
-	// Release connection from limiter
-	if s.releaseConn != nil {
-		s.releaseConn()
-		s.releaseConn = nil
-	}
+	// The connection limiter slot is released by connectionLimitingConn.Close when go-smtp
+	// closes the socket, after Logout.
 
 	metrics.ConnectionDuration.WithLabelValues("lmtp", s.backend.name, s.backend.hostname).Observe(time.Since(s.startTime).Seconds())
 
@@ -1267,7 +1182,7 @@ func (s *LMTPSession) fixedFieldsLog(logFn func(msg string, keysAndValues ...any
 // read-only: RFC 3463 4.3.1 "mail system full" is the reply MTAs understand as "back off,
 // storage", not a server error. It is nil for any other error.
 func spoolFullReply(err error) *smtp.SMTPError {
-	if !errors.Is(err, syscall.ENOSPC) && !errors.Is(err, syscall.EROFS) {
+	if !helpers.IsInsufficientStorage(err) {
 		return nil
 	}
 	return &smtp.SMTPError{

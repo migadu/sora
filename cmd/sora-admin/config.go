@@ -61,7 +61,7 @@ func handleConfigCommand(ctx context.Context) {
 	case "help":
 		printConfigUsage()
 	default:
-		fmt.Printf("Unknown config subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown config subcommand: %s\n\n", subcommand)
 		printConfigUsage()
 		os.Exit(1)
 	}
@@ -90,7 +90,7 @@ func handleConfigValidate(_ context.Context) {
 	}
 
 	if configFile == "" {
-		fmt.Printf("Error: --config is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --config is required\n\n")
 		printConfigValidateUsage()
 		os.Exit(1)
 	}
@@ -225,7 +225,7 @@ Examples:
 	}
 
 	if configFile == "" {
-		fmt.Printf("Error: --config is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --config is required\n\n")
 		flagSet.Usage()
 		os.Exit(1)
 	}

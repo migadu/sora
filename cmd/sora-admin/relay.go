@@ -36,7 +36,7 @@ func handleRelayCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printRelayUsage()
 	default:
-		fmt.Printf("Unknown relay subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown relay subcommand: %s\n\n", subcommand)
 		printRelayUsage()
 		os.Exit(1)
 	}
@@ -63,13 +63,25 @@ func openExistingRelayQueue(queuePath string, maxAttempts int) (*relayqueue.Disk
 
 func handleRelayStats(_ context.Context) {
 	flags := flag.NewFlagSet("relay stats", flag.ExitOnError)
+	flags.Usage = func() {
+		fmt.Printf(`Show relay queue statistics
+
+Usage:
+  sora-admin --config PATH relay stats
+
+Counts the messages in the pending, processing and failed queues of this host.
+
+Examples:
+  sora-admin --config config.toml relay stats
+`)
+	}
 	flags.Parse(os.Args[3:])
 
 	// Use global config for relay queue path
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -115,13 +127,27 @@ func handleRelayList(_ context.Context) {
 	flags := flag.NewFlagSet("relay list", flag.ExitOnError)
 	queueType := flags.String("queue", "pending", "Queue to list (pending, processing, failed)")
 	limit := flags.Int("limit", 100, "Maximum number of messages to display")
+	flags.Usage = func() {
+		fmt.Printf(`List messages in a relay queue
+
+Usage:
+  sora-admin --config PATH relay list [options]
+
+Options:
+  --queue string  Queue to list: pending, processing, failed (default: pending)
+  --limit int     Maximum number of messages to display (default: 100)
+
+Examples:
+  sora-admin --config config.toml relay list --queue failed --limit 50
+`)
+	}
 	flags.Parse(os.Args[3:])
 
 	// Use global config
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -211,6 +237,20 @@ func handleRelayShow(_ context.Context) {
 	flags := flag.NewFlagSet("relay show", flag.ExitOnError)
 	messageID := flags.String("id", "", "Message ID to display (required)")
 	queueType := flags.String("queue", "pending", "Queue to search (pending, processing, failed)")
+	flags.Usage = func() {
+		fmt.Printf(`Show detailed information for a specific relay queue message
+
+Usage:
+  sora-admin --config PATH relay show [options]
+
+Options:
+  --id string     Message ID to display (required)
+  --queue string  Queue to search: pending, processing, failed (default: pending)
+
+Examples:
+  sora-admin --config config.toml relay show --id 3f2b9c1e-8d4a-4f6b-9a7e-2c5d1e0f4b8a --queue failed
+`)
+	}
 	flags.Parse(os.Args[3:])
 
 	if *messageID == "" {
@@ -223,7 +263,7 @@ func handleRelayShow(_ context.Context) {
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -292,6 +332,22 @@ func handleRelayDelete(_ context.Context) {
 	messageID := flags.String("id", "", "Message ID to delete (use 'all' to delete all messages)")
 	queueType := flags.String("queue", "failed", "Queue to delete from (pending, processing, failed)")
 	confirm := flags.Bool("confirm", false, "Confirm deletion (required)")
+	flags.Usage = func() {
+		fmt.Printf(`Delete a message or all messages from a relay queue
+
+Usage:
+  sora-admin --config PATH relay delete [options]
+
+Options:
+  --id string     Message ID to delete, or 'all' to delete all messages (required)
+  --queue string  Queue to delete from: pending, processing, failed (default: failed)
+  --confirm       Confirm deletion (required); there is no undo
+
+Examples:
+  sora-admin --config config.toml relay delete --id 3f2b9c1e-8d4a-4f6b-9a7e-2c5d1e0f4b8a --queue failed --confirm
+  sora-admin --config config.toml relay delete --id all --queue failed --confirm
+`)
+	}
 	flags.Parse(os.Args[3:])
 
 	if *messageID == "" {
@@ -309,7 +365,7 @@ func handleRelayDelete(_ context.Context) {
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -375,6 +431,21 @@ func handleRelayRequeue(_ context.Context) {
 	flags := flag.NewFlagSet("relay requeue", flag.ExitOnError)
 	messageID := flags.String("id", "", "Message ID to requeue (use 'all' to requeue all failed messages)")
 	confirm := flags.Bool("confirm", false, "Confirm requeue operation (required)")
+	flags.Usage = func() {
+		fmt.Printf(`Move message(s) from the failed relay queue back to pending
+
+Usage:
+  sora-admin --config PATH relay requeue [options]
+
+Options:
+  --id string  Message ID to requeue, or 'all' to requeue all failed messages (required)
+  --confirm    Confirm the requeue (required)
+
+Examples:
+  sora-admin --config config.toml relay requeue --id 3f2b9c1e-8d4a-4f6b-9a7e-2c5d1e0f4b8a --confirm
+  sora-admin --config config.toml relay requeue --id all --confirm
+`)
+	}
 	flags.Parse(os.Args[3:])
 
 	if *messageID == "" {
@@ -392,7 +463,7 @@ func handleRelayRequeue(_ context.Context) {
 	cfg := globalConfig
 
 	if !cfg.Relay.IsQueueEnabled() {
-		fmt.Println("Relay is not configured (queue is enabled automatically when relay is configured)")
+		fmt.Fprintln(os.Stderr, "Relay is not configured (queue is enabled automatically when relay is configured)")
 		os.Exit(1)
 	}
 
@@ -444,7 +515,7 @@ func printRelayUsage() {
 	fmt.Printf(`Relay Queue Management
 
 Usage:
-  sora-admin relay <subcommand> [options]
+  sora-admin --config PATH relay <subcommand> [options]
 
 Subcommands:
   stats      Show relay queue statistics

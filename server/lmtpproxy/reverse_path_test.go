@@ -31,7 +31,12 @@ func TestUnreadableReversePathRefused(t *testing.T) {
 		{"second path after null path", "<><sender@example.org>"},
 		{"extra closing bracket after null path", "<>>"},
 		{"trailing text after path", "<sender@example.org>@other.org"},
-		{"quoted local part with inner closing bracket", `<"alice@evil.com>"@example.org>`},
+		// An angle bracket inside a quoted local part is read (TestLenientReversePathForwarded),
+		// one outside it, or a quoted string that is never closed, is not.
+		{"closing bracket in domain after quoted local part", `<"alice@x>"@exa>mple.org>`},
+		{"opening bracket in domain after quoted local part", `<"alice@x>"@exa<mple.org>`},
+		{"quoted local part with inner closing bracket and no closing bracket", `<"alice@x>"@example.org`},
+		{"unclosed quoted local part with inner closing bracket", `<"alice@x>@example.org>`},
 		{"unseparated parameter after path", "<sender@example.org>SIZE=999999999"},
 		{"quoted path with trailing text", `"<user@example.com> foo"`},
 		{"quoted path with trailing text after a space", ` "<user@example.com> foo"`},
@@ -151,14 +156,19 @@ func TestUnreadableReversePathRefused(t *testing.T) {
 }
 
 // A reverse-path go-smtp reads, and a sora backend accepts, is not refused by the proxy
-// either (#1907): a quoted local part holding a space, and the dot-strings and domains
-// go-smtp is lenient about. Each reaches the backend as the client wrote it, inside its
-// angle brackets. A forward-path with a quoted space stays refused: recipients are
-// checked strictly.
+// either (#1907, #1948): a quoted local part holding a space or an angle bracket, and the
+// dot-strings and domains go-smtp is lenient about. Each reaches the backend as the client
+// wrote it, inside its angle brackets: go-smtp reads a quoted local part to its closing
+// quote, so a ">" inside it does not end the path there. A forward-path with a quoted
+// space stays refused: recipients are checked strictly.
 func TestLenientReversePathForwarded(t *testing.T) {
 	for _, from := range []string{
 		`"john doe"@example.org`,
 		`"john \"jd\" doe"@example.org`,
+		`"alice@x>"@example.org`,
+		`"a<b"@example.org`,
+		`"<>"@example.org`,
+		`"x> SIZE=1"@example.org`,
 		"first..last@example.org",
 		".lead@example.org",
 		"trail.@example.org",
