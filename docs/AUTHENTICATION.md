@@ -762,11 +762,6 @@ ways:
 - **Behind a PROXY header**, the client the header names is the one judged: a client behind a
   trusted load balancer cannot replace its address with ID or `XCLIENT` unless its own address is
   in the list ([SECURITY.md](SECURITY.md#31-trusted_networks)).
-- **POP3 `XCLIENT` and the rate limiter.** The rate limiter's checks and counters use an
-  `XCLIENT` `ADDR` only when the `XCLIENT` also carries the `proxy-source-ip` variable in its
-  `FORWARD` parameter, or when a PROXY header came first. Sora's POP3 proxy always sends
-  `proxy-source-ip`. A bare `ADDR` from another forwarder changes the logged address, but the rate
-  limiter keeps counting the TCP peer.
 - **Rate-limit exemption.** Unless `exempt_networks` is set, addresses in the list are exempt from
   rate limiting (section 10.5).
 
