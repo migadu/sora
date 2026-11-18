@@ -142,8 +142,7 @@ type LMTPSession struct {
 	ownerResolver *resilient.OwnerResolver
 	mutex         sync.RWMutex
 	mutexHelper   *server.MutexTimeoutHelper
-	releaseConn   func() // Function to release connection from limiter
-	useMasterDB   bool   // Pin session to master DB after a write to ensure consistency
+	useMasterDB   bool // Pin session to master DB after a write to ensure consistency
 	startTime     time.Time
 	traceID       string // X-Mizu-Trace-ID of the message in this transaction; "" until DATA has parsed it
 
@@ -1204,14 +1203,26 @@ func (s *LMTPSession) Logout() error {
 	// go-smtp also logs a session out from Server.Close, on the closing goroutine, while this
 	// connection's goroutine may be inside a command writing the user, the trace id or the
 	// remote address. Those are written under the session lock and read here only with it.
-	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	var acquired bool
+	release := func() {}
+	if s.ctx.Err() != nil {
+		// Server.Close cancelled the session. Take the lock only if it is free, never wait
+		// for it: go-smtp closes the connections one by one and each socket only after its
+		// Logout, so a DATA still reading the body would hold the lock, and the shutdown,
+		// for the whole MutexTimeout. Without the lock Logout touches only what NewSession
+		// fixed, atomics and the transaction count (under txMu).
+		if acquired = s.mutex.TryLock(); acquired {
+			release = s.mutex.Unlock
+		}
+	} else {
+		acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
+	}
 	debugLog, infoLog := s.DebugLog, s.InfoLog
 	if acquired {
 		defer release()
 	} else {
-		// Continue with logout even if we can't get the lock. The command holding it may still
-		// be writing (go-smtp cancels the session context at Server.Close, and a cancelled
-		// session does not wait for the lock), so log only what was fixed at session creation.
+		// Continue with logout without the lock. The command holding it may still be
+		// writing, so log only what was fixed at session creation.
 		debugLog, infoLog = s.fixedFieldsLog(logger.Debug), s.fixedFieldsLog(logger.Info)
 		s.fixedFieldsLog(logger.Warn)("failed to acquire write lock", "command", "LOGOUT")
 	}
@@ -1223,11 +1234,8 @@ func (s *LMTPSession) Logout() error {
 		debugLog("client dropped connection")
 	}
 
-	// Release connection from limiter
-	if s.releaseConn != nil {
-		s.releaseConn()
-		s.releaseConn = nil
-	}
+	// The connection limiter slot is released by connectionLimitingConn.Close when go-smtp
+	// closes the socket, after Logout.
 
 	metrics.ConnectionDuration.WithLabelValues("lmtp", s.backend.name, s.backend.hostname).Observe(time.Since(s.startTime).Seconds())
 
