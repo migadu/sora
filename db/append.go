@@ -45,6 +45,7 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 		}
 	}
 	var fromFound, toFound, ccFound bool
+	var ccGroupKey string // a leading Cc group's name, the head of the Cc section
 	for _, r := range recipients {
 		if r.GroupEnd {
 			continue
@@ -82,7 +83,13 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 				extra(2, r.Name, r.EmailAddress, r.Group)
 			} else {
 				ccEmailSort, ccFound = email, true
-				extra(2, r.Name, r.Group)
+				if r.Group != "" {
+					// The CC sort key; bounded like the sort columns, and set aside
+					// from the shares below so other addresses cannot shorten it.
+					ccGroupKey = helpers.TruncateUTF8Safe(extraAddressesValue.Replace(strings.ToLower(r.Group)), helpers.MaxSortColumnBytes)
+				} else {
+					extra(2, r.Name)
+				}
 			}
 		}
 	}
@@ -90,16 +97,22 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 	var lengths [3]int
 	for i, values := range sections {
 		joined[i] = strings.Join(values, extraAddressesValueSep)
+		if i == 2 && ccGroupKey != "" && joined[i] != "" {
+			joined[i] = extraAddressesValueSep + joined[i] // after the key
+		}
 		lengths[i] = len(joined[i])
 	}
-	// The sections share what the sort columns leave of the budget, less the two section
-	// separators. Each is cut to its share (extraAddressesShares), never the whole value at
-	// the end, so a long From or To list cannot crowd the Cc addresses out.
+	// The sections share what the sort columns, the two section separators and a leading
+	// Cc group's name (the CC sort key, at most helpers.MaxSortColumnBytes) leave of the
+	// budget. Each is cut to its share (extraAddressesShares), never the whole value at the
+	// end, so a long From or To list can neither crowd the Cc addresses out nor change the
+	// CC sort key.
 	budget := helpers.MaxAddressColumnsBytes - len(fromNameSort) - len(fromEmailSort) - len(toNameSort) - len(toEmailSort) - len(ccEmailSort)
-	shares := extraAddressesShares(lengths, budget-2*len(extraAddressesSectionSep))
+	shares := extraAddressesShares(lengths, budget-2*len(extraAddressesSectionSep)-len(ccGroupKey))
 	for i := range joined {
 		joined[i] = helpers.TruncateUTF8Safe(joined[i], shares[i])
 	}
+	joined[2] = ccGroupKey + joined[2]
 	extraAddresses = strings.TrimRight(strings.Join(joined[:], extraAddressesSectionSep), extraAddressesSectionSep)
 	return
 }

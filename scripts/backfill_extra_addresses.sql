@@ -88,8 +88,9 @@ $$;
 -- name, or its group name when Cc starts with a group; a later group start's address is its
 -- group name, a group end has none), in header order, separated by a tab; tabs and newlines inside a value become spaces;
 -- trailing empty sections dropped; each section cut to its share
--- (sora_extra_addresses_shares) of what the sort columns and the two section separators
--- leave of 1300 bytes (helpers.MaxAddressColumnsBytes).
+-- (sora_extra_addresses_shares) of what the sort columns, the two section separators and a
+-- leading Cc group's name (cut to 200 bytes, kept whole) leave of 1300 bytes
+-- (helpers.MaxAddressColumnsBytes).
 CREATE OR REPLACE FUNCTION sora_extra_addresses(
 	recipients jsonb, from_name text, from_email text, to_name text, to_email text, cc_email text
 ) RETURNS text
@@ -106,20 +107,24 @@ LANGUAGE sql IMMUTABLE AS $$
 	), v AS (
 		SELECT kind, ord, 1 AS part, name AS val FROM r WHERE name <> '' AND (nth > 1 OR kind = 'cc')
 		UNION ALL
-		SELECT kind, ord, 1, grp FROM r WHERE grp <> '' AND nth = 1 AND kind = 'cc'
-		UNION ALL
 		SELECT kind, ord, 2, email FROM r WHERE email <> '' AND nth > 1
 	), s AS (
 		SELECT COALESCE(string_agg(val, E'\t' ORDER BY ord, part) FILTER (WHERE kind = 'from'), '') AS f,
 		       COALESCE(string_agg(val, E'\t' ORDER BY ord, part) FILTER (WHERE kind = 'to'), '') AS t,
 		       COALESCE(string_agg(val, E'\t' ORDER BY ord, part) FILTER (WHERE kind = 'cc'), '') AS c
 		FROM v
+	), k AS (
+		-- A leading Cc group's name, the CC sort key: bounded like the sort columns and set
+		-- aside from the shares, so other addresses cannot shorten it.
+		SELECT COALESCE((SELECT sora_trunc_utf8(grp, 200) FROM r WHERE kind = 'cc' AND nth = 1 AND grp <> ''), '') AS key
+	), cc AS (
+		SELECT f, t, key, CASE WHEN key <> '' AND c <> '' THEN E'\t' || c ELSE c END AS c FROM s, k
 	)
-	SELECT rtrim(sora_trunc_utf8(f, sh[1]) || E'\n' || sora_trunc_utf8(t, sh[2]) || E'\n' || sora_trunc_utf8(c, sh[3]), E'\n')
-	FROM s, LATERAL (SELECT sora_extra_addresses_shares(octet_length(f), octet_length(t), octet_length(c),
-	                        1300 - octet_length(COALESCE(from_name, '')) - octet_length(COALESCE(from_email, ''))
-	                             - octet_length(COALESCE(to_name, '')) - octet_length(COALESCE(to_email, ''))
-	                             - octet_length(COALESCE(cc_email, '')) - 2) AS sh) AS budget
+	SELECT rtrim(sora_trunc_utf8(f, sh[1]) || E'\n' || sora_trunc_utf8(t, sh[2]) || E'\n' || key || sora_trunc_utf8(c, sh[3]), E'\n')
+	FROM cc, LATERAL (SELECT sora_extra_addresses_shares(octet_length(f), octet_length(t), octet_length(c),
+	                         1300 - octet_length(COALESCE(from_name, '')) - octet_length(COALESCE(from_email, ''))
+	                              - octet_length(COALESCE(to_name, '')) - octet_length(COALESCE(to_email, ''))
+	                              - octet_length(COALESCE(cc_email, '')) - 2 - octet_length(key)) AS sh) AS budget
 $$;
 
 -- One batch: fill the live rows with ids in [p_lo, p_hi] that are still NULL and have

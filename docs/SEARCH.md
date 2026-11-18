@@ -121,8 +121,10 @@ Stored values are cut to fixed lengths, so only the start of a very long value i
 So in a message with very many recipients, not every address is searchable. The From, To
 and Cc parts of `extra_addresses` share its length: each keeps all of itself or an equal share,
 whichever is less, and what a short part leaves goes to the others. A long To list therefore
-cuts only the end of the To list, never the Cc addresses (or a leading Cc group's name, the
-`CC` sort key). Messages stored before this rule keep the value cut at the end.
+cuts only the end of the To list, never the Cc addresses. A leading Cc group's name, the `CC`
+sort key, is set aside before the parts share the rest: it keeps its first 200 bytes, like the
+other sort columns, however many other addresses the message has. Messages stored before this
+rule keep the value cut at the end.
 
 ### The covering index
 
