@@ -82,4 +82,29 @@ func TestXCLIENTReappliedAttributesAreWhatGoSMTPRecorded(t *testing.T) {
 			}
 		})
 	}
+
+	// An attribute outside the six is refused whatever its case, so applyXCLIENTAttrs never
+	// sees one: a later session keeps the identity an earlier XCLIENT recorded and gains no
+	// variable (no xclient-* one) from the refused XCLIENT.
+	for _, foo := range []string{"FOO", "foo"} {
+		t.Run("XCLIENT with "+foo+"=bar is refused and nothing of it recorded", func(t *testing.T) {
+			conn, r, sessions := newConn(t)
+			send(t, conn, r, "LHLO mta.example.org", "250 ")
+			nextSession(t, sessions)
+			send(t, conn, r, "XCLIENT ADDR=203.0.113.7 NAME=client.example.org", "220 ")
+			send(t, conn, r, "XCLIENT ADDR=198.51.100.9 "+foo+"=bar", "501 5.5.4 Invalid XCLIENT attributes: unknown attribute: FOO")
+			send(t, conn, r, "LHLO mta.example.org", "250 ")
+			s := nextSession(t, sessions)
+			if s.RemoteIP != "203.0.113.7" {
+				t.Errorf("client address = %q, want 203.0.113.7 from the accepted XCLIENT", s.RemoteIP)
+			}
+			if s.ForwardingParams == nil {
+				t.Fatal("the accepted XCLIENT was not re-applied to the next session")
+			}
+			vars := s.ForwardingParams.Variables
+			if len(vars) != 1 || vars["client-hostname"] != "client.example.org" {
+				t.Errorf("session variables = %v, want only client-hostname=client.example.org", vars)
+			}
+		})
+	}
 }
