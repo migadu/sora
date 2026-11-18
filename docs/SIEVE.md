@@ -349,7 +349,9 @@ See [section 8](#8-vacation).
 
 ## 6. Errors, limits and timeouts
 
-A Sieve problem never makes delivery fail. Sora keeps the message instead.
+A Sieve problem never makes delivery fail. Sora keeps the message instead. The one exception is
+a user script that cannot be read: Sora defers the message rather than deliver it without the
+user's rules.
 
 | What goes wrong | What Sora does |
 |---|---|
@@ -358,7 +360,7 @@ A Sieve problem never makes delivery fail. Sora keeps the message instead.
 | The script runs longer than `[sieve] max_execution_time` | Same as a run-time error. |
 | The interpreter panics | Recovered and handled as a run-time error, so the LMTP connection stays up. |
 | The default script fails at run time | Logs `default sieve script evaluation error`; the message is kept in INBOX unless the user script decides otherwise. |
-| Reading the active script from the database fails | The default script's result is used. |
+| Reading the active script from the database fails | Logs `failed to get active sieve script` at warning level and defers the message: LMTP answers `451 4.3.0`, the Admin API reports a transient error, and the MTA retries. Nothing is stored, redirected or replied to. An account without an active script is not an error; the default script's result is used. |
 
 Every run, default or user, is counted in `sora_sieve_executions_total{protocol, result}` with
 `result` `success` or `failure`.
@@ -707,6 +709,7 @@ Useful log lines (LMTP session logs carry the session and message fields):
 | `sieve message discarded` | info | Nothing was stored. |
 | `failed to get/create sieve executor` | warn | The stored script does not compile; it was skipped. |
 | `user sieve script evaluation error` | warn | The script failed at run time or timed out. |
+| `failed to get active sieve script` | warn | The account's active script could not be read from the database; the delivery was deferred with `451 4.3.0`. |
 | `Sieve fileinto "<name>" is unavailable or has no insert right; keeping in INBOX` | warn | `fileinto` named a missing folder, the shared namespace root, or a shared folder without the `i` right. |
 | `sieve set invalid IMAP keywords, dropped` | warn | A flag name was not a valid IMAP keyword. |
 | `mail loop detected via Delivered-To, rejecting` | warn | A redirect loop was refused with 550. |
