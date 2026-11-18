@@ -83,7 +83,8 @@ sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
 
 ### Output, logs and exit status
 
-- Reports and tables go to standard output. Log lines (`INFO`, `WARN`, `ERROR`, with a
+- Reports and tables go to standard output, and so does the usage `--help` prints, so
+  `sora-admin <command> <subcommand> --help | less` works. Log lines (`INFO`, `WARN`, `ERROR`, with a
   timestamp) go to standard error. `sora-admin` does not use the `[logging]` section.
 - The exit status is `0` on success and `1` on error. A few commands report problems but still
   exit `0`; this is noted where it applies (for example `verify s3`).
