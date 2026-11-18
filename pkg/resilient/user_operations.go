@@ -154,7 +154,7 @@ func (rdb *ResilientDatabase) UpdateMessageFlagsWithRetry(ctx context.Context, a
 		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).UpdateMessageFlags(ctx, accountID, messageID, addFlags, removeFlags)
 	}
 
-	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
+	_, err := rdb.executeAutocommitWriteWithRetry(ctx, config, timeoutWrite, op)
 	return err
 }
 
@@ -167,7 +167,7 @@ func (rdb *ResilientDatabase) CreateMailboxForUserWithRetry(ctx context.Context,
 		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).CreateMailboxForUser(ctx, accountID, mailboxPath)
 	}
 
-	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
+	_, err := rdb.executeAutocommitWriteWithRetry(ctx, config, timeoutWrite, op)
 	return err
 }
 
@@ -180,7 +180,7 @@ func (rdb *ResilientDatabase) DeleteMailboxForUserWithRetry(ctx context.Context,
 		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).DeleteMailboxForUser(ctx, accountID, mailboxPath)
 	}
 
-	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
+	_, err := rdb.executeAutocommitWriteWithRetry(ctx, config, timeoutWrite, op)
 	return err
 }
 
@@ -193,7 +193,7 @@ func (rdb *ResilientDatabase) SubscribeToMailboxWithRetry(ctx context.Context, a
 		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).SubscribeToMailbox(ctx, accountID, mailboxPath)
 	}
 
-	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
+	_, err := rdb.executeAutocommitWriteWithRetry(ctx, config, timeoutWrite, op)
 	return err
 }
 
@@ -206,7 +206,7 @@ func (rdb *ResilientDatabase) UnsubscribeFromMailboxWithRetry(ctx context.Contex
 		return nil, rdb.getOperationalDatabaseForOperation(ctx, true).UnsubscribeFromMailbox(ctx, accountID, mailboxPath)
 	}
 
-	_, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
+	_, err := rdb.executeAutocommitWriteWithRetry(ctx, config, timeoutWrite, op)
 	return err
 }
 
@@ -263,7 +263,7 @@ func (rdb *ResilientDatabase) MarkMessagesAsNotUploadedWithRetry(ctx context.Con
 		return rdb.getOperationalDatabaseForOperation(ctx, true).MarkMessagesAsNotUploaded(ctx, s3Keys)
 	}
 
-	result, err := rdb.executeReadWithRetry(ctx, config, timeoutWrite, op)
+	result, err := rdb.executeAutocommitWriteWithRetry(ctx, config, timeoutWrite, op)
 	if err != nil {
 		return 0, err
 	}
@@ -276,7 +276,7 @@ func (rdb *ResilientDatabase) MarkMessagesAsNotUploadedIfAbsentWithRetry(ctx con
 	op := func(ctx context.Context) (any, error) {
 		return rdb.getOperationalDatabaseForOperation(ctx, true).MarkMessagesAsNotUploadedIfAbsent(ctx, obj, exists)
 	}
-	result, err := rdb.executeReadWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
+	result, err := rdb.executeAutocommitWriteWithRetry(ctx, writeRetryConfig, timeoutWrite, op)
 	if err != nil {
 		return 0, err
 	}
