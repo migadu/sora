@@ -178,6 +178,23 @@ func (s *IMAPSession) Store(ctx context.Context, w *imapserver.FetchWriter, numS
 		if !answers {
 			return
 		}
+		// A keyword new to the mailbox is announced before the first FETCH
+		// response showing it, and recorded, so the poll after the command
+		// does not announce it again (#2090).
+		if !sanitizedStoreFlags.Silent {
+			var keywords []string
+			for _, modified := range responseMessages {
+				if modified.seq != 0 {
+					for _, f := range modified.flags {
+						keywords = append(keywords, string(f))
+					}
+				}
+			}
+			if err := s.announceNewKeywords(selectedMailboxID, keywords, w.WriteMailboxFlags); err != nil {
+				s.DebugLog("failed to write mailbox FLAGS update", "error", err)
+				return
+			}
+		}
 		for _, modified := range responseMessages {
 			// A message the client has not been told about has no number to be
 			// answered under; Poll reports it once the client knows it.
