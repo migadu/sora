@@ -5,29 +5,23 @@ import (
 	"testing"
 
 	"github.com/migadu/go-imap"
-	"github.com/migadu/sora/db"
 )
 
 func TestMailboxFlagsWithNewKeywords(t *testing.T) {
 	announced := buildDisplayFlags([]string{"$Old"})
 
 	t.Run("nothing new", func(t *testing.T) {
-		updates := []db.MessageUpdate{
-			{CustomFlags: []string{"$old", "$junk"}}, // case-insensitive identity (RFC 9051 §2.3.2)
-			{IsExpunge: true, CustomFlags: []string{"$Gone"}},
-			{CustomFlags: []string{"Кириллица", ""}}, // never shown, so never announced
+		keywords := []string{
+			"$old", "$junk", // case-insensitive identity (RFC 9051 §2.3.2)
+			"Кириллица", "", // never shown, so never announced
 		}
-		if got := mailboxFlagsWithNewKeywords(announced, updates); got != nil {
+		if got := mailboxFlagsWithNewKeywords(announced, keywords); got != nil {
 			t.Fatalf("got %v, want nil", got)
 		}
 	})
 
 	t.Run("new keywords extend the announced list", func(t *testing.T) {
-		updates := []db.MessageUpdate{
-			{CustomFlags: []string{"$New", "$Old"}},
-			{CustomFlags: []string{"$new", "$Other"}},
-		}
-		got := mailboxFlagsWithNewKeywords(announced, updates)
+		got := mailboxFlagsWithNewKeywords(announced, []string{"$New", "$Old", "$new", "$Other"})
 		for _, f := range announced {
 			if !slices.Contains(got, f) {
 				t.Errorf("%v dropped %s", got, f)
