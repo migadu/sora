@@ -2,8 +2,9 @@
 
 This document explains how Sora checks a login. It covers accounts and their credentials, how a
 login name is read, the password schemes Sora accepts and writes, the bcrypt cost, master
-credentials, the login commands and SASL mechanisms of each protocol, and the authentication rate
-limiter with its delays and blocks. It is written for operators who run Sora and for contributors who
+credentials, the login commands and SASL mechanisms of each protocol, the authentication rate
+limiter with its delays and blocks, and how cached logins are cancelled when a password changes. It
+is written for operators who run Sora and for contributors who
 change the login code.
 
 Related documents:
@@ -100,8 +101,8 @@ sora-admin --config config.toml credentials add --primary user@example.com \
 sora-admin --config config.toml accounts update --email user@example.com --password 'changed-passphrase'
 ```
 
-A change made through the Admin API or `sora-admin` also requests invalidation of the account's cached logins
-(section 12).
+Every change to a password, a credential address or an account's status also drops the account's
+cached logins on every node, whichever tool or SQL statement made it (section 12).
 
 ---
 
@@ -125,10 +126,10 @@ Sora looks it up:
 
 The address that Sora then looks up is the **base address**: lower case, no `+tag`, no suffix.
 
-A name that does not parse fails the login. The replies are `NO [AUTHENTICATIONFAILED] Address not in
-the correct format` (IMAP), `-ERR [AUTH] Invalid username format` (POP3),
-`NO "Invalid username format"` (ManageSieve `AUTHENTICATE`) and `NO "Invalid address"` (ManageSieve
-`LOGIN`). Except on ManageSieve's `LOGIN`, it counts as a failed attempt for the rate limiter.
+A name that does not parse fails the login like a wrong password: the client gets the protocol's
+bad-credentials reply (section 6), and the attempt counts as a failed login for the rate limiter. The
+reply does not say that the name was malformed, so it cannot be used to probe which names Sora
+accepts.
 
 A suffix that is not the configured `master_username`, and the `master_username` suffix with any
 password other than `master_password` (section 8.1):
@@ -141,20 +142,28 @@ password other than `master_password` (section 8.1):
 
 ## 4. Password schemes
 
-The stored hash starts with a prefix that names its scheme. Sora verifies these
-([db/auth.go](../db/auth.go)):
+The stored hash is either a bare bcrypt hash or Dovecot's `{SCHEME}data` form, where the scheme
+name says how to check it. Sora verifies these ([db/password_hash.go](../db/password_hash.go),
+[db/auth.go](../db/auth.go)):
 
 | Stored hash starts with | Scheme | Notes |
 |---|---|---|
 | `$2a$`, `$2b$`, `$2y$` | bcrypt | Standard bcrypt. |
 | `{BLF-CRYPT}` | bcrypt | Dovecot's name for bcrypt. Sora writes new bcrypt hashes in this form: `{BLF-CRYPT}$2a$12$...`. |
-| `{SSHA512}`, `{SSHA512.b64}` | salted SHA-512, base64 | The decoded value is the 64-byte SHA-512 of password + salt, followed by the salt. |
-| `{SSHA512.HEX}` | salted SHA-512, hex | Same, hex-encoded. |
-| `{SHA512}`, `{SHA512.b64}`, `{SHA512.HEX}` | SHA-512 without salt | Accepted for logins of old accounts. |
+| `{CRYPT}` | bcrypt | Only when the data is a bcrypt hash (`$2a$`, `$2b$` or `$2y$`). |
+| `{SSHA512}` | salted SHA-512 | The decoded value is the 64-byte SHA-512 of password + salt, followed by the salt. Base64 by default. |
+| `{SHA512}` | SHA-512 without salt | Accepted for logins of old accounts. Base64 by default; a value of exactly 128 characters is read as hex when it is valid hex. |
 
-Any other prefix fails every login for that credential and logs
-`Database: unknown password hash scheme`. In particular, crypt(3) hashes such as `{SHA512-CRYPT}`
-or `$6$...` are not supported. Comparisons of SHA-512 digests are constant-time.
+As in Dovecot, the scheme name is not case-sensitive, and an encoding suffix may follow it:
+`.b64` or `.base64` for base64, `.hex` for hex (`{SSHA512.HEX}...`). Base64 data may contain
+spaces and line breaks. Comparisons of SHA-512 digests are constant-time.
+
+Sora does not verify any other scheme. This includes the other crypt(3) algorithms (`$1$`, `$5$`,
+`$6$`, `{SHA512-CRYPT}`, `{MD5-CRYPT}`), Argon2, PBKDF2, SCRAM and plaintext schemes. A stored hash
+that Sora cannot check (an unknown scheme, data that does not decode, a wrong length or a malformed
+bcrypt hash) is not treated as a wrong password: no password could ever match it, so the login gets
+a temporary failure and is not counted by the rate limiter (section 6). Sora logs
+`Password hash cannot be verified` at ERROR with the reason, but never any part of the stored value.
 
 **Writing hashes.** When Sora is given a plaintext password it writes:
 
@@ -165,9 +174,12 @@ SHA-512 without salt is not written for new passwords: `sora-admin` (`--hash` an
 `--credentials` JSON list) and the Admin API's `credentials` array refuse `sha512` as a hash
 type.
 
+bcrypt uses at most 72 bytes of a password. Sora refuses to write a bcrypt hash for a longer
+password: the account or credential change fails with an invalid-request error.
+
 `--password-hash` (sora-admin) and `password_hash` (Admin API) store a hash you computed elsewhere,
-exactly as given. Sora does not check it. Use one of the prefixes above, or the account cannot log
-in.
+exactly as given. Sora first checks that it is a hash it can verify (the table above) and refuses
+the change otherwise, so a credential that no password could open is never stored.
 
 **Which to use.** Use bcrypt. A salted or unsalted SHA-512 hash takes one SHA-512 computation to
 check, so a stolen database can be guessed against very fast. Sora never converts an SHA-512 hash to
@@ -203,10 +215,18 @@ spare at the login peak (for example after a restart, when every client logs in 
   password costs whatever the stored hash (section 6).
 
 **Rehash.** After a successful login that was checked against PostgreSQL, Sora looks at the stored
-hash. If it is bcrypt (with or without `{BLF-CRYPT}`) and its cost differs from `bcrypt_cost`, higher
-or lower, Sora computes a hash at the configured cost in the background and stores it. It keeps the
-`{BLF-CRYPT}` prefix if the old hash had one. The login does not wait for this. A successful rehash
-logs `Rehash: Successfully rehashed and updated password`.
+hash. If it is bcrypt (bare, `{BLF-CRYPT}` or `{CRYPT}`) and its cost differs from `bcrypt_cost`,
+higher or lower, Sora computes a hash at the configured cost in the background and stores it. The
+login does not wait for this.
+
+- The new hash keeps the `{BLF-CRYPT}` prefix if the old hash had one. Any other bcrypt hash,
+  including a `{CRYPT}` one, is stored as a bare bcrypt hash.
+- Sora stores the new hash only if the credential still has the hash that was checked, still
+  belongs to the same account, and the account is still active. A password change or deletion
+  made while bcrypt was running is never overwritten.
+- A successful rehash logs `Rehash: Successfully rehashed and updated password`. Because the stored
+  hash changed, the account's cached logins are dropped as for any password change (section 12),
+  and the next login is checked against the database again.
 
 - Backends (IMAP, POP3, ManageSieve) run at most half as many rehashes at once as the node has CPUs
   (at least one). When all slots are busy, the rehash is skipped and happens at a later login.
@@ -247,8 +267,8 @@ This is the order on an IMAP, POP3 or ManageSieve backend. The code is in `serve
     A wrong password then takes about as long as an unknown address, whatever the account's scheme.
     A bcrypt hash above `bcrypt_cost` takes longer, until the rehash (section 5) brings it down.
 12. **Failure.** The attempt is recorded for the rate limiter and the reply is the "bad credentials"
-    reply of the protocol. A database error is not a failed login: it gets a temporary failure
-    (below).
+    reply of the protocol. A database error, or a stored hash Sora cannot check (section 4), is not
+    a failed login: it gets a temporary failure (below).
 13. **Success.** The attempt is recorded as a success, which clears the failure counts of this IP
     and of this IP and name (section 10.2). Sora caches the login and queues a rehash if needed.
     IMAP and POP3 also create the account's default mailboxes if they are missing, and refuse the
@@ -264,11 +284,12 @@ The bad-credentials replies are:
 | POP3 | `-ERR [AUTH] Authentication failed` |
 | ManageSieve | `NO "Authentication failed"` |
 
-A login that cannot be checked because of a database error, a timeout or a cancellation (for
-example because the server is shutting down) gets a temporary failure instead and is not recorded
-as a failure: `NO [UNAVAILABLE] ...` (IMAP), `-ERR [SYS/TEMP] ...` (POP3) or `NO (TRYLATER) ...`
-(ManageSieve). During a database outage, clients are told to try again later, and once the
-database is back the user logs in normally.
+A login that cannot be checked gets a temporary failure instead and is not recorded as a failure:
+`NO [UNAVAILABLE] ...` (IMAP), `-ERR [SYS/TEMP] ...` (POP3) or `NO (TRYLATER) ...` (ManageSieve).
+This covers a database error, a database that does not answer in time, a stored hash Sora cannot
+check, and a server that is shutting down. During a database outage, clients are told to try again
+later, and once the database is back the user logs in normally. The same holds for master logins
+(section 8).
 
 ### The backend lookup cache
 
@@ -278,9 +299,14 @@ Each backend listener caches recent logins in memory, keyed by the base address.
   and only for the same password. The password is compared through a salted, keyed digest; the
   plaintext password is never stored. Sora still verifies the cached hash. What it saves is the
   database round trip.
-- A different password, or an older entry, goes to the database.
+- An older entry goes to the database. A different password drops the success entry first and then
+  goes to the database. So during a database outage, guesses at the password get a temporary
+  failure; they are never checked against the cached hash, where the rate limiter would not see
+  them.
 - A failure entry never refuses a login. The next attempt is always checked against the database.
   Failure entries hold no password material.
+- The cache serves no logins until the node has read the credential change feed (section 12), and
+  an account's entries are dropped when its password, credentials or status change.
 
 Settings are in `[server.lookup_cache]` inside the server block:
 
@@ -314,7 +340,12 @@ ManageSieve proxies follow the same plan):
 5. A name with the proxy's `master_username` as suffix is checked against the proxy's
    `master_password` here (section 8).
 6. With remote lookup configured, the lookup service authenticates and routes the user
-   ([PROXY.md](PROXY.md#4-remote-lookup)).
+   ([PROXY.md](PROXY.md#4-remote-lookup)). As on a backend, only a real verdict is a failed
+   login: a `401` or `403` refuses the account, and a wrong password against the hash the service
+   returned is a wrong password. An answer that says nothing about the password (the service
+   down, a `5xx`, `408`, `429` or other `4xx`, a `200` that is not a valid answer, or a returned
+   hash Sora cannot check) gives the client a temporary failure and is not counted. The status
+   codes are listed in [PROXY.md](PROXY.md#43-status-codes).
 7. Otherwise, or when the lookup says the user is not found and `lookup_local_users = true`, the
    proxy checks PostgreSQL. With `[auth_cache]` on, it tries the local SQLite cache first
    ([PROXY.md](PROXY.md#11-auth-cache)). On success it may rehash (section 5).
@@ -332,7 +363,9 @@ What a client cannot do through a proxy:
   resolved to, such as the master username form's target) and refuse any other once the password
   checked out, with the backends' replies (section 8.2): `NO [AUTHORIZATIONFAILED] Proxy login not
   permitted for this user.` (IMAP), `NO "Proxy authentication requires master credentials"`
-  (ManageSieve). The POP3 proxy refuses an `AUTH PLAIN` whose authorization identity differs from
+  (ManageSieve). Such a refusal is not a successful login: it does not clear the rate limiter's
+  failure counts, is not counted as a success in the metrics, and leaves the connection
+  unauthenticated. The POP3 proxy refuses an `AUTH PLAIN` whose authorization identity differs from
   the authentication identity, with
   `-ERR [AUTH] Authorization identity not supported on proxy (configure master SASL on backend)`.
 - Use master SASL credentials. Those are for the proxy's own login to backends.
@@ -377,6 +410,8 @@ a1 LOGIN user@example.com@support a-long-random-secret
   address before the suffix and refuses an authorization identity naming anybody else (section 7).
 - The target must be an active account. A target that is not a valid address, or a target account
   that does not exist, gets the protocol's bad-credentials reply and is counted as a failed login.
+  If the database cannot be asked about the target, the login gets a temporary failure and is not
+  counted.
 - Any other password is not a master login. The name is then handled like a name with any other
   suffix (section 3): the user's own password logs in as the user, and anything else gets the
   bad-credentials reply. The failure is counted under the master credential's key, the success
@@ -409,21 +444,26 @@ AUTHENTICATE PLAIN base64("user@example.com" NUL "proxyuser" NUL "proxy-secret")
 
 ### 8.3 `master_sasl_allowed_networks`
 
-A list of IPs or CIDRs, per backend `[[server]]` block. When it is set, master SASL logins are
-accepted only from those source addresses. The check uses the real TCP peer, which a PROXY header,
-XCLIENT or IMAP ID forwarding cannot change. So list the proxy hosts, not client networks.
+A list of IPs or CIDRs, per backend `[[server]]` block (`imap`, `pop3`, `managesieve`). When it is
+set, master logins of **both** kinds are accepted only from those source addresses: master SASL
+(8.2) and the master username form (8.1). Both let one secret log in as anyone, so one list confines
+both. The check uses the real TCP peer, which a PROXY header, XCLIENT or IMAP ID forwarding cannot
+change. So list the proxy hosts, not client networks.
 
 ```toml
 master_sasl_allowed_networks = ["10.20.0.5", "10.20.0.6"]
 ```
 
-- Empty (the default): master SASL is accepted from any source. If master SASL is configured without
-  this list, the backend logs a warning at startup, for example `IMAP: master SASL enabled without
-  master_sasl_allowed_networks; backend trusts any source that knows the secret. ...`
+- Empty (the default): master logins are accepted from any source. If master SASL is configured
+  without this list, the backend logs a warning at startup, for example `IMAP: master SASL enabled
+  without master_sasl_allowed_networks; backend trusts any source that knows the secret. ...`
 - An entry that is not an IP or CIDR is refused: startup stops, `sora-admin config validate` fails
   the file, and a SIGHUP reload skips that server's block, which keeps its previous settings.
-- A login with correct master SASL credentials from another address gets the bad-credentials reply
-  and logs `master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting`.
+- A login with a correct master secret from another address gets the bad-credentials reply, is
+  counted as a failed login, and logs, for example, `master SASL credentials valid but source not in
+  master_sasl_allowed_networks; rejecting` (or `master username credentials valid ...`).
+- The proxies do not read this key. A proxy checks the master username form itself (section 7), so
+  restrict who can reach a proxy that has `master_username` set, or leave that key unset on proxies.
 
 ### 8.4 Rules common to both
 
@@ -434,6 +474,12 @@ master_sasl_allowed_networks = ["10.20.0.5", "10.20.0.6"]
 - Secrets are compared in constant time.
 - Every failure reply looks like a wrong password, so a reply cannot confirm a guessed master
   username or password. The real reason is logged at WARN.
+- Every refusal also takes as long as a wrong password. A wrong master password is checked as the
+  base address's own login, so it costs one password check like any other wrong password. A correct
+  master secret that is then refused (a source outside `master_sasl_allowed_networks`, a target that
+  does not parse, a target with no account) is checked the same way before the refusal, so it costs
+  the same. The response time therefore cannot confirm a guessed master username or password
+  either.
 - Rate limiting counts master attempts under the master credential's own key, never under the
   account they name (section 10.2). A wrong master password therefore cannot lock out the user it
   names, and each source IP gets the normal number of guesses at the master password.
@@ -461,6 +507,10 @@ No other SASL mechanism is offered (no `LOGIN`, `CRAM-MD5`, `SCRAM-*`, `XOAUTH2`
 Because PLAIN carries the password in clear, Sora refuses these commands on an unencrypted
 connection unless plaintext logins are allowed on that listener
 ([SECURITY.md](SECURITY.md#2-tls-and-plaintext-logins)).
+
+On the IMAP backend, `AUTH=PLAIN` cannot be removed with `disabled_caps` or a `client_filters` entry.
+Sora logs a warning for such an entry and keeps advertising the mechanism wherever logins are
+allowed.
 
 On the POP3 backend, `USER` and `PASS` arguments wrapped in double quotes are unquoted.
 
@@ -690,9 +740,10 @@ sora-admin --config config.toml stats blocked --protocol imap_proxy
 This asks the Admin API at `[admin_cli] addr` (`GET /admin/auth/blocked`, optionally
 `?protocol=...`), so it shows the blocks of that one node. Protocol names are `imap`, `pop3`,
 `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `userapi` and `userapi_proxy`. Each
-entry has the IP, the name for a Tier 1 block, `blocked_until`, the failure count, the first and last failure and the
-type (`ip_username` or `ip`). There is no command to lift a block early; a restart of the node clears
-them all. See [ADMIN_API.md](ADMIN_API.md#16-authentication-statistics).
+entry has the IP, the name for a Tier 1 block, `blocked_until`, the failure count, the first and
+last failure and the type (`ip_username` or `ip`). A Tier 2 block that several listeners of one
+protocol share (section 10.8) is listed once. There is no command to lift a block early; a restart
+of the node clears them all. See [ADMIN_API.md](ADMIN_API.md#16-authentication-statistics).
 
 ---
 
@@ -704,16 +755,18 @@ empty by default. Its full effect is described in
 ways:
 
 - **The client IP.** A host in the list may pass on the client's address with a PROXY header (on a
-  listener with `proxy_protocol = true`), with IMAP ID forwarding parameters, or with POP3 XCLIENT.
-  Logs use that forwarded address. Authentication rate-limit checks and counters do too, but POP3
-  `XCLIENT` needs `FORWARD` metadata containing `proxy-source-ip` when no client address came from
-  a PROXY header. Sora's POP3 proxy sends it; bare `ADDR` changes the logged address while those
-  checks and counters still use the TCP peer. From a host not in the list, ID and XCLIENT
-  forwarding are ignored or refused and the TCP peer is the client, and a
-  `proxy_protocol = true` listener closes the connection. Behind a PROXY header, ID and POP3
-  XCLIENT forwarding are judged by the client the header names, so a client behind a trusted load
-  balancer cannot forward another address unless its own address is in the list
-  ([SECURITY.md](SECURITY.md#31-trusted_networks)).
+  listener with `proxy_protocol = true`), with IMAP ID forwarding parameters, or with POP3
+  `XCLIENT`. Logs and the rate limiter then use that forwarded address. From a host not in the
+  list, ID forwarding is ignored, `XCLIENT` is refused, and the TCP peer is the client; a
+  `proxy_protocol = true` listener closes the connection.
+- **Behind a PROXY header**, the client the header names is the one judged: a client behind a
+  trusted load balancer cannot replace its address with ID or `XCLIENT` unless its own address is
+  in the list ([SECURITY.md](SECURITY.md#31-trusted_networks)).
+- **POP3 `XCLIENT` and the rate limiter.** The rate limiter's checks and counters use an
+  `XCLIENT` `ADDR` only when the `XCLIENT` also carries the `proxy-source-ip` variable in its
+  `FORWARD` parameter, or when a PROXY header came first. Sora's POP3 proxy always sends
+  `proxy-source-ip`. A bare `ADDR` from another forwarder changes the logged address, but the rate
+  limiter keeps counting the TCP peer.
 - **Rate-limit exemption.** Unless `exempt_networks` is set, addresses in the list are exempt from
   rate limiting (section 10.5).
 
@@ -723,41 +776,94 @@ The master SASL gate (`master_sasl_allowed_networks`) is separate and always use
 
 ## 12. Cached logins and password changes
 
-Backend and proxy lookup caches keep recent verdicts in memory; `[auth_cache]` can also retain
-successful PostgreSQL checks in SQLite across restarts. On nodes with database access, migration 69
-records password changes, credential removals and accounts taken out of service. Each node reads
-this feed from the primary, normally every five seconds, and invalidates affected cache entries.
-The cursor follows the primary snapshot's safe transaction horizon: an arbitrarily late commit
-cannot fall behind it because of its trigger timestamp. It advances only after the local sinks
-and synchronization callback succeed. Administrative gossip can deliver changes sooner.
+Sora keeps recent logins in three kinds of cache:
 
-Database-backed caches start suspended, including new listeners introduced by reload. Before the
-persistent cache resumes, its marker must match the primary database UUID and tracking version;
-old untracked rows or rows from another database are flushed atomically. A matching marker allows
-a normal restart to retain warm entries after synchronization. Feed-read or sink failures suspend
-cache hits and fills; authentication then uses primary credential reads. Recovery re-enables the
-caches after successful synchronization. Healthy polling does not flush unaffected warm entries.
+- the **lookup cache** of each backend listener (section 6) and of each proxy listener
+  ([PROXY.md](PROXY.md#10-lookup-cache)), in memory;
+- the **auth cache** (`[auth_cache]`, proxies only), in SQLite, which keeps successful PostgreSQL
+  checks across restarts ([PROXY.md](PROXY.md#11-auth-cache)).
 
-Cache fills carry an invalidation generation captured before their lookup. A lookup racing a
-change can finish its own already-started check, but cannot persist an obsolete verdict after the
-invalidation. A generation fence also closes authenticated mail sessions that register after an
-account-removal notification passed. It is conservative: a concurrent unrelated removal can make
-an in-flight login reconnect. Accounts taken out of service have their local sessions ended on
-each node. After a feed gap of at least seven days, a backwards database clock or cursor rollback,
-account attribution may be incomplete: all local login caches and mail sessions are reset before
-resuming. Entries are retained for pruning from their first observation, not their pre-commit
-trigger time.
+When a password changes, these caches must stop answering with the old one on every node. Sora does
+this with a **credential change feed** in PostgreSQL.
 
-The User API has no login cache. It reads the password hash and credential epoch together from
-the primary, and token refresh reads the epoch from the primary too. A configured User API
-`lookup_cache` is ignored and warned about. Existing access tokens retain their normal JWT expiry
-rules; this feed is not a per-request JWT revocation service.
+### 12.1 The credential change feed
 
-Upgrade every cache-serving node before relying on this behavior. Nodes without database access
-and credentials owned by an external remote-lookup service still follow that service's cache and
-invalidation policy ([PROXY.md](PROXY.md#10-lookup-cache)). After restoring PostgreSQL to an older
-state, clear its associated persistent auth caches before admitting logins; preserving a logical
-database UUID does not prove that a restored database contains the cache's newer credential state.
+The table `credential_changes` (migration 69) gets a row, from database triggers, whenever:
+
+- a credential's password, address or account changes;
+- a credential is removed (also by an account purge);
+- an account is taken out of service (soft-deleted or marked for purging), or deleted.
+
+The triggers fire for every change, whether it was made by `sora-admin`, the Admin API, the User API
+or SQL run by hand, and they are part of the same transaction.
+
+Every node with database access reads the feed from the primary database every **5 seconds**, and
+at once when a listener starts. For each changed account it then:
+
+1. drops the account's entries from every lookup cache on the node, and from the node's auth cache;
+2. if the account was taken out of service or deleted, ends the account's mail sessions on the node.
+   A password change alone does not end open sessions.
+
+The node remembers how far it has read only after all of this has succeeded. If any step fails, it
+reads the same changes again at the next poll. A change committed late, by a long transaction, is
+not skipped: the read position follows the database's transaction IDs, not the time of the change.
+
+A kick or an account change through the Admin API also reaches the other nodes through the cluster,
+which can be sooner than the next poll ([CLUSTER.md](CLUSTER.md)).
+
+Rows are kept for **7 days** after a node first saw them, then deleted. The auth cache's `max_age`
+is capped at those 7 days, so no cached login can be older than the feed that would cancel it.
+
+### 12.2 When caches are not used
+
+A cache that might hold a cancelled login answers nothing. Logins are then checked against the
+database, so they still work, just without the cache's speed-up. This is the case:
+
+- **At startup**, and for a listener added by a reload, until the node has read the feed once.
+- **After a failed read** of the feed, or a failed step, until a later read succeeds. Sora logs
+  `Credential changes: initial synchronization failed; ...` when the read at startup fails.
+- **For the auth cache, until it is bound to the database.** The SQLite file records which database
+  (by its UUID) and which feed version its entries came from. If either does not match, for example
+  a file copied from another installation or one written before the feed existed, its entries are
+  deleted before use. A file that matches keeps its entries across a normal restart.
+
+A normal poll drops only the entries of changed accounts. The rest of the cache stays warm.
+
+**After a long gap.** If a node could not read the feed for 7 days or more, or the database clock or
+the feed's position went backwards, the node can no longer tell which accounts changed. It then
+empties all its login caches and ends all its mail sessions before it uses the caches again.
+
+### 12.3 Logins that race a change
+
+A login that started before a change and finishes after it cannot put the old verdict back into a
+cache: each cache entry carries a counter taken before its lookup, and an entry whose counter is
+older than the last change is not stored.
+
+A login that is checked just before its account is taken out of service (or kicked), and opens its
+session just after, is disconnected at once. To keep this cheap, Sora keeps one counter per group of
+accounts (1024 groups, by account ID), not one per account. A login of another account in the same
+group, made in that same moment, can be disconnected too and must reconnect. Sessions that are
+already open are never affected by another account's change.
+
+### 12.4 The User API, remote lookup, and restores
+
+- **User API.** The User API has no login cache. A login reads the address the same way as the
+  mail protocols (lower case, internationalised domain converted to its ASCII form; a name that does
+  not parse, or has a suffix, is a failed login answered with 401). It then reads the password hash
+  and the credential's version from the primary database. A token refresh checks the credential
+  there too, and is refused when the account is gone, when the address now belongs to another
+  account, when the password changed after the token was issued, or when the token carries no
+  credential version. An access token stays valid until it expires: the feed does not cancel tokens
+  already issued ([USER_API.md](USER_API.md)). A `lookup_cache` table on an `http_user_api` block is
+  ignored with a warning.
+- **Remote lookup.** Credentials that a remote lookup service owns are not in PostgreSQL, so the feed
+  knows nothing of them. Their cache follows the lookup cache's own lifetimes
+  ([PROXY.md](PROXY.md#10-lookup-cache)). Nodes without database access read no feed.
+- **Restoring PostgreSQL** to an earlier state keeps the database UUID, so the auth cache would trust
+  entries newer than the restored data. Delete the auth cache file on every proxy node before you let
+  logins in again.
+- **Upgrades.** Only nodes that run a Sora version with the feed drop cancelled logins. Upgrade every
+  node that caches logins.
 
 ---
 
@@ -779,6 +885,8 @@ Log lines (INFO unless noted), with the session's fields:
 | `Auth rate limiter stats` | Every 10th cleanup: table sizes and caps. |
 | `Rehash: Successfully rehashed and updated password` | Section 5. |
 | `Slow password verification` | A hash check took more than 100 ms. bcrypt at the default cost often takes about that long, so expect this line. A wrong password takes about that long whatever the scheme (section 6). |
+| ERROR `Password hash cannot be verified` | A stored hash is not one Sora can check (section 4). The `type` and `error` fields say why; the value itself is never logged. Fix the credential with a new password. |
+| WARN `Credential changes: initial synchronization failed; ...` | The node could not read the credential change feed at startup. Its login caches stay off until a read succeeds (section 12.2). |
 | WARN `master username authentication failed (invalid master password)` | Section 8. |
 | WARN `master SASL credentials valid but source not in master_sasl_allowed_networks; rejecting` | Section 8.3. |
 
@@ -787,7 +895,8 @@ Metrics (see [METRICS.md](METRICS.md)):
 | Metric | Labels | Meaning |
 |---|---|---|
 | `sora_authentication_attempts_total` | `protocol`, `server_name`, `hostname`, `result` | Logins by result (`success`, `failure`, and on some listeners `rate_limited` or `unavailable`). |
-| `sora_password_verification_attempts_total` | `hash_type`, `result` | Hash checks by scheme (`bcrypt`, `blf_crypt`, `ssha512`, `sha512`, `unknown`) and result. |
+| `sora_password_verification_attempts_total` | `hash_type`, `result` | Hash checks by scheme (`bcrypt`, `blf_crypt`, `crypt`, `ssha512`, `sha512`, `unknown`) and result. |
+| `sora_password_dummy_verifications_total` | none | bcrypt checks against the dummy hash, run for failed logins that have no stored hash to check (an unknown address), so that they cost what a wrong password costs. |
 | `sora_auth_rate_limiter_ip_username_entries` | `protocol`, `server_name`, `hostname` | Tier 1 table size. |
 | `sora_auth_rate_limiter_ip_entries` | same | Tier 2 table size. |
 | `sora_auth_rate_limiter_username_entries` | same | Statistics table size. |
@@ -816,4 +925,7 @@ Per-address detail is in the logs and, for blocks, in `GET /admin/auth/blocked` 
 | [server/auth_rate_limit_key.go](../server/auth_rate_limit_key.go) | The rate-limit key, including the master keys. |
 | [server/auth_delay_helper.go](../server/auth_delay_helper.go) | Progressive delays and the per-IP limit on waiting logins. |
 | [server/master_sasl_gate.go](../server/master_sasl_gate.go) | `master_sasl_allowed_networks`. |
+| [db/password_hash.go](../db/password_hash.go) | Parsing stored hashes: schemes, encodings, the check of a supplied hash. |
+| [db/migrations/000069_credential_changes.up.sql](../db/migrations/000069_credential_changes.up.sql) | The credential change feed and its triggers. |
+| [server/credchanges/watcher.go](../server/credchanges/watcher.go), [cmd/sora/credential_changes.go](../cmd/sora/credential_changes.go) | Reading the feed, dropping cached logins, suspending the caches. |
 | [config/config.go](../config/config.go) | `AuthRateLimiterConfig`, its defaults and the merge of defaults; `GetBcryptCost`; master credential validation. |

@@ -3,8 +3,8 @@
 This is the operator's runbook for Sora. It covers how the `sora` process starts, what it checks
 before it serves anyone, the signals it handles and what a reload changes, how it shuts down, what a
 restart loses, every file it writes on local disk, logging and log rotation, the service files in
-`dist/`, database migrations, upgrades and mixed-version windows, backups, and the network
-connections a host must allow.
+`dist/`, database migrations, upgrades and mixed-version windows, backups, the network
+connections a host must allow, and how to enable message-body deletion.
 
 It is written for people who run Sora. You should know Linux, PostgreSQL and mail in general; you do
 not need to know Sora's code. Where a detail lives in another reference document, this one links to
@@ -30,6 +30,7 @@ proxies and backend maintenance, [METRICS.md](METRICS.md) for monitoring, and
 13. [Backups and restores](#13-backups-and-restores)
 14. [Network: listeners and outbound connections](#14-network-listeners-and-outbound-connections)
 15. [Common questions](#15-common-questions)
+16. [Message-body deletion](#16-message-body-deletion)
 
 ---
 
@@ -89,6 +90,8 @@ Sora starts in this order. A failure in any step ends the process with status 1,
    here and Sora writes them to standard error.
 3. **Validation.** In this order:
    - Unknown names in `[sieve] enabled_extensions` are a warning.
+   - A `[[server]]` block with `enabled = false` is left out of everything that follows. Sora
+     logs `Server block has enabled = false - not starting it` for it.
    - Each `[[server]]` block is validated: a `type`, `name` and `addr`, a known `type`, and no
      `master_username` or `master_sasl_username` with an empty password.
    - `[[pool]]` blocks are validated against the proxies that use them ([PROXY.md](PROXY.md)).
@@ -122,9 +125,9 @@ Sora starts in this order. A failure in any step ends the process with status 1,
       checks passwords in the database (no remote lookup, or
       `[server.remote_lookup] lookup_local_users = true`). Step 3 has checked that what it needs is
       configured. A node with an `imap`, `pop3` or `lmtp` server and the default `[uploader] path`
-      then checks that the old default spool, `/tmp/sora/uploads`, holds no staged body
-      in its filesystem namespace. Migrate the host's old spool before first starting the new
-      `PrivateTmp` unit ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)).
+      then checks that the old default spool, `/tmp/sora/uploads`, as this process sees it,
+      holds no staged body. A unit with a private `/tmp` cannot see the host's old spool, so
+      drain or move it before you first start such a unit ([Moving off the old `/tmp/sora` defaults](#moving-off-the-old-tmpsora-defaults)).
    3. **S3**, when needed: the client is set up with `[s3] endpoint` and `bucket`. Without
       `access_key` and `secret_key` the AWS default credential chain must supply them. Sora does not
       contact S3 here and does not create the bucket. With `[s3] encrypt = true` the encryption key
@@ -140,17 +143,19 @@ Sora starts in this order. A failure in any step ends the process with status 1,
       **purge worker** and the **uploader** start.
    7. The **relay queue** and its worker start, if `[relay] type` is set. A type other than `smtp`
       or `http` stops startup with `unsupported [relay] type`.
-   8. The **cluster** joins, if `[cluster] enabled = true`, and with it the affinity manager (with
-      `[cluster.affinity] enabled = true`) and its optional SQLite file.
+   8. The **cluster**, if `[cluster] enabled = true`. With `[cluster.affinity] cache_path` set,
+      the affinity cache file opens first, so affinity news that arrives right after the join is
+      stored. Then the node joins the cluster, and the affinity manager starts (unless
+      `[cluster.affinity] enabled = false`).
    9. The **TLS manager** starts, if `[tls] enabled = true`: it loads certificate files, or sets up
       Let's Encrypt ([TLS.md](TLS.md)).
    10. Health checks, the metrics collector and the spam-training client start.
-10. **SIGHUP** reloads the config from this point. An earlier SIGHUP does not end the process,
-    and the log file can be reopened at any time.
-11. **Listeners.** Backend maintenance is loaded (on nodes with proxies and a database), the
+10. **Listeners.** Backend maintenance is loaded (on nodes with proxies and a database), the
     HTTP-01 listener on port 80 starts (Let's Encrypt only), and every `[[server]]` starts. Each logs
     a line when it listens, for example `IMAP server listening with TLS name=imaps addr=:993` or
     `lmtp server listening name=lmtp addr=127.0.0.1:24 tls=false`.
+11. **Config reload on SIGHUP** starts once every server that takes a reload has registered
+    for it ([SIGHUP](#sighup)). A SIGHUP that came earlier is held and reloads the config now.
 
 A listener that fails to start (for example, the address is already in use) ends the whole process
 with status 1. It does not leave the other listeners running.
@@ -193,7 +198,7 @@ show nothing on standard error: look in the log file or in syslog.
 | `Fatal error` with operation `initialize resilient database` | No write host reachable, or migrations failed. The line before it says why. | See [Database migrations](#10-database-migrations) and [DATABASE.md](DATABASE.md). |
 | `Fatal error` with operation `initialize cache` | `[local_cache] path` cannot be created. | Fix the path or its permissions. |
 | `Fatal error` with operation `create upload worker` | `[uploader] path` cannot be created. | Fix the path or its permissions. |
-| `Invalid configuration` with field `uploader path` and `the previous default [uploader] path, still holds staged bodies` | `[uploader] path` is the default, and the process can see staged bodies in the old `/tmp/sora/uploads` (step 9.2). A private `/tmp` can hide the host's old spool. | Drain or migrate the old spool before changing the unit ([What a restart loses and keeps](#5-what-a-restart-loses-and-keeps)). |
+| `Invalid configuration` with field `uploader path` and `the previous default [uploader] path, still holds staged bodies` | `[uploader] path` is the default, and the process can see staged bodies in the old `/tmp/sora/uploads` (step 9.2). A private `/tmp` can hide the host's old spool. | Drain or migrate the old spool before changing the unit ([Moving off the old `/tmp/sora` defaults](#moving-off-the-old-tmpsora-defaults)). |
 | `Fatal error` with operation `initialize TLS manager` | Certificate files unreadable, or a Let's Encrypt setting is missing. | See [TLS.md](TLS.md). |
 | `Fatal error` with operation `server operation` | A listener could not start or failed later, for example `address already in use`. | Free the port, or check privileges for ports below 1024. |
 
@@ -247,9 +252,13 @@ Sora handles SIGINT, SIGTERM and SIGHUP.
 | Signal | Handled from | Effect |
 |---|---|---|
 | SIGINT, SIGTERM | Step 8 of [Startup](#startup-order) | Graceful shutdown. |
-| SIGHUP | Step 10 of [Startup](#startup-order), after all services are up | Reopen the log file, then reload the config. |
+| SIGHUP | The very start, before the flags are read | Reopen the log file, then reload the config. |
 
-Before step 10, a SIGHUP does not end the process, and the log file can be reopened at any time.
+Startup can take minutes (migrations, waiting for another node's migrations, joining a cluster).
+A SIGHUP in that time never ends the process. Sora reopens the log file at once and logs
+`SIGHUP received during start-up - log file reopened; the configuration is reloaded once the
+servers have started`. It holds the config reload until step 11 of [Startup](#startup-order) and
+then reloads once, however many SIGHUPs came.
 
 ### SIGHUP
 
@@ -273,11 +282,15 @@ For each `[[server]]` that is running, Sora looks up the block with the same `na
 
 - If the new block fails validation (for example a master user without a password), Sora logs
   `Skipping reload: invalid new server config` and that server keeps its settings.
+- If two blocks in the new file share that name, Sora logs `Skipping reload: duplicate server
+  name in config; a restart will refuse to start with it` and the server keeps its settings.
+- If the new block has a different `type`, Sora logs `Config reload: server type changed;
+  keeping running server until restart` and applies nothing to it.
 - Otherwise the server applies the settings in the table below. It logs `<Protocol> config reloaded`
   with the list of what changed, for example `IMAP config reloaded name=imaps updated=[command_timeout]`.
 - Every other setting that differs from the file the process **started** with is listed in
   `Config reload: server settings changed but require restart to take effect` with the server name
-  and the changed keys.
+  and the changed keys in `fields`.
 
 New settings reach connections, logins and requests that start after the reload. Sessions that are
 already open keep the settings they started with.
@@ -295,32 +308,34 @@ already open keep the settings they started with.
 | `http_admin_api` | `api_key`, `read_only_api_key`, `allowed_hosts` |
 | `http_user_api` | `jwt_secret`, `allowed_origins`, `allowed_hosts` |
 | `user_api_proxy` | `jwt_secret`, `allowed_origins` |
-| `metrics` | nothing; changes are not reported either |
+| `metrics` | nothing; every change is listed as needing a restart |
 
 The list lives in `reloadableServerSettings` in
 [cmd/sora/server_reload.go](../cmd/sora/server_reload.go). The admin API refuses a new `api_key`
 shorter than 16 characters or equal to the placeholder from `config.toml.example`; it then keeps the
 old key and Sora logs `Failed to reload server config`.
 
-A reload never starts or stops a listener, and Sora reports added and removed blocks:
+A reload never starts or stops a listener. Sora reports added and removed blocks:
 
-- A `[[server]]` block added to the file is not started.
-- A block removed from the file keeps running.
+- A valid `[[server]]` block added to the file, or switched to `enabled = true`, is not started:
+  `Config reload: server added or enabled but not running; it is not started until restart`.
+- A block removed from the file, or set to `enabled = false`, keeps running:
+  `Config reload: server removed or set to enabled = false, but it keeps running until a restart`.
 - A block whose `name` changed counts as both: the old one keeps running, the new one does not start.
 
-Outside the `[[server]]` blocks, nothing is applied by a reload. Sora reports every section that
-changed, each with a line `Config reload: <section> changed but requires restart to take effect`:
+Outside the `[[server]]` blocks, a reload applies nothing. Sora compares every global setting
+with the file it started with and logs one line,
+`Config reload: global settings changed but require restart to take effect`, whose `fields`
+names each changed setting as a dotted TOML key, for example `logging.level`,
+`relay.smtp_host` or `cleanup.grace_period`. A top-level key and the `[[pool]]` blocks count as
+one setting each (`bcrypt_cost`, `pool`). Only names are logged, never values, because values
+include passwords. `[admin_cli]` is left out: it belongs to `sora-admin`, which reads the file on
+every run.
 
-- `[logging]` (`level`, `output` and `format`)
-- `[cleanup]`
-- `[shared_mailboxes]`
-- `[sieve]`
-- `[backend_maintenance]`
-- `[metadata]`
-- `[servers] trusted_networks` (logged as a warning: until a restart, the networks Sora started with
-  stay trusted and added ones are not)
-- `[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[relay]`, `[cluster]`, `[tls]`,
-  `[auth_cache]`, `[[pool]]`, `[spam_training]`, `[timeout_scheduler]` and `bcrypt_cost`
+A change to `[servers] trusted_networks` also logs a warning,
+`Config reload: servers.trusted_networks changed but requires restart to take effect`, with the
+old and new lists: until a restart, the networks Sora started with stay trusted and added ones are
+not.
 
 Sora also checks the new file as startup does (the checks `sora-admin config validate` runs) and logs
 an error for each problem it finds, `Config reload: <section> is invalid and the server will not
@@ -332,7 +347,7 @@ per-server `tls_cert_file`/`tls_key_file`) are read once, at startup, so a renew
 a restart. Certificates from Let's Encrypt renew inside the running process
 ([TLS.md](TLS.md)).
 
-The "requires restart" lines compare with the config the process started with. They repeat on every
+The "restart to take effect" lines compare with the config the process started with. They repeat on every
 later SIGHUP until you restart.
 
 ### SIGINT and SIGTERM
@@ -356,12 +371,14 @@ The first SIGINT or SIGTERM starts a graceful shutdown. Sora logs
    or `Server shutdown timeout reached after 10 seconds`.
 3. Sora logs `Waiting for active connections to finish` and waits a fixed **3 seconds**, then logs
    `Shutdown grace period complete - releasing database resources`.
-4. Background workers stop, in this order: relay worker, uploader, FTS worker, purge worker, cleaner,
-   metrics collector, health checks. Each logs a line such as `Uploader: worker stopped`. Uploads in
-   flight are abandoned; they stay queued and run again after the restart.
+4. Background workers stop, in this order: spam-training client, relay worker, uploader, FTS
+   worker, purge worker, cleaner, metrics collector, health checks. Each logs a line such as
+   `Uploader: worker stopped`. Uploads in flight are abandoned; they stay queued and run again
+   after the restart. Spam-training jobs still queued are dropped.
 5. The node leaves the cluster, if there is one (it waits up to 5 seconds for the other nodes to
    hear it). Then the local cache, the affinity manager, the auth cache and the database pools close.
-6. Sora exits with status 0.
+6. With `[logging] output` set to a file, Sora logs `Closing log file` and closes it.
+7. Sora exits with status 0.
 
 A shutdown usually takes between 3 and 15 seconds, plus up to 5 seconds to leave a cluster. The
 workers in step 4 have no time limit of their own; they end quickly because every worker is told to
@@ -418,38 +435,55 @@ Sora runs as, on a disk that survives reboots, or set the paths elsewhere
 ([What Sora writes to local disk](#6-what-sora-writes-to-local-disk)). Never put `[uploader] path`
 on `tmpfs` or under a `/tmp` that is cleared at boot.
 
-Earlier releases defaulted all three paths to `/tmp/sora`. Nothing defaults to it any more. At
-storage startup Sora checks the old spool in its filesystem namespace: a node with an `imap`, `pop3` or `lmtp` server whose
-`[uploader] path` is the default refuses to start while `/tmp/sora/uploads` still holds staged
-bodies, because the new default would never upload them. It logs `Invalid configuration` for the
-field `uploader path`, with an error that begins
-`/tmp/sora/uploads, the previous default [uploader] path, still holds staged bodies` and names one
-of them, and exits with status 1. Either set `[uploader] path = "/tmp/sora/uploads"` until
-`sora-admin uploader status` shows nothing pending and then remove it, or stop Sora and move that
-directory to `/var/spool/sora/uploads`. `sora-admin uploader resolve` refuses to run in the same
-case. At startup only entries of the user Sora runs as, or of root, count: any local user can
-write to `/tmp`, so an entry there that belongs to another user, or that Sora cannot read, is
-logged as a warning (`Uploader: ignoring an entry under the previous default [uploader] path ...`)
-and passed over with everything below it, as is the whole old spool when `/tmp/sora` is a link
-of another user. `resolve`, often run as root, cannot tell which user the server runs as: it
-counts every entry and refuses when it cannot read one. Neither counts a file at
-`/tmp/sora/uploads` itself: bodies were staged in directories below it.
+### Moving off the old `/tmp/sora` defaults
 
-The startup check assumes the service user is unchanged from the version that staged those
-bodies. Changing that user in the same upgrade, or leaving genuine old bodies unreadable, can
-make startup pass over bodies the database still needs. Inspect and drain or migrate those
-bodies before starting on the new path. File ownership does not establish that a spool belongs
-to the connected database; use the matching instance and configuration.
+Earlier releases put the spool, the local cache and the auth cache under `/tmp/sora`. Nothing
+defaults to it any more. Bodies still staged in the old spool, `/tmp/sora/uploads`, are the only
+copy of those messages, and a node on the new default path would never upload them.
 
-Check the host's old spool before the first start with the new systemd unit. Its
+So Sora checks for them. A node with an `imap`, `pop3` or `lmtp` server whose `[uploader] path`
+is the default refuses to start while `/tmp/sora/uploads` holds staged bodies. It logs
+`Invalid configuration` for the field `uploader path`, with an error that begins
+`/tmp/sora/uploads, the previous default [uploader] path, still holds staged bodies` and names
+one of them, and exits with status 1. `sora-admin uploader resolve` refuses to run in the same
+case.
+
+To move a node off the old spool, do one of these before you upgrade it:
+
+- **Drain it in place.** Set `[uploader] path = "/tmp/sora/uploads"` explicitly, upgrade, wait
+  until `sora-admin uploader status` shows nothing pending for the node, then remove the setting
+  and restart.
+- **Move it.** Stop Sora, move `/tmp/sora/uploads` to `/var/spool/sora/uploads` (owned by the user
+  Sora runs as), then start the new version.
+
+If you also install the new systemd unit, its
 [`PrivateTmp=true`](https://www.freedesktop.org/software/systemd/man/latest/systemd.exec.html#PrivateTmp=)
-gives Sora a different `/tmp`, so the startup check cannot see the host's
-`/tmp/sora/uploads`. Drain that spool using the old service and configuration before replacing
-the unit, or stop the old service and move the preserved host spool to the durable path before
-starting the new one. Merely setting the old path in the new private namespace does not expose
-the host's files. Never configure the upload spool under the unit's private `/tmp`: systemd
-removes that temporary directory when the service stops. If the old service itself stored bodies
-in a private `/tmp`, drain its uploads before stopping it.
+gives Sora a private `/tmp`. Sora then cannot see the host's `/tmp/sora/uploads` at all, so the
+check above cannot protect you, and setting the old path inside the private `/tmp` does not
+reach the host's files either. In that case:
+
+1. Drain the old spool with the old unit and old config, or stop the old service and move the
+   host's `/tmp/sora/uploads` to `/var/spool/sora/uploads`.
+2. Only then install the new unit and start Sora.
+
+If the old service already ran with a private `/tmp` and kept its spool there, drain its uploads
+before you stop it: systemd deletes a private `/tmp` when the service stops. For the same reason,
+never set `[uploader] path` under `/tmp` with the new unit.
+
+What the check counts:
+
+- At startup, only entries owned by the user Sora runs as, or by root. Anyone can write to
+  `/tmp`, so an entry of another user, or one Sora cannot read, is logged as a warning
+  (`Uploader: ignoring an entry under the previous default [uploader] path ...`) and skipped
+  with everything below it. The whole old spool is skipped when `/tmp/sora` is a link owned by
+  another user.
+- `sora-admin uploader resolve`, often run as root, cannot tell which user the server runs as. It
+  counts every entry and refuses when it cannot read one.
+- Neither counts a plain file at `/tmp/sora/uploads` itself; bodies were staged in directories
+  below it.
+
+Because the check relies on file ownership, change the user Sora runs as in a separate step,
+after the old spool is drained. Otherwise startup can skip bodies the database still needs.
 
 An older release that defaults `[uploader] path` to `/tmp/sora/uploads` has no such check and does
 not look in `/var/spool/sora/uploads`: before rolling back to one, set the path explicitly
@@ -671,10 +705,21 @@ Before it starts Sora, it creates `sora_logdir`, `sora_spooldir`, `sora_cachedir
 `sora_statedir` (mode 0750, owned by the user). The default paths are under them.
 `service sora reload` sends SIGHUP.
 
-The script runs Sora under `daemon(8)`, which detaches it and writes the pid file
-`/var/run/sora.pid`. `service sora start` returns once Sora is running, `status` reports its PID,
-`stop` stops it and `reload` sends it SIGHUP. Set `[logging] output` to a file such as
-`/var/log/sora/sora.log`; newsyslog uses the pid file to send SIGHUP after rotating the log.
+The script runs Sora under `daemon(8)`, as `sora_user`. `daemon` detaches Sora, writes Sora's PID
+to `/var/run/sora.pid` and its own PID to `/var/run/sora_daemon.pid`, and sends Sora's standard
+output and standard error to `sora_logdir/sora.out`. `service sora start` returns once Sora is
+running, `status` reports its PID, `stop` stops it and `reload` sends it SIGHUP.
+`sora_program` names another binary than `/usr/local/bin/sora`.
+
+Set `[logging] output` to a file such as `/var/log/sora/sora.log`. With the default `stderr`, the
+log goes to `sora.out`. Rotate both with newsyslog: a SIGHUP to `daemon` makes it reopen
+`sora.out`, and a SIGHUP to Sora makes Sora reopen `sora.log`. The lines for
+`/etc/newsyslog.conf.d/sora.conf`:
+
+```
+/var/log/sora/sora.out            600  7  *  @T00  J  /var/run/sora_daemon.pid
+/var/log/sora/sora.log  sora:sora 640  7  *  @T00  J  /var/run/sora.pid
+```
 
 ---
 
@@ -763,6 +808,9 @@ host and port rules as `sora`:
 | `up` | Applies every pending migration. | Yes, per the tool's help |
 | `down [--limit N \| --all]` | Reverts migrations, one by default. | Yes |
 | `force N` | Sets the version to N and clears the dirty flag. Runs no SQL. | Yes |
+
+`migrate down` never reverts the first migration (the initial schema): `--all` stops at
+version 1, and a `--limit` that would go past it is refused.
 
 `sora-admin` does not apply migrations on its own: on a new database, start `sora` once or run
 `migrate up` before other `sora-admin` commands.
@@ -877,8 +925,10 @@ rebuilt and need no backup.
 
 The cleaner deletes a body from S3 only when every message that used it was expunged more than
 `[cleanup] grace_period` ago (default 14 days) ([STORAGE.md](STORAGE.md)). So a database backup that
-is younger than the grace period refers only to bodies that are still in the bucket. Accounts purged
-through the admin API are the exception: their bodies are deleted at once.
+is younger than the grace period refers only to bodies that are still in the bucket. Purged
+accounts are the exception: their bodies are deleted as soon as the purge runs, without a grace
+period. While body deletion is paused, nothing is deleted at all
+([Message-body deletion](#16-message-body-deletion)).
 
 After such a restore:
 
@@ -937,7 +987,7 @@ none of what it shares. See [CLUSTER.md](CLUSTER.md) for what it adds.
 `SORA application starting` line, which has `version`, `commit` and `built`.
 
 **I changed the config and nothing happened.** Most settings need a restart. Check the
-[SIGHUP](#sighup) tables, and look for `requires restart` in the log after the reload.
+[SIGHUP](#sighup) tables, and look for `restart to take effect` in the log after the reload.
 
 **Sora does not start and the journal is empty.** With `[logging] output` set to a file, errors after
 step 6 of [Startup](#startup-order) are in that file.
@@ -950,137 +1000,141 @@ bodies that are not in S3 yet.
 **My certificate was renewed on disk. Do I need a restart?** Yes, for certificate files. Let's
 Encrypt certificates renew inside the process.
 
-
-## Upgrading the S3 message-body lock protocol
-
-Message-body deletion is paused by default. `[s3] body_deletion_protocol` accepts
-`"paused"` (also the default when omitted) or `"global-hash-v1"`. The latter is an
-operator acknowledgment that the following cutover has completed; Sora cannot
-inspect every running binary, external job, or outstanding storage request.
-Unknown values are refused.
-
-The new lock depends on the content hash, independently of account ID. Two accounts
-can reference one physical `domain/localpart/hash` key after address reassignment
-or copying. Equal hashes under different keys also share a lock, conservatively.
-Old binaries lock `(accountID, hash)` and do not honor the new pause setting. Taking
-both an old account lock and the new hash lock in a new process cannot exclude an
-old writer using a different account's lock.
-
-1. Stop scheduling **all old message-body deleters** and wait for their current work
-   to finish: cleaner body/reference retirement, purge workers and direct account or
-   domain purges, `verify s3 --fix-orphaned`, and `import rekey --delete-old-objects`.
-   Stop the jobs/processes themselves; adding this setting does not pause old binaries.
-   Prevent external bucket lifecycle rules or administrative tools from deleting the
-   same body keys during this interval.
-2. Keep deletion paused while upgrading every body claimant and deleter, including
-   backends, upload workers, restore/COPY/MOVE operations, and every Maildir/S3 import
-   or rekey process. Deploy the complete claim/commit and global reference-retirement
-   protocol before enabling deletion; the lock-name change alone is insufficient.
-   Drain old processes and their queued or in-flight storage requests. Outstanding
-   external write capabilities must finish, expire, or be revoked before proceeding.
-3. Confirm that no old participant or operation can resume, then set
-   `body_deletion_protocol = "global-hash-v1"` in every process allowed to retire body
-   references or delete message bodies, and restart those processes. Queued purges and
-   retained cleanup candidates can now resume. Keep the normal grace period and
-   restore policy; this acknowledgment does not shorten either.
-
-Mail delivery, message reads and uploads can remain available while destructive
-cleanup is paused, subject to the deployment's ability to isolate and drain those
-jobs. Storage usage grows during the pause. The switch is a startup configuration,
-not an online cancellation mechanism: changing a file alone does not drain an
-already running operation. When paused, new cleanup workers retain failed-upload,
-account/mailbox and S3 candidate state, purge workers retain queued requests, and
-explicit destructive CLI requests refuse without reporting a successful purge.
-Dry-run verification and rekeying that retains old bodies remain available.
-TLS certificate objects use their separate publication/deletion protocol.
-All accounts sharing physical message-body keys must use the same logical PostgreSQL
-coordination database. Advisory locks do not coordinate independent databases sharing
-the same bucket namespace.
-
-Rollback also requires pausing and draining all message-body deletion first. Do not
-resume old deleters alongside new claimers or resume deletion while old work or
-write capabilities can still arrive. This runbook does not establish storage fencing
-across independent PostgreSQL writers after failover; the deployment must retain its
-existing single-writer/fencing guarantees.
-
-### An uncertain body DELETE stays quarantined
-
-The upgraded cleanup path commits a durable deletion intent (migration 72) before
-sending a message-body DELETE. The intent names the content hash, physical keys,
-and an operation UUID. If its PostgreSQL lock holder dies, a storage request times
-out, or the result/retirement commit is uncertain, the intent remains. New upload
-gates, uploaded-state finalization, COPY/MOVE object admission, restore and the
-exclusive object gate refuse that hash. Other deliveries can still stage it for a
-later upload. Neither an old timestamp, an upload lease expiring, nor a restart
-clears this fence. Cleanup retains its candidate rows when retirement cannot commit
-on the connection that held the reference lock.
-
-Inspect these records without changing anything:
-
-```sh
-sora-admin verify body-deletions
-```
-
-An operator must establish that the earlier storage operations cannot still arrive
-before reconciling one record. Stop/drain or revoke the relevant operations and
-capabilities at the provider as required; a canceled HTTP client or a dead database
-session is not that proof. Then use the exact hash and operation UUID from the
-listing, with the deletion protocol enabled:
-
-```sh
-sora-admin verify body-deletions --reconcile --content-hash HASH --operation-id UUID --storage-drained
-```
-
-Under the global hash lock this command checks current references. Bodies needed by
-references outside the original eligible expunge lifecycle must be present and pass
-their content-hash check; restore missing or corrupt bytes from a trusted copy first.
-Orphan-only keys are deleted before the exact intent is cleared. Missing/corrupt
-protected bytes, a changed UUID, a failed storage request, or a failed commit keeps
-the fence. `--storage-drained` is an explicit manual acknowledgment, not automatic
-detection of outstanding provider operations. Do not erase intent rows or downgrade
-migration 72 while they remain; its down migration refuses unresolved records.
-
-A stalled PUT that loses its pending-upload lease cannot finalize a retired row.
-If the provider accepts that PUT after cleanup has finished, it can leave an orphan
-object for later verification; the protocol does not promise to retract remote PUTs
-or external write capabilities. Retain the single-writer database and operational
-drain requirements above. The complete verify/rekey commit-fencing cohort must be
-deployed before enabling destructive cleanup.
+**S3 keeps growing and expunged mail is never deleted.** Check `[s3] body_deletion_protocol`. Its
+default, `"paused"`, keeps every body. See [Message-body deletion](#16-message-body-deletion).
 
 
-### Uncertain message-body DELETE requests (migration72)
+---
 
-The body deletion protocol commits a durable per-hash operation UUID, physical
-keys and eligible expunge lifecycles before contacting storage. A lost database
-holder, unknown storage result or uncertain retirement commit leaves this intent
-in place. It never expires with upload leases or elapsed time. All upgraded body
-claimers refuse the quarantined hash until reconciliation; staged uploads remain
-available to retry later. Confirmed retirement removes only the original eligible
-row tuples, preserving rows staged or expunged later within their grace period.
+## 16. Message-body deletion
 
-Body cleanup retains its writable lock connection while committing the intent
-on another write-pool connection. A deletion-capable process needs at least two
-available write-pool connections and headroom for other workers. A saturated or
-one-connection pool times out and leaves candidates untouched; this protocol does
-not promise deletion progress at full pool saturation. A local 100-key/2000-row
-SQL probe measured about2x the previous pipeline's time; production costs depend
-on storage latency, pool sizing and workload.
+Sora deletes a message body from S3 only when no message uses it any more. Several processes take
+part in that decision: the cleaner and the purge worker on every backend, the uploader, IMAP
+COPY and MOVE, restores, and some `sora-admin` commands. They coordinate with a lock per body in
+PostgreSQL. [STORAGE.md](STORAGE.md) explains the design; this section is the operator's side.
 
-Keep body deletion paused until the complete #607/#774/#787/#838 protocol is
-installed on every server, uploader and admin process sharing the logical write
-database and object store, and every old deleter, writer and outstanding storage
-capability has been drained as described above. Migration72 does not detect that
-drain. Never enable this protocol while an older participant can resume.
+The lock is per content hash, whatever account uses the body, because two accounts can share one
+stored object (after an address is reassigned, or a message copied between accounts). Releases
+before this lock used a lock per account and hash. An old and a new process do not exclude each
+other, so destructive work must not run while both kinds exist.
 
-List unresolved work with `sora-admin verify body-deletions` (read-only). For one
-intent, first establish that its old DELETE requests and writers cannot resume;
-cancellation or a missing PostgreSQL connection alone does not prove that. Then
-run `sora-admin verify body-deletions --reconcile --content-hash HASH --operation-id UUID --storage-drained`
-with `body_deletion_protocol = "global-hash-v1"`. The explicit acknowledgment is an
-operator assertion, not automatic fleet detection. The command holds the body
-lock, verifies downloaded bytes for references outside the original eligible
-expunge lifecycles, deletes orphan-only keys, and clears only the exact UUID.
-Missing or corrupt protected bytes must be restored from an authoritative copy
-before reconciliation can succeed. Any uncertain new storage request keeps the
-fence. Do not manually delete intent rows or use a TTL to bypass this process.
-Migration72 rollback refuses while any intent remains, preserving recovery state.
+### The `[s3] body_deletion_protocol` setting
+
+| Value | Meaning |
+|---|---|
+| `"paused"` (the default, also when the key is missing) | Destructive body work is paused. |
+| `"global-hash-v1"` | You confirm that every process that claims or deletes bodies uses the per-hash lock. Deletion runs. |
+
+Any other value is refused at startup and by `sora-admin`. Sora cannot check the other processes
+for you: `"global-hash-v1"` is your statement that the steps below are done.
+
+While deletion is paused:
+
+- Delivery, reading and uploads work as usual.
+- The cleaner still expunges messages past `max_age_restriction`, but it keeps every body and its
+  cleanup rows. It also defers removing messages whose upload failed and retiring deleted
+  accounts and mailboxes. It logs `Cleanup: message bodies and their candidate rows retained
+  while S3 deletion is paused` and `Cleanup: failed-upload and account/mailbox retirement deferred
+  during the body-lock cutover`.
+- The purge worker keeps queued account purges (`Purge: queued accounts retained while S3 body
+  deletion is paused`). `sora_account_purges_pending` keeps growing.
+- These `sora-admin` commands refuse with an error and purge nothing:
+  `accounts delete --purge`, `accounts purge-domain`, `verify s3 --fix-orphaned` (without
+  `--dry-run`), `import rekey --delete-old-objects` and `verify body-deletions --reconcile`.
+  Dry runs, and a rekey that keeps the old objects, still work.
+- S3 usage grows until deletion resumes.
+
+The setting is read at startup. Changing it in the file does nothing to a running process until
+it restarts, and does not stop an operation that is already running.
+
+TLS certificate objects in S3 are not affected; they have their own protocol ([TLS.md](TLS.md)).
+
+### New installation
+
+A new deployment has no old processes. Set `body_deletion_protocol = "global-hash-v1"` in `[s3]`
+on every node and in the config `sora-admin` uses, before the first start.
+
+### Upgrading the S3 message-body lock protocol
+
+Follow these steps when you upgrade from a release that locked bodies per account.
+
+1. **Stop all old body deleters.** Stop the cleaner and purge workers of old binaries (stop those
+   processes), and stop scheduling `sora-admin accounts delete --purge`,
+   `accounts purge-domain`, `verify s3 --fix-orphaned` and `import rekey --delete-old-objects`.
+   Wait for work in progress to finish. Also make sure no bucket lifecycle rule or other tool
+   deletes message-body keys in this time. Adding the setting does not pause an old binary.
+2. **Upgrade everything with deletion paused.** Leave `body_deletion_protocol` at `"paused"`.
+   Upgrade every process that writes or deletes bodies: all backends, their uploaders, and every
+   `sora-admin` that restores, imports or rekeys mail. Let old processes finish and drain their
+   storage requests in flight. Any external credentials that can still write to the bucket for
+   an old process must finish, expire or be revoked.
+3. **Check.** Confirm that no old process or job can start again.
+4. **Enable deletion.** Set `body_deletion_protocol = "global-hash-v1"` in every process allowed
+   to delete bodies (every backend, and the config of `sora-admin`), and restart those processes.
+   Queued purges and retained cleanup work then resume. `[cleanup] grace_period` and your restore
+   policy apply as before.
+
+Every account that shares body keys must use the same PostgreSQL database: the locks do not
+coordinate separate databases that use the same bucket. After a database failover, the single
+writer guarantee of your PostgreSQL setup still has to hold; this procedure does not add one.
+
+**Rolling back** to a release with the old lock: first set `"paused"` everywhere and drain all
+body deletion as in step 1. Never run old deleters next to new processes, and never resume
+deletion while old work or old write credentials can still arrive.
+
+### Body deletions that stay quarantined
+
+Before the cleaner sends a DELETE for a body to S3, it commits a deletion intent in PostgreSQL
+(the `s3_body_delete_intents` table, migration `000072`). The intent names the content hash, the
+object keys and an operation ID. When the outcome is uncertain, the intent stays. That happens
+when the process holding the lock dies, a storage request times out, or the commit after the
+delete is uncertain.
+
+While an intent exists, its hash is quarantined:
+
+- New uploads of that body, marking an upload as done, COPY and MOVE into another account, and
+  restores refuse it. New deliveries can still stage it, to upload later.
+- Neither time, an expired upload lease nor a restart clears the intent.
+- The cleaner keeps its rows for that body until the intent is resolved.
+
+The cleaner holds its lock connection while it commits the intent on a second write-pool
+connection. A node that deletes bodies therefore needs at least two free connections in the write
+pool, plus room for its other workers. With a full pool the cleanup cycle times out and leaves
+its candidates for the next one.
+
+To resolve a quarantined body:
+
+1. List the intents. This changes nothing:
+
+   ```sh
+   sora-admin --config /etc/sora/config.toml verify body-deletions
+   ```
+
+   Each line shows the content hash, the operation ID, the time and the object keys, and the last
+   error if there is one.
+2. Make sure the earlier storage requests for that body can no longer arrive at S3. Stop or drain
+   the processes and revoke credentials at the provider as needed. A cancelled HTTP request or a
+   dead database session does not prove this.
+3. If a message still uses the body and the object is missing or damaged, restore the object from
+   a trusted copy first.
+4. Reconcile the intent, with `body_deletion_protocol = "global-hash-v1"` in the config, using the
+   exact hash and operation ID from step 1:
+
+   ```sh
+   sora-admin --config /etc/sora/config.toml verify body-deletions --reconcile \
+     --content-hash HASH --operation-id UUID --storage-drained
+   ```
+
+   `--storage-drained` is your statement that step 2 is done; Sora does not detect it. Under the
+   body's lock, the command checks which keys messages still use. It downloads each such object
+   and checks it against its hash, deletes the keys nothing uses, and then removes that one intent.
+   A missing or damaged object that a message still needs, a changed operation ID, a failed
+   storage request or a failed commit leaves the intent in place, and the command exits with
+   status 1.
+
+Never delete intent rows by hand. Migration `000072` cannot be reverted while intents remain:
+its down migration refuses.
+
+A PUT that stalls and loses its upload lease cannot mark its message as uploaded afterwards. If
+the provider still accepts that PUT later, it leaves an object that nothing references, which
+`sora-admin verify s3` finds.

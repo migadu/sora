@@ -3,9 +3,10 @@
 This document lists the protections Sora applies to every connection, with their defaults: TLS and
 plaintext logins, trusted networks and the PROXY protocol, connection limits, timeouts and the
 slow-client guard, limits on failed logins, memory and size limits, search limits, the metrics
-endpoint and client-side encryption of stored mail. For each it says what an attacker or a client
-sees, and whether the limit is counted per node or across the cluster. It is written for operators
-who expose Sora to the internet and for contributors who change these paths.
+endpoint, client-side encryption of stored mail, and how secrets and outgoing connections are
+protected. For each it says what an attacker or a client sees, and whether the limit is counted
+per node or across the cluster. It is written for operators who expose Sora to the internet and for
+contributors who change these paths.
 
 How logins are checked, password schemes, master credentials and the authentication rate limiter
 are in [AUTHENTICATION.md](AUTHENTICATION.md). Certificates are in [TLS.md](TLS.md). Proxy routing is
@@ -25,9 +26,10 @@ in [PROXY.md](PROXY.md).
 10. [The metrics endpoint](#10-the-metrics-endpoint)
 11. [The HTTP APIs](#11-the-http-apis)
 12. [Client-side encryption of message bodies](#12-client-side-encryption-of-message-bodies)
-13. [Per node or across the cluster](#13-per-node-or-across-the-cluster)
-14. [Startup checks and warnings](#14-startup-checks-and-warnings)
-15. [Checklist](#15-checklist)
+13. [Secrets and outgoing connections](#13-secrets-and-outgoing-connections)
+14. [Per node or across the cluster](#14-per-node-or-across-the-cluster)
+15. [Startup checks and warnings](#15-startup-checks-and-warnings)
+16. [Checklist](#16-checklist)
 
 ---
 
@@ -129,7 +131,7 @@ balancers.
 | What | Effect of `trusted_networks` |
 |---|---|
 | PROXY protocol | A listener with `proxy_protocol = true` accepts connections only from these addresses (3.2). |
-| Client address forwarding | IMAP ID forwarding fields, POP3 `XCLIENT`, and LMTP `XCLIENT`/`XRCPTFORWARD` are honoured only from these addresses. From anyone else they are ignored (IMAP) or refused (POP3: `-ERR Connection not from trusted proxy`). Behind a PROXY header, IMAP ID and POP3 `XCLIENT` are judged by the client the header names, not the load balancer that sent it; LMTP has its own rule (below). |
+| Client address forwarding | IMAP ID forwarding fields, POP3 `XCLIENT`, and LMTP `XCLIENT`/`XRCPTFORWARD` are honoured only from these addresses. From anyone else they are ignored (IMAP) or refused (POP3: `-ERR Connection not from trusted proxy`). Behind a PROXY header, a forwarded client address is applied only when the client the header names is itself in the list, not because the load balancer that sent the header is (details below). |
 | Per-IP connection limit | Connections from these addresses do not count against `max_connections_per_ip`. Behind a PROXY header the address is the client the header names, not the load balancer that sent it (section 4). |
 | Authentication rate limiting | These addresses are exempt, unless the server's `auth_rate_limit.exempt_networks` says otherwise ([AUTHENTICATION.md](AUTHENTICATION.md#105-exempt-networks)). |
 | LMTP backend admission | Only these addresses may connect to an `lmtp` listener. **When the list is empty**, the LMTP backend accepts `127.0.0.0/8`, `::1`, `10.0.0.0/8`, `172.16.0.0/12` and `192.168.0.0/16` instead. |
@@ -141,13 +143,19 @@ Most of these check the TCP peer, the host that actually connected. The exceptio
   `XCLIENT` metadata requirement in
   [AUTHENTICATION.md](AUTHENTICATION.md#11-trusted-networks-and-logins).
 - The per-IP limit checks the client a PROXY header names when there is one.
-- IMAP ID forwarding and POP3 `XCLIENT` check the client a PROXY header names when there is one,
-  else the TCP peer (also when the header names no client: `LOCAL` or `UNKNOWN`). A load balancer
-  that sends PROXY headers is trusted to say who the client is, not to vouch for the commands that
-  follow, which are the client's own. So behind a trusted layer-4 load balancer (HAProxy, nginx
-  `stream`), a proxy that reaches the backend through the load balancer may forward only when its
-  own address is in the list. Other clients have their ID forwarding fields ignored and `XCLIENT`
-  refused unless their own address is also in the list.
+- IMAP ID forwarding checks the client a PROXY header names when there is one, else the TCP peer
+  (also when the header names no client: `LOCAL` or `UNKNOWN`). A load balancer that sends PROXY
+  headers is trusted to say who the client is, not to vouch for the commands that follow, which are
+  the client's own. So behind a trusted layer-4 load balancer (HAProxy, nginx `stream`), only a
+  client whose own address is in the list may forward with ID; the others have their ID forwarding
+  fields ignored.
+- POP3 `XCLIENT` is accepted (`+OK`) when either the TCP peer or the client a PROXY header names is
+  in the list. This lets a Sora `pop3_proxy` send a PROXY header and `XCLIENT` on one connection.
+  But its `ADDR` and `PORT` replace the client address only when the client the header names (or,
+  without a header, the TCP peer) is in the list. Otherwise they are ignored, the address from the
+  header stays, and the other `XCLIENT` fields (such as `TTL` and the `FORWARD` variables) still
+  apply. Behind a trusted load balancer, a client that is not itself in the list therefore cannot
+  change its address.
 - LMTP `XCLIENT` is accepted from a trusted TCP peer: an `lmtp_proxy` may send a PROXY header and
   `XCLIENT` on one connection. Its `ADDR` and `PORT` replace the address a PROXY header gave only
   when that address is itself in the list; otherwise they are ignored and the other attributes
@@ -196,10 +204,9 @@ With `proxy_protocol = true`:
 - A connection from a trusted address must send a valid header within `proxy_protocol_timeout`, or
   it is closed. There is no "optional" mode.
 - The client address from the header is used for logs, rate limiting and `max_connections_per_ip`.
-  It is also the address IMAP ID forwarding and POP3 `XCLIENT` are judged by: a client behind a
-  trusted load balancer may forward an address only when its own address is in `trusted_networks`.
-  LMTP `XCLIENT` is accepted from the TCP peer, but its `ADDR` and `PORT` replace the header's
-  address only when that address is in `trusted_networks` (3.1). Which hosts may send a header,
+  It is also the address that decides whether IMAP ID, POP3 `XCLIENT` or LMTP `XCLIENT` may
+  replace the client address: a client behind a trusted load balancer may forward an address only
+  when its own address is in `trusted_networks` (3.1). Which hosts may send a header,
   and which may use master SASL (`master_sasl_allowed_networks`), are judged by the TCP peer.
 - A client the header names is exempt from `max_connections_per_ip` only when its own address is in
   `trusted_networks`: the load balancer's address does not exempt the clients behind it. A header
@@ -237,7 +244,7 @@ Where each applies:
 |---|---|---|
 | `max_connections` | yes | yes |
 | `max_connections_per_ip` | yes, except for trusted networks; with `proxy_protocol = true` it counts the client the header names | as on the backends; with `[cluster]`, counted across the cluster ([CLUSTER.md](CLUSTER.md#65-per-ip-connection-counts-imap-pop3-and-managesieve-proxies)) |
-| `max_connections_per_user` | enforced, per listener | enforced across the cluster; needs `[cluster]`, otherwise not enforced |
+| `max_connections_per_user` | enforced, per listener | enforced across the cluster; needs `[cluster]`, otherwise not enforced (with a startup warning) |
 | `max_connections_per_user_per_ip` | as above; on `imap` the IP is the client's real address, as forwarded by a proxy | as above |
 
 `max_connections` also applies to `lmtp` (unset, `0` or less gives 1000) and `lmtp_proxy` listeners.
@@ -476,7 +483,7 @@ Fixed limits that bound memory before login:
 | Where | Limit |
 |---|---|
 | IMAP backend command line | 50 KiB |
-| IMAP proxy, before login | 64 KiB per line, 8 KiB per literal |
+| IMAP proxy, before login | 64 KiB per line; 8 KiB per synchronizing literal, 4 KiB per non-synchronizing literal (`{N+}`, a larger one ends the session) |
 | POP3 backend and proxy | 1024 bytes per line |
 | ManageSieve backend | 8192 bytes per line |
 
@@ -512,6 +519,11 @@ Other per-account limits, described elsewhere:
 The Prometheus endpoint (`type = "metrics"`) shows per-domain activity, optionally per-user
 activity, and a detailed picture of internal state. **It has no access control unless you configure
 one.**
+
+Domain metrics (`enable_domain_metrics`) are on by default and name your mail domains. User metrics
+(`enable_user_metrics`) are off by default; when on, they cover at most `max_tracked_users` heavy
+users, named by a 16-character SHA-256 prefix of the address unless `hash_usernames = false`. See
+[METRICS.md](METRICS.md#318-domain-and-user-metrics).
 
 | Key | Meaning |
 |---|---|
@@ -549,6 +561,10 @@ allowed_hosts and/or api_key`. The metrics themselves are in [METRICS.md](METRIC
   `jwt_secret`. Sora refuses to start without a secret, with one shorter than 32 bytes, or with the
   placeholder. Token lifetimes over 7 days are cut to 7 days. The block's own `auth_rate_limit` applies to
   these logins, with the same rules as for the mail protocols. See [USER_API.md](USER_API.md).
+- **CORS** (`allowed_origins`, User API and User API proxy): `"*"` answers every origin with a literal
+  `*` and never allows credentials. A listed origin is echoed back with credentials allowed. Unless
+  `"*"` is the first entry, every response carries `Vary: Origin`, so a shared HTTP cache cannot
+  answer one origin with a response meant for another. An empty list sends no CORS headers.
 
 ---
 
@@ -570,7 +586,33 @@ same key on every node. Details are in [STORAGE.md](STORAGE.md).
 
 ---
 
-## 13. Per node or across the cluster
+## 13. Secrets and outgoing connections
+
+### 13.1 Secrets in logs and configuration dumps
+
+- **Configuration dumps.** `sora-admin config dump` masks every secret setting (passwords, API keys,
+  tokens, JWT and cluster secrets, the S3 keys) as `***MASKED***` by default. In URLs it masks the
+  user information and the query values, and keeps the scheme, host and path so the endpoint is
+  still recognisable. `--mask-secrets=false` prints everything in clear; do not paste that output
+  anywhere. An unset secret stays empty in the dump, so you can still see which ones are set.
+- **Logs and error messages.** The URLs of the remote lookup service, the HTTP relay and the spam
+  training endpoint are logged with their user information and query values masked, at startup,
+  per request and in error messages (including the errors Go's HTTP client returns).
+- **Passwords** are never logged. A stored hash Sora cannot check is reported without any part of
+  its value ([AUTHENTICATION.md](AUTHENTICATION.md#4-password-schemes)).
+
+### 13.2 Outgoing HTTP and SMTP connections
+
+| Connection | Protection |
+|---|---|
+| Remote lookup (`remote_lookup.url`) | Must be `https://` unless the host is a loopback address; startup refuses anything else. Redirects are never followed, so the request and its bearer token cannot be sent to another host: a `3xx` answer means "user not found". See [PROXY.md](PROXY.md#4-remote-lookup). |
+| HTTP relay (`[relay] http_url`) | Redirects are never followed; a `3xx` is a failed delivery. An `http://` URL to a host that is not loopback is accepted with a startup warning, since mail and the `auth_token` then travel in clear. See [RELAY.md](RELAY.md). |
+| SMTP relay (`[relay] smtp_host`) | TLS (`smtp_tls`) and certificate verification (`smtp_tls_verify`) are on by default. Turning either off for a host that is not loopback gives a startup warning. See [RELAY.md](RELAY.md). |
+| Spam training endpoint | Redirects are never followed. |
+
+---
+
+## 14. Per node or across the cluster
 
 | Protection | Counted |
 |---|---|
@@ -583,14 +625,14 @@ same key on every node. Details are in [STORAGE.md](STORAGE.md).
 | Authentication rate limits on backends, the User API and the User API proxy | Per listener. |
 | Search rate limit | Per account in each IMAP listener of each node. |
 | Session memory, error counts, timeouts | Per connection. |
-| Lookup caches | Per listener; an account's entries are dropped on every node after a kick or an Admin API change. |
-| Auth cache | Per proxy node; an account's entries are dropped on every node after an Admin API change. |
+| Lookup caches | Per listener. An account's entries are dropped on every node within about 5 seconds of a change to its password, credentials or status, and after a kick ([AUTHENTICATION.md](AUTHENTICATION.md#12-cached-logins-and-password-changes)). |
+| Auth cache | Per proxy node, dropped the same way. |
 
 See [CLUSTER.md](CLUSTER.md#7-what-the-cluster-does-not-share).
 
 ---
 
-## 14. Startup checks and warnings
+## 15. Startup checks and warnings
 
 Sora **refuses to start** when:
 
@@ -598,8 +640,10 @@ Sora **refuses to start** when:
 - a `[servers] trusted_networks` entry is neither an IP address nor a CIDR block;
 - a block sets `master_username` without `master_password`, or `master_sasl_username` without
   `master_sasl_password` ([AUTHENTICATION.md](AUTHENTICATION.md#8-master-credentials));
-- `master_sasl_allowed_networks` has an entry that is not an IP or CIDR;
+- `master_sasl_allowed_networks` or `auth_rate_limit.exempt_networks` has an entry that is not an
+  IP or CIDR;
 - an `auth_rate_limit` duration does not parse;
+- a `remote_lookup.url` uses `http://` for a host that is not loopback (section 13.2);
 - an `http_admin_api` block has a missing, short or placeholder `api_key`, or an `http_user_api` block
   a missing, short or placeholder `jwt_secret` (section 11);
 - a listener has `tls = true` with neither certificate files nor a global `[tls]` section
@@ -609,14 +653,24 @@ Sora **warns** at startup when:
 
 - plaintext logins are allowed on a publicly reachable address (section 2);
 - the metrics endpoint has no access control on a publicly reachable address (section 10);
-- master SASL is configured without `master_sasl_allowed_networks`;
+- master SASL is configured without `master_sasl_allowed_networks`
+  ([AUTHENTICATION.md](AUTHENTICATION.md#83-master_sasl_allowed_networks));
 - `trusted_networks` contains a whole private range (section 3.1);
+- a proxy sets `max_connections_per_user` or `max_connections_per_user_per_ip` without `[cluster]`,
+  where they are not applied (section 4);
+- the relay is reached in plaintext, or without certificate verification, on a host that is not
+  loopback (section 13.2);
 - an IMAP `command_timeout` is 35 minutes or more (section 5.3);
-- `tls` is set on a metrics block (section 10).
+- `tls` is set on a metrics block (section 10);
+- a key is set on a server type that never reads it, such as `master_sasl_allowed_networks` on a
+  proxy.
+
+`sora-admin config validate` reports the same refusals and most of these warnings from the file
+alone, without starting the server.
 
 ---
 
-## 15. Checklist
+## 16. Checklist
 
 - Give every listener that clients reach `tls = true`. On STARTTLS ports, keep `insecure_auth = false`.
 - Keep backend ports, LMTP ports and the Admin API reachable only from your own hosts.
@@ -631,4 +685,5 @@ Sora **warns** at startup when:
 - Restrict the metrics endpoint with `allowed_hosts` and/or `api_key`.
 - Store passwords as bcrypt. Move old SHA-512 accounts to bcrypt by setting a new password.
 - If you turn on S3 encryption, back up `encryption_key`.
-- After every change, read the startup log for the warnings of section 14.
+- After every change, read the startup log for the warnings of section 15, or run
+  `sora-admin config validate`.

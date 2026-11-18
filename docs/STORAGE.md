@@ -4,7 +4,8 @@ This document explains where Sora keeps mail and how a message body moves betwee
 places: from the local disk of the node that accepted it, to S3, into each node's local
 cache, and finally out of the system when it is deleted. It covers content hashing and
 deduplication, client-side encryption, the upload queue, the local cache, two-phase
-deletion, retention, account deletion and purge, and what an operator must back up.
+deletion and how deletions are made safe, retention, account deletion and purge, and what an
+operator must back up.
 
 It is for operators who size, run and recover a deployment, and for contributors who change
 the storage code. For the big picture first, read [ARCHITECTURE.md](ARCHITECTURE.md). Search
@@ -60,6 +61,10 @@ stateDiagram-v2
     Expunged --> [*]: cleaner deletes object and rows after grace_period
 ```
 
+The cleaner and the purge worker delete bodies only when message-body deletion is turned on
+with `[s3] body_deletion_protocol`. It is off by default; see
+[9.5](#95-how-deletions-are-made-safe).
+
 ---
 
 ## 2. S3 keys
@@ -80,7 +85,11 @@ message row was written**. Each message row stores them in its own `s3_domain` a
   have objects under more than one prefix.
 - A message in a shared mailbox is stored under the mailbox **owner's** key, not the key of
   the user who delivered or copied it.
-- Keys are per account. Two accounts never share an object.
+- Normally each account's objects are under its own address. Two accounts can still use one
+  object: when an address moves from one account to another, the new owner's messages are
+  stored under the same prefix as the old owner's messages, and a message with the same body
+  then has the same key in both accounts. Sora deletes such an object only when no message
+  row of any account uses it ([9.2](#92-removal-after-the-grace-period)).
 
 All objects go into the one bucket named in `[s3] bucket`, with no extra prefix. Sora does
 not create the bucket and does not check it at startup, so create it first. The credentials
@@ -102,8 +111,9 @@ Deduplication works per S3 key, which means per account:
   new message rows that point at the same object; nothing new is written to S3. An APPEND of
   bytes the account already has under the same key is marked uploaded at once, with no new
   upload.
-- **Accounts never share objects.** The same body in two accounts is two objects, under two
-  keys.
+- **Accounts do not share objects on purpose.** The same body in two accounts is normally two
+  objects, under two keys. The exception is a key that two accounts both use after an address
+  moved between them ([section 2](#2-s3-keys)).
 - **Incoming mail is not deduplicated in practice.** Every delivery over LMTP or the Admin
   API gets its own `Received:` header, with a unique ID and a timestamp, and a
   `Delivered-To:` header. Two deliveries of the same message therefore have different bytes
@@ -175,8 +185,15 @@ breakers around it in [pkg/resilient/storage.go](../pkg/resilient/storage.go).
 - `[s3] endpoint` may be `host`, `host:port`, or a full URL with `http://` or `https://`.
   Without a scheme, Sora uses `https://`, or `http://` when `disable_tls = true`. With a
   scheme, `disable_tls` is ignored.
-- Sora uses path-style URLs (`<endpoint>/<bucket>/<key>`) and signs every request for the
-  region `us-east-1`. Neither is configurable.
+- Sora always uses path-style URLs (`<endpoint>/<bucket>/<key>`).
+- Requests are signed for `[s3] region`. Without it, Sora takes the region from the AWS
+  environment (`AWS_REGION` or the shared AWS config file), and else uses `us-east-1`.
+- **Credentials.** Set `access_key` and `secret_key` together, or leave both empty. With both
+  empty, Sora uses the AWS default credential chain (environment variables, the shared
+  credentials file, an instance or container role) and fetches the credentials once at
+  startup: if the chain finds none, `sora` stops with `no S3 credentials: set access_key and
+  secret_key, or provide them through the AWS default credential chain`. Setting only one of
+  the two keys is refused when the config is checked.
 - `[s3] timeout` (default `30s`) bounds each request, including the transfer of the body.
   For an IMAP body read it is also the budget for all retries together, so a hanging
   provider costs the client one timeout, not one per retry.
@@ -191,12 +208,22 @@ jitter:
 |---|---|---|---|
 | GET | 4 | 0.5 s | 10 s |
 | PUT, COPY | 3 | 1 s | 30 s |
-| DELETE, bulk DELETE | 3 | 1 s | 15 s |
+| Bulk DELETE | see below | | |
 
 Network errors, timeouts, HTTP 5xx and 429 are retried. A GET that answers 404 (no such key)
 is not retried. Deleting a key that does not exist counts as success, including the
-`InvalidRequest` answer some providers give for a missing file. Bulk deletes send at most
-1000 keys per request and retry only the keys that failed.
+`InvalidRequest` answer some providers give for a missing file.
+
+Bulk deletes, which the cleaner and account purges use, send at most 1000 keys per request.
+They treat each failed key by what the answer proves:
+
+- **Refused.** The provider clearly refused the delete (for example `AccessDenied`, HTTP 403,
+  `NoSuchBucket`). The object is still there. The key is reported as failed, and its rows are
+  kept for a later cycle.
+- **Uncertain.** A timeout, a broken connection, HTTP 5xx or 429: the request may still reach
+  the provider later. The key is not retried, because a retry proves nothing about the earlier
+  request. The body stays fenced by its deletion intent
+  ([9.5](#95-how-deletions-are-made-safe)).
 
 ### Circuit breakers
 
@@ -274,7 +301,10 @@ account, still has to be written to S3", and it names the node that holds the fi
 | `created_at` | When the body was first queued. |
 
 A new delivery of a body whose row already exists re-arms the row: attempts go back to 0 and
-the row moves to the delivering node, which has written a fresh file.
+the row moves to the delivering node, which has written a fresh file. A cross-account COPY or
+MOVE of a body that is still staged on this node does the same for the owner's row: it links
+the staged file under the owner's account ID and queues or re-arms the owner's upload under
+this node's instance ID.
 
 ### 6.3 The worker loop
 
@@ -283,7 +313,8 @@ seconds, and at once whenever a message is queued on this node. In each pass it:
 
 1. **Leases a batch.** It takes up to `[uploader] batch_size` rows, oldest first, that belong
    to this node's instance ID, have fewer than `max_attempts` attempts, were not taken within
-   the last `retry_interval`, and have no live lease. Taking them sets `last_attempt`.
+   the last `retry_interval`, and have no live lease. Taking them sets `last_attempt`. Both
+   times are measured on the database's clock, so clock skew between nodes does not matter.
 2. **Uploads them**, at most `[uploader] concurrency` at a time. For each one it:
    1. works out the keys still missing an object (normally one);
    2. passes the write gate (see [6.4](#64-leases-and-the-write-gate));
@@ -298,22 +329,27 @@ seconds, and at once whenever a message is queued on this node. In each pass it:
 
 ### 6.4 Leases and the write gate
 
-Within an account, Sora orders S3 deletes (by the cleanup worker and by account purges)
-and writes of a body with a PostgreSQL advisory lock keyed by `(accountID, contentHash)`
-and a lease on the pending row. Another account's reference to the same physical S3 key
-uses a different advisory lock; these locks do not exclude every writer of that key.
-For operations using the same account/hash key:
+An S3 delete of a body and an upload of the same body must never overlap. Sora orders them
+with the **body lock**, a PostgreSQL advisory lock keyed by the content hash alone (the same
+lock for every account), and with a **lease** on the pending row. Section
+[9.5](#95-how-deletions-are-made-safe) describes the body lock in full.
 
-- Before it writes, an upload briefly takes the body's lock. If a delete, a restore, or a
-  cross-account copy or move of that body is running, the upload is deferred until the
-  row's `retry_interval` passes.
-- Passing the gate leases the pending row to this upload for 2 minutes. The worker renews
-  the lease every 30 seconds while the transfer runs. If it cannot renew in time, or the row
-  is gone, it stops the transfer.
-- A deleter never removes a body that still has a pending row, and account deletion leaves a
-  leased row alone. So nothing can delete the body while it is being written.
+- **The write gate.** Before it writes, an upload tries the body lock in shared mode, checks
+  that the body has no open deletion intent, and leases its pending row, all in one short
+  transaction. If a delete of that body holds the lock, if the body has an open deletion
+  intent, or if another upload holds the row's lease, the upload is deferred: it is taken
+  again after `retry_interval` and does not count as a failed attempt.
+- **The lease.** Passing the gate leases the pending row to this upload for 2 minutes. The
+  worker renews the lease every 30 seconds while the transfer runs. If it cannot renew in
+  time, or the row is gone, it stops the transfer.
+- **The finalize** takes the body lock in shared mode again and checks the deletion intents
+  once more before it marks the messages uploaded. An upload that lost its lease cannot
+  finalize.
+- A deleter never removes a body that still has a pending row in any account, and account
+  deletion leaves a leased row alone. So nothing can delete the body while it is being
+  written.
 
-The lease holds no database connection during the transfer.
+Neither the lock nor the lease holds a database connection during the transfer.
 
 ### 6.5 What counts as a failed attempt
 
@@ -555,15 +591,21 @@ is removed from S3 yet.
 ### 9.2 Removal after the grace period
 
 The cleanup worker runs at startup and then every `[cleanup] wake_interval` (default 1 hour).
-In each cycle it looks for bodies where, within one account:
+When message-body deletion is turned on ([9.5](#95-how-deletions-are-made-safe)), each cycle
+looks for bodies where, within one account:
 
 - every message row with that body is expunged,
 - the most recent of those expunges is older than `[cleanup] grace_period` (default 14 days),
-- and no pending upload exists for the body.
+- no pending upload exists for the body, in any account,
+- and the body has no open deletion intent.
 
-For each such body it deletes the S3 object first and then the expunged message rows. If the
-process stops between the two, the next cycle sees the rows again, repeats the delete (which
-succeeds, since the object is already gone) and removes the rows.
+For each such body, under the body lock, it first records a deletion intent, then deletes the
+S3 object, and then, in one transaction, deletes the expunged message rows it found and the
+intent. If rows of another account still point at the same key (see
+[section 2](#2-s3-keys)), the object stays and only this account's rows go. If S3 refuses
+the delete, the rows and the object stay and a later cycle tries again. If the outcome of the
+delete is uncertain, the intent stays and the body is quarantined until an operator resolves
+it ([9.5](#95-how-deletions-are-made-safe)).
 
 With the defaults, a body is removed between 14 days and 14 days and 1 hour after the last
 message using it was expunged. One cycle spends at most about 2 minutes on S3 deletes, so a
@@ -572,7 +614,7 @@ large backlog takes several cycles.
 | When | What happens | Can it be undone? |
 |---|---|---|
 | Expunge | The message disappears from the mailbox. | Yes: `sora-admin messages restore`, or the Admin API. |
-| `grace_period` later, at the next cleanup cycle | The S3 object and the message rows are deleted. | No. |
+| `grace_period` later, at the next cleanup cycle (with body deletion turned on) | The S3 object and the message rows are deleted. | No. |
 | Later | Each node's cached copy goes at a purge cycle, once it has not been read for `orphan_cleanup_age`, or earlier when the cache trims for space. The search vectors go with the cleanup cycle's orphan sweep ([SEARCH.md](SEARCH.md)). | No. |
 
 As long as one live message of the account still uses a body, the body stays, however old
@@ -590,6 +632,13 @@ The Admin API offers `GET /admin/accounts/{email}/messages/deleted` and
 exist, that is, until the cleanup worker removes them. See [ADMIN_CLI.md](ADMIN_CLI.md) for
 the restore options.
 
+A restore inserts a **new** message row, with a new UID and a new MODSEQ, in the mailbox the
+message came from (recreating the mailbox if needed). The expunged row stays, marked as
+restored (`messages.restored_at`), as the record that the old UID was expunged; it is no longer
+listed as a deleted message and cannot be restored a second time. The cleanup worker removes
+it with the other expunged rows. A restore takes the body lock in shared mode and refuses a
+body with an open deletion intent.
+
 Setting `grace_period = "0"` removes expunged mail at the next cleanup cycle, with no chance
 to restore it.
 
@@ -597,7 +646,10 @@ to restore it.
 
 IMAP `DELETE` only marks the mailbox as deleted, so the command returns at once. The next
 cleanup cycle, with no grace period, expunges the mailbox's messages and removes the mailbox
-row, up to 50 mailboxes per cycle. The bodies then follow the normal grace period.
+row, up to 50 mailboxes per cycle. The bodies then follow the normal grace period. While
+message-body deletion is paused ([9.5](#95-how-deletions-are-made-safe)), this step waits too:
+the deleted mailbox stays hidden from clients, and its messages are expunged once deletion is
+turned on.
 
 ### 9.4 Retention with `max_age_restriction`
 
@@ -617,6 +669,83 @@ than that, in every mailbox of every account.
 Search vectors have their own retention, `[cleanup] fts_retention`. See
 [SEARCH.md](SEARCH.md).
 
+`max_age_restriction` works whether or not message-body deletion is turned on: it only
+expunges. The bodies are removed later, by the step in [9.2](#92-removal-after-the-grace-period).
+
+### 9.5 How deletions are made safe
+
+Deleting a body from S3 cannot be undone, and an S3 DELETE cannot be called back once it is
+sent. Sora therefore guards every body deletion in three ways: a lock that keeps deletes and
+writes of one body apart, a durable record of every delete before it is sent, and a switch that
+keeps deletion off until every process in the deployment follows these rules. The operator's
+side (turning deletion on, upgrading, resolving quarantined bodies) is in
+[OPERATIONS.md](OPERATIONS.md#16-message-body-deletion).
+
+**The body lock.** Every body has one PostgreSQL advisory lock, keyed by its content hash
+alone. All accounts use the same lock for one hash, because two accounts can use one S3 object
+([section 2](#2-s3-keys)). The lock has two modes:
+
+| Mode | Who takes it | How |
+|---|---|---|
+| Shared | The upload write gate and upload finalize, cross-account COPY and MOVE, restores, imports, `import rekey`, `uploader resolve` | Shared holders do not exclude each other. They wait for an exclusive holder; the upload gate does not wait, it defers the upload. |
+| Exclusive | The cleaner's S3 step, account purges, `verify s3 --fix-orphaned`, `import rekey --delete-old-objects`, `verify body-deletions --reconcile` | The deleters only try the lock and skip a body that is busy; a later cycle or run comes back to it. `--reconcile` waits for the lock. |
+
+The lock is transaction-scoped: it lasts as long as the transaction that took it. A deleter, and
+a writer such as a cross-account COPY, keeps that transaction open across its S3 calls, and a
+writer keeps its lock until its rows commit, so the cleaner can never see "nothing uses this
+body" between a writer's S3 check and its commit. The upload gate is the exception: it holds
+the lock only for its short check, and the lease on the pending row covers the transfer
+([6.4](#64-leases-and-the-write-gate)). A cross-account COPY or MOVE takes the locks of all its bodies in one transaction, so
+one command may move at most 1000 distinct bodies into another account; a larger one is refused
+with `NO [LIMIT]` and nothing is copied ([DATABASE.md](DATABASE.md#server-settings)).
+
+**Deletion intents.** Before a deleter sends a DELETE to S3, it commits a row in the
+`s3_body_delete_intents` table: the content hash, the object keys, an operation ID and the
+message rows it is allowed to remove. The intent is committed on its own, so it survives even if
+the lock holder's connection dies. Then:
+
+- **S3 confirms the delete.** In one transaction, the deleter removes exactly the rows it
+  recorded and the intent. Rows expunged or staged after the intent was written stay.
+- **S3 clearly refuses the delete** (for example `AccessDenied`). The object is still there. The
+  intent is removed, the rows stay, and a later cycle tries again.
+- **The outcome is uncertain.** A timeout, a 5xx answer, a lost lock or a failed commit. The
+  earlier request may still reach S3 later. The intent stays, and the body is **quarantined**.
+
+While a body is quarantined, upload gates and finalizes, COPY and MOVE into another account,
+restores and imports refuse it. A delivery of the same bytes still stages its file; the upload
+waits and is not counted as a failed attempt. Reading a body is not affected. The cleaner leaves
+the body and its rows alone. No timeout, lease or restart clears an intent: only
+`sora-admin verify body-deletions --reconcile`, after an operator has made sure the old request
+can no longer arrive ([OPERATIONS.md](OPERATIONS.md#body-deletions-that-stay-quarantined)).
+`sora-admin verify body-deletions` lists the open intents.
+
+**The switch.** `[s3] body_deletion_protocol` decides whether a process may delete bodies:
+
+| Value | Effect |
+|---|---|
+| `"paused"`, or the key left out | Destructive body work is off. |
+| `"global-hash-v1"` | The operator confirms that every process sharing the database and bucket uses the per-hash body lock. Deletion runs. |
+
+Any other value is refused at startup. Releases before the per-hash lock locked a body per
+account and hash, and an old and a new process do not exclude each other: that is why deletion
+stays off until the operator says otherwise. While it is paused:
+
+- delivery, reads and uploads work as usual, and `max_age_restriction` still expunges;
+- the cleaner skips the steps that remove data: unuploaded messages
+  ([section 10](#10-failed-uploads-and-lost-nodes)), the hard delete of soft-deleted accounts,
+  deleted mailboxes and S3 objects ([section 11](#11-the-cleanup-cycle)), and logs
+  `Cleanup: failed-upload and account/mailbox retirement deferred during the body-lock cutover`
+  and `Cleanup: message bodies and their candidate rows retained while S3 deletion is paused`;
+- the purge worker keeps the accounts marked for purging
+  (`Purge: queued accounts retained while S3 body deletion is paused`);
+- the `sora-admin` commands that delete bodies (`accounts delete --purge`,
+  `accounts purge-domain`, `verify s3 --fix-orphaned`, `import rekey --delete-old-objects`,
+  `verify body-deletions --reconcile`) refuse with
+  `S3 message-body deletion is paused; ...`;
+- S3 usage and the expunged rows grow until deletion is turned on.
+
+The setting is read at startup.
+
 ---
 
 ## 10. Failed uploads and lost nodes
@@ -626,8 +755,9 @@ section explains when Sora gives up on such a body and deletes its messages.
 
 ### When the cleanup worker removes unuploaded messages
 
-In each cycle, and only while its S3 circuit breakers report S3 as healthy, the cleanup
-worker deletes a message that is not uploaded when both of these hold:
+In each cycle, only while message-body deletion is turned on
+([9.5](#95-how-deletions-are-made-safe)) and its S3 circuit breakers report S3 as healthy, the
+cleanup worker deletes a message that is not uploaded when both of these hold:
 
 1. The message was stored more than `grace_period` ago.
 2. No pending upload can still deliver its body. That is: no upload of it is in flight right
@@ -722,6 +852,9 @@ minute is raised to 1 minute. In order, one cycle:
 
 Steps 10 and 11 are described in [SEARCH.md](SEARCH.md).
 
+While message-body deletion is paused ([9.5](#95-how-deletions-are-made-safe)), steps 2, 3, 4
+and 9 are skipped and logged as such; every other step runs.
+
 The cycle ends with one summary line, `Cleanup: Cycle completed`, whose fields count what
 each step did: `failed_uploads`, `soft_deleted_accounts`, `vacation_responses`,
 `redirect_log`, `health_statuses`, `s3_objects`, `orphan_fts_hashes`, `finalized_accounts`
@@ -744,8 +877,11 @@ Sora keeps accepting mail while S3 is down, and catches up by itself afterwards.
 - **Reads.** Bodies in the local cache, and bodies still in staging on this node, stay
   readable. Other bodies get `NO [UNAVAILABLE]` in IMAP, and the client retries.
 - **The cleanup worker** skips the removal of unuploaded messages while its breakers are not
-  healthy. Its S3 deletes fail and are retried in later cycles; the rows stay until the
-  objects are gone.
+  healthy. A delete that the open breaker stops before it is sent is simply tried again in a
+  later cycle. A delete that was sent and timed out or failed with a 5xx has an uncertain
+  outcome: its bodies stay quarantined until an operator resolves them
+  ([9.5](#95-how-deletions-are-made-safe)). The cycle ends at the first such batch (at most
+  500 bodies), and the next cycle carries on with the other bodies.
 - **The health check** `s3_storage` fails.
 - **After about an hour**, each node logs
   `UploaderMonitor: ALERT - pending uploads are not reaching S3`, and
@@ -785,6 +921,11 @@ The cleanup worker then removes the account in stages. With the defaults:
 | Day 14, at the next cycle | **Hard delete.** Mailbox by mailbox, every message is expunged and the mailbox removed. Sieve scripts, vacation records and pending uploads that are not in flight are deleted. Bodies still waiting for upload are never uploaded. |
 | Day 28, at the next cycle | The account's bodies are deleted from S3 and its message rows removed. Messages that never reached S3 are removed earlier, by the failed-upload step of the cycles after the hard delete. |
 | Same cycle, once nothing is left | The account row, its addresses and its search vectors are deleted. The addresses can be used again. |
+
+This timeline assumes message-body deletion is turned on
+([9.5](#95-how-deletions-are-made-safe)). While it is paused, the account stays soft-deleted,
+out of service and restorable, with all its data, and the stages start once deletion is turned
+on.
 
 Each hard delete runs in small steps, each in its own transaction, so a large account cannot
 hold a long lock. Every step first checks that the account is still deleted, so a restore
@@ -834,9 +975,15 @@ run the purge themselves, under the same lock, so they need the S3 settings in t
 a server's purge worker is already purging the account, the command waits for it. If the
 command stops halfway, the purge worker finishes the account.
 
-A purge only deletes keys of the account's own messages, which are under the account's own
-addresses, so it never touches another account's bodies. Restoring the account before the
-purge finishes cancels it.
+A purge only deletes keys of the account's own messages, and like the cleaner it keeps an
+object that a message of another account still uses
+([9.2](#92-removal-after-the-grace-period)). It never deletes the body of a live message.
+Restoring the account before the purge finishes cancels it.
+
+While message-body deletion is paused ([9.5](#95-how-deletions-are-made-safe)), an Admin API
+purge request still takes the account out of service and marks it, but the purge workers keep
+it queued until deletion is turned on. The `sora-admin` purge commands refuse to run and mark
+nothing.
 
 Metrics and log lines:
 
@@ -904,6 +1051,11 @@ moment with a bucket from another.
 
 All metrics are listed in [METRICS.md](METRICS.md).
 
+Quarantined bodies ([9.5](#95-how-deletions-are-made-safe)) have no metric of their own. List
+them with `sora-admin verify body-deletions`. The cleanup cycle whose delete became uncertain
+logs `Cleanup: Failed to lock S3 objects for deletion`, with `storage deletion outcome remains
+quarantined` in its error; later cycles skip the body without a log line.
+
 ### Suggested alerts
 
 ```yaml
@@ -943,19 +1095,21 @@ They are read at startup; a change needs a restart. Durations take Go syntax plu
 
 ### `[s3]`
 
-Required on every storage node.
+Required on every storage node, and on a node with a User API (to serve message bodies).
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
 | `endpoint` | string | none, required | S3 endpoint: `host`, `host:port`, or a URL with `http://` or `https://`. |
 | `disable_tls` | bool | `false` | Use `http://` when `endpoint` has no scheme. Ignored when it has one. |
-| `access_key` | string | none, required | Access key ID. |
-| `secret_key` | string | none, required | Secret access key. |
 | `bucket` | string | none, required | Bucket for message bodies. Sora does not create it. |
+| `access_key` | string | none | Access key ID. Set it together with `secret_key`, or leave both empty to use the AWS default credential chain ([section 5](#5-the-s3-client)). |
+| `secret_key` | string | none | Secret access key. |
+| `region` | string | from the AWS environment, else `"us-east-1"` | Region requests are signed for. |
 | `timeout` | duration | `"30s"` | Limit for one S3 request, body transfer included. An invalid value stops `sora`. |
 | `debug` | bool | `false` | Log every S3 request and response. |
 | `encrypt` | bool | `false` | Client-side AES-256-GCM encryption (see [section 4](#4-client-side-encryption)). |
 | `encryption_key` | string | none | 64 hexadecimal characters. Required when `encrypt = true`. |
+| `body_deletion_protocol` | string | `"paused"` | `"paused"` keeps message-body deletion off; `"global-hash-v1"` turns it on once every process uses the per-hash body lock. See [9.5](#95-how-deletions-are-made-safe). Any other value stops `sora`. |
 
 ### `[local_cache]`
 
@@ -983,7 +1137,7 @@ An invalid duration or size in this section is logged as a warning and the defau
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `path` | string | `"/var/spool/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. |
+| `path` | string | `"/var/spool/sora/uploads"` | Staging directory for bodies not yet in S3. Must be durable. Left at the default, `sora` refuses to start while `/tmp/sora/uploads`, the default of earlier releases, still holds staged bodies ([OPERATIONS.md](OPERATIONS.md#moving-off-the-old-tmpsora-defaults)). |
 | `instance_id` | string | the hostname | The node's [instance ID](ARCHITECTURE.md#8-node-identity), the owner of its pending uploads. Unique per `sora` process, stable across restarts. |
 | `batch_size` | int | `10` | Pending rows taken per database query. Each body is still its own S3 request. Must be positive. |
 | `concurrency` | int | `20` | Uploads in flight at once. Must be positive. |
@@ -1021,49 +1175,10 @@ and on the account. Entries are stored in PostgreSQL. Only the IMAP server uses 
 | `max_entries_per_server` | int | `50` | Most account-level entries (set on the empty mailbox name `""`). |
 | `max_total_size` | int (bytes) | `1048576` | Most bytes of values per account, mailbox and account entries together. |
 
-A `SETMETADATA` that would break a limit is refused with `NO`, and nothing in it is stored. A
+Entry names are case-insensitive (RFC 5464): Sora stores them in lower case, folding only the
+ASCII letters. A `SETMETADATA` that would break a limit is refused with `NO`, and nothing in it
+is stored. A
 limit of `0` turns that check off. An overwrite counts only its change in size, and a delete
 frees its slot. The count and size limits refuse only a command that raises the count or the
 size, so an account already past one (the limit was lowered) can still delete, overwrite and
 shrink entries to get back under it.
-
-
-### Forward-only header presence (migration70)
-
-Newly ingested messages record whether the supported searchable fields exist,
-independently of empty values or address parsing. This covers From, To, Cc, Bcc,
-Sender, Reply-To, Subject, Message-ID, In-Reply-To and References. An explicit
-`HEADER <name> ""` uses this presence metadata; address shorthand retains the
-meaning of the currently represented ENVELOPE address lists. The inherited
-empty-group ENVELOPE representation limitation is not changed here. Nonempty
-header terms and unsupported field names retain their existing search behavior.
-
-This change is forward-only. There is no historical or lazy backfill and no S3
-read to repair old metadata. A NULL `messages.header_presence` means unknown,
-and those rows keep their prior search results (including known empty-term
-inaccuracies). COPY, MOVE and restore preserve that unknown state even though
-they create a new row or UID. Mail newly ingested through APPEND, LMTP, HTTP
-or either importer records final headers, after Sieve edits where applicable;
-old writers during a rolling upgrade and severely malformed APPEND headers
-accepted with degraded metadata can still produce unknown rows.
-
-For large databases, follow the concurrent covering-index preparation in
-`db/migrations/000070_messages_header_presence.up.sql` before upgrading. The
-migration refuses an unprepared blocking rebuild. Existing bodies, flags, UIDs,
-MODSEQs, search caches and content hashes are not rewritten.
-
-### Initial flag-state versions (migration71)
-
-A new UID and a later flag change can arrive between the same two polls. The
-nullable `message_state.initial_modseq` records the flag version installed by
-that row's INSERT; a trigger keeps it unchanged on UPDATE. Poll suppresses the
-initial flags of a newly announced message, while a later STORE still produces
-FlagChange or keeps the reported CONDSTORE watermark below a filtered change.
-This also covers an own APPEND whose MessageNew FETCH is suppressed.
-
-Existing state rows remain NULL and follow the conservative flag-update path.
-There is no backfill or body read. All writers get this metadata from the INSERT
-trigger, including older servers during a rolling upgrade. COPY, MOVE and restore
-install a fresh state row and initial version; they do not reuse the source's
-version. Rolling migration71 back removes this knowledge; applying it again
-leaves those existing rows unknown rather than inferring their original flags.

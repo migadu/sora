@@ -34,7 +34,7 @@ by their BLAKE3 hash.
 
 | Table | What it holds |
 |---|---|
-| `accounts` | One row per account, with its deletion and purge marks. |
+| `accounts` | One row per account, with its deletion mark (`deleted_at`) and purge request (`purge_requested_at`). |
 | `credentials` | Login addresses (the primary address and aliases) and their password hashes. |
 | `mailboxes` | Folders. Deleted folders stay as tombstones until the cleaner removes them. |
 | `subscriptions` | IMAP subscriptions, by folder name, per account. |
@@ -44,6 +44,7 @@ by their BLAKE3 hash.
 | `mailbox_stats` | Message count, unseen count, total size, highest MODSEQ and keyword list per folder, kept current by database triggers. |
 | `messages_fts_v2` | Body search vectors. The only copy of this data; see [SEARCH.md](SEARCH.md#4-the-fts-table-and-the-fts-worker). |
 | `pending_uploads` | Bodies waiting to be uploaded to S3, with the node that owns each and its upload lease. |
+| `s3_body_delete_intents` | S3 deletes of message bodies that have been sent but not yet confirmed. A body with a row here is quarantined ([STORAGE.md](STORAGE.md#95-how-deletions-are-made-safe)). |
 | `instance_heartbeats` | When each uploader instance was last alive. |
 | `instance_sessions` | Open sessions each node reports, used to drain a backend for maintenance. |
 | `backend_maintenance` | Backends taken out of rotation ([PROXY.md](PROXY.md)). |
@@ -52,6 +53,8 @@ by their BLAKE3 hash.
 | `redirect_log` | Sieve redirects per account, for the redirect rate limit. |
 | `metadata` | IMAP METADATA entries. |
 | `locks` | Named locks with an expiry, for work that must run on exactly one node (TLS certificate issuance). |
+| `credential_changes` | One row for every changed or removed password, login address or account, written by database triggers. Every node reads it to drop cached logins ([AUTHENTICATION.md](AUTHENTICATION.md#121-the-credential-change-feed)). Rows are deleted 7 days after a node first saw them. |
+| `database_identity` | One random UUID that names this database. Imports use it to recognise the database they resume into, and the auth cache to recognise its own entries. Backups and failover keep it. |
 | `health_status` | Current health of each node's components. |
 | `cache_metrics` | Hit and miss counts of each node's local cache. |
 | `schema_migrations` | The schema version and its dirty flag ([section 9](#9-migrations)). |
@@ -113,14 +116,18 @@ CREATE DATABASE sora_mail_db OWNER sora ENCODING 'UTF8' TEMPLATE template0;
   run a statement at least every minute to stay alive (see [section 8](#8-pgbouncer-and-other-connection-poolers)).
 - **`max_locks_per_transaction`**: PostgreSQL has room for `max_locks_per_transaction` ×
   (`max_connections` + `max_prepared_transactions`) locks for the whole server, advisory locks
-  included; once they are used up, every session fails with `out of shared memory` (SQLSTATE
-  `53200`). A batch of the cleanup cycle holds up to 1,000 advisory locks, and an IMAP `COPY` or
-  `MOVE` with any row handed to another owner is limited to 1,000 distinct source bodies,
-  including selected legacy rows already owned by the destination. Matching global source
-  and destination claims coalesce; body claims plus FTS locks consume at most 2,000 entries
-  for that command. Source-account guards and ordinary SQL locks are additional. Pure
-  same-owner commands retain their existing uncapped body-admission policy. This is not a
-  server-wide capacity guarantee: leave headroom for other lock classes and concurrent work.
+  included. Once they are used up, every session fails with `out of shared memory` (SQLSTATE
+  `53200`). Some of Sora's transactions take many advisory locks at once:
+  - The cleanup cycle locks up to 500 message bodies per batch of S3 deletes, and up to 1,000
+    search rows when it sweeps orphaned search vectors.
+  - An IMAP `COPY` or `MOVE` that moves messages into a mailbox of another account locks every
+    distinct body it carries, and their search rows, until it commits. Such a command may carry
+    at most 1,000 distinct bodies, so it takes at most about 2,000 advisory locks, plus its
+    ordinary row locks. A larger command is refused with `NO [LIMIT]` and changes nothing.
+    COPY and MOVE within one account have no such limit.
+
+  These numbers are per transaction. Leave room for several of them at once, and for all other
+  locks.
 
 ---
 
@@ -254,12 +261,21 @@ or your pooler, for all of them together.
 
 ### Pool size
 
-For **every host** in `hosts`, Sora opens connections with that endpoint's settings:
+For **every host** in `hosts`, Sora opens a pool with that endpoint's settings:
 `max_connections` sets the upper limit and `min_idle_connections` the idle connections kept
 ready. The pools grow only as load needs, but the upper limit is what PostgreSQL must be ready
 for.
 
-`sora-admin` connects to the write hosts only, and never to replicas.
+**Without `[database.read]`**, each write host gets a second pool, of the same size, for
+reads. Heavy writes (a large import, a burst of deliveries) then cannot starve reads of
+connections. Such a host can therefore see up to 2 × `max_connections` connections from one
+process. With `[database.read]`, a write host has one pool, and reads share it only when no
+replica is healthy.
+
+`sora-admin` connects to the write hosts only, and never to replicas. The import commands and
+`import rekey` need at least 2 connections in the write pool: each worker holds one for its
+body locks while its writes use another. They run at most half as many workers as the pool has
+connections.
 
 ### Pool behaviour
 
@@ -385,8 +401,8 @@ writes move to the server that answers as primary within one check interval.
 ### Advisory locks across a failover
 
 Sora orders the deletion of a message body in S3 (the cleaner, account purges, `import rekey`)
-against the writes that claim one (uploads, restores, cross-account copies and moves) with advisory locks
-on the write host. A lock excludes only what runs on the server that holds it. So when Sora stops
+against the writes that claim one (uploads, restores, imports, cross-account copies and moves)
+with advisory locks on the write host ([STORAGE.md](STORAGE.md#95-how-deletions-are-made-safe)). A lock excludes only what runs on the server that holds it. So when Sora stops
 writing through a server, it revokes the locks it holds there: the work they guard is cancelled
 (a cleanup batch or purge runs again in a later cycle; a copy or `import rekey` fails and can be
 retried). It does so when it switches to another write host, before it writes anything there, and
@@ -475,8 +491,9 @@ These hold one server connection behind the pooler for as long as they run:
 
 | Holder | How many |
 |---|---|
-| The cleanup cycle | Two on the node running the cycle: one for the whole cycle, one during each batch of S3 deletes. |
-| An account purge | One per node while it purges an account. |
+| The cleanup cycle | Two on the node running the cycle: one for the whole cycle, one during each batch of S3 deletes. A third is used briefly to commit each batch's deletion intents ([STORAGE.md](STORAGE.md#95-how-deletions-are-made-safe)). |
+| An account purge | One per node while it purges an account, and a second briefly for its deletion intents. |
+| `sora-admin` imports and `import rekey` | Two per worker: one for the body locks, one for the writes. |
 | IMAP `COPY` or `MOVE` into a folder owned by another account | One per command in progress: its own transaction, from the S3 check and copy until its rows commit. |
 | Migrations | Two on the node applying them, for the whole run: the leader lock and the connection the migrations run on. |
 
@@ -486,7 +503,7 @@ statements, so `[uploader] concurrency` is bounded by S3, not by the pool.
 Size the pooler's pool for Sora's database user with this in mind:
 
 ```
-pool_size >= 2 + headroom for interactive writes, cross-account copies and moves, and uploader statements
+pool_size >= 3 + headroom for interactive writes, cross-account copies and moves, imports, and uploader statements
 ```
 
 A pool sized only for short IMAP and LMTP transactions can queue mail delivery behind the
@@ -601,15 +618,21 @@ The tool's help asks you to stop Sora before `up`, `down` and `force`. `migrate`
 When a migration fails, the version is left dirty and nodes refuse to start. Because the failed
 file's changes were rolled back as a whole:
 
-1. Read the error in the log. It names the problem, for example a missing prerequisite.
+1. Read the error in the log. It names the problem, for example a missing prerequisite or
+   out-of-band preparation that is not finished ([Large databases](#large-databases)).
 2. Fix the cause.
 3. Set the version back to the last migration that completed: `sora-admin migrate force <N-1>`,
-   where N is the version shown as dirty. The numbering has gaps (there is no 000032), so use the
-   number of the previous file that exists.
+   where N is the version shown as dirty. The numbering has gaps (there is no 000032 and no
+   000063), so use the number of the previous file that exists.
 4. Start Sora again, or run `sora-admin migrate up`.
 
-If a migration file had a statement that cannot run inside a transaction, check by hand what was
-applied before you force a version.
+A failed **down** migration is recorded the other way round: reverting N leaves the version at
+N−1, dirty. Finish its preparation, run `sora-admin migrate force N`, and run
+`migrate down` again.
+
+Never force a version to skip a migration that refused: the migration's checks are what keep a
+blocking index build away from a large table. If a migration file had a statement that cannot
+run inside a transaction, check by hand what was applied before you force a version.
 
 ### Rolling back
 
@@ -617,8 +640,22 @@ applied before you force a version.
 `up` files created, with their data. For example, reverting 000050 drops `messages_fts_v2`, the
 only copy of body search data. Restore from a backup instead when you can, and never run
 `down --all` on a live system: it reverts every migration after 000001 and deletes their data.
-The down file of 000001 is commented out on purpose, so the initial tables stay; to tear down a
-database completely, drop and recreate it.
+`migrate down` never reverts 000001: `--all` stops after it, and a `--limit` that would reach it
+is refused. To tear down a database completely, drop and recreate it.
+
+Stop every binary that uses what a migration added before you revert it. Some down files need
+care:
+
+| Migration | Reverting it |
+|---|---|
+| 000059, 000070, 000073 | On more than 25,000 messages, refuses until you have done its work by hand (rebuild the previous index, drop the new one and the column), as the down file's comment describes. |
+| 000062 | Drops its index with an exclusive lock on `messages`. On a large database run `DROP INDEX CONCURRENTLY IF EXISTS idx_messages_mailbox_sent_date_unknown;` first. |
+| 000064, 000065 | Changes nothing. The folded or deleted METADATA entries cannot be brought back. |
+| 000067 | Drops `restored_at`. Expunged rows of restored messages are listed as deleted messages again until the cleaner removes them. |
+| 000068 | Drops the database identity. Applying 000068 again creates a **new** one, so imports cannot resume into this database as the same destination. |
+| 000069 | Drops the credential change feed. Nodes then learn of changed logins only through the cluster or on the node that made the change. |
+| 000071 | Drops `message_state.initial_modseq`. Applying it again leaves existing rows unknown. |
+| 000072 | Refuses while any deletion intent remains. Resolve them first ([OPERATIONS.md](OPERATIONS.md#body-deletions-that-stay-quarantined)). |
 
 ### Large databases
 
@@ -639,7 +676,17 @@ pooler), off-peak. The migrations on `main` that need it on a large database:
 | 000050 | `messages_fts_v2`, the per-account search table, and `btree_gin`. | See [Migration 000050](#migration-000050) below. |
 | 000051 | Replaces seven indexes on `messages` with `idx_messages_mailbox_active`. | Create the new index with `CREATE INDEX CONCURRENTLY`, then drop the seven old ones with `DROP INDEX CONCURRENTLY`, one at a time. |
 | 000052 | `idx_messages_mailbox_headers`, the covering index for header search. | Fix over-long rows with [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql), then build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file. |
-| 000062 | `idx_messages_mailbox_sent_date_unknown`, the messages without a usable `Date:` header, which SENTBEFORE, SENTON and SENTSINCE leave out. | Build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file, and check that it is valid. On more than 25,000 messages the migration refuses to build it itself. |
+| 000059 | `messages.extra_addresses` and the covering header index `idx_messages_mailbox_headers_v2`, which replaces `idx_messages_mailbox_headers`. | Add the column with a short `lock_timeout`, build the new index with `CREATE INDEX CONCURRENTLY`, check that it is valid, then drop the old index with `DROP INDEX CONCURRENTLY`. If the same upgrade also applies 000070, build `idx_messages_mailbox_headers_v3` instead of v2 (add `header_presence` first): 000059 accepts a valid v3. Optionally fill old rows afterwards with [scripts/backfill_extra_addresses.sql](../scripts/backfill_extra_addresses.sql). |
+| 000060, 000061, 000067 | New nullable columns on `messages`: `sent_utc_offset`, `sent_date_unknown`, `restored_at`. | Adding a column needs a brief exclusive lock on `messages`. Add each one first with `SET lock_timeout = '3s'` and the `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` from the file, and retry on a lock timeout. |
+| 000062 | `idx_messages_mailbox_sent_date_unknown`, the messages without a usable `Date:` header, which SENTBEFORE, SENTON and SENTSINCE leave out. | Build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file, and check that it is valid. |
+| 000070 | `messages.header_presence` and the covering header index `idx_messages_mailbox_headers_v3`, which replaces v2. | Add the column with a short `lock_timeout`, build v3 with `CREATE INDEX CONCURRENTLY`, check that it is valid and ready, then drop v2 with `DROP INDEX CONCURRENTLY`. Both indexes exist during the change: plan for the extra disk space and write load. |
+| 000073 | `messages.message_id_raw` and the partial index `idx_messages_mailbox_message_id_raw`. | Add the column with a short `lock_timeout`, then build the index with `CREATE INDEX CONCURRENTLY` and check that it is valid. |
+
+On more than 25,000 messages, 000059, 000062, 000070 and 000073 refuse to do this work
+themselves, and always refuse an index that is invalid. Startup then stops with the version
+dirty, although nothing was changed: finish the preparation, `migrate force` the previous version,
+and start again ([A failed migration](#a-failed-migration)). Once the work is done, these
+migrations only look at the catalog and take no lock on `messages`.
 
 Older migrations (for example 000008, 000010, 000012, 000014, 000038 and 000039) carry the same
 kind of note. Copy index definitions exactly from the migration file: the migration only checks
@@ -714,6 +761,39 @@ with `CREATE INDEX CONCURRENTLY`, using the definition from the migration file. 
 header comment lists the session settings that help a large build (`maintenance_work_mem`,
 `temp_file_limit`, `statement_timeout`).
 
+#### Migrations 000060 to 000073
+
+What each of these changes, and what it means for existing data. Most of them are
+**forward-only**: they add a column that new mail fills in, and Sora never fills it for mail
+stored before. Nothing reads the bodies in S3 again to fill them, and there is no command to do
+so. Rows written before the migration, or by older binaries during a rolling upgrade, keep the
+behaviour they had.
+
+| Migration | Change | Existing rows |
+|---|---|---|
+| 000060 | `messages.sent_utc_offset`: the time zone of the `Date:` header, so that SENTBEFORE, SENTON and SENTSINCE match the day the header names ([SEARCH.md](SEARCH.md)). | NULL: searched by the UTC day, as before. |
+| 000061 | `messages.sent_date_unknown`: TRUE for a message without a `Date:` header that parses. Its ENVELOPE date is NIL ([PROTOCOLS.md](PROTOCOLS.md)). | NULL: the stored date is reported, as before. |
+| 000062 | The index of the messages marked by 000061, which date searches leave out. | Only new rows can be marked. |
+| 000064 | Folds METADATA entry names to lower case, keeping the newest entry where two fold to one name. | Rewritten. Cannot be undone. |
+| 000065 | Deletes METADATA entries named `/private/` or `/shared/`, which no command can read or delete. | Deleted. Cannot be undone. |
+| 000066 | Replaces a trigger function: a restored message raises its mailbox's highest MODSEQ. | Nothing rewritten. |
+| 000067 | `messages.restored_at`: marks the expunged row of a restored message ([STORAGE.md](STORAGE.md#92-removal-after-the-grace-period)). | NULL. |
+| 000068 | `database_identity`, a random UUID for this database. | One row is created. |
+| 000069 | `credential_changes` and the triggers on `credentials` and `accounts` that fill it ([AUTHENTICATION.md](AUTHENTICATION.md#121-the-credential-change-feed)). | None needed. |
+| 000070 | `messages.header_presence`: which searchable header fields a message has, so that a search for an empty header value is exact ([SEARCH.md](SEARCH.md)). Replaces the header index with v3. | NULL: searched as before. COPY, MOVE and restore keep NULL. |
+| 000071 | `message_state.initial_modseq`, set by a trigger on every new flag row, so that a client is not told twice of the flags of a message it has just learnt of. | NULL: handled as before. |
+| 000072 | `s3_body_delete_intents` ([STORAGE.md](STORAGE.md#95-how-deletions-are-made-safe)). | Empty table. |
+| 000073 | `messages.message_id_raw`: the full `Message-ID:` field when it is not one plain `<id@domain>`, for exact `HEADER Message-ID` searches. | NULL: searched by the normalised ID, as before. |
+
+000060, 000061, 000067 and 000071 only add a column: on a small database they apply in
+moments. 000071 alters the partitioned `message_state` table directly, with a brief exclusive
+lock; it has no out-of-band step. 000064 locks the `metadata` table against writes while it runs.
+
+**Flag rows.** Every message Sora stores now gets its `message_state` row, including copies,
+moves, restores and imports. A message stored by an older release may have none; it reads as
+having no flags. An IMAP `STORE` or a User API flag change on such a message creates its row
+first. Reads and background work do not create missing rows.
+
 ---
 
 ## 10. Maintenance
@@ -749,7 +829,21 @@ The cleaner ([STORAGE.md](STORAGE.md)) deletes expunged messages after the grace
 folders, deleted accounts, expired search vectors ([SEARCH.md](SEARCH.md#6-fts-retention)),
 orphaned search rows and old `health_status` rows (`[cleanup] health_status_retention`). Each node
 with a local cache deletes its old `cache_metrics` rows (`[local_cache] metrics_retention`). You
-do not need cron jobs for these.
+do not need cron jobs for these. The steps that remove messages, mailboxes and accounts run
+only once message-body deletion is turned on ([STORAGE.md](STORAGE.md#95-how-deletions-are-made-safe));
+until then expunged rows and deleted accounts stay in the database.
+
+### Repair commands
+
+`sora-admin` has commands for data that older releases left inconsistent. Each one has a dry-run
+mode; see [ADMIN_CLI.md](ADMIN_CLI.md):
+
+- [`mailbox repair-unseen`](ADMIN_CLI.md#mailbox-repair-unseen) recounts unseen counters that
+  are too high (the cleaner already repairs counters that went below zero);
+- [`mailbox repair-hierarchy`](ADMIN_CLI.md#mailbox-repair-hierarchy) repairs the parent links
+  of mailboxes;
+- [`messages repair-references`](ADMIN_CLI.md#messages-repair-references) fills the stored
+  References of messages that have none.
 
 ---
 
@@ -787,65 +881,3 @@ transaction` for a long time are usually the lock holders of [section 8](#8-pgbo
 | `out of shared memory` (SQLSTATE `53200`) | The shared lock table is full. | Look for long-held locks in `pg_locks`; with a transaction pooler, look for session-level advisory locks left behind. |
 | Writes fail with `read-only transaction` after a failover | The write host name still points at the old primary. | Point it at the new primary (DNS, virtual IP or pooler); Sora reconnects on its own. |
 | Clients get `NO [UNAVAILABLE]` under load | Timeouts, lock timeouts, an open circuit breaker or an exhausted pool. | Check the circuit breaker log lines, `sora_db_pool_in_use_conns` and slow queries in PostgreSQL. |
-
-
-### Message state for newly created rows
-
-COPY and MOVE create a `message_state` row for each destination message even when
-an older source message has none. Missing source state is represented by empty
-flags and keywords, matching the source's existing displayed state. Delivery,
-APPEND, imports and restore also create state for their newly inserted rows.
-
-Explicit IMAP STORE and User API flag-write requests initialize missing state
-only for the live messages they target, then apply the requested mutation. This
-does not recover lost historical flags. Reads, SELECT and background work do not
-repair missing state, and no historical backfill command or scan is provided.
-
-This is a forward-only repair after all writers have been upgraded. Existing
-messages without state are left unchanged; their historical SEARCH UNSEEN,
-STATUS counts remain unchanged until an explicit flag-write targets them. There is no
-historical backfill, backfill migration or startup scan for this change. Older
-writers and transactions started before upgrade can still create missing rows.
-
-New APPENDs whose structured MIME parsing is degraded still record searchable
-header presence from their raw header block. This applies only to the new
-ingress row; legacy NULL masks remain unknown, with no scan, S3 read or repair
-command to populate historical rows.
-
-### Import body admission connections
-
-Maildir batches and S3 import workers hold one write-pool connection for shared
-body admission while their write transactions use another. These commands require
-at least two write-pool connections; S3 import limits workers to half the pool
-size to leave room for their inserts. Uploaded-state transactions also take the
-global body lock and check durable deletion intents before admitting references.
-A lost outer lock therefore cannot make an unrelated transaction a valid commit
-fence. Keep message-body deletion paused until the complete upgraded protocol is
-deployed, as described in [Operations](OPERATIONS.md#upgrading-the-s3-message-body-lock-protocol).
-
-The original storage holder and each actual write transaction must overlap: the
-write transaction takes its shared body locks, then synchronously pings the original
-holder for the exact hashes it is admitting. It keeps its own locks until commit.
-A delayed write cannot simply reacquire a free lock after an intervening DELETE
-finished and cleared its intent. A lost or retired original holder refuses that
-stale completion. These checks also cover same-account COPY and content deduplication,
-using a fresh source read after locking; delivery can still stage quarantined bytes
-without declaring them uploaded. S3 import inserts and marks a stored body uploaded
-in one transaction. Rekey old-body deletion uses the durable intent protocol, not
-just a held advisory lock. Historical inconsistent rows are not automatically repaired.
-
-### Raw Message-ID field text for newly ingested messages
-
-Migration 73 adds nullable `message_id_raw` and a partial mailbox index. New
-APPEND, LMTP delivery and imports retain the complete unfolded Message-ID field
-text when normalization alone would lose comments, malformed or empty values,
-quoted local parts, domain literals or duplicate fields. Canonical single IDs use
-the existing normalized value and store NULL in the new column. Whole-ID searches
-keep the existing equality index; noncanonical rows use the partial mailbox index.
-
-This is forward only. Existing rows are not scanned or backfilled, and COPY, MOVE
-and restore carry the stored value or NULL without reading historical bodies.
-Legacy NULL rows retain their prior normalized search behavior. For large tables,
-follow the preparation and rollback instructions in the migration 73 SQL files;
-the automatic migration refuses blocking DDL above 25,000 rows if preparation is
-incomplete.

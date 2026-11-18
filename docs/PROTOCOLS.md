@@ -196,11 +196,18 @@ The PROXY protocol and how Sora's own proxies use it are described in [PROXY.md]
 
 A connection over `max_connections` or `max_connections_per_ip` is closed at once, without a
 greeting. On IMAP, a connection from an address that the auth rate limiter has blocked is closed
-the same way. The exception is a client a PROXY header names that is over `max_connections_per_ip`,
-or blocked on IMAP: it gets a refusal greeting, after the TLS handshake on an implicit-TLS
-listener (IMAP `* BYE`, POP3 `-ERR [SYS/TEMP]`, ManageSieve `NO (TRYLATER)`), so that a proxy in
-front fails only that client's login and does not count a backend failure. See
-[SECURITY.md](SECURITY.md#4-connection-limits).
+the same way.
+
+There is one exception: a client named in a PROXY header that is over `max_connections_per_ip`
+(or, on IMAP, blocked). It gets a refusal greeting instead, after the TLS handshake on an
+implicit-TLS listener:
+
+- IMAP: `* BYE ...`
+- POP3: `-ERR [SYS/TEMP] ...`
+- ManageSieve: `BYE (TRYLATER) "Too many connections"`
+
+This way the proxy in front fails only that client's login and does not count it as a backend
+failure. See [SECURITY.md](SECURITY.md#4-connection-limits).
 
 The per-user limits on a backend count sessions on that one server block only. A login over the
 limit is refused and the session stays unauthenticated: IMAP answers
@@ -257,7 +264,8 @@ protocol.
 | `timeouts.absolute_session_timeout` | `24h` | `24h` | `24h` |
 | `timeouts.min_bytes_per_minute` | `0` (off) | `0` (off) | `0` (off) |
 
-LMTP timeouts are in section 8.8.
+LMTP reads `timeouts.command_timeout` too, with a default of `5m`; its timeouts are in
+section 8.8.
 
 Notes:
 
@@ -269,6 +277,8 @@ Notes:
 - `auth_idle_timeout` is a top-level key of the `[[server]]` block, not part of `timeouts`. It
   replaces `command_timeout` until the client logs in. On POP3 and ManageSieve it also bounds a
   SASL continuation and the STARTTLS handshake.
+- On POP3, the library also uses `command_timeout` as the longest time one command may take,
+  `USER`, `PASS` and `AUTH` included.
 - `absolute_session_timeout = "0"` removes the session limit.
 - `min_bytes_per_minute` works in one-minute windows and starts two minutes after the connection
   opens. A window counts as stalled when the client sent some bytes, fewer than the threshold, and
@@ -282,7 +292,7 @@ What the client sees when a timeout fires:
 | Protocol | Idle | Absolute | Throughput |
 |---|---|---|---|
 | IMAP | `* BYE [UNAVAILABLE] Idle timeout, please reconnect` | `* BYE [UNAVAILABLE] Maximum session duration exceeded, please reconnect` | `* BYE [UNAVAILABLE] Connection too slow, please reconnect` |
-| POP3 | `-ERR Idle timeout, connection timed out` | `-ERR [IN-USE] Maximum session duration exceeded` | `-ERR [IN-USE] Connection too slow, please reconnect` |
+| POP3 | `-ERR Idle timeout, connection timed out` | `-ERR Maximum session duration exceeded` | `-ERR Connection too slow, please reconnect` |
 | ManageSieve | `BYE (TRYLATER) "Connection timed out due to inactivity, please reconnect"` | `BYE (TRYLATER) "Maximum session duration exceeded, please reconnect"` | `BYE (TRYLATER) "Connection too slow, please reconnect"` |
 
 Every timeout close is counted in `sora_connection_timeouts_total{protocol, server_name, hostname,
@@ -355,10 +365,19 @@ list depends on the connection state:
 | `additional_caps` | | If configured. |
 
 Not supported: `QUOTA`, `COMPRESS`, `CATENATE`, `WITHIN`, `UNAUTHENTICATE`, `METADATA-SERVER`,
-`OBJECTID`, `SAVEDATE`, `UIDONLY`, `MULTIAPPEND`, `LIST-MYRIGHTS`, `REPLACE`, `URLAUTH`.
+`LIST-METADATA`, `OBJECTID`, `SAVEDATE`, `UIDONLY`, `MULTIAPPEND`, `LIST-MYRIGHTS`, `REPLACE`,
+`URLAUTH`.
 
 The list is the same for every client unless `disabled_caps` or `client_filters` remove entries
 (section 6).
+
+A command, option or modifier that belongs to an extension the session does not advertise is
+refused with `BAD [CLIENTBUG]`, so a client cannot use an extension it was not offered. Sora
+answers `BAD [CLIENTBUG] <command> is not supported` for `MOVE`, `UID EXPUNGE`, `SORT`, `THREAD`,
+`ESEARCH IN`, `NAMESPACE`, `GETMETADATA`, `SETMETADATA`, `CREATE ... (USE ...)`,
+`LIST ... RETURN (STATUS)`, `LIST ... RETURN (METADATA)`, `LIST (SPECIAL-USE)`, `STATUS SIZE`
+and `FETCH BINARY`. The IMAP library does the same for the CONDSTORE and QRESYNC modifiers
+(section 5.8).
 
 ### 5.2 Login
 
@@ -368,15 +387,23 @@ maintenance gate, and the per-user connection limit. Replies a client may see:
 
 | Situation | Reply |
 |---|---|
-| Wrong address or password, unknown user, or a rate-limited attempt | `NO [AUTHENTICATIONFAILED] Invalid address or password` |
+| Wrong address or password, unknown user, an address that does not parse, or a rate-limited attempt | `NO [AUTHENTICATIONFAILED] Invalid address or password` |
 | Empty password | `NO [AUTHENTICATIONFAILED] Authentication failed` |
-| Address that does not parse | `NO [AUTHENTICATIONFAILED] Address not in the correct format` |
 | Too many logins waiting in the delay queue | `* BYE [ALERT] Too many concurrent authentication attempts. Please try again later.` |
+| The database cannot be reached to check the login | `NO [UNAVAILABLE] authentication service temporarily unavailable, please try again later` |
+| The server is shutting down | `NO [UNAVAILABLE] server is shutting down, please try again` |
+| A master SASL login for a user it may not act as | `NO [AUTHORIZATIONFAILED] Proxy login not permitted for this user.` |
 | Per-user limit reached | `NO [LIMIT] Maximum connections reached` |
 | Backend in maintenance | `NO [UNAVAILABLE] Server in maintenance, please try again later` |
 
-A rate-limited attempt gets the same reply as a wrong password on purpose, so the reply does not
-reveal that the account or address is being limited. Master users (`user@example.com@MASTER` with
+A rate-limited attempt and an address that does not parse get the same reply as a wrong password
+on purpose, so the reply does not reveal anything about the account or the limiter.
+
+`AUTHENTICATE` supports only the `PLAIN` mechanism. A client response must be one line of base64.
+`*` cancels the exchange. A response that is not valid base64, contains a CR, or is a lone `=`
+in reply to a continuation is refused with `BAD`. When the client does not answer a continuation
+in time, the server sends `* BYE Timed out waiting for AUTHENTICATE response` and closes the
+connection. Master users (`user@example.com@MASTER` with
 `master_username`, and SASL authorization identities with `master_sasl_username`), the lookup cache
 and the rate limiter are described in [AUTHENTICATION.md](AUTHENTICATION.md).
 
@@ -397,6 +424,8 @@ start a cache warm-up that copies the newest INBOX messages from S3 to the local
   special-use attributes `\Sent`, `\Drafts`, `\Archive`, `\Junk` and `\Trash`.
 - `RENAME INBOX <name>` follows RFC 3501 §6.3.5: it moves every message from INBOX into a new
   mailbox and leaves INBOX empty.
+- The shared namespace root itself (`Shared` by default) holds no messages. It is listed as
+  `\Noselect`; `SELECT`, `EXAMINE` and `STATUS` on it get `NO`, and `CREATE` of it is refused.
 - Access to shared mailboxes is governed by ACL rights; see [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
 
 ### 5.4 Messages and flags
@@ -408,19 +437,33 @@ start a cache warm-up that copies the newest INBOX messages from S3 to the local
   message, the library reads and discards the data so the stream stays in sync.
 - An empty message is refused: `NO empty message rejected: a message must contain at least headers`.
 - A missing target mailbox gets `NO [TRYCREATE]`.
+- An APPEND without a date-time gets the current time as its INTERNALDATE (RFC 9051 §6.3.12).
 - When the session memory limit cannot hold the message:
   `NO [UNAVAILABLE] Session memory limit reached, please try again later`.
-- When the local upload spool is full or read-only:
+- When this node's upload spool is over its size limit:
   `NO [UNAVAILABLE] System storage limit reached, please try again later`.
+- When the message cannot be written to the spool (for example, the disk is full or read-only):
+  `NO [SERVERBUG] failed to save message to disk: <cause>`. The reply names the cause, such as
+  `no space left on device`, never the spool path.
 - The body is written to the local spool and uploaded to S3 in the background; see
   [STORAGE.md](STORAGE.md).
 
+**Read-only selections**
+
+A mailbox opened with `EXAMINE` reports an empty `PERMANENTFLAGS` list. `STORE` on it gets
+`NO Mailbox is read-only (opened with EXAMINE)`, and `MOVE` from it gets `NO Mailbox is read-only`.
+
 **COPY and MOVE**
 
-- A `COPY` or `MOVE` that rekeys any selected row to another owner may carry at most
-  1,000 distinct source bodies, including legacy rows already owned by the destination. A larger one is refused with
-  `NO [LIMIT] COPY across accounts is limited to 1000 distinct message bodies`
-  and copies or moves nothing; see [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md#storage-and-statistics).
+- A `COPY` or `MOVE` into a mailbox of another account (a shared mailbox) may carry at most
+  1,000 distinct message bodies. A larger one copies or moves nothing and is refused with
+  `NO [LIMIT] COPY across accounts is limited to 1000 distinct message bodies` (or `MOVE ...`).
+  See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md#storage-and-statistics).
+- A `COPY` into the selected mailbox itself gets `NO Cannot copy messages to the same mailbox`.
+- When a source message's body is renamed while it is copied or moved (by a `sora-admin`
+  import), the command writes nothing and answers
+  `NO [INUSE] Messages changed during the copy, please retry` (or `... the move ...`).
+  A retry succeeds.
 
 **Keywords**
 
@@ -436,7 +479,10 @@ start a cache warm-up that copies the newest INBOX messages from S3 to the local
 **\Recent**
 
 Sora tracks `\Recent` in memory on each server, per mailbox, from the highest UID at the last
-read-write `SELECT`. It is approximate across several servers and is reset on restart.
+read-write `SELECT`. It is approximate across several servers and is reset on restart. Within a
+session, the `RECENT` count, `SEARCH RECENT` (and `NEW`, `OLD`) and the `\Recent` flag in `FETCH
+FLAGS` all use the same threshold, so they agree. A client that has enabled IMAP4rev2, where
+`\Recent` is deprecated, sees it on no message.
 
 **EXPUNGE**
 
@@ -459,14 +505,32 @@ local spool first, then S3. Three replies are specific to Sora:
   client cannot mistake it for an empty message.
 - `NO [LIMIT] Message too large for the session memory limit` when the message can never be
   fetched within the session memory budget: its body is larger than the whole budget, or a section
-  (`BODY[TEXT]`, `BODY[2]`, `BINARY[2]`) does not fit beside the body it is copied from. RFC 5530
-  defines LIMIT as "The operation ran up against an implementation limit of some kind"; a retry
-  cannot succeed, and a NOTIFY `MessageNew` fetch passes such a message over at once.
+  (`BODY[TEXT]`, `BODY[2]`, `BINARY[2]`) does not fit beside the body it is copied from. A retry
+  cannot succeed (RFC 5530 LIMIT: an implementation limit). A NOTIFY `MessageNew` fetch skips such
+  a message at once.
 - `NO [UNAVAILABLE] Session memory limit reached, please try again later` when the body or section
   would fit the budget, but other data the session holds at the moment does not leave room for it.
   A retry can succeed.
 
 In both memory cases the message is not marked `\Seen`, and nothing of its response is sent.
+
+Other rules for FETCH:
+
+- **Implicit `\Seen`.** `BODY[...]` and `BINARY[...]` without `.PEEK` set `\Seen`, one message at a
+  time, just before that message's response. A FETCH that fails part way has set `\Seen` only
+  on the messages it answered. When the flag changes, the response includes the new `FLAGS`
+  (and `MODSEQ` once CONDSTORE is enabled).
+- **ENVELOPE.** The date is the message's `Date:` header in the zone it was written in, and
+  `NIL` when the message has no `Date:` header that parses (SORT and THREAD then use the
+  INTERNALDATE). The message ID is `NIL` when the message has no `Message-ID:` header. Messages
+  stored by versions before these rules report what they reported before.
+- **BINARY.** A `BINARY` or `BINARY.SIZE` section whose Content-Transfer-Encoding Sora cannot
+  decode gets `NO [UNKNOWN-CTE]` (RFC 9051 §7.5.2).
+- **Large sections fetched in pieces.** A client often fetches a large attachment in
+  `<offset.size>` chunks. Sora keeps the last section it extracted or decoded for the session, so
+  it does not reload the message for every chunk. A section up to 8 MiB is kept in memory; a
+  larger one, up to 128 MiB, is kept in a temporary file that is deleted from the directory at once, up to 2 GiB
+  of such files on the node.
 
 `limits.session_memory_limit` (default `100mb`, `0` for no limit) bounds the memory one session
 may hold at once for FETCH bodies, APPEND data, SEARCH results and previews. Each refusal is counted
@@ -489,8 +553,9 @@ on the IMAP server block are:
 
 A search refused by the rate limit gets `NO [LIMIT]`. A `THREAD` that matches more than the cap
 gets `NO [LIMIT] THREAD matches more than <n> messages, narrow the search`, never a partial result.
-`THREAD` supports the algorithms `REFERENCES`, `REFS` and `ORDEREDSUBJECT`; any other gets
-`NO Unsupported threading algorithm`.
+`THREAD` supports the algorithms `REFERENCES`, `REFS` and `ORDEREDSUBJECT`. An algorithm that is
+not advertised (any other, or one removed in section 6) gets
+`BAD [CLIENTBUG] THREAD <algorithm> is not supported`. An unknown `SORT` key gets `BAD`.
 
 ### 5.7 IDLE and NOTIFY
 
@@ -506,23 +571,48 @@ Sora servers and read replicas. The latency is one poll interval plus replica la
   When more than 100 mailboxes change in one interval, Sora drops the watch with
   `* OK [NOTIFICATIONOVERFLOW]` and the client must re-synchronise. At most 64 new-message responses
   for the selected mailbox are sent per interval; the rest follow on the next ones.
+- **Changes seen by polling.** A message that arrives and has its flags changed within one
+  interval is announced once, with its current flags; the client does not get a separate flag
+  update for the flags it was stored with. Changes a session made itself (its own `STORE`,
+  `COPY`, `RENAME`) are not reported back to it as NOTIFY events.
 
 ### 5.8 CONDSTORE and QRESYNC
 
-Both are advertised. Sora sends `MODSEQ` data only to a client that has enabled CONDSTORE on the
-connection, by `ENABLE CONDSTORE` or `ENABLE QRESYNC`, or by using a CONDSTORE modifier such as
-`SELECT ... (CONDSTORE)`, `CHANGEDSINCE` or `UNCHANGEDSINCE`. A `STORE ... UNCHANGEDSINCE` that
-fails for some messages answers `OK [MODIFIED <set>]`, in the command's number space (sequence
-numbers for `STORE`, UIDs for `UID STORE`), per RFC 7162 §3.1.3.
+Both are advertised.
+
+**When MODSEQ data is sent.** Sora sends `MODSEQ` data only to a client that has enabled
+CONDSTORE on the connection. A client enables it with `ENABLE CONDSTORE` or `ENABLE QRESYNC`, or
+by using a CONDSTORE enabling command: `SELECT ... (CONDSTORE)`, `FETCH ... (MODSEQ)`,
+`CHANGEDSINCE`, `UNCHANGEDSINCE`, `SEARCH MODSEQ` or `STATUS ... (HIGHESTMODSEQ)` (RFC 7162
+§3.1). The first such command reports the mailbox's `HIGHESTMODSEQ`.
+
+**What is refused.** When CONDSTORE is not advertised to the session (removed in section 6), its
+modifiers get `BAD [CLIENTBUG]`: `FETCH MODSEQ`, `CHANGEDSINCE`, `UNCHANGEDSINCE`, `SEARCH
+MODSEQ`, `SELECT (CONDSTORE)` and `STATUS (HIGHESTMODSEQ)`. These are also refused with `BAD`:
+
+- `SELECT ... (QRESYNC ...)` before `ENABLE QRESYNC`;
+- `UID FETCH ... (VANISHED)` without `ENABLE QRESYNC` and `CHANGEDSINCE`:
+  `BAD VANISHED requires ENABLE QRESYNC and CHANGEDSINCE`;
+- a mod-sequence of `0` in `CHANGEDSINCE` or `QRESYNC`, a value above 2^63-1 in
+  `UNCHANGEDSINCE` or `SEARCH MODSEQ`, and a `QRESYNC` UIDVALIDITY of `0` or `*`.
+
+**STORE UNCHANGEDSINCE.** A `STORE ... UNCHANGEDSINCE` that fails for some messages answers
+`OK [MODIFIED <set>]`, in the command's number space (sequence numbers for `STORE`, UIDs for
+`UID STORE`), per RFC 7162 §3.1.3.
 
 ### 5.9 METADATA
 
 `GETMETADATA` and `SETMETADATA` store annotations per mailbox, and per account for the server
-entry (mailbox `""`). Entry names must start with `/private/` or `/shared/` and are
-case-insensitive; a `SETMETADATA` naming one entry twice in different letter case gets
-`BAD [CLIENTBUG]`. A wildcard mailbox name (`*` or `%`) gets `NO [CLIENTBUG]`. The size and count
-limits come from the `[metadata]` section (64 KiB per entry, 100 entries per mailbox, 50 server
-entries per account, 1 MiB per account by default); see [STORAGE.md](STORAGE.md).
+entry (mailbox `""`).
+
+- Entry names must start with `/private/` or `/shared/`, below the scope root itself. They are
+  case-insensitive: `/private/Comment` and `/private/comment` are the same entry.
+- A malformed entry name, an empty entry list, an empty options list, or a `SETMETADATA` that
+  names one entry twice (in any letter case) gets `BAD [CLIENTBUG]`.
+- A wildcard mailbox name (`*` or `%`) gets `NO [CLIENTBUG]`. Entry names are checked first.
+- The size and count limits come from the `[metadata]` section (64 KiB per entry, 100 entries
+  per mailbox, 50 server entries per account, 1 MiB per account by default); see
+  [STORAGE.md](STORAGE.md).
 
 ### 5.10 PREVIEW
 
@@ -615,6 +705,11 @@ These come from `github.com/migadu/go-imap` and cannot be configured:
 
 ### 5.14 Other replies
 
+`STATUS` items: `DELETED` is answered when IMAP4rev2 is advertised (it is an IMAP4rev2 item);
+`DELETED-STORAGE` gets `BAD [CLIENTBUG] STATUS DELETED-STORAGE is not supported`, because Sora has
+no QUOTA; `RECENT` gets `BAD Unknown STATUS data item` from a client that has enabled IMAP4rev2,
+also in `LIST ... RETURN (STATUS (RECENT))`. `CHECK` is accepted only with a mailbox selected.
+
 | Reply | Meaning |
 |---|---|
 | `NO [UNAVAILABLE] Service temporarily unavailable, please try again later` | A temporary failure: database or S3 unavailable, a lock wait or a command timeout. The client should retry later. |
@@ -645,22 +740,31 @@ Rules:
   `CREATE-SPECIAL-USE`, `LIST-EXTENDED`, `LIST-STATUS`, `STATUS=SIZE`, `BINARY`, `CONDSTORE`,
   `QRESYNC`, `NOTIFY`, `CHILDREN`, `ID`, `NAMESPACE`, `METADATA`, `THREAD=REFERENCES`,
   `THREAD=REFS`, `THREAD=ORDEREDSUBJECT`, `MULTISEARCH`, and `PREVIEW` when enabled. Names are
-  case-insensitive (`idle` is `IDLE`). Any other name is ignored and logged at WARN when the
-  server starts.
-- `IMAP4rev2` includes `NAMESPACE`, `UNSELECT`, `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ENABLE`,
-  `IDLE`, `SASL-IR`, `LIST-EXTENDED`, `LIST-STATUS`, `MOVE`, `LITERAL-`, `STATUS=SIZE` and
-  `CHILDREN`. Removing one of these with `disabled_caps` also removes `IMAP4rev2`, so clients fall
-  back to IMAP4rev1 and really lose the extension, and Sora logs it. `client_filters` follows the
-  same rule (see below).
+  case-insensitive (`idle` is `IDLE`).
+- Removing a capability also removes every capability that depends on it, so a client never
+  sees an extension whose base is gone. Sora logs every name it removed. The dependencies are:
+  - `IMAP4rev2` includes `NAMESPACE`, `UNSELECT`, `UIDPLUS`, `ESEARCH`, `SEARCHRES`, `ENABLE`,
+    `IDLE`, `SASL-IR`, `LIST-EXTENDED`, `LIST-STATUS`, `MOVE`, `LITERAL-`, `STATUS=SIZE` and
+    `CHILDREN`. Removing one of these also removes `IMAP4rev2`, so clients fall back to
+    IMAP4rev1 and really lose the extension.
+  - `QRESYNC` depends on `CONDSTORE`.
+  - `SORT=DISPLAY` and `ESORT` depend on `SORT`.
+  - `SEARCHRES`, `ESORT` and `MULTISEARCH` depend on `ESEARCH`.
+  - `CREATE-SPECIAL-USE` depends on `SPECIAL-USE`.
+
+  `client_filters` follows the same rules (see below).
 - With `IMAP4rev1`, `SASL-IR` is always advertised, and `LITERAL-` is offered until
   `LITERAL+` replaces it after login. After login, `UNSELECT`, `ENABLE` and `UTF8=ACCEPT`
   are also always advertised. These names cannot be removed this way; naming one of them
   removes neither it nor `IMAP4rev2`. `STARTTLS`, `LOGINDISABLED` and
   `AUTH=PLAIN` follow `tls`, `tls_use_starttls` and `insecure_auth`; `disabled_caps` does not
   change them. `ACL`, `RIGHTS=` and `APPENDLIMIT=` cannot be removed either.
-- Do not remove both `IMAP4rev1` and `IMAP4rev2`.
-- Most commands and modifiers of a removed extension are also refused by the library, so a client
-  that ignores the list cannot use them.
+- A list that removes both `IMAP4rev1` and `IMAP4rev2` (directly, or through a capability
+  `IMAP4rev2` includes) stops startup, and `sora-admin config validate` reports it.
+- A name that removes nothing (unknown, always advertised, or not offered by this server) is
+  logged at WARN at startup and reported by `sora-admin config validate`.
+- The commands and modifiers of a removed extension are refused with `BAD [CLIENTBUG]`
+  (section 5.1), so a client that ignores the list cannot use them.
 - The setting needs a restart.
 
 ### `additional_caps`
@@ -735,20 +839,23 @@ When filters apply:
   greeting's capability list is filtered.
 - A name and version match applies when the client sends `ID`. Clients usually send `ID` early,
   but anything they learned from an earlier `CAPABILITY` stays in their memory.
-- A filter never takes away what the connection has already enabled: an extension the client
-  named in `ENABLE` (`IMAP4rev2`, `CONDSTORE`, `QRESYNC`), `CONDSTORE` once the client has sent any
-  CONDSTORE enabling command such as `SELECT ... (CONDSTORE)` (RFC 7162 §3.1), and `IMAP4rev2` on
-  a server without `IMAP4rev1`. RFC 9051 §6.3.1: "Once enabled using ENABLE, each extension
-  remains active until the IMAP connection is closed." A filter matched by an `ID` sent after
-  `ENABLE IMAP4rev2` therefore leaves `IMAP4rev2` and every extension it includes in place, and
-  only removes the rest. The session logs `capability filters partly applied` with the names it
-  kept.
+- A filter never takes away what the connection has already enabled, because an enabled
+  extension stays active until the connection closes (RFC 9051 §6.3.1, RFC 7162 §3.1). Kept are:
+  - an extension the client named in `ENABLE` (`IMAP4rev2`, `CONDSTORE`, `QRESYNC`), with every
+    extension it includes;
+  - `CONDSTORE`, once the client has sent any CONDSTORE enabling command (section 5.8);
+  - `IMAP4rev2` on a server without `IMAP4rev1`.
+
+  For example, a filter matched by an `ID` sent after `ENABLE IMAP4rev2` leaves `IMAP4rev2` and
+  everything it includes in place, and removes only the rest. The session then logs
+  `capability filters partly applied` with the names it kept.
 
 As with `disabled_caps`, a filter that removes a capability included in `IMAP4rev2` also removes
 `IMAP4rev2` for that session, unless the connection has it enabled (above), so the client falls
 back to IMAP4rev1 and really loses the extension. The same list of removable names applies as for
-`disabled_caps`, case-insensitively, and any other name is logged at WARN when the server starts,
-with the entry number. When a filter changes the list, the session logs `capability filters applied`
+`disabled_caps`, case-insensitively, except `IMAP4rev1`: the library picks the protocol version
+from the server's own list, so only `disabled_caps` can remove it. Any other name is logged at
+WARN when the server starts, with the entry number. When a filter changes the list, the session logs `capability filters applied`
 with the client and the removed names.
 
 ---
@@ -774,7 +881,7 @@ this order:
 | `SASL PLAIN` | When login is allowed on this connection. |
 | `LANG` | Always. |
 | `UTF8` | Always. |
-| `EXPIRE NEVER` or `EXPIRE <days>` | `<days>` is `[cleanup] max_age_restriction` in whole days, rounded down. |
+| `EXPIRE NEVER` or `EXPIRE <days>` | `<days>` is `[cleanup] max_age_restriction` in whole days, rounded down, and at least 1 (RFC 2449 reads `EXPIRE 0` as "do not leave mail on the server"). |
 | `AUTH-RESP-CODE` | Always. |
 | `IMPLEMENTATION Sora-POP3-Server` | Always. |
 
@@ -814,19 +921,25 @@ the upload has not finished.
 `limits.session_memory_limit` (default `100mb`) bounds the memory of one session. A listing too
 large for it gets `-ERR [SYS/TEMP] Mailbox too large to open in this session`. A body that cannot
 fit beside the session's message list gets `-ERR [SYS/PERM] Message too large for the session
-memory limit`: RFC 3206 gives SYS/PERM to "problems which are unlikely to be resolved without
-intervention", here raising the limit. A body that would fit, but not beside what the session holds
+memory limit`; SYS/PERM (RFC 3206) because only raising the limit helps. A body that would fit, but not beside what the session holds
 at the moment, gets `-ERR [SYS/TEMP] Session memory limit reached, please try again later`.
 
 ### 7.4 Login and errors
 
 | Situation | Reply |
 |---|---|
-| Wrong address or password, or rate-limited | `-ERR [AUTH] Authentication failed` |
-| Address that does not parse | `-ERR [AUTH] Invalid username format` |
+| Wrong address or password, an address that does not parse, or rate-limited | `-ERR [AUTH] Authentication failed` |
 | Login before TLS on a STARTTLS port with `insecure_auth = false` | `-ERR Authentication requires TLS. Use STLS first` |
-| Too many logins waiting in the delay queue | `-ERR [IN-USE] Too many concurrent authentication attempts. Please try again later.` |
+| Too many logins waiting in the delay queue | `-ERR [SYS/TEMP] Too many concurrent authentication attempts. Please try again later.` |
+| The database cannot be reached | `-ERR [SYS/TEMP] Service temporarily unavailable, please try again later` |
+| A master SASL login with an authorization identity it may not use | `-ERR [AUTH] Proxy authentication requires master credentials` |
 | Backend in maintenance | `-ERR [SYS/TEMP] Server in maintenance, please try again later` |
+| `AUTH` response that is not valid base64 or not a valid PLAIN message | `-ERR Invalid SASL PLAIN response` |
+| `AUTH` with a mechanism other than `PLAIN` | `-ERR Unsupported SASL mechanism` |
+| `*` sent to cancel `AUTH` | `-ERR Authentication aborted` (not counted as an error) |
+
+An address that does not parse is answered and counted like a wrong password, so the reply does
+not tell a guessed name from a real one.
 
 The library closes a session after 4 errors (failed logins included), with
 `-ERR Too many errors, closing connection`. Each error adds a delay of 3 seconds times the error
@@ -836,13 +949,23 @@ does not apply to the POP3 backend.
 
 ### 7.5 XCLIENT
 
-A peer in `trusted_networks` may send `XCLIENT` before login to pass the real client address. Behind
-a PROXY header the peer is the client the header names, not the load balancer that sent it
-([SECURITY.md](SECURITY.md#31-trusted_networks)). Attributes: `ADDR`, `PORT`, `SESSION`, `TTL` and
-`FORWARD`. It is allowed once per session and only before login. Replies:
-`+OK XCLIENT parameters accepted`, `-ERR Connection not from trusted proxy`,
-`-ERR Invalid XCLIENT parameters`, and `-ERR Proxy TTL expired` (which closes the connection).
-Sora's POP3 proxy uses it; see [PROXY.md](PROXY.md).
+A trusted peer may send `XCLIENT` before login to pass the real client address. Its attributes
+are `ADDR`, `PORT`, `SESSION`, `TTL` and `FORWARD` (upper case; other spellings are ignored). Sora's
+POP3 proxy uses it; see [PROXY.md](PROXY.md).
+
+- **Who may send it.** The connection's peer must be in `trusted_networks`. Behind a PROXY
+  header, either the load balancer that sent the header or the client the header names may be.
+- **Which address counts.** Behind a PROXY header, `ADDR` and `PORT` are applied only when the
+  client the header names is itself in `trusted_networks`; otherwise they are ignored and the
+  other attributes still apply ([SECURITY.md](SECURITY.md#31-trusted_networks)).
+- **When.** Once per session, before login. A second one gets
+  `-ERR [AUTH] XCLIENT already provided`, and one after login
+  `-ERR [AUTH] XCLIENT not allowed after authentication`; both close the connection. A refused
+  `XCLIENT` does not use up the allowance.
+
+Other replies: `+OK XCLIENT parameters accepted`, `-ERR Connection not from trusted proxy`,
+`-ERR Invalid XCLIENT parameters`, `-ERR Invalid forwarding parameters` (an `ADDR` that is not an
+IP address, or a bad port), and `-ERR Proxy TTL expired`, which closes the connection.
 
 ### 7.6 Per-command timeouts
 
@@ -878,8 +1001,10 @@ address:
 - If it is empty, Sora admits `127.0.0.0/8`, `::1/128`, `10.0.0.0/8`, `172.16.0.0/12` and
   `192.168.0.0/16`, and logs that it does so at startup.
 
-Any other peer still receives the greeting, and its `LHLO` gets
-`451 4.0.0 LMTP connections only allowed from trusted networks`.
+A connection from any other peer is closed as soon as it is accepted, before TLS and without a
+greeting. It does not take a `max_connections` slot. Sora logs
+`connection rejected - not from trusted network`, and the MTA treats the closed connection as a
+temporary failure.
 
 ### 8.2 Greeting and LHLO
 
@@ -895,15 +1020,27 @@ name. `HELO` and `EHLO` get `500 5.5.1 This is a LMTP server, use LHLO`. `LHLO` 
 | `LIMITS RCPTMAX=1` | Always. |
 | `XCLIENT ADDR PORT PROTO HELO LOGIN NAME` | Only to peers in `[servers] trusted_networks`. |
 
-There is no `AUTH`, `DSN` or `BINARYMIME`.
+There is no `AUTH`, `DSN`, `BINARYMIME` or `REQUIRETLS`. `XCLIENT` is advertised only when the
+socket peer is in a `trusted_networks` list that is set; with an empty list nobody gets it.
+
+Other replies before a transaction:
+
+- `LHLO` without a domain: `501 5.5.2 Domain/address argument required for HELO`.
+- `LHLO` during a `BDAT` transfer: `550 5.5.1 Finish or reset the chunked transfer before greeting again`.
+- `AUTH`: `504 5.7.4 Unsupported authentication mechanism`.
 
 ### 8.3 Envelope
 
 - `MAIL FROM:<>` (the null sender) is accepted. Any other sender must be a valid address, or the
-  reply is `553 5.1.7 Invalid sender`.
+  reply is `553 5.1.7 Invalid sender`. A `MAIL` command that does not parse at all gets
+  `501 5.5.2 Was expecting MAIL arg syntax of FROM:<address>`.
+- A recipient that is not a valid address gets `553 5.1.3 Invalid recipient address syntax`, or
+  `501 5.1.3 Was expecting RCPT arg syntax of TO:<address>` when the command does not parse.
+  Addresses are compared in lower case.
 - One recipient per transaction. A second `RCPT` gets `452 4.5.3 Maximum limit of 1 recipients reached`,
   and the MTA sends it in a new transaction.
-- An unknown or deleted account gets `550 5.1.1 No such user here`. A database error gets
+- An unknown or deleted account gets `550 5.1.1 No such user here`; Sora checks the primary
+  database before it answers this. A database error gets
   `451 4.4.3 Temporary failure, please try again later`, so the MTA retries.
 - `user+detail@example.com` is delivered to the account of `user@example.com`. The detail is kept
   for Sieve.
@@ -911,37 +1048,79 @@ There is no `AUTH`, `DSN` or `BINARYMIME`.
   to its ASCII form. The local part may be up to 256 octets (longer than RFC 5321's 64, to allow SRS
   addresses), the domain up to 255, and the address up to 512. A non-ASCII address is accepted even
   when the MTA did not send the `SMTPUTF8` parameter.
-- A `MAIL` or `RCPT` parameter the server does not implement gets `555 5.5.4` (RFC 5321
-  §4.1.1.11), the DSN parameters `NOTIFY`, `ORCPT`, `RET` and `ENVID` among them, and `AUTH`, as
-  `LHLO` does not announce `AUTH`. `XRCPTFORWARD` is the only `RCPT` parameter taken. A malformed
-  parameter gets `501 5.5.4`: `SMTPUTF8` with a value (RFC 6531 §3.4), any parameter written
-  with `=` and no value (RFC 5321 §4.1.2), or any parameter given twice (RFC 6152 §3,
-  RFC 1870 §6). Empty values and repeated keywords are refused before extension checks.
-  Otherwise, parameters are checked in the order sent and the first refused decides the
-  reply, so `SIZE=abc FOO=1` gets `501` and `FOO=1 SIZE=abc` gets `555`.
 - `VRFY` answers `252 2.5.0 Cannot VRFY user, but will accept message`.
+
+**MAIL and RCPT parameters**
+
+| Parameter | Reply |
+|---|---|
+| `SIZE=<n>` (MAIL) | Accepted; see section 8.4. |
+| `BODY=7BIT`, `BODY=8BITMIME` (MAIL) | Accepted. |
+| `SMTPUTF8` (MAIL) | Accepted. With a value: `501 5.5.4 SMTPUTF8 does not take a value` (RFC 6531 §3.4). |
+| `BODY=BINARYMIME` | `555 5.5.4 BINARYMIME is not implemented`. Any other `BODY` value: `501 5.5.4 Unknown BODY value`. |
+| `AUTH=` (MAIL) | `555 5.5.4 AUTH is not implemented`, because `LHLO` does not announce `AUTH`. |
+| `RET`, `ENVID`, `NOTIFY`, `ORCPT` (DSN) | `555 5.5.4 <name> is not implemented`. |
+| `XRCPTFORWARD` (RCPT) | Taken from trusted peers; silently ignored from others. A malformed value: `501 5.5.4 Malformed XRCPTFORWARD parameter: ...`. |
+| Any other parameter | `555 5.5.4 Unknown MAIL FROM argument` or `555 5.5.4 Unknown RCPT parameter` (RFC 5321 §4.1.1.11). |
+
+Two malformations are refused before any parameter is checked, with
+`501 5.5.4 Unable to parse MAIL ESMTP parameters` (or `RCPT`): a parameter written with `=` and no
+value (RFC 5321 §4.1.2), and a parameter given twice (RFC 6152 §3, RFC 1870 §6). Otherwise the
+parameters are checked in the order sent and the first refused one decides the reply: `SIZE=abc
+FOO=1` gets `501`, and `FOO=1 SIZE=abc` gets `555`.
+
+**Command order**
+
+Commands out of order get `503 5.5.1`:
+
+| Command | Reply text |
+|---|---|
+| `MAIL` before `LHLO` | `Please introduce yourself first.` |
+| A second `MAIL` in one transaction | `Sender already specified` |
+| `RCPT` before `MAIL` | `Missing MAIL FROM command.` |
+| `DATA` or `BDAT` without an accepted recipient | `Missing RCPT TO command.` |
+| `MAIL`, `RCPT` or `DATA` during a `BDAT` transfer | `MAIL not allowed during message transfer` (or `RCPT`, `DATA`) |
+| `RCPT` after a refused `BDAT` chunk | `RCPT not allowed after a refused BDAT` |
+
+`DATA` with an argument gets `501 5.5.4 DATA command should not have any arguments`. A refused
+`BDAT` chunk is still read and thrown away, so the connection stays in step, and the
+transaction is reset. A `BDAT LAST` in a transaction with no accepted recipient gets no reply at
+all, because LMTP answers once per accepted recipient, and there is none (RFC 2033 §4.2).
 
 ### 8.4 Message size
 
-`max_message_size` (default `50mb`) is advertised in `LHLO` and enforced twice. A `MAIL` command
-whose `SIZE=` parameter is above the limit gets `552 5.3.4` at once; one whose value is not 1 to
-20 digits (RFC 1870 §3, `size-value ::= 1*20DIGIT`) gets `501 5.5.4`, even when leading zeros
-leave a small number. A message that turns out larger while it is read gets
-`552 5.3.4 message size exceeds maximum allowed size of <n> bytes` after the data. `max_message_size = "0"` means the default 50 MiB, not unlimited. An empty message
-gets `550 5.6.0 empty message rejected: a message must contain at least headers`.
+`max_message_size` (default `50mb`) is advertised in `LHLO` and enforced twice:
+
+1. **At MAIL.** A `SIZE=` value above the limit gets `552 5.3.4 Max message size exceeded`. A value
+   that is not a number gets `501 5.5.4 Unable to parse SIZE as an integer`, and one longer than
+   20 digits (RFC 1870 §3, `size-value ::= 1*20DIGIT`) gets
+   `501 5.5.4 SIZE value longer than 20 digits`, even when leading zeros leave a small number.
+   Sizes of 4 GiB and more are compared correctly.
+2. **While the data is read.** A message that turns out larger gets
+   `552 5.3.4 message size exceeds maximum allowed size of <n> bytes` after the data. A `BDAT`
+   chunk that takes the message over the limit gets `552 5.3.4 Max message size exceeded`; the
+   chunk is thrown away and the transaction reset.
+
+`max_message_size = "0"` means the default 50 MiB, not unlimited. A value above 2147483647 bytes
+(2 GiB - 1) is lowered to that, with a warning at startup. An empty message gets
+`550 5.6.0 empty message rejected: a message must contain at least headers`.
+
+After `DATA` and the last `BDAT`, each reply carries the recipient, for example
+`250 2.0.0 <user@example.com> OK: queued` or `552 5.3.4 <user@example.com> message size ...`.
 
 ### 8.5 Delivery
 
 For each accepted message, Sora:
 
 1. checks for a delivery loop (an `X-Sora-Loop` header together with a `Delivered-To` equal to the
-   recipient), answering `550 5.4.6 routing loop detected (Delivered-To)`;
+   account's primary address), answering `550 5.4.6 routing loop detected (Delivered-To)`;
 2. adds a `Received:` header and a `Delivered-To:` header naming the account's primary address;
-3. runs the built-in default Sieve script, then the user's active script (see
+3. checks that this node's upload spool has room for the message;
+4. runs the built-in default Sieve script, then the user's active script (see
    [SIEVE.md](SIEVE.md));
-4. writes the message to the local spool (with fsync), stores its metadata in PostgreSQL and queues
+5. writes the message to the local spool (with fsync), stores its metadata in PostgreSQL and queues
    the body for upload to S3 (see [STORAGE.md](STORAGE.md));
-5. answers `250 2.0.0 <recipient> OK: queued`.
+6. answers `250 2.0.0 <recipient> OK: queued`.
 
 The `Received:` header has this form:
 
@@ -954,24 +1133,39 @@ Received: from <helo> ([<client-ip>])
 `<helo>` is the `HELO` value from XCLIENT if the MTA sent one, otherwise the `LHLO` name. The
 protocol word is `UTF8LMTP` for an internationalised transaction (RFC 6531 §3.7.3).
 
-The built-in default script files messages whose `X-Spam` header contains `Yes` into the
-account's personal mailbox with the `\Junk` special-use attribute, or into `Junk` if none has it.
-For an address with a detail, it files the message into a mailbox named after the detail, creating
-it if needed. Any sender can therefore create a folder in an account by writing to `user+name@`.
+The built-in default script does two things:
 
-A message that is already in the target mailbox (same Message-ID and content, or the same bytes
-delivered again after an MTA retry) is answered `250` and not stored a second time.
+- A message whose `X-Spam` header contains `Yes` (in any case) is filed into the account's
+  personal mailbox with the `\Junk` special-use attribute, or into `Junk` if none has it, or into
+  INBOX if neither exists. Nothing else in the default script applies to it.
+- A message to an address with a detail (`user+name@example.com`) is filed into a personal
+  mailbox named after the detail in lower case, created if needed. Any sender can therefore
+  create a folder in an account by writing to `user+name@`. A detail that names the shared
+  namespace or a name the mailbox rules refuse is delivered to INBOX instead.
+
+No message is ever stored in the shared namespace root itself; such a target falls back to INBOX.
+
+A message delivered again with the same bytes (an MTA retry after a lost reply) is answered `250`
+and not stored a second time in the same mailbox.
 
 Temporary failures, all of which make the MTA retry:
 
 | Reply | Cause |
 |---|---|
+| `451 4.3.2 Server in maintenance, try again later` | The backend is in maintenance (at MAIL; section 3). |
 | `451 4.4.3 Recipient validation timed out, please try again later` | The RCPT timeout ran out. |
 | `451 4.3.0 Message processing timed out, please try again later` | The DATA timeout ran out. |
-| `452 4.3.1 Insufficient system storage` | The upload spool is over its size limit, full or read-only. |
+| `452 4.3.1 Insufficient system storage` | The upload spool is over its size limit. |
+| `452 4.3.1 Insufficient system storage, please try again later` | The spool disk is full or read-only. |
 | `421 4.4.5 Server busy, try again later` | A lock could not be taken in time. |
 | `421 4.4.2 Error reading message data` | The data could not be read from the connection. |
-| `451 4.3.0 <text>` | Another internal error. |
+| `421 4.2.1 service shutting down` | The server is shutting down. |
+| `451 4.3.0 <text>` | Another internal error, for example `failed to save message` or `failed to save message to disk: <cause>`. The text names the cause, never the spool path. |
+
+When Sieve files a message into a shared mailbox that another account owns, the body is also
+staged for upload under the owner's account. When that staging fails, the delivery fails with
+`451 4.3.0 failed to save message`, so no message is stored without a body to upload. The MTA's
+retry is deduplicated against the copies already stored.
 
 There is no quota check at delivery.
 
@@ -998,19 +1192,28 @@ apply ([SECURITY.md](SECURITY.md#31-trusted_networks)). From any other peer `XCL
 is not advertised and gets `550 5.7.1 XCLIENT denied`. The LMTP proxy uses XCLIENT; see
 [PROXY.md](PROXY.md).
 
+Other XCLIENT replies:
+
+- `503 5.5.1 XCLIENT not permitted after MAIL FROM`;
+- `501 5.5.4 Invalid XCLIENT attributes: ...` for an attribute other than the six above, or a bad
+  `ADDR`, `PORT` or `PROTO` value, or an empty `HELO`, `LOGIN` or `NAME`;
+- `501 5.5.4 Invalid XCLIENT syntax: ...`;
+- `451 4.0.0 XCLIENT temporarily unavailable`, a temporary failure inside the server.
+
 ### 8.8 Timeouts and fixed limits
 
 | Setting | Value | Notes |
 |---|---|---|
-| Idle timeout | 5 minutes | Applies to each read, between commands and while message data arrives. `421 4.4.2 Idle timeout, bye bye`. |
+| Idle timeout | `timeouts.command_timeout`, default `5m` | The longest wait for one read. Between commands it ends with `421 4.4.2 Idle timeout, bye bye`; while message data arrives, with `421 4.4.2 Error reading message data` (per recipient after `DATA`). `0` means the default. Needs a restart. |
+| Data timeout | 1 hour, fixed | The longest one `DATA` body or one `BDAT` chunk may take as a whole. |
 | Write timeout | 2 minutes, fixed | |
 | `timeouts.lmtp_command_timeouts.rcpt` | `10s` | Account lookup and mailbox creation at RCPT. `"0"` turns it off. |
 | `timeouts.lmtp_command_timeouts.data` | `60s` | The work after the data has arrived: Sieve, spool, database. Not the transfer itself. `"0"` turns it off. |
 | Command line length | 2000 bytes, fixed | `500 5.4.0 Too long line, closing connection`. |
-| Protocol errors | 3, fixed | After more, `500 5.5.1 Too many errors. Quiting now`. |
+| Protocol errors | 3, fixed | On the fourth, `500 5.5.1 Too many errors. Quiting now`. Counted are empty lines, unknown commands and commands that do not parse. |
 
-The idle timeout applies to each read, so a large message from an MTA that keeps sending is
-transferred however long it takes as a whole.
+The idle timeout applies to each read, so a large message from an MTA that keeps sending is not
+cut off after a few minutes; only the data timeout bounds the transfer as a whole.
 
 LMTP has no login, so the LMTP server does not read `auth_rate_limit`, `lookup_cache` or the master
 credentials.
@@ -1036,11 +1239,11 @@ lines. The greeting looks like this:
 "STARTTLS"
 "SASL" "PLAIN"
 "MAXSCRIPTSIZE" "<bytes>"
-OK "Sora" ManageSieve server ready.
+OK "Sora ManageSieve server ready."
 ```
 
 - `STARTTLS` appears only on a STARTTLS listener before the upgrade. There the greeting's last line
-  is `OK (STARTTLS) "Sora" ManageSieve server ready.` The `CAPABILITY` reply ends with a bare `OK`.
+  is `OK (STARTTLS) "Sora ManageSieve server ready."` The `CAPABILITY` reply ends with a bare `OK`.
 - `SASL` is `""` while login is not allowed on the connection (section 3).
 - `SIEVE` lists the extensions from `[sieve] enabled_extensions` that the engine supports, or the
   default set when that list is empty. The same set is used to validate scripts. See
@@ -1067,18 +1270,32 @@ Behaviour:
   script again.
 - The active script cannot be deleted:
   `NO (ACTIVE) "Cannot delete the active script; deactivate it first"`.
-- `RENAMESCRIPT` onto an existing name gets `NO (ALREADYEXISTS) ...` and keeps the active flag.
+- `DELETESCRIPT` answers `OK "Script deleted"`.
+- `RENAMESCRIPT` keeps the script's content and active flag and answers a bare `OK`. A target
+  name that already exists gets `NO (ALREADYEXISTS) ...`.
+- `HAVESPACE` for an account at the 100-script limit gets
+  `NO (QUOTA/MAXSCRIPTS) "Maximum number of scripts reached"`.
 - A missing script gets `NO (NONEXISTENT) "Script does not exist"`. A database failure gets
   `NO (TRYLATER) "Service temporarily unavailable"`.
+- A script that contains a NUL byte or is not valid UTF-8 is refused with
+  `NO "Script validation failed: sieve script contains NUL or invalid UTF-8"`. A script name that
+  is empty, contains control characters or is not valid UTF-8 is refused too.
 
 ### 9.3 Login and errors
 
 - A failed login gets `NO "Authentication failed"`.
+- `AUTHENTICATE` data that is not valid base64 gets `NO "Invalid authentication data"`, a PLAIN
+  message with the wrong number of parts `NO "Invalid authentication format"`, and a mechanism
+  other than `PLAIN` `NO "Unsupported authentication mechanism"`. `*` in reply to a
+  continuation cancels with `NO "Authentication cancelled"`, which is not counted as an error.
+- When the database cannot be reached, a login gets
+  `NO (TRYLATER) "Service temporarily unavailable"`.
 - After 10 errors (failed logins included) the server sends
   `BYE "Too many errors, closing connection"`. This is fixed, and `limits.max_auth_errors` does not
   apply.
 - A command line may be up to 8192 bytes; a longer one gets `NO "Command line too long"` and the
-  connection is closed.
+  connection is closed. A line that does not end in CRLF gets
+  `NO "Command line must end with CRLF"` and the connection is closed.
 - There is no maintenance gate on ManageSieve.
 
 ### 9.4 Per-command timeouts
@@ -1103,7 +1320,7 @@ plain number of bytes.
 | `type` | string | required | all | `imap`, `pop3`, `lmtp` or `managesieve`. |
 | `name` | string | required | all | Unique server name. |
 | `addr` | string | required | all | Listen address. |
-| `debug` | bool | `false` | IMAP, LMTP | IMAP: writes a raw protocol trace, with LOGIN and AUTHENTICATE passwords masked but message content included, to the log file when `[logging] output` is a file, otherwise to standard output. LMTP: logs each message's headers at debug level before Sieve runs. No effect on POP3 and ManageSieve, where it is ignored with a startup warning. Needs a restart. |
+| `debug` | bool | `false` | IMAP, LMTP | IMAP: writes a raw protocol trace, with LOGIN and AUTHENTICATE passwords masked but message content included, to the log file when `[logging] output` is a file, otherwise to standard output. LMTP: writes go-smtp's raw protocol trace, message content included, to standard output, and logs each message's headers at debug level before Sieve runs. No effect on POP3 and ManageSieve, where it is ignored with a startup warning. Needs a restart. |
 
 ### 10.2 TLS
 
@@ -1158,7 +1375,7 @@ block:
 | Key | Type | Default | Read by |
 |---|---|---|---|
 | `auth_idle_timeout` | duration | `2m` | IMAP, POP3, ManageSieve |
-| `timeouts.command_timeout` | duration | IMAP `30m`, POP3 `10m`, ManageSieve `3m` | IMAP, POP3, ManageSieve |
+| `timeouts.command_timeout` | duration | IMAP `30m`, POP3 `10m`, ManageSieve `3m`, LMTP `5m` | all four |
 | `timeouts.absolute_session_timeout` | duration | `24h` (`0`: none) | IMAP, POP3, ManageSieve |
 | `timeouts.min_bytes_per_minute` | int | `0` (off) | IMAP, POP3, ManageSieve |
 | `timeouts.imap_command_timeouts.*` | duration | section 5.12 | IMAP |
@@ -1196,7 +1413,7 @@ Section 4 explains each one; the LMTP timeouts are in section 8.8.
 | `additional_caps` | list | none | IMAP | Section 6. |
 | `client_filters` | array of tables | none | IMAP | Section 6. |
 | `id_name`, `id_version`, `id_vendor`, `id_support_url` | string | section 5.11 | IMAP | `ID` reply fields. |
-| `max_message_size` | size | `50mb` | LMTP | Largest message delivered. `0` also means 50 MiB. |
+| `max_message_size` | size | `50mb` | LMTP | Largest message delivered. `0` also means 50 MiB; at most 2147483647 bytes. |
 | `max_script_size` | size | `16kb` | ManageSieve | Largest Sieve script. |
 
 Global settings these servers also read: `[servers] trusted_networks` (section 2),
@@ -1218,6 +1435,14 @@ New values reach connections accepted after the reload. Existing sessions keep t
 | `pop3` | the same as `imap` |
 | `managesieve` | `timeouts.command_timeout`, `timeouts.absolute_session_timeout`, `timeouts.min_bytes_per_minute`, `max_script_size`, `master_sasl_username`, `master_sasl_password`, `master_sasl_allowed_networks` |
 | `lmtp` | `max_message_size` |
+
+Two exceptions to "existing sessions keep their values":
+
+- The `master_sasl_*` keys are read at each login, so a connection that has not logged in yet
+  uses the new values.
+- LMTP reads `max_message_size` at every `LHLO`, `MAIL`, `DATA` and `BDAT`, so an open connection
+  gets the new limit with its next transaction. A value that does not parse keeps the running
+  one, with the warning `LMTP config reload: invalid max_message_size, keeping the running value`.
 
 A server block added to the file is not started, and a removed one is not stopped, until a restart.
 The full reload behaviour is in [OPERATIONS.md](OPERATIONS.md).

@@ -17,7 +17,8 @@
 # - Unknown keys will log warnings but are ignored (helps detect typos)
 # - Duplicate keys will log warnings and use first occurrence
 # - Syntax errors (e.g., "f" instead of "false") will fail with helpful hints
-# - Run './sora --config config.toml' to validate your configuration
+# - Run 'sora-admin --config config.toml config validate' to check a file without
+#   starting the server: it runs every check startup runs
 
 # GLOBAL: bcrypt cost factor for password hashing (clamped to 10..14, default 12).
 # Higher is stronger but slower per login; raising it transparently rehashes existing
@@ -36,8 +37,8 @@ insecure_skip_verify = true                 # Skip TLS cert verification. Defaul
 
 # Maximum message size for maildir import operations
 # Messages larger than this will be skipped during import
-# Default: 50mb (larger than IMAP append_limit since imports are batch operations)
-# This setting is independent of IMAP server configuration
+# Default: the append_limit of the first imap server in this file (25mb if it sets none),
+# or 50mb when the file has no imap server.
 # A message above 2147483647 bytes (the largest sora can store) is skipped whatever the limit
 import_message_limit = "50mb"
 
@@ -80,6 +81,7 @@ lock_timeout = "10s"            # Max time a write statement waits for a row loc
 migration_timeout = "2m"      # Timeout for auto-migrations at startup. When multiple instances start simultaneously,
                                 # one will run migrations while others wait. If timeout is reached, the instance will
                                 # verify migrations are complete before continuing. Default: "2m" (2 minutes).
+fetch_chunk_size = 5000          # Messages fetched per chunk for large result sets (default: 5000; 0 or less = the default).
 
 # WRITE DATABASE CONFIGURATION
 # =============================================================================
@@ -140,7 +142,8 @@ query_timeout = "30s"           # Per-endpoint timeout for individual database q
 # and durability. Message metadata remains in PostgreSQL for fast access.
 
 [s3]
-# Keep paused until every old body deleter and claimer has drained; see OPERATIONS.md.
+# Keep paused until every old body deleter and claimer has drained; see docs/OPERATIONS.md,
+# "Upgrading the S3 message-body lock protocol". Any other value stops startup.
 # This acknowledgment is manual, not automatic fleet-version detection.
 body_deletion_protocol = "paused" # after the completed cutover: "global-hash-v1"
 endpoint = "s3.amazonaws.com"           # S3-compatible storage endpoint (e.g., "s3.amazonaws.com", "https://s3.amazonaws.com", "minio.example.com:9000").
@@ -196,7 +199,7 @@ encryption_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcd
 
 [tls]
 enabled = false                                 # Enable global TLS management (default: false)
-provider = "file"                               # TLS provider: "file" or "letsencrypt" (default: "file")
+provider = "file"                               # TLS provider: "file" or "letsencrypt" (no default: required when enabled = true)
 
 # --- OPTION 1: FILE-BASED CERTIFICATES (provider = "file") ---
 # Use this for static certificates (purchased SSL, self-signed, or existing certs)
@@ -234,7 +237,7 @@ default_domain = ""                             # OPTIONAL: Default domain to us
 storage_provider = "s3"                         # Certificate storage backend (currently only "s3" is supported)
 
 # OPTIONAL: Customize certificate renewal window (default: 30 days before expiry)
-# renew_before = "720h"                         # Renew certificates 720 hours (30 days) before expiration (format: "Xh", "Xd" not supported, use hours)
+# renew_before = "720h"                         # Renew certificates 720 hours (30 days) before expiration (whole days work too: "30d")
 
 # OPTIONAL: Certificate synchronization from S3 (enabled by default)
 # sync_interval = "5m"                          # Interval to check S3 for certificate updates (e.g., "5m", "10m", "1h"). Default: "5m"
@@ -249,6 +252,14 @@ storage_provider = "s3"                         # Certificate storage backend (c
 #
 # IMPORTANT: If the fallback directory cannot be created (e.g., permission denied),
 # Sora will automatically disable fallback and use S3-only mode with a warning.
+# This prevents server crashes due to filesystem permission issues.
+#
+# When to disable fallback (enable_fallback = false):
+# - You prefer hard failure when S3 is down (fail-fast approach)
+# - You don't want local disk dependencies
+# - You're running in a container with ephemeral storage
+# - You have strict compliance requirements about certificate storage locations
+# Startup warns with enable_fallback = false: TLS handshakes fail while S3 is unavailable.
 
 # S3 storage configuration for Let's Encrypt certificates
 # Certificates are stored in S3 to enable sharing across multiple Sora instances
@@ -278,13 +289,6 @@ debug = false                                   # Log every S3 request and respo
                                                 # Existing objects are unaffected either way: these modes are transparent on read,
                                                 # and objects already in the bucket are re-encrypted only when renewal rewrites them.
 # server_side_encryption_kms_key_id = ""        # KMS key id, required by (and only used with) server_side_encryption = "aws:kms"
-# This prevents server crashes due to filesystem permission issues.
-#
-# When to disable fallback (enable_fallback = false):
-# - You prefer hard failure when S3 is down (fail-fast approach)
-# - You don't want local disk dependencies
-# - You're running in a container with ephemeral storage
-# - You have strict compliance requirements about certificate storage locations
 
 # EXAMPLE USAGE (Global TLS with Let's Encrypt):
 # [tls]
@@ -766,7 +770,7 @@ retry_backoff = ["1m", "5m", "15m", "1h", "6h", "24h"]           # Backoff durat
                                                                   # With these 6 values and 10 max_attempts:
                                                                   # Attempts 1-6 use the configured backoff values
                                                                   # Attempts 7-10 all use 24h (last value is repeated)
-                                                                  # Total retry time: ~1m+5m+15m+1h+6h+24h+24h+24h+24h ≈ 99 hours (4 days)
+                                                                  # Total retry time: ~1m+5m+15m+1h+6h+24h+24h+24h+24h ≈ 103 hours (4.3 days)
 
 # Circuit Breaker Configuration
 circuit_breaker_threshold = 5                                     # Consecutive failures before opening circuit (default: 5)
@@ -797,8 +801,8 @@ cleanup_interval = "1h"                                           # How often to
 
 [metadata]
 max_entry_size = 65536         # Maximum size per metadata entry (64KB). Prevents huge single values.
-max_entries_per_mailbox = 1000 # Maximum number of metadata entries per mailbox (mailbox-level).
-max_entries_per_server = 1000  # Maximum number of account-level metadata entries (server-level).
+max_entries_per_mailbox = 1000 # Maximum number of metadata entries per mailbox (mailbox-level). Default: 100.
+max_entries_per_server = 1000  # Maximum number of account-level metadata entries (server-level). Default: 50.
 max_total_size = 1048576       # Maximum total metadata size per account (1MB). Overall quota protection.
 
 
@@ -954,7 +958,6 @@ enabled = false
 # endpoint = "https://rspamd.example.com/learnspam"
 # auth_token = "secret-token-123"
 # timeout = "15s"
-# async = true
 #
 # [spam_training.circuit_breaker]
 # threshold = 10
@@ -1043,6 +1046,7 @@ trusted_networks = []
 type = "imap"
 name = "main-imap"            # Unique server name for identification
 addr = ":143"                 # Listen address and port. Use :993 for IMAPS.
+# enabled = false             # Keep this block in the file without checking or starting it (default: true)
 debug = false                 # Enable debug logging for this IMAP server
 
 # --- CONNECTION LIMITING AND MEMORY MANAGEMENT ---
@@ -1278,6 +1282,9 @@ limits.search_rate_limit_window = "1m"   # Time window for search rate limiting 
 # Raising this cap increases memory and CPU use. Omitted, zero or negative values use 50000;
 # there is no unlimited setting. Changes require restarting this server.
 limits.thread_max_messages = 50000
+# limits.session_memory_limit = "100mb"  # Memory one session may use (imap and pop3; default: 100mb, "0" = no limit).
+                                         # FETCH, RETR and APPEND hold the whole message in it; keep it above the
+                                         # lmtp servers' max_message_size.
 # S3 downloads made to answer FETCH PREVIEW without LAZY (only with enable_preview).
 # limits.preview_s3_per_min = 300        # Per account per minute (default: 300, 0 = unlimited).
 # limits.preview_s3_burst = 200          # Back to back (default: min(200, positive preview_s3_per_min)).
@@ -1297,6 +1304,8 @@ timeouts.command_timeout = "30m"            # Maximum idle time before disconnec
                                             # minutes of client silence during IDLE).
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration regardless of activity (e.g., "24h", default: 24 hours)
 timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = disabled, 512 recommended). Counts only windows where the client sent bytes but no command completed; idle pollers (NOOP every N seconds) and silent sessions are unaffected.
+# timeouts.scheduler_shard_count has no effect (a startup warning says so): every server
+# shares one timeout scheduler, sized by [timeout_scheduler] shard_count.
 
 # Per-command hard execution timeouts (IMAP only). These are safety nets that
 # abort runaway commands — normal operations complete far below these limits.
@@ -1316,6 +1325,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # Two-tier blocking system protects shared IPs while catching distributed attacks
 # Use dotted notation for nested config within [[server]] array element
 # A key left out or set to 0 takes its default; a negative value stops startup.
+# Durations here are strings ("15m", "1d"); a bare number or a value that does not parse stops startup.
 auth_rate_limit.enabled = false                   # Enable authentication rate limiting.
 
 # TIER 1: Fast IP+username blocking (protects shared IPs like corporate gateways)
@@ -1384,6 +1394,7 @@ auth_rate_limit.max_username_entries = 50000      # Max username tracking entrie
 # keys left out of the table keep their defaults (a table without "enabled" leaves it on).
 # Exception: user_api_proxy caches routes only when the table is present.
 # http_user_api ignores this table: each login reads its hash and token epoch from the primary.
+# A proxy whose remote_lookup url contains $ip never uses this cache (see REMOTE_LOOKUP below).
 # [server.lookup_cache]
 # enabled = true                          # Enable authentication and routing lookup caching for this server (default: true)
 # positive_ttl = "5m"                     # How long to cache successful authentications (default: 5m)
@@ -1604,20 +1615,24 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # for a lookup that fails or answers nothing usable: with pools, no answer is never a
 # guess at the default pool.
 #
-# A User API proxy sends a CORS preflight, and a login or refresh that names no user
-# (no email, no password, no token, a malformed body), which reach no account, to the
-# default pool, else to the first pool in this file's order with a backend available.
-# Give the http_user_api backends of every pool the same allowed_origins. A refresh whose
-# token the proxy refuses (expired, invalidly signed, or lacking usable account identity)
-# is answered 401 by the proxy and sent to no pool. So is a login for an address the
-# lookup does not know (404/3xx, without lookup_local_users) or refuses (401/403): after
-# a password verification, as a backend answers a wrong password, so the answer does not
-# show which addresses the lookup knows.
+# User API proxy with pools:
+#   - A CORS preflight, and a login or refresh that names no user (no email, no password,
+#     no token, a malformed body), go to the default pool, else to the first pool in this
+#     file with a backend available. Give the http_user_api backends of every pool the
+#     same allowed_origins.
+#   - A refresh whose token the proxy refuses (expired, badly signed, no usable account)
+#     is answered 401 by the proxy and sent to no pool.
+#   - So is a login for an address the lookup does not know (404/3xx, without
+#     lookup_local_users) or refuses (401/403). The answer comes after a password check,
+#     like a wrong password, so it does not show which addresses the lookup knows.
+#   - A request with a token that falls back to lookup_local_users needs a local
+#     database whose active credential matches both the token's email and account ID.
 #
 # A backend in maintenance (see BACKEND MAINTENANCE) is skipped inside its pool. A user
 # the API pins with "server" to a backend in maintenance is routed among the other
 # members of that backend's pool, and refused when its pool is unknown or none is
-# left; the pin takes the user back when maintenance ends.
+# left; the pin takes the user back when maintenance ends. With pools, a "server" pin
+# that cannot be dialed and belongs to no pool is refused, never sent to another pool.
 #
 # TLS to a pool member is verified against that pool's remote_tls_ca_file (system roots
 # without one), on every proxy and however routing reached it (a lookup pin to a member
@@ -1632,9 +1647,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # answering with "pool". A proxy still on remote_addrs ignores the field (with a
 # warning) and routes the user into remote_addrs. Keep default = true on the old pool
 # until the API names a pool for every user, then drop it.
-# With named pools, an unusable server pin without a known owning pool is refused.
-# User API lookup_local_users fallback for JWT requests also requires a local database
-# whose active credential matches both the token's email and account ID.
+#
 # Write an IPv6 backend with an explicit port as "[2001:db8::10:20]:143";
 # a bare "2001:db8::10:20" is one IP and receives the proxy's remote_port.
 #
@@ -1646,6 +1659,7 @@ timeouts.min_bytes_per_minute = 512         # Slowloris guard (bytes/min, 0 = di
 # remote_use_id_command = true          # IMAP: forward the client IP via ID
 # remote_use_xclient = true             # POP3/LMTP: forward the client IP via XCLIENT
 # remote_use_utf8 = true                # POP3: sora backends only
+# remote_skip_forwarding_with_proxy_protocol = false  # IMAP/POP3: leave out ID/XCLIENT on a leg that sends PROXY
 # remote_tls = false
 # remote_tls_use_starttls = false       # IMAP/POP3/LMTP/ManageSieve dial plaintext and STARTTLS after the greeting; the User API always uses implicit TLS
 # remote_tls_verify = true
@@ -1701,7 +1715,7 @@ tls_verify = false                    # true requires client certificates (mutua
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend server TLS certificates
+remote_tls_verify = true              # Verify backend server TLS certificates (default: false)
 # remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_id_command = false         # Send IMAP ID command to backends
@@ -1762,7 +1776,7 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 
 # --- IMAP ID COMMAND CUSTOMIZATION ---
 # Override the fields returned by the IMAP ID command (RFC 2971) in proxy mode.
-# If left empty, Sora defaults will be used ("Sora-Proxy", "1.0", etc.).
+# If left empty, Sora defaults will be used ("Sora", "1.0", "Migadu-Mail GmbH", "https://migadu.com").
 # id_name = "Dovecot"
 # id_version = "2.3.20"
 # id_vendor = "Dovecot authors"
@@ -1782,12 +1796,12 @@ enable_affinity = true        # Enable user-to-backend affinity (requires [clust
 #      - IDLE commands can legitimately last 29+ minutes (RFC 2177)
 #      - Proxy is protocol-agnostic and cannot detect IDLE
 #      - Backend IMAP server handles IDLE correctly with its own timeouts
-#    - Pre-auth protection is already provided by session_timeout above
+#    - Pre-auth protection is already provided by auth_idle_timeout above
 #
 # 3. absolute_session_timeout (below): Maximum total session duration
 #    - Enforced throughout entire connection (pre-auth AND post-auth)
 #    - Prevents indefinitely long sessions
-#    - 30 minutes from connection to disconnection, regardless of activity
+#    - 24 hours by default, from connection to disconnection, regardless of activity
 #
 timeouts.command_timeout = "0"              # Idle timeout. Set to "0" to disable (REQUIRED for IMAP proxy; default when absent or invalid: 30m).
 timeouts.absolute_session_timeout = "24h"   # Maximum total session duration from connect to disconnect (default: 24h).
@@ -1908,10 +1922,11 @@ url = "http://localhost:8080/lookup?email=$email"  # HTTP endpoint URL with $ema
                                             #   "http://localhost:8080/lookup?email=$email" → query parameter
                                             #   "http://localhost:8080/user/$email/lookup" → path parameter
                                             #   "http://localhost:8080/api/v1/auth?user=$email&format=json" → custom format
-timeout = "10s"                             # HTTP response timeout (default: 10s)
+timeout = "10s"                             # HTTP response timeout (default: 5s)
                                             # NOTE: The actual context timeout is automatically calculated as:
                                             #   dial_timeout + tls_handshake_timeout + timeout + 10% buffer
-                                            # With defaults (10s + 10s + 10s + 10%) = ~33 seconds for first request
+                                            # With timeout = "10s" as here and the default dial and TLS timeouts:
+                                            # (10s + 10s + 10s) + 10% = 33 seconds for a first request
                                             # Subsequent requests reuse connections and complete within this timeout
 # auth_token = "your-secret-token"          # Bearer token for HTTP authentication (optional)
                                             # If set, sends "Authorization: Bearer <token>" header with requests
@@ -1965,10 +1980,13 @@ lookup_local_users = true             # Check local DB when remote returns 404/3
                                       #
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend TLS certificates
-# remote_port = 143                   # Port to append if the server address has none (default: the proxy's remote_port, else the protocol's standard port)
+remote_tls_verify = true              # Verify backend TLS certificates (default: true)
+# remote_port = 143                   # Port to append if the server address has none (default: the proxy's remote_port, else 993/995 with
+                                      # implicit remote_tls, else the protocol's standard port)
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends
 remote_use_id_command = false         # Send IMAP ID command to backends (IMAP only)
+# remote_use_xclient = false          # Send XCLIENT to backends (POP3 and LMTP only)
+# remote_skip_forwarding_with_proxy_protocol = false  # IMAP/POP3 only: leave out ID/XCLIENT when PROXY is sent
 # restrict_to_pool = false            # SSRF defense (routing mode). When true, a backend
                                       # address returned by the remote_lookup API is used
                                       # ONLY if it is in this proxy's configured pool
@@ -2095,7 +2113,7 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
   # The context timeout for authentication is automatically calculated as:
   #   context_timeout = (dial_timeout + tls_handshake_timeout + timeout) * 1.10
   #
-  # With default values:
+  # With timeout = "10s" as in this example (the default is 5s, giving 27.5s):
   #   context_timeout = (10s + 10s + 10s) * 1.10 = 33s
   #
   # This ensures:
@@ -2143,8 +2161,6 @@ remote_use_id_command = false         # Send IMAP ID command to backends (IMAP o
 #
 # The "address" field in the HTTP response determines which user the proxy authenticates as on the backend.
 # All logic for token splitting, validation, alias resolution, etc. is handled by your HTTP endpoint.
-#
-# See test_remote_lookup_server.go for a working example implementation.
 
 
 # POP3 PROXY EXAMPLE
@@ -2174,7 +2190,7 @@ tls_verify = false                    # true requires client certificates (mutua
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend server TLS certificates
+remote_tls_verify = true              # Verify backend server TLS certificates (default: false)
 # remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info
@@ -2241,7 +2257,7 @@ tls_verify = false                    # true requires client certificates (mutua
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend server TLS certificates
+remote_tls_verify = true              # Verify backend server TLS certificates (default: false)
 # remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_health_checks = true           # Enable backend health tracking (default: true)
@@ -2268,8 +2284,10 @@ timeouts.min_bytes_per_minute = 0           # Slowloris guard (bytes/min, 0 = di
 # --- AUTHENTICATION ERROR LIMIT ---
 limits.max_auth_errors = 2                  # Disconnect at this many protocol errors before authentication (default: 2). See the IMAP proxy example above.
 
-# NOTE: SIEVE extensions are configured globally in the [sieve] section.
-# The proxy should match capabilities from backend servers.
+# Sieve extensions the proxy advertises before login. A managesieve backend advertises
+# [sieve] enabled_extensions instead; list the same names here. Unsupported names are
+# dropped with a warning; empty (or none left) = the default set.
+# supported_extensions = ["fileinto", "vacation", "envelope", "imap4flags", "variables"]
 
 # --- DEBUG LOGGING ---
 debug = false                         # Enable debug logging (logs backend greetings/responses)
@@ -2300,7 +2318,7 @@ tls_verify = false                    # true requires client certificates (mutua
 # --- BACKEND TLS CONFIGURATION ---
 remote_tls = false                    # Enable TLS for backend connections (implicit TLS or StartTLS)
 remote_tls_use_starttls = false       # Use STARTTLS for backend connections (requires remote_tls = true)
-remote_tls_verify = true              # Verify backend server TLS certificates
+remote_tls_verify = true              # Verify backend server TLS certificates (default: false)
 # remote_tls_ca_file = "/etc/sora/backend-ca.pem"  # [OPTIONAL] PEM bundle to verify backend certs against (private CA / self-signed) instead of system roots; only for backends in no [[pool]].
 remote_use_proxy_protocol = true      # Send PROXY protocol headers to backends (outgoing)
 remote_use_xclient = false            # Send XCLIENT command to backends for forwarding client info

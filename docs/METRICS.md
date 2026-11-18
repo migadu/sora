@@ -65,11 +65,13 @@ Treat the endpoint as sensitive. With domain metrics on, it shows which domains 
 user metrics on, it can show user names, and with `hash_usernames = false` it shows them in clear
 text.
 
-The five `enable_*`, `user_metrics_threshold`, `max_tracked_users` and `hash_usernames` settings
-apply to the whole process, but only a `metrics` block sets them: in another block they are ignored,
-with a startup warning. With several `metrics` blocks, the last one in the file wins.
+The settings `enable_domain_metrics`, `enable_user_metrics`, `user_metrics_threshold`,
+`max_tracked_users` and `hash_usernames` apply to the whole process, but only a `metrics` block
+sets them: in another block they are ignored, with a startup warning. With several `metrics`
+blocks, the last one in the file wins.
 
-The metrics server is not reloaded by `SIGHUP`: restart Sora to change it. See
+The metrics server is not reloaded by `SIGHUP`: a reload lists every change to its block as
+needing a restart. See
 [CONFIGURATION.md](CONFIGURATION.md#6-reloading-with-sighup).
 
 ### Prometheus scrape configuration
@@ -135,7 +137,8 @@ Types: a **counter** only goes up (use `rate()` or `increase()`), a **gauge** go
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `sora_authentication_attempts_total` | counter | `protocol`, `server_name`, `hostname`, `result` | Login attempts. `result`: `success`, `failure`; `rate_limited` on `pop3`; `unavailable` on the IMAP, POP3 and ManageSieve proxies (the remote lookup service was temporarily unavailable). |
-| `sora_password_verification_attempts_total` | counter | `hash_type`, `result` | Password hash checks. `hash_type`: `bcrypt`, `blf_crypt`, `ssha512`, `sha512`, `unknown`. `result`: `success`, `failure`. |
+| `sora_password_verification_attempts_total` | counter | `hash_type`, `result` | Password hash checks. `hash_type`: `bcrypt`, `blf_crypt`, `crypt`, `ssha512`, `sha512`, `unknown`. `result`: `success`, `failure`. |
+| `sora_password_dummy_verifications_total` | counter | none | bcrypt checks against a dummy hash, made for a failed login that had no password hash to check (for example an unknown user), so that it takes as long as a wrong password. |
 | `sora_auth_rate_limiter_ip_username_entries` | gauge | `protocol`, `server_name`, `hostname` | Tracked IP-and-user pairs in the login rate limiter. `protocol`: `imap`, `pop3`, `managesieve`, `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `userapi`, `userapi_proxy`. |
 | `sora_auth_rate_limiter_ip_entries` | gauge | same | Tracked IPs with failures. |
 | `sora_auth_rate_limiter_username_entries` | gauge | same | Tracked user names with failures. |
@@ -150,12 +153,11 @@ The `sora_auth_delay_*` metrics only exist while `[server.auth_rate_limit]` is e
 method of a server (LOGIN, AUTHENTICATE, master user) counts under it. Per-address detail is in
 the log and in `GET /admin/auth/blocked`. See [AUTHENTICATION.md](AUTHENTICATION.md).
 
-Upgrade note: `sora_auth_rate_limiter_*`, `sora_auth_delay_*` and
-`sora_connection_tracker_*` previously used labels such as `IMAP`, `IMAP-PROXY`,
-`SIEVE-PROXY` and `IMAP-LOGIN`. Update dashboard and alert selectors to the server-type
-values above. Queries must account for both spellings while a rolling upgrade still
-has nodes running the previous version. Auth-delay log `protocol` fields use the new
-server-type values too.
+**Upgrading from an older release.** Older releases gave `sora_auth_rate_limiter_*`,
+`sora_auth_delay_*` and `sora_connection_tracker_*` a `protocol` such as `IMAP`, `IMAP-PROXY`,
+`SIEVE-PROXY` or `IMAP-LOGIN`. They now use the server types listed above, and so does the
+`protocol` field of the auth-delay log lines. Change dashboard and alert selectors to the new
+values. While a rolling upgrade still has old nodes, match both spellings.
 
 ### 3.3 Commands and protocol errors
 
@@ -205,6 +207,8 @@ Each counted IMAP error is also logged at WARN as `protocol error` with the same
 | `sora_relay_queue_age_seconds` | histogram | `type` | Age of a message when the worker picks it up. Buckets from 1 s to 1 day. |
 | `sora_relay_queue_operations_total` | counter | `operation`, `result` | Queue file operations. `operation`: `enqueue`, `acquire`, `mark_success`, `mark_failure`, `mark_permanent_failure`, `release`. `result`: `success`, `error`. |
 | `sora_relay_queue_operation_duration_seconds` | histogram | `operation` | Time of those operations. |
+
+| `sora_spam_training_messages_total` | counter | `result` | Messages moved into or out of Junk that were handed to `[spam_training]`. `result`: `submitted`, `failed`, `too_large` (over its `max_message_size`), `dropped` (queue full, or shutting down). |
 
 See [RELAY.md](RELAY.md) and [SIEVE.md](SIEVE.md).
 
@@ -266,8 +270,8 @@ See [CLUSTER.md](CLUSTER.md).
 | `sora_message_fetch_chunks` | histogram | `type` | Chunks per chunked read. |
 | `sora_large_body_storage_skipped_total` | counter | none | Message texts cut to 64 KB before full-text indexing because they were larger. |
 | `sora_go_mailbox_lock_wait_seconds` | histogram | none | Time a message insert waited for Sora's in-memory per-mailbox lock before taking a database connection. |
-| `sora_mailbox_lock_duration_seconds` | histogram | `protocol`, `lock_type`, `result` | Time to take a session's internal lock. `protocol`: `imap`, `pop3`, `lmtp`, `managesieve`. `lock_type`: `read`, `write`. `result`: `success`, `timeout`. |
-| `sora_mailbox_lock_timeouts_total` | counter | `protocol`, `lock_type` | Times that lock could not be taken in time. |
+| `sora_session_lock_duration_seconds` | histogram | `protocol`, `lock_type`, `result` | Time to take a session's internal state lock. `protocol`: `imap`, `pop3`, `lmtp`, `managesieve`. `lock_type`: `read`, `write`. `result`: `success`, `timeout`. Buckets from 1 ms to 5 s. |
+| `sora_session_lock_timeouts_total` | counter | `protocol`, `lock_type` | Times that lock could not be taken in time. |
 
 See [DATABASE.md](DATABASE.md).
 
@@ -279,6 +283,7 @@ See [DATABASE.md](DATABASE.md).
 | `sora_s3_operation_duration_seconds` | histogram | `operation` | Time of each S3 attempt (`GET`, `PUT`, `DELETE`, `DELETE_BULK`). Buckets from 10 ms to 10 s. |
 | `sora_s3_upload_attempts_total` | counter | `result` | Upload attempts by the uploader. `result`: `success`, `failure`. |
 | `sora_storage_errors_total` | counter | `operation`, `error_type` | Failed S3 PUT attempts by cause: `timeout`, `canceled`, `access_denied`, `not_found`, `throttled`, `network_error`, `encryption_error`, `unknown`. |
+| `sora_storage_retries_total` | counter | `operation` | S3 attempts repeated after a failure that can be retried (a 5xx answer, a timeout, a connection error). `operation` as in `sora_s3_operations_total`. A rising rate means S3 is flaky even when `sora_s3_operations_total{status="error"}` stays flat. |
 
 See [STORAGE.md](STORAGE.md).
 
@@ -291,9 +296,10 @@ See [STORAGE.md](STORAGE.md).
 | `sora_cache_objects_total` | gauge | none | Objects in the local body cache. |
 | `sora_lookup_cache_hits_total` | counter | none | Hits of the in-memory login lookup caches, all servers together. |
 | `sora_lookup_cache_misses_total` | counter | none | Misses of those caches. |
-| `sora_lookup_cache_entries_total` | gauge | per server | Entries in one server's lookup cache. |
-| `sora_lookup_cache_hit_rate` | gauge | per server | Hit rate of one server's lookup cache, in percent (0..100). |
+| `sora_lookup_cache_entries_total` | gauge | `protocol`, `server_name` | Entries in one server's lookup cache. `protocol` is the server type (`imap`, `imap_proxy`, `userapi`, ...). |
+| `sora_lookup_cache_hit_rate` | gauge | `protocol`, `server_name` | Hit rate of one server's lookup cache, in percent (0..100). |
 | `sora_lookup_cache_shared_fetches_total` | counter | none | Lookups whose result was shared by concurrent requests for the same user, so one database or API call served several logins. |
+| `sora_lookup_cache_results_total` | counter | `protocol`, `result` | How a proxy used its lookup cache for a login or a route. `protocol`: `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `lmtp_proxy`, `userapi_proxy`. `result`: `hit` (the cached answer was used), `miss`, and `hit_negative` (a cached failed login, repeated with the same password). The IMAP, POP3 and ManageSieve proxies also count `revalidate_negative_different_pw` (a cached failure tried with another password, checked again), `revalidate_positive_different_pw` (a cached success tried with another password, checked again because the entry is past its revalidation window) and `hit_positive_wrong_pw` (the same, but the entry is fresh, so the login is refused as a wrong password). |
 | `sora_auth_cache_operations_total` | counter | `result` | Reads of the persistent `[auth_cache]`. `result`: `hit`, `miss`, `error`. |
 | `sora_auth_cache_entries_total` | gauge | none | Entries in that cache. |
 
@@ -479,7 +485,7 @@ start from what your graphs show on a normal day.
 | S3 errors | `sum by (instance) (rate(sora_s3_operations_total{status="error"}[5m])) / sum by (instance) (rate(sora_s3_operations_total[5m])) > 0.05` | More than 5% of S3 operations fail (example). |
 | Database pool near its limit | `increase(sora_db_pool_exhaustion_total[15m]) > 0` | A pool was more than 95% in use. |
 | Search indexing falls behind | `max(sora_fts_queue_depth) > 50000` for 30m (example) | New mail is missing from search results. |
-| Account purges are stuck | `max(sora_account_purge_oldest_pending_seconds) > 3600` | No node with object storage is picking up purge requests. |
+| Account purges are stuck | `max(sora_account_purge_oldest_pending_seconds) > 3600` | No node with object storage is picking up purge requests, or body deletion is still paused (`[s3] body_deletion_protocol`, see [OPERATIONS.md](OPERATIONS.md#16-message-body-deletion)). |
 | Relay queue backs up | `max by (instance) (sora_relay_queue_depth{state="pending"}) > 1000` for 15m | Redirects and vacation replies wait. Same limit as the `relay_queue` health check. |
 | Relay failures | `sum by (instance) (rate(sora_relay_delivery_total{result=~"temporary_failure\|permanent_failure"}[15m])) > 0` | The relay is refusing mail. |
 | Delivery failures | `sum by (instance) (rate(sora_messages_throughput_total{protocol="lmtp",operation="delivered",status!="success"}[5m])) > 0` for 10m | LMTP deliveries fail or time out. |
@@ -523,7 +529,8 @@ messages point at trouble that a metric shows late or not at all.
 | `Connection closed - timeout` | INFO | A connection hit a timeout, with `reason`. |
 | `Connection limiter: Maximum total connections reached`, `Connection limiter: Maximum connections per IP reached` | INFO | A connection limit refused a client. There is no metric for this. |
 | `Connection tracker: Maximum connections per user reached` | INFO | A per-user limit refused a login. |
-| `Config reload: ... requires restart to take effect` | INFO, WARN | A `SIGHUP` found changes it cannot apply. |
+| `Config reload: global settings changed but require restart to take effect`, `Config reload: server settings changed but require restart to take effect`, `Config reload: servers.trusted_networks changed but requires restart to take effect` | INFO, WARN | A `SIGHUP` found changes it cannot apply; `fields` names them. |
 | `Config reload failed - keeping current config` | ERROR | The file did not parse on `SIGHUP`. |
 | `Config reload: ... is invalid and the server will not start with this config` | ERROR | The file a `SIGHUP` read fails the startup checks, with the reason in `error`. The running process carries on, but the next restart refuses the file. |
 | `MetricsCollector: error collecting metrics` | ERROR | The database gauges are stale. |
+| `Cleanup: message bodies and their candidate rows retained while S3 deletion is paused`, `Purge: queued accounts retained while S3 body deletion is paused` | INFO | Body deletion is paused, so expunged mail and purged accounts keep their bodies in S3 ([OPERATIONS.md](OPERATIONS.md#16-message-body-deletion)). |

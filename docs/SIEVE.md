@@ -88,7 +88,9 @@ Scripts are stored in PostgreSQL, per account, by name. Names are case-sensitive
 
 Users and operators manage scripts through four paths. Every path compiles the script against the
 configured extension set before it stores or activates it, so a script that would fail at
-delivery is refused up front.
+delivery is refused up front. A script must be valid UTF-8 and must not contain a NUL byte
+(RFC 5228 section 1.1); one that breaks either rule does not compile. A script name with a NUL
+byte or invalid UTF-8 is refused too, also as the new name of a rename.
 
 | Path | Size limit | Notes |
 |---|---|---|
@@ -230,16 +232,22 @@ including headers other systems rely on. Even when it is on, `deleteheader` cann
 
 ### Behaviour of particular extensions in Sora
 
-- **`date`:** a date in the RFC 5322 form (`Tue, 1 Jan 2019 12:00:00 +0100`) whose zone is not an
-  RFC 5322 zone (`GMT+1`, `UTC-0500`, `+01`, `+01:00`, `CET/CEST`, minutes above 59 as in
-  `+0060`), or with anything but white space or a comment after the zone (`-0400 EDT`), holds no
-  date: every `date` test on it is false and `:count` is 0 (RFC 5260 section 4). An alphabetic
-  zone whose meaning is not known (`CET`, `XYZ`, a one-letter military zone) is read as `-0000`,
-  the time of day as written at offset zero (RFC 5322 section 4.3); `:originalzone` then gives the
-  zone as `+0000`. A field holding an RFC 3339 date-time (`2019-01-01T12:00:00+01:00`) is also a
-  date, read by RFC 3339's grammar, where an offset hour above 23 (`+24:00`) is not a date. The
-  sent date Sora stores for IMAP `SORT` and `THREAD` is read separately and takes an invalid zone
-  as UTC (RFC 5256 section 2.2).
+- **`date`:** Sora reads a header date by the RFC 5322 grammar, including its obsolete forms:
+  comments and extra white space between the parts, two- and three-digit years, and leap
+  seconds. In a `Received:` field it reads the date after the last `;`. Some dates do not parse,
+  and then every `date` test on that field is false and `:count` is 0 (RFC 5260 section 4):
+  - a zone that is not an RFC 5322 zone, such as `GMT+1`, `UTC-0500`, `+01`, `+01:00`,
+    `CET/CEST`, or minutes above 59 as in `+0060`;
+  - anything but white space or a comment after the zone, as in `-0400 EDT`.
+
+  An alphabetic zone Sora does not know (`CET`, `XYZ`, a one-letter military zone) is read as
+  `-0000`: the time of day as written, at offset zero (RFC 5322 section 4.3). `:originalzone`
+  then gives the zone as `+0000`. A field that holds an RFC 3339 date-time
+  (`2019-01-01T12:00:00+01:00`) is also a date; there an offset hour above 23 (`+24:00`) is not
+  a date. `:zone` and the date-part argument may use variables. All `currentdate` tests in one
+  run see the same moment. The sent date that Sora stores for IMAP `SORT` and `THREAD` is read
+  separately, and an invalid zone there counts as UTC (RFC 5256 section 2.2).
+- **`envelope`:** the `auth` part never matches, because a delivery has no authenticated user.
 - **`mailbox`:** `fileinto :create` creates a missing folder ([section 5](#5-what-each-action-does)).
   The `mailboxexists` test is true only when every named folder exists and the user may deliver
   into it: an own folder, or a shared folder on which the user holds the right to add messages.
@@ -271,22 +279,24 @@ implicit keep (`fileinto` without `:copy`, `redirect` without `:copy`, `discard`
 - The message goes to the named folder instead of INBOX. Folder names are matched
   case-insensitively.
 - If the folder does not exist, the message goes to INBOX instead. Sora logs
-  `mailbox not found, falling back to inbox` at warning level.
+  `Sieve fileinto "<name>" is unavailable or has no insert right; keeping in INBOX` at warning
+  level.
 - With `:create` (extension `mailbox`), Sora creates a missing folder, and any missing parent
   folders, and delivers into it. When the folder already exists, own or shared, `:create` is
   ignored and the message is filed exactly as without it. `:create` never creates a folder in the
-  shared namespace.
+  shared namespace. If the name is not a valid folder name, nothing is created and the message
+  goes to INBOX.
 - With `:copy` (extension `copy`), the message goes to the named folder **and** to INBOX.
-- `fileinto :flags` and `imap4flags` flags are stored on every copy.
 - A script that files one message into several folders stores a copy in each; a folder named
-  twice gets one copy.
+  twice gets one copy. One run may file into at most **32** folders. A script that files into
+  more fails at run time ([section 6](#6-errors-limits-and-timeouts)).
 - `fileinto` and `redirect` combine: if one run does both, the message is filed and also
   redirected.
 
 Filing into a shared folder owned by another account needs the insert (`i`) right on that folder.
-Without it, the message goes to the recipient's own INBOX and Sora logs
-`fileinto denied: no insert right on shared mailbox, delivering to INBOX`. The stored message
-belongs to the folder's owner. See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md#9-sharing-and-the-rest-of-sora).
+Without it, the message goes to the recipient's own INBOX, with the same warning as for a missing
+folder. The stored message belongs to the folder's owner. See
+[SHARED_MAILBOXES.md](SHARED_MAILBOXES.md#9-sharing-and-the-rest-of-sora).
 
 ### redirect
 
@@ -312,16 +322,24 @@ A script that combines `reject` with `keep`, `fileinto`, `redirect` or `vacation
 ### Flags (imap4flags)
 
 `setflag`, `addflag`, `removeflag` and `fileinto :flags` set flags and keywords on the stored
-message. A keyword that is not a valid IMAP atom is dropped, and Sora logs
-`sieve set invalid IMAP keywords, dropped` with the names, so support can find the script line.
-`discard` clears the flags.
+message. `hasflag` tests them. Each stored copy gets its own flags (RFC 5232):
+
+- a copy filed by `fileinto` gets that command's `:flags`, or, without `:flags`, the flags the
+  script had set when the `fileinto` ran;
+- the copy kept in INBOX gets the flags as they were at an explicit `keep`, or, for the implicit
+  keep, the flags at the end of the script.
+
+When two actions store into the same folder, the later action's flags win. A keyword that is not
+a valid IMAP atom is dropped, and Sora logs `sieve set invalid IMAP keywords, dropped` with the
+names, so support can find the script line.
 
 ### Header edits (editheader)
 
-`addheader` and `deleteheader` change the stored message. The edits run before the message is
-hashed and stored, so the stored body, the redirected copy and the vacation reply all see the
-edited headers. If the edited message cannot be parsed, Sora logs a warning and stores the
-original.
+`addheader` and `deleteheader` change the stored message. Tests later in the same script see the
+edited headers. The edits are applied before the message is hashed and stored, so the stored
+message, its search index, the redirected copy and the vacation reply all see them. Every field
+the script does not add or delete keeps its exact bytes, so a DKIM signature over them still
+verifies. If the edited message cannot be parsed, Sora logs a warning and stores the original.
 
 ### vacation
 
@@ -336,7 +354,7 @@ A Sieve problem never makes delivery fail. Sora keeps the message instead.
 | What goes wrong | What Sora does |
 |---|---|
 | The user's script does not compile (for example after an extension was removed) | Logs `failed to get/create sieve executor` at warning level; the default script's result is used. |
-| The script fails at run time (too many redirects, `reject` conflicts, a regex error) | Logs `user sieve script evaluation error` at warning level; the default script's result is used. |
+| The script fails at run time (more than 5 redirects, more than 32 `fileinto` folders, `reject` conflicts, a regex error) | Logs `user sieve script evaluation error` at warning level; the default script's result is used. |
 | The script runs longer than `[sieve] max_execution_time` | Same as a run-time error. |
 | The interpreter panics | Recovered and handled as a run-time error, so the LMTP connection stays up. |
 | The default script fails at run time | Logs `default sieve script evaluation error`; the message is kept in INBOX unless the user script decides otherwise. |
@@ -351,17 +369,18 @@ Every run, default or user, is counted in `sora_sieve_executions_total{protocol,
 `100ms` and `60s`. An empty, unparsable, zero or negative value means the default. The value is
 read at startup; a change needs a restart.
 
-The budget also supplies the deadline for a single `:regex` or `:matches` match. Inputs
-larger than 1 KB are matched synchronously through a reader that checks the deadline as
-input advances, roughly every 64 bytes. A stopped match returns a timeout only after the matching
-work has ended; it leaves no background match goroutine. These checks are cooperative,
-so work can continue until the next check. Inputs up to 1 KB and pattern compilation run
-inline, bounded by the input, pattern and program limits below; the budget is not a strict
-wall-clock cap for those operations. Cancellation after the last sampled input read can
-race with normal match completion.
+If less time is left on the LMTP `DATA` command (`timeouts.lmtp_command_timeouts`, see
+[PROTOCOLS.md](PROTOCOLS.md)), the run gets only that time.
 
-Each run also receives the time left on the LMTP `DATA` command, if that is shorter
-(`timeouts.lmtp_command_timeouts`, see [PROTOCOLS.md](PROTOCOLS.md)).
+The same budget is the deadline of each single `:regex` or `:matches` match. The budget is checked
+cooperatively, not enforced by a hard clock:
+
+- When the text is larger than 1 KB, the matcher checks the deadline as it reads the text, about
+  every 64 bytes, and stops with a timeout when the deadline has passed.
+- A match on text of 1 KB or less, and the compilation of a pattern, run without checks. The
+  input, pattern and program-size limits below keep them short.
+
+So a run can go on a little past the budget, until its next check.
 
 ### Fixed interpreter limits
 
@@ -373,15 +392,18 @@ These come from go-sieve and are not configurable.
 | Nesting of blocks | 15 | The script does not compile. |
 | Nesting of tests | 15 | The script does not compile. |
 | Redirect actions in one run | 5 | The run fails ([section 7](#7-redirect)). |
+| Folders one run files into | 32 (set by Sora) | The run fails. |
+| Variables in a script | 128 | The script fails. |
 | Variable name length | 32 bytes | The script fails. |
 | Variable value length | 4000 bytes | The value is cut. |
 | Regex pattern length | 1000 bytes | The script fails. |
-| Estimated compiled cost of a `:regex` key | 10000 weighted program-cost units; a counted repeat such as `a{100}` multiplies the repeated cost | The script fails. |
+| Size of a compiled `:regex` pattern | 10000 cost units (see below) | The script fails. |
 | Text fed to one regex or `:matches` match | 256 KB | The text is cut, the match goes on. |
 
-The regex program estimate also accounts for character-class ranges and case folding. It is
-neither an exact VM instruction count nor a heap byte cap. The execution budget remains
-cooperative, with the inline-match and compilation limits described above.
+The size of a compiled pattern is an estimate of the work the pattern can cause. Character
+classes and case folding add to it, and a counted repeat multiplies it: `a{100}` costs about a
+hundred times `a`. A `:regex` key with a fixed text is checked when the script is stored, so a
+pattern that is too large, or does not compile at all, is refused up front.
 
 ---
 
@@ -405,11 +427,12 @@ redirect is skipped and the message is kept, as if the line were not there:
    `list`, or when a `List-Id` header is present. **So Sieve does not forward mailing-list mail,
    bounces or auto-replies.**
 4. The account is under its redirect rate limit: at most `redirect_rate_limit` redirected
-   addresses (default 100) per `redirect_rate_window` (default `1h`). `0` turns the limit off. If
-   the database check fails, the redirect is skipped.
-5. A relay is configured (`[relay] type` set). Sora checks this at delivery, after the script has
-   run, so without a relay the message is stored as when the relay queue cannot take a redirect
-   (see below).
+   addresses (default 100) per `redirect_rate_window` (default `1h`). `0` turns the limit off.
+   Only addresses that were actually handed to the relay queue count. If the database check
+   fails, the redirect is skipped.
+5. A relay is configured (`[relay] type` set). Sora checks this after the script has run.
+   Without a relay, the message is stored as when the relay queue cannot take a redirect (see
+   below): where the rest of the script puts it, or in INBOX.
 
 A script may redirect to several addresses; an address named twice is sent once. More than five
 redirect actions in one run make the run fail, and the message is then handled as in
@@ -516,7 +539,7 @@ reply is sent.
 | Envelope recipient | The original message's envelope sender. |
 | `From` | The `:from` address, if it is a bare address that belongs to the account. Otherwise the account's primary address. A `:from` that is not the account's is ignored (logged at debug level). |
 | `To` | The original envelope sender. |
-| `Subject` | The `:subject`. Without one, `Auto: ` followed by the original subject, or `Automated reply` when the original message has no subject. RFC 2047-encoded when it is not ASCII. |
+| `Subject` | The `:subject`, even an empty one (`:subject ""`). Without `:subject`, `Auto: ` followed by the original subject, or `Automated reply` when the original message has no subject. Cut to 256 characters, and RFC 2047-encoded when it is not ASCII. |
 | `Message-ID` | `<nanoseconds.vacation@host>`, where host is the machine's hostname. Give the machine a fully qualified name; Sora warns at startup when it is not. |
 | `In-Reply-To`, `References` | Built from the original message so clients thread the reply. |
 | `Auto-Submitted` | `auto-replied` |
@@ -528,8 +551,10 @@ reply is sent.
 
 With `:mime`, the reason must be a complete MIME entity (headers, blank line, body). Sora keeps
 its `Content-*` headers and body as written and takes every other header from the table above.
-Invalid MIME (duplicate `Content-Type`, non-ASCII header bytes, nesting deeper than 64 levels,
-and similar) means no reply; the window is not used up.
+Sora checks the entity before it sends it. Invalid MIME means no reply, and the window is not
+used up. Examples of invalid MIME: a duplicate `Content-Type`, non-ASCII bytes in a header,
+nesting deeper than 64 levels, a multipart boundary or close-delimiter line that is malformed,
+and a body that does not match its `Content-Transfer-Encoding`.
 
 The relay must accept mail from Sora with an empty envelope sender. If it signs outgoing mail
 (DKIM), it signs these replies too.
@@ -574,15 +599,16 @@ otherwise. Sora does not advertise `MAXREDIRECTS`; the limit is 5 ([section 6](#
 |---|---|
 | `LISTSCRIPTS` | Lists the account's scripts and marks the active one. |
 | `GETSCRIPT` | Returns a script. `NO (NONEXISTENT)` if there is none of that name. |
-| `PUTSCRIPT` | Compiles the script against `[sieve] enabled_extensions` and stores it. A script over `max_script_size` is refused before it is read. A new script beyond 100 per account gives `NO (QUOTA/MAXSCRIPTS)`. Replacing the active script keeps it active. |
+| `PUTSCRIPT` | Compiles the script against `[sieve] enabled_extensions` and stores it. A script over `max_script_size` is refused before it is read. A new script beyond 100 per account gives `NO (QUOTA/MAXSCRIPTS)`. Replacing a script keeps its active flag. |
 | `CHECKSCRIPT` | Compiles the script and stores nothing. Sora never returns warnings. |
 | `SETACTIVE` | Compiles the stored script again and activates it. `SETACTIVE ""` deactivates all scripts. |
 | `DELETESCRIPT` | Refuses the active script with `NO (ACTIVE)`; deactivate it first. |
-| `RENAMESCRIPT` | Renames in one step; the active flag stays. `NO (ALREADYEXISTS)` if the new name is taken. |
+| `RENAMESCRIPT` | Renames in one step; the active flag stays. `NO (ALREADYEXISTS)` if the new name is taken, `NO (NONEXISTENT)` if there is no script of the old name. |
 | `HAVESPACE` | Checks the size against `max_script_size` and the 100-script limit (replacing a script of the same name does not count as a new one). |
 
-A compile failure answers `NO "Script validation failed: <reason>"`. A database error answers a
-temporary failure; the client may retry.
+A compile failure answers `NO "Script validation failed: <reason>"`; so does a script or a new
+script name with a NUL byte or invalid UTF-8. A database error answers a temporary failure; the
+client may retry.
 
 ### The ManageSieve proxy
 
@@ -616,18 +642,22 @@ redirect or vacation reply wakes the relay worker at once. They differ in these 
 | `enabled_extensions` | list of strings | `[]` (the default set of 23) | The extensions scripts may require. Replaces the default set. See [section 4](#4-supported-extensions). |
 | `max_execution_time` | duration | `"2s"` | Budget for one script run and for one regex match. Clamped to 100ms–60s. |
 
-Both are read at startup. A reload (`SIGHUP`) logs
-`Config reload: [sieve] changed but requires restart to take effect` and changes nothing.
+Both are read at startup. A reload (`SIGHUP`) changes nothing; it logs
+`Config reload: global settings changed but require restart to take effect` with the changed keys
+in `fields` (for example `sieve.enabled_extensions`). At startup, and in
+`sora-admin config validate`, Sora warns about extension names it does not support.
 
 ### Keys in `[[server]]` blocks
 
 | Key | Server types | Default | Meaning |
 |---|---|---|---|
 | `limits.redirect_rate_limit` | `lmtp`, `http_admin_api` | `100` | Redirected addresses allowed per account per window. `0` means no limit. |
-| `limits.redirect_rate_window` | `lmtp`, `http_admin_api` | `"1h"` | The window for the limit above. An invalid value falls back to `1h` with a log line. |
+| `limits.redirect_rate_window` | `lmtp`, `http_admin_api` | `"1h"` | The window for the limit above. Zero or a negative value stops startup (use `redirect_rate_limit = 0` to turn the limit off). A value that does not parse falls back to `1h` with a log line. |
 | `limits.max_redirect_hops` | `lmtp`, `http_admin_api` | `2` | How many times Sora may redirect one message, counted in `X-Sora-Loop`. `1` allows one redirect. `0` means no limit; `Delivered-To` loop detection still applies. |
 | `max_script_size` | `managesieve` | `"16kb"` | Largest script ManageSieve accepts. Reloads on `SIGHUP`. |
 | `supported_extensions` | `managesieve_proxy` | the default set | Extensions the proxy advertises before login. |
+
+The three `limits.redirect_*` keys need a restart to change.
 
 ```toml
 [sieve]
@@ -677,7 +707,7 @@ Useful log lines (LMTP session logs carry the session and message fields):
 | `sieve message discarded` | info | Nothing was stored. |
 | `failed to get/create sieve executor` | warn | The stored script does not compile; it was skipped. |
 | `user sieve script evaluation error` | warn | The script failed at run time or timed out. |
-| `mailbox not found, falling back to inbox` | warn | `fileinto` named a missing folder without `:create`. |
+| `Sieve fileinto "<name>" is unavailable or has no insert right; keeping in INBOX` | warn | `fileinto` named a missing folder, the shared namespace root, or a shared folder without the `i` right. |
 | `sieve set invalid IMAP keywords, dropped` | warn | A flag name was not a valid IMAP keyword. |
 | `mail loop detected via Delivered-To, rejecting` | warn | A redirect loop was refused with 550. |
 | `sieve redirect could not be queued` | warn | LMTP: a redirect did not go out (`redirect_to`, `error`); the relay queue refused it or could not hand it to the relay worker. See [section 7](#7-redirect) for where the message is stored. |

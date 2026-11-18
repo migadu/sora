@@ -133,15 +133,23 @@ peers = ["10.0.0.12:7946", "10.0.0.13:7946"]
 
 - A peer can be an IP address or a host name, with or without a port. Without a port, this node's
   own gossip port is used.
+- A host name can stand for several nodes, for example one DNS name that lists every node of the
+  cluster. The node joins every address the name resolves to, except its own.
 - Joining one live node is enough: memberlist then learns about every other member from it. Still,
   list all the other nodes, so a node can start whichever of them is up.
 - If no peer answers, the node starts anyway. It logs
-  `Failed to join cluster peers (will retry in background)` and tries again every 10 seconds.
-- For as long as it runs, the node keeps re-joining the configured peers that are not current
-  members. A peer that comes back, or the other side of a healed network split, rejoins the cluster
-  without a restart.
-- An entry equal to this node's own address is dropped, with a warning, so all nodes can share one
-  `peers` list.
+  `Failed to join cluster peers (will retry in background)`.
+- Every 10 seconds, for as long as it runs, the node joins again the configured peers that are not
+  current members. A peer that comes back, or the other side of a healed network split, rejoins the
+  cluster without a restart. While a peer stays away, the node logs
+  `Cluster: Configured peers are not members and could not be joined - retrying` (once, not every
+  10 seconds), and `Cluster: Rejoined configured peers` when it is back.
+- List each peer by the address it has in its own `addr`. A peer that answers on a different
+  address (for example a NAT address) is not recognised as a member, so the node joins it again
+  every 10 seconds and logs
+  `Cluster: Configured peers answer on an address no member advertises - ...`.
+- An entry that stands only for this node's own address is dropped, with a warning, so all nodes
+  can share one `peers` list.
 
 ### Node names
 
@@ -178,8 +186,9 @@ that does not decode to exactly 32 bytes stops startup with
 keys, and a missing one.
 
 memberlist encrypts every packet with AES-256-GCM and drops anything it cannot decrypt. A node with
-a different key cannot join: it logs `Failed to join cluster peers`, then `Cluster: Retry join
-failed` every 10 seconds, and stays a cluster of one that names itself leader.
+a different key cannot join: it logs `Failed to join cluster peers`, then
+`Cluster: Configured peers are not members and could not be joined - retrying`, and stays a
+cluster of one that names itself leader.
 
 Sora accepts only one key. To change it, stop or reconfigure all nodes together: during the change,
 nodes with the old key and nodes with the new key form two separate clusters.
@@ -285,15 +294,21 @@ their `[[server]]` block sets `enable_affinity = true`. How routing uses affinit
 
 The cluster shares the affinity store:
 
-- A node has an affinity store when the cluster is on and `[cluster.affinity] enabled = true`.
-  Without it, `enable_affinity` has no effect.
+- A node has an affinity store when the cluster is on and `[cluster.affinity] enabled = true` (the
+  default). Without it, `enable_affinity` has no effect: those proxies route by consistent hash,
+  and startup logs
+  `enable_affinity has no effect without [cluster] and [cluster.affinity] enabled - these proxies route by consistent hash`
+  with the server names. `sora-admin config validate` reports the same.
 - Each assignment, change and removal is gossiped to every node. When two nodes disagree, the
   newer assignment wins.
 - An entry expires after `[cluster.affinity] ttl` (default `24h`), counted from when it was set.
   Expired entries are removed every `cleanup_interval` (default `1h`).
 - Affinity has no full-state exchange. A node that joins or restarts learns only the assignments
   made after it joined, unless it keeps them on disk: with `[cluster.affinity] cache_path` set, the
-  node writes every entry to a local SQLite file and loads it at startup.
+  node writes every entry, and every change it receives by gossip, to a local SQLite file, in the
+  order they happen. At startup it loads the unexpired entries from the file first and only then
+  applies the affinity gossip that arrived meanwhile, so an older entry from the file never
+  undoes a newer change. Startup logs `Affinity: Loaded persisted affinities` with the counts.
 - The admin API can read one entry (`GET /admin/affinity?user=...&protocol=imap`), set and
   delete entries (`POST` and `DELETE /admin/affinity`), and count them (`GET /admin/affinity/stats`).
   A change made there is gossiped too. See [ADMIN_API.md](ADMIN_API.md).
@@ -481,11 +496,14 @@ Sora has no command or endpoint that lists the members. Use the log, the admin A
 
 **At startup**, each node logs:
 
+- `Join returned - contacted peers` with `count` (the peers it reached) and `members` when the
+  join worked, or `Failed to join cluster peers (will retry in background)` when it did not.
 - `Cluster manager initialized` with `node_id`, `members` and `leader`, right after joining.
-- `Join returned - contacted peers` and `Cluster members after join (expected 2+)` with the member
-  count when the join worked, or `Failed to join cluster peers (will retry in background)` when it
-  did not.
 - `Cluster leader changed` whenever its view of the leader changes.
+
+Later, the rejoin loop (section 3) logs `Cluster: Rejoined configured peers` when it brings a
+peer back, and `Cluster: All configured peers are members` once every configured peer is a member
+again.
 
 Every node should end up naming the same leader. With the default logging to standard error under
 systemd:
@@ -515,7 +533,7 @@ is logged as `CLUSTER-LIMITER: Applied cluster block for IP`, with the `ip`, the
 
 | Metric | Meaning |
 |---|---|
-| `sora_connection_tracker_users{protocol,server_name,hostname}` | Users the tracker knows, on all nodes. |
+| `sora_connection_tracker_users{protocol,server_name,hostname}` | Users the tracker knows, on all nodes. `protocol` is the server type: `imap_proxy`, `pop3_proxy`, `managesieve_proxy`, `lmtp_proxy` (local only), or `imap`, `pop3`, `managesieve` on backends. |
 | `sora_connection_tracker_instance_ids{...}` | For each tracked user, the number of proxy listeners (on any node) where the user has connections, summed over all users. |
 | `sora_connection_tracker_ips{...}` | Client IPs tracked across all users. |
 | `sora_connection_tracker_broadcast_queue_size{...}` | Events waiting to be gossiped. A value that keeps growing means gossip is not draining (no reachable members, or too much traffic). |
@@ -551,10 +569,23 @@ them.
 
 | Key | Type | Default | Meaning |
 |---|---|---|---|
-| `enabled` | bool | `true` | Run the cluster-wide affinity store on this node. The proxies opt in with `enable_affinity`. |
+| `enabled` | bool | `true` | Run the cluster-wide affinity store on this node. The proxies opt in with `enable_affinity`. `false` runs no store: nothing is gossiped or saved, and proxies with `enable_affinity` route by consistent hash. |
 | `ttl` | duration | `"24h"` | How long an affinity entry lives after it is set. An invalid value logs a warning and uses `24h`. |
 | `cleanup_interval` | duration | `"1h"` | How often expired entries are removed (and the affinity metrics refreshed). An invalid value logs a warning and uses `1h`, `0` uses `1h` too, and a negative value stops startup. |
-| `cache_path` | string | `""` | Path of a SQLite file that keeps affinity entries across restarts. Empty keeps them in memory only. The directory must exist and be writable; if the file cannot be opened Sora logs `Failed to initialize affinity cache - continuing without persistence` and runs without it. A corrupt file is deleted and recreated. |
+| `cache_path` | string | `""` | SQLite file that keeps affinity entries across restarts: a path, or an SQLite `file:` URI. Empty keeps them in memory only. Details below the table. |
+
+About `cache_path`:
+
+- The directory must exist and be writable by the `sora` user. Sora creates the file with mode
+  `0600`.
+- If the file cannot be opened (missing directory, no permission, a read-only file system), Sora
+  logs `Failed to initialize affinity cache - continuing without persistence` with the error and
+  runs without it.
+- A corrupt file is deleted and created again, with the warning
+  `AffinityCache: Database appears corrupted, recreating`. A `file:` URI whose `mode` does not
+  allow creating the file (`mode=ro` or `mode=rw`) is not recreated; Sora runs without persistence.
+- A name that is not a file (`:memory:`, `file::memory:`, a URI with `mode=memory`) is refused: it would not
+  survive a restart.
 
 Durations accept Go units (`"30m"`, `"24h"`) and days (`"7d"`); see
 [CONFIGURATION.md](CONFIGURATION.md).
