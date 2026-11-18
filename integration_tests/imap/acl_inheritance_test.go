@@ -17,11 +17,15 @@ import (
 func TestACL_ChildMailboxInheritance(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server, account1 := common.SetupIMAPServer(t)
+	server, _ := common.SetupIMAPServer(t)
 	defer server.Close()
 
+	// Own domain: "anyone" reaches every account in the owner's domain, and a grant
+	// left behind on example.com would list this mailbox to every later test.
+	domain := common.UniqueTestDomain()
+	account1 := common.CreateTestAccountInDomain(t, server.ResilientDB, domain)
+
 	// Create second user in same domain
-	domain := "example.com"
 	email1 := account1.Email
 	email2 := fmt.Sprintf("user2-%d@%s", common.GetTimestamp(), domain)
 	password1 := account1.Password

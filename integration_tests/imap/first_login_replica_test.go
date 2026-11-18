@@ -135,9 +135,12 @@ func TestIMAP_FirstLoginReadsTheDefaultMailboxesFromTheWriter(t *testing.T) {
 		if err != nil {
 			t.Fatalf("LIST failed: %v", err)
 		}
-		if len(listed) != len(consts.DefaultMailboxes) {
-			t.Errorf("LIST returned %d mailboxes, want the %d the replica has: a login that created nothing must not move the session to the writer",
-				len(listed), len(consts.DefaultMailboxes))
+		// Asserted by name, not by count: the test database is shared, and another
+		// test's mailbox shared with "anyone" in example.com is listed here too.
+		for _, m := range listed {
+			if m.Mailbox == "NotReplayed" {
+				t.Errorf("LIST returned %q, which only the writer has: a login that created nothing must not move the session to the writer", m.Mailbox)
+			}
 		}
 	})
 }

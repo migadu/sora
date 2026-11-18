@@ -107,11 +107,15 @@ func TestLIST_SharedMailboxes_DirectACL(t *testing.T) {
 func TestLIST_SharedMailboxes_AnyoneIdentifier(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server, account1 := common.SetupIMAPServer(t)
+	server, _ := common.SetupIMAPServer(t)
 	defer server.Close()
 
+	// Own domain: "anyone" reaches every account in the owner's domain, and a grant
+	// left behind on example.com would list this mailbox to every later test.
+	domain := common.UniqueTestDomain()
+	account1 := common.CreateTestAccountInDomain(t, server.ResilientDB, domain)
+
 	// Create second user in same domain
-	domain := "example.com"
 	email1 := account1.Email
 	email2 := fmt.Sprintf("user2-%d@%s", common.GetTimestamp(), domain)
 	password1 := account1.Password
@@ -185,8 +189,12 @@ func TestLIST_SharedMailboxes_AnyoneIdentifier(t *testing.T) {
 func TestLIST_SharedMailboxes_CrossDomain(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
-	server, account1 := common.SetupIMAPServer(t)
+	server, _ := common.SetupIMAPServer(t)
 	defer server.Close()
+
+	// Own domain: "anyone" reaches every account in the owner's domain, and a grant
+	// left behind on example.com would list this mailbox to every later test.
+	account1 := common.CreateTestAccountInDomain(t, server.ResilientDB, common.UniqueTestDomain())
 
 	// Create second user in DIFFERENT domain
 	email1 := account1.Email
