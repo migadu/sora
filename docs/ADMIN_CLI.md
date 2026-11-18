@@ -59,8 +59,8 @@ sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
 
 - `--config PATH` is **required** for every command except `help`, `version` and `--help` (see
   below). There is no default path. The flag may appear anywhere on the line, and `--config=PATH`
-  works too. Use two dashes: `-config` is not recognised and the tool stops with `--config flag is
-  required`.
+  works too. Use two dashes: `-config` is not recognised; after the command the tool stops with
+  `--config flag is required`, before it with the error below.
 - `sora-admin` reads the same TOML file as the server. It loads it with the server's loader, so
   unknown keys and duplicate keys produce the same warnings, and a file the server cannot load
   stops the tool. Settings the file leaves out take the server's defaults, so a command that
@@ -73,6 +73,10 @@ sora-admin --config /etc/sora/config.toml <command> <subcommand> [flags]
 - Flags of a subcommand come **after** the subcommand. They are parsed with Go's `flag` package,
   so `--flag value`, `--flag=value` and `-flag value` all work. A boolean flag that defaults to
   `true` is turned off with `--flag=false`.
+- Before the command only `--config PATH` / `--config=PATH` may appear, and the tool-wide
+  `--help`, `-h`, `-help`, `--version` and `-v`, which print the tool's usage or version and exit
+  `0`. Any other flag there stops the tool with `unexpected flag ... before the command` and exit
+  status `1`, and nothing runs.
 - Worker counts (`--jobs`, `--workers`) must be at least `1`. So must the batch sizes and limits
   this document marks "at least 1"; a smaller value stops the command with an error.
 - `sora-admin <command> --help` lists the subcommands. `sora-admin <command> <subcommand> --help`
