@@ -43,8 +43,10 @@ func TestAdminAPI_DeliverMail_RefusesUnparseableSender(t *testing.T) {
 		return "application/json", b
 	}
 	const bad = "not an address"
-	// net/mail reads this From: header, NewReversePath does not (local part over 64).
-	longLocal := strings.Repeat("a", 70) + "@example.net"
+	// net/mail reads this From: header, NewReversePath does not: "_" cannot stand in a
+	// domain name (RFC 5321 §4.1.2 sub-domain), though it is atext to RFC 5322. Were the
+	// fallback checked like a named sender, this delivery would get a 400.
+	badDomain := "sender@bad_domain.example"
 
 	for _, tc := range []struct {
 		name   string
@@ -77,7 +79,7 @@ func TestAdminAPI_DeliverMail_RefusesUnparseableSender(t *testing.T) {
 			return "/admin/mail/deliver", ct, nil, b
 		}},
 		{name: "unparseable From header fallback", status: http.StatusOK, build: func() (string, string, http.Header, []byte) {
-			ct, b := jsonBody(map[string]any{"recipients": []string{email}, "message": message(longLocal)})
+			ct, b := jsonBody(map[string]any{"recipients": []string{email}, "message": message(badDomain)})
 			return "/admin/mail/deliver", ct, nil, b
 		}},
 	} {
