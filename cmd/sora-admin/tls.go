@@ -81,8 +81,8 @@ This command shows:
 
 Examples:
   sora-admin tls list --config config.toml
-  sora-admin tls list --details
-  sora-admin tls list --cache-dir /custom/path
+  sora-admin tls list --details --config config.toml
+  sora-admin tls list --cache-dir /custom/path --config config.toml
 `)
 	}
 
@@ -305,7 +305,7 @@ Subcommands:
 
 Examples:
   sora-admin tls list --config config.toml
-  sora-admin tls list --details
+  sora-admin tls list --details --config config.toml
   sora-admin tls delete --domain imap.example.com --config config.toml
   sora-admin tls delete --key 9f01dab509f55b97 --config config.toml
   sora-admin tls clean --config config.toml

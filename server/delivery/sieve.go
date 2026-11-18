@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -17,7 +16,6 @@ import (
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/helpers"
-	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 	"github.com/migadu/sora/pkg/resilient"
 	"github.com/migadu/sora/server"
@@ -312,7 +310,19 @@ func (s *StandardSieveExecutor) ExecuteSieve(ctx context.Context, recipient Reci
 	allHeld := true
 	if len(result.RedirectTo) > 0 {
 		arrivedHops := helpers.RedirectHopCount(helpers.HeaderGetter(sieveCtx.Header))
-		outcome.Redirect, outcome.AbortRedirect, allHeld = s.holdRedirects(ctx, recipient, result, outcome.MessageBytes, arrivedHops)
+		outcome.Redirect, outcome.AbortRedirect, allHeld = RedirectHold{
+			Records:      s.DeliveryCtx.RDB,
+			Queue:        s.RelayQueue,
+			Handler:      s.RelayHandler,
+			Notify:       s.RelayNotify,
+			Log:          deliveryRedirectLog{log: s.DeliveryCtx.Logger, accountID: recipient.AccountID},
+			AccountID:    recipient.AccountID,
+			DeliveryHash: recipient.DeliveryHash,
+			From:         recipient.FromAddress,
+			Owner:        recipient.Address,
+			MessageBytes: outcome.MessageBytes,
+			ArrivedHops:  arrivedHops,
+		}.Hold(ctx, result)
 	}
 
 	if result.Action == sieveengine.ActionDiscard && result.Rejected {
@@ -369,83 +379,6 @@ func (s *StandardSieveExecutor) sieveFlags(names []string) []imap.Flag {
 			strings.Join(rejected, ","))
 	}
 	return flags
-}
-
-// holdRedirects writes the message to the relay queue for every redirect without
-// handing it to the relay worker, and reports whether every target was held. commit
-// hands over every redirect still held, charges each one handed over against the rate
-// limit, and reports whether all of them went; abort drops the ones still held. A
-// direct relay handler cannot hold a message: its commit sends it. arrivedHops is
-// the redirect hop count of the message before the script's header edits; every
-// outgoing copy is stamped one above it.
-func (s *StandardSieveExecutor) holdRedirects(ctx context.Context, recipient RecipientInfo, result sieveengine.Result, messageBytes []byte, arrivedHops int) (commit func() bool, abort func(), allHeld bool) {
-	type heldRedirect struct {
-		to     string
-		commit func() error
-		abort  func()
-	}
-	var held []heldRedirect
-	allHeld = true
-	if recipient.FromAddress != nil && (s.RelayQueue != nil || s.RelayHandler != nil) {
-		// Stamp the outgoing copy with an incremented hop count (loop backstop).
-		relayBytes := helpers.PrependHeaderLine(messageBytes, helpers.RedirectLoopHeader, strconv.Itoa(arrivedHops+1))
-		// Attribute this redirect to the script owner, replacing any earlier or
-		// sender-supplied attribution. Aliases still use the account's primary address.
-		relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, recipient.Address.FullAddress())
-		from := recipient.FromAddress.FullAddress()
-		for _, redirectTo := range result.RedirectTo {
-			if s.RelayQueue == nil {
-				held = append(held, heldRedirect{
-					to:     redirectTo,
-					commit: func() error { return s.RelayHandler.SendToExternalRelay(from, redirectTo, relayBytes) },
-					abort:  func() {},
-				})
-				continue
-			}
-			commit, abort, err := s.RelayQueue.Hold(from, redirectTo, "redirect", relayBytes)
-			if err != nil {
-				s.DeliveryCtx.Logger.Log("Failed to enqueue redirect message: %v", err)
-				logger.Warn("Sieve redirect could not be queued",
-					"account_id", recipient.AccountID, "redirect_to", redirectTo, "error", err)
-				allHeld = false
-				continue
-			}
-			held = append(held, heldRedirect{to: redirectTo, commit: commit, abort: abort})
-		}
-	} else {
-		allHeld = false
-	}
-
-	commit = func() bool {
-		ok := true
-		for _, h := range held {
-			if err := h.commit(); err != nil {
-				s.DeliveryCtx.Logger.Log("Failed to hand redirect message to the relay: %v", err)
-				logger.Warn("Sieve redirect could not be handed to the relay",
-					"account_id", recipient.AccountID, "redirect_to", h.to, "error", err)
-				ok = false
-				continue
-			}
-			if s.RelayQueue != nil && s.RelayNotify != nil {
-				s.RelayNotify()
-			}
-			if result.RecordRedirect != nil {
-				if err := result.RecordRedirect(ctx); err != nil {
-					logger.Warn("Sieve redirect could not be charged against the rate limit",
-						"account_id", recipient.AccountID, "redirect_to", h.to, "error", err)
-				}
-			}
-		}
-		held = nil
-		return ok
-	}
-	abort = func() {
-		for _, h := range held {
-			h.abort()
-		}
-		held = nil
-	}
-	return commit, abort, allHeld
 }
 
 // MergeSieveResults decides what the default script and the user script together

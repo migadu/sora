@@ -57,6 +57,13 @@ func TestPOP3BackendSpecialCharacterPasswords(t *testing.T) {
 			password:    `password\`,
 			description: "Password ending with backslash",
 		},
+		{
+			// Without the UTF8 command: UTF8 USER (RFC 6856 section 2.2) lets a
+			// client use UTF-8 credentials before or without it (#1934).
+			name:        "password_with_utf8",
+			password:    "p\u00e4ssw\u00f6rd\u20ac",
+			description: "Password containing non-ASCII UTF-8",
+		},
 	}
 
 	for _, tc := range testCases {

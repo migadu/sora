@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -1444,32 +1445,48 @@ func (s *POP3ProxySession) Login(ctx context.Context, username, password string)
 	// never unquoted.
 	username = server.UnquoteString(username)
 	password = server.UnquoteString(password)
+	// RFC 6856 section 2.2: "The server MUST reject UTF-8 usernames or passwords
+	// that fail to comply with the formal syntax in UTF-8". No stored credential
+	// can match them, so, like an empty password, they are refused before the
+	// lookup with the wrong-password reply. Valid UTF-8 is checked as sent,
+	// without SASLprep.
+	if !utf8.ValidString(username) || !utf8.ValidString(password) {
+		s.InfoLog("login refused: user name or password is not valid UTF-8")
+		return &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
+	}
 	return s.doLogin(ctx, username, password)
+}
+
+// loginErrorReply is the reply to a USER/PASS or AUTH login that authenticate refused
+// with err: a backend outage or a temporary failure is -ERR [SYS/TEMP], anything else
+// [AUTH] Authentication failed.
+func loginErrorReply(err error) *pop3server.Error {
+	var rateLimitErr *server.RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		// DELIBERATE: byte-identical to the bad-password reply below —
+		// a distinguishable throttle reply ([LOGIN-DELAY], "too many
+		// attempts") is an oracle that lets credential-stuffers detect
+		// when the limiter engages, pace just under it, and separate
+		// "throttled, untested" from "tested and wrong". RFC 3206 [AUTH]
+		// is the code for rejected auth; [LOGIN-DELAY] would imply valid
+		// credentials. Only Close differs: drop the connection to shed
+		// load, the text must not change.
+		return &pop3server.Error{Code: "AUTH", Message: "Authentication failed", Close: true}
+	}
+	if server.IsTemporaryAuthFailure(err) {
+		return &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later"}
+	}
+	if server.IsBackendError(err) {
+		return &pop3server.Error{Code: "SYS/TEMP", Message: "Backend server temporarily unavailable"}
+	}
+	return &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
 }
 
 func (s *POP3ProxySession) doLogin(ctx context.Context, username, password string) error {
 	authStart := time.Now()
 	s.username = username
 	if err := s.authenticate(username, password); err != nil {
-		var rateLimitErr *server.RateLimitError
-		if errors.As(err, &rateLimitErr) {
-			// DELIBERATE: byte-identical to the bad-password reply below —
-			// a distinguishable throttle reply ([LOGIN-DELAY], "too many
-			// attempts") is an oracle that lets credential-stuffers detect
-			// when the limiter engages, pace just under it, and separate
-			// "throttled, untested" from "tested and wrong". RFC 3206 [AUTH]
-			// is the code for rejected auth; [LOGIN-DELAY] would imply valid
-			// credentials. Only Close differs: drop the connection to shed
-			// load, the text must not change.
-			return &pop3server.Error{Code: "AUTH", Message: "Authentication failed", Close: true}
-		}
-		if server.IsTemporaryAuthFailure(err) {
-			return &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later"}
-		}
-		if server.IsBackendError(err) {
-			return &pop3server.Error{Code: "SYS/TEMP", Message: "Backend server temporarily unavailable"}
-		}
-		return &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
+		return loginErrorReply(err)
 	}
 
 	if err := s.registerConnection(); err != nil {

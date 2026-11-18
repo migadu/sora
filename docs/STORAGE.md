@@ -838,7 +838,7 @@ minute is raised to 1 minute. In order, one cycle:
    These records stop a sender from getting a second reply within a vacation's `:days`. See
    [SIEVE.md](SIEVE.md).
 6. **Redirect log.** Deletes entries of the Sieve redirect rate limit, and the records of which
-   LMTP deliveries were redirected where, older than `grace_period` or the longest
+   deliveries were redirected where, older than `grace_period` or the longest
    `limits.redirect_rate_window` of the node's `lmtp` and `http_admin_api` servers, whichever is
    longer. Until then a retried delivery is not redirected again
    ([SIEVE.md](SIEVE.md#7-redirect)). A rate-limit entry is also kept until the

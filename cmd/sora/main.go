@@ -1717,6 +1717,7 @@ func startDynamicPOP3Server(ctx context.Context, deps *serverDependencies, serve
 		AbsoluteSessionTimeout:    absoluteSessionTimeout,
 		MinBytesPerMinute:         serverConfig.GetMinBytesPerMinute(),
 		InsecureAuth:              serverConfig.InsecureAuth || !serverConfig.TLS, // Default true when TLS not enabled (backend behind proxy)
+		StrictUTF8Content:         serverConfig.StrictUTF8Content,
 		Config:                    &deps.config,
 	})
 

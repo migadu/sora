@@ -59,6 +59,9 @@ func handleBackendsCommand(ctx context.Context) {
 func handleBackendsMaintenance(ctx context.Context) {
 	if len(os.Args) < 4 || (os.Args[3] != "on" && os.Args[3] != "off") {
 		printBackendsUsage()
+		if len(os.Args) >= 4 && helpRequested(os.Args[3:4]) {
+			os.Exit(0)
+		}
 		os.Exit(1)
 	}
 	action := os.Args[3]
@@ -514,8 +517,8 @@ itself once it has been in maintenance for its [backend_maintenance] refuse_afte
 (default 30s), however they reach it.
 
 Examples:
-  sora-admin backends maintenance on --host storage2.example.com --reason "disk swap" --wait
-  sora-admin backends status
-  sora-admin backends maintenance off --host storage2.example.com
+  sora-admin backends maintenance on --host storage2.example.com --reason "disk swap" --wait --config config.toml
+  sora-admin backends status --config config.toml
+  sora-admin backends maintenance off --host storage2.example.com --config config.toml
 `)
 }

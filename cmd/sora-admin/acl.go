@@ -43,6 +43,24 @@ func handleACLGrant(ctx context.Context) {
 	identifier := fs.String("identifier", "", "Email address or 'anyone' (required, can also use --user)")
 	user := fs.String("user", "", "Alias for --identifier")
 	rights := fs.String("rights", "", "ACL rights string, e.g., 'lrs' (required)")
+	fs.Usage = func() {
+		fmt.Printf(`Grant ACL rights to a user or identifier on a mailbox
+
+Usage:
+  sora-admin acl grant [options]
+
+Options:
+  --email string       Email address of the mailbox owner (required)
+  --mailbox string     Mailbox name, e.g. 'Shared/Sales' (required)
+  --identifier string  Email address or 'anyone' (required, can also use --user)
+  --user string        Alias for --identifier
+  --rights string      ACL rights string, e.g. 'lrs' (required); replaces any rights the identifier had
+
+Examples:
+  sora-admin --config config.toml acl grant --email owner@example.com --mailbox "Shared/Sales" --user bob@example.com --rights lrs
+  sora-admin --config config.toml acl grant --email owner@example.com --mailbox "Shared/Sales" --identifier anyone --rights lr
+`)
+	}
 
 	fs.Parse(os.Args[3:])
 
@@ -110,6 +128,22 @@ func handleACLRevoke(ctx context.Context) {
 	mailbox := fs.String("mailbox", "", "Mailbox name, e.g., 'Shared/Sales' (required)")
 	identifier := fs.String("identifier", "", "Email address or 'anyone' (required, can also use --user)")
 	user := fs.String("user", "", "Alias for --identifier")
+	fs.Usage = func() {
+		fmt.Printf(`Revoke ACL rights from a user or identifier on a mailbox
+
+Usage:
+  sora-admin acl revoke [options]
+
+Options:
+  --email string       Email address of the mailbox owner (required)
+  --mailbox string     Mailbox name, e.g. 'Shared/Sales' (required)
+  --identifier string  Email address or 'anyone' (required, can also use --user)
+  --user string        Alias for --identifier
+
+Examples:
+  sora-admin --config config.toml acl revoke --email owner@example.com --mailbox "Shared/Sales" --user bob@example.com
+`)
+	}
 
 	fs.Parse(os.Args[3:])
 
@@ -169,6 +203,20 @@ func handleACLList(ctx context.Context) {
 	fs := flag.NewFlagSet("acl list", flag.ExitOnError)
 	email := fs.String("email", "", "Email address of the mailbox owner (required)")
 	mailbox := fs.String("mailbox", "", "Mailbox name, e.g., 'Shared/Sales' (required)")
+	fs.Usage = func() {
+		fmt.Printf(`List all ACL entries for a mailbox
+
+Usage:
+  sora-admin acl list [options]
+
+Options:
+  --email string    Email address of the mailbox owner (required)
+  --mailbox string  Mailbox name, e.g. 'Shared/Sales' (required)
+
+Examples:
+  sora-admin --config config.toml acl list --email owner@example.com --mailbox "Shared/Sales"
+`)
+	}
 
 	fs.Parse(os.Args[3:])
 
@@ -232,16 +280,16 @@ Subcommands:
 
 Examples:
   # Grant read-only access to a user on a shared mailbox
-  sora-admin acl grant --email owner@domain.com --mailbox "Shared/Sales" --user bob@domain.com --rights "lrs"
+  sora-admin acl grant --email owner@domain.com --mailbox "Shared/Sales" --user bob@domain.com --rights "lrs" --config config.toml
 
   # Grant access to everyone in the same domain
-  sora-admin acl grant --email owner@domain.com --mailbox "Shared/Sales" --identifier "anyone" --rights "lr"
+  sora-admin acl grant --email owner@domain.com --mailbox "Shared/Sales" --identifier "anyone" --rights "lr" --config config.toml
 
   # Revoke access from a user
-  sora-admin acl revoke --email owner@domain.com --mailbox "Shared/Sales" --user bob@domain.com
+  sora-admin acl revoke --email owner@domain.com --mailbox "Shared/Sales" --user bob@domain.com --config config.toml
 
   # List all ACL entries for a mailbox
-  sora-admin acl list --email owner@domain.com --mailbox "Shared/Sales"
+  sora-admin acl list --email owner@domain.com --mailbox "Shared/Sales" --config config.toml
 
 ACL Rights:
   l - lookup   (mailbox is visible in listings)
@@ -257,5 +305,5 @@ ACL Rights:
   a - admin    (administer ACL)
 
 For more information on a subcommand, run:
-  sora-admin acl <subcommand> --help`)
+  sora-admin acl <subcommand> --help --config config.toml`)
 }

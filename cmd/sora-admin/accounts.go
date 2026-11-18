@@ -171,8 +171,7 @@ Options:
   --domain string        Domain to list accounts for (e.g., example.com) (required)
 
 Examples:
-  sora-admin accounts list --domain example.com
-  sora-admin accounts list --domain example.com --config /path/to/config.toml
+  sora-admin accounts list --domain example.com --config config.toml
 `)
 	}
 
@@ -218,9 +217,8 @@ Options:
   --json             Output in JSON format instead of human-readable format
 
 Examples:
-  sora-admin accounts show --email user@example.com
-  sora-admin accounts show --email user@example.com --json
-  sora-admin accounts show --email user@example.com --config /path/to/config.toml
+  sora-admin accounts show --email user@example.com --config config.toml
+  sora-admin accounts show --email user@example.com --json --config config.toml
 `)
 	}
 
@@ -420,7 +418,7 @@ Options:
   --config string        Path to TOML configuration file (required)
 
 Examples:
-  sora-admin accounts restore --email user@example.com
+  sora-admin accounts restore --email user@example.com --config config.toml
 `)
 	}
 
@@ -528,14 +526,14 @@ Subcommands:
   purge-domain  Purge all accounts in a domain (irreversible, resumable)
 
 Examples:
-  sora-admin accounts create --email user@example.com --password mypassword
-  sora-admin accounts list --domain example.com
-  sora-admin accounts show --email user@example.com
-  sora-admin accounts update --email user@example.com --password newpassword
-  sora-admin accounts delete --email user@example.com --confirm
-  sora-admin accounts delete --email user@example.com --confirm --purge
-  sora-admin accounts restore --email user@example.com
-  sora-admin accounts purge-domain --domain example.com --confirm
+  sora-admin accounts create --email user@example.com --password mypassword --config config.toml
+  sora-admin accounts list --domain example.com --config config.toml
+  sora-admin accounts show --email user@example.com --config config.toml
+  sora-admin accounts update --email user@example.com --password newpassword --config config.toml
+  sora-admin accounts delete --email user@example.com --confirm --config config.toml
+  sora-admin accounts delete --email user@example.com --confirm --purge --config config.toml
+  sora-admin accounts restore --email user@example.com --config config.toml
+  sora-admin accounts purge-domain --domain example.com --confirm --config config.toml
 
 Use 'sora-admin accounts <subcommand> --help' for detailed help.
 `)

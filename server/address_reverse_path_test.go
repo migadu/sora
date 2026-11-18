@@ -53,14 +53,14 @@ func TestNewReversePathLenient(t *testing.T) {
 }
 
 // Every sender NewAddress accepts comes back from NewReversePath exactly as from
-// NewAddress, so nothing changes for the senders accepted before #1907.
+// NewAddress, so nothing changes for the senders accepted before #1907. A sender with
+// a master-token suffix is not one of them (TestNewReversePathNoMasterSuffix, #1938).
 func TestNewReversePathMatchesNewAddress(t *testing.T) {
 	for _, in := range []string{
 		"user@example.com",
 		"User+Tag@Example.com",
 		"a/b=c@example.com",
 		"josé@bücher.example",
-		"user@example.com@SUFFIX",
 	} {
 		want, err := NewAddress(in)
 		if err != nil {
