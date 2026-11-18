@@ -76,8 +76,8 @@ func lockMailboxStatsPair(ctx context.Context, tx pgx.Tx, a, b int64) error {
 }
 
 // RecomputeMailboxUnseen recomputes unseen_count for a single mailbox from the
-// authoritative source of truth (active, unseen message_state rows) and writes
-// it back into the mailbox_stats cache. It is the self-healing counterpart to
+// authoritative source of truth (its live messages without \Seen, see
+// liveUnseenCount) and writes it back into the mailbox_stats cache. It is the self-healing counterpart to
 // the incremental trigger maintenance: where the triggers can drift under
 // concurrency, this restores the exact value.
 //
@@ -109,19 +109,22 @@ func (d *Database) RecomputeMailboxUnseen(ctx context.Context, tx pgx.Tx, mailbo
 }
 
 // liveUnseenCount is a subquery that counts the live unseen messages of the mailbox
-// whose id is mailboxID, an SQL expression: the value unseen_count caches.
+// whose id is mailboxID, an SQL expression: the value unseen_count caches. A message
+// without a message_state row (left by older builds) has no flags, so it is unseen, as
+// for FETCH and SEARCH UNSEEN (#1949); the stats triggers count it the same way
+// (migration 000076).
 func liveUnseenCount(mailboxID string) string {
 	return fmt.Sprintf(`(
 		SELECT COUNT(*)
-		FROM message_state mst
-		JOIN messages m ON m.id = mst.message_id AND m.mailbox_id = mst.mailbox_id
-		WHERE mst.mailbox_id = %s AND (mst.flags & %d) = 0 AND m.expunged_at IS NULL
+		FROM messages m
+		LEFT JOIN message_state mst ON mst.message_id = m.id AND mst.mailbox_id = m.mailbox_id
+		WHERE m.mailbox_id = %s AND m.expunged_at IS NULL AND (mst.flags IS NULL OR (mst.flags & %d) = 0)
 	)`, mailboxID, FlagSeen)
 }
 
-// MailboxUnseenExcess is a mailbox whose cached unseen_count (Cached) is above the
+// MailboxUnseenDrift is a mailbox whose cached unseen_count (Cached) differs from the
 // number of live unseen messages it holds (Actual).
-type MailboxUnseenExcess struct {
+type MailboxUnseenDrift struct {
 	MailboxID int64
 	AccountID int64
 	Name      string
@@ -129,22 +132,24 @@ type MailboxUnseenExcess struct {
 	Actual    int64
 }
 
-// UnseenExcessBatch is one batch of FindExcessUnseenCounts.
-type UnseenExcessBatch struct {
-	Excess        []MailboxUnseenExcess // the checked mailboxes counted too high
-	Checked       int                   // how many mailboxes the batch checked; 0 at the end
-	LastMailboxID int64                 // the last mailbox checked: where the next batch starts
+// UnseenDriftBatch is one batch of FindDriftedUnseenCounts.
+type UnseenDriftBatch struct {
+	Drifted       []MailboxUnseenDrift // the checked mailboxes counted wrong
+	Checked       int                  // how many mailboxes the batch checked; 0 at the end
+	LastMailboxID int64                // the last mailbox checked: where the next batch starts
 }
 
-// FindExcessUnseenCounts checks up to limit mailboxes with a positive cached
-// unseen_count, in id order after afterMailboxID, of the account accountID (of every
-// account when it is 0), and returns those whose cached count is above the live count.
-// Hard deletes of live unseen messages before #1564 left such counts, and the self-heal
-// (ReconcileNegativeMailboxStats, STATUS, LIST) recomputes only a negative one.
+// FindDriftedUnseenCounts checks up to limit mailboxes, in id order after
+// afterMailboxID, of the account accountID (of every account when it is 0), and returns
+// those whose cached unseen_count differs from the live count. Hard deletes of live
+// unseen messages before #1564 left counts too high; triggers before migration 000076
+// left out the messages without a message_state row, so a mailbox holding such
+// messages is counted too low (#1949). The self-heal (ReconcileNegativeMailboxStats,
+// STATUS, LIST) recomputes only a negative count.
 //
 // It only reads, in one statement, so each cached count is compared with the live
 // count of the same snapshot. RecomputeMailboxUnseen repairs a mailbox it returns.
-func (d *Database) FindExcessUnseenCounts(ctx context.Context, accountID, afterMailboxID int64, limit int) (UnseenExcessBatch, error) {
+func (d *Database) FindDriftedUnseenCounts(ctx context.Context, accountID, afterMailboxID int64, limit int) (UnseenDriftBatch, error) {
 	args := []any{afterMailboxID, limit}
 	account := ""
 	if accountID != 0 {
@@ -158,27 +163,27 @@ func (d *Database) FindExcessUnseenCounts(ctx context.Context, accountID, afterM
 			SELECT ms.mailbox_id, mb.account_id, mb.name, ms.unseen_count
 			FROM mailbox_stats ms
 			JOIN mailboxes mb ON mb.id = ms.mailbox_id
-			WHERE ms.mailbox_id > $1 AND ms.unseen_count > 0 `+account+`
+			WHERE ms.mailbox_id > $1 `+account+`
 			ORDER BY ms.mailbox_id
 			LIMIT $2
 		) b
 		ORDER BY b.mailbox_id
 	`, args...)
 	if err != nil {
-		return UnseenExcessBatch{}, fmt.Errorf("failed to check unseen counts after mailbox %d: %w", afterMailboxID, err)
+		return UnseenDriftBatch{}, fmt.Errorf("failed to check unseen counts after mailbox %d: %w", afterMailboxID, err)
 	}
-	checked, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (MailboxUnseenExcess, error) {
-		var m MailboxUnseenExcess
+	checked, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (MailboxUnseenDrift, error) {
+		var m MailboxUnseenDrift
 		err := row.Scan(&m.MailboxID, &m.AccountID, &m.Name, &m.Cached, &m.Actual)
 		return m, err
 	})
 	if err != nil {
-		return UnseenExcessBatch{}, fmt.Errorf("failed to check unseen counts after mailbox %d: %w", afterMailboxID, err)
+		return UnseenDriftBatch{}, fmt.Errorf("failed to check unseen counts after mailbox %d: %w", afterMailboxID, err)
 	}
-	batch := UnseenExcessBatch{Checked: len(checked)}
+	batch := UnseenDriftBatch{Checked: len(checked)}
 	for _, m := range checked {
-		if m.Cached > m.Actual {
-			batch.Excess = append(batch.Excess, m)
+		if m.Cached != m.Actual {
+			batch.Drifted = append(batch.Drifted, m)
 		}
 		batch.LastMailboxID = m.MailboxID
 	}

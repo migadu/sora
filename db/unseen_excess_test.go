@@ -14,11 +14,13 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// TestFindExcessUnseenCounts covers the drift that hard deletes before #1564 left: a live
-// unseen message deleted directly stayed counted in unseen_count. The self-heal only
-// recomputes a negative count, so the scan must find the mailboxes whose cached count is
-// above the authoritative one, batch by batch, and nothing else.
-func TestFindExcessUnseenCounts(t *testing.T) {
+// TestFindDriftedUnseenCounts covers the drift that hard deletes before #1564 left: a live
+// unseen message deleted directly stayed counted in unseen_count; and a count left too
+// low, as triggers before migration 000076 left it for messages without a message_state
+// row (#1949). The self-heal only recomputes a negative count, so the scan must find the
+// mailboxes whose cached count differs from the authoritative one, batch by batch, and
+// nothing else.
+func TestFindDriftedUnseenCounts(t *testing.T) {
 	db := setupTestDatabase(t)
 	defer db.Close()
 	ctx := context.Background()
@@ -68,27 +70,29 @@ func TestFindExcessUnseenCounts(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, int64(3), readUnseenCount(ctx, t, db, mailboxes["Drifted"].ID))
 	require.Equal(t, int64(1), authoritativeUnseenCount(ctx, t, db, mailboxes["Drifted"].ID))
-	// Below has drifted the other way, which the self-heal handles once it goes negative.
+	// Below has drifted the other way: counted one too low.
 	insertUnseen(mailboxes["Below"], 2)
 	_, err = db.GetWritePool().Exec(ctx,
 		`UPDATE mailbox_stats SET unseen_count = unseen_count - 1 WHERE mailbox_id = $1`, mailboxes["Below"].ID)
 	require.NoError(t, err)
 
-	want := []MailboxUnseenExcess{{
+	want := []MailboxUnseenDrift{{
 		MailboxID: mailboxes["Drifted"].ID, AccountID: accountID, Name: "Drifted", Cached: 3, Actual: 1,
+	}, {
+		MailboxID: mailboxes["Below"].ID, AccountID: accountID, Name: "Below", Cached: 1, Actual: 2,
 	}}
 
 	// scan pages through the account's mailboxes limit at a time, as the repair does.
-	scan := func(limit int) (excess []MailboxUnseenExcess, checked []int64) {
+	scan := func(limit int) (drifted []MailboxUnseenDrift, checked []int64) {
 		t.Helper()
 		var after int64
 		for {
-			batch, err := db.FindExcessUnseenCounts(ctx, accountID, after, limit)
+			batch, err := db.FindDriftedUnseenCounts(ctx, accountID, after, limit)
 			require.NoError(t, err)
 			require.LessOrEqual(t, batch.Checked, limit)
-			excess = append(excess, batch.Excess...)
+			drifted = append(drifted, batch.Drifted...)
 			if batch.Checked == 0 {
-				return excess, checked
+				return drifted, checked
 			}
 			require.Greater(t, batch.LastMailboxID, after, "the batches move forward")
 			after = batch.LastMailboxID
@@ -97,27 +101,30 @@ func TestFindExcessUnseenCounts(t *testing.T) {
 	}
 
 	t.Run("one batch", func(t *testing.T) {
-		excess, _ := scan(100)
-		require.Equal(t, want, excess)
+		drifted, _ := scan(100)
+		require.Equal(t, want, drifted)
 	})
 	t.Run("batches of one", func(t *testing.T) {
-		excess, checked := scan(1)
-		require.Equal(t, want, excess)
+		drifted, checked := scan(1)
+		require.Equal(t, want, drifted)
 		require.Equal(t, []int64{mailboxes["INBOX"].ID, mailboxes["Drifted"].ID, mailboxes["Below"].ID}, checked,
 			"each mailbox with unseen messages is checked once, in id order")
 	})
 	t.Run("all accounts", func(t *testing.T) {
-		batch, err := db.FindExcessUnseenCounts(ctx, 0, mailboxes["Drifted"].ID-1, 1)
+		batch, err := db.FindDriftedUnseenCounts(ctx, 0, mailboxes["Drifted"].ID-1, 1)
 		require.NoError(t, err)
-		require.Equal(t, want, batch.Excess)
+		require.Equal(t, want[:1], batch.Drifted)
 	})
 	t.Run("repaired", func(t *testing.T) {
 		inTx(t, db, func(tx pgx.Tx) {
 			unseen, err := db.RecomputeMailboxUnseen(ctx, tx, mailboxes["Drifted"].ID)
 			require.NoError(t, err)
 			require.Equal(t, int64(1), unseen)
+			unseen, err = db.RecomputeMailboxUnseen(ctx, tx, mailboxes["Below"].ID)
+			require.NoError(t, err)
+			require.Equal(t, int64(2), unseen)
 		})
-		excess, _ := scan(100)
-		require.Empty(t, excess)
+		drifted, _ := scan(100)
+		require.Empty(t, drifted)
 	})
 }
