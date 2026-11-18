@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -33,98 +31,6 @@ import (
 // defaultSieveScript is the built-in script run before the user's own; a variable
 // so a test can replace it before New compiles it.
 var defaultSieveScript = delivery.DefaultSieveScript
-
-// holdRedirects writes the message to the relay queue for every redirect without
-// handing it to the relay worker, and reports whether every target was held. commit
-// hands over every redirect still held, charges each one handed over against the rate
-// limit, and reports whether all of them went; abort drops the ones still held.
-// arrivedHops is the redirect hop count of the message before the script's header
-// edits; every outgoing copy is stamped one above it.
-//
-// deliveryHash identifies the upstream submission (InsertMessageOptions.DeliveryHash).
-// A target an earlier attempt of the same delivery already handed over (an MTA retry
-// whose 250 was lost, maybe on another node) is skipped and counts as held, the way
-// the stored copy of such a retry is absorbed; commit records each target it hands
-// over, after handing it over, so a crash or a failed record errs toward relaying the
-// message again rather than not at all.
-func (s *LMTPSession) holdRedirects(ctx context.Context, result sieveengine.Result, arrivedHops int, fullMessageBytes []byte, deliveryHash string) (commit func() bool, abort func(), allHeld bool) {
-	type heldRedirect struct {
-		to     string
-		commit func() error
-		abort  func()
-	}
-	var held []heldRedirect
-	allHeld = true
-	if len(result.RedirectTo) > 0 {
-		if result.Copy {
-			s.DebugLog("sieve redirect :copy action", "redirect_to", result.RedirectTo)
-		} else {
-			s.DebugLog("sieve redirect action", "redirect_to", result.RedirectTo)
-		}
-
-		if s.backend.relayQueue != nil {
-			// Stamp the outgoing copy with an incremented hop count (loop backstop).
-			relayBytes := helpers.PrependHeaderLine(fullMessageBytes, helpers.RedirectLoopHeader, strconv.Itoa(arrivedHops+1))
-			// User.Address is the script owner's primary address, even for aliases.
-			// Replace earlier or sender-supplied attribution on the outgoing copy only.
-			relayBytes = helpers.SetHeaderLine(relayBytes, helpers.RedirectedByHeader, s.User.Address.FullAddress())
-			queued, err := s.backend.rdb.RedirectedTargetsWithRetry(ctx, s.AccountID(), deliveryHash)
-			if err != nil {
-				s.WarnLog("could not check for redirects queued by an earlier attempt, queuing all", "error", err)
-			}
-			for _, redirectTo := range result.RedirectTo {
-				if slices.Contains(queued, redirectTo) {
-					s.InfoLog("sieve redirect already queued by an earlier attempt of this delivery, skipping", "redirect_to", redirectTo)
-					continue
-				}
-				commit, abort, err := s.backend.relayQueue.Hold(s.sender.FullAddress(), redirectTo, "redirect", relayBytes)
-				if err != nil {
-					// Delivery goes on: the message is kept in INBOX unless a fileinto
-					// stores it (Result.Destinations). Say so where an operator will see
-					// it, as the Admin API path does: the user's redirect did not happen.
-					s.WarnLog("sieve redirect could not be queued", "redirect_to", redirectTo, "error", err)
-					allHeld = false
-					continue
-				}
-				held = append(held, heldRedirect{to: redirectTo, commit: commit, abort: abort})
-			}
-		} else {
-			s.DebugLog("redirect requested but external relay not configured")
-			allHeld = false
-		}
-	}
-
-	commit = func() bool {
-		ok := true
-		for _, h := range held {
-			if err := h.commit(); err != nil {
-				s.WarnLog("sieve redirect could not be queued", "redirect_to", h.to, "error", err)
-				ok = false
-				continue
-			}
-			s.DebugLog("successfully queued message for relay delivery", "redirect_to", h.to)
-			s.notifyRelayWorker()
-			if err := s.backend.rdb.RecordRedirectDeliveryWithRetry(ctx, s.AccountID(), deliveryHash, h.to); err != nil {
-				s.WarnLog("failed to record a queued redirect, a retry of this delivery would queue it again", "redirect_to", h.to, "error", err)
-			}
-			// Only a queued redirect counts against the rate limit.
-			if result.RecordRedirect != nil {
-				if err := result.RecordRedirect(ctx); err != nil {
-					s.WarnLog("failed to charge redirect against the rate limit", "redirect_to", h.to, "error", err)
-				}
-			}
-		}
-		held = nil
-		return ok
-	}
-	abort = func() {
-		for _, h := range held {
-			h.abort()
-		}
-		held = nil
-	}
-	return commit, abort, allHeld
-}
 
 // LMTPSession represents a single LMTP session.
 type LMTPSession struct {
@@ -906,7 +812,18 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// (RFC 5293 §6 leaves which fields it may delete to local policy), and a count read
 	// after its edits would restart on every pass and never reach max_redirect_hops.
 	arrivedHops := helpers.RedirectHopCount(helpers.HeaderGetter(sieveCtx.Header))
-	commitRedirects, abortRedirects, allHeld := s.holdRedirects(ctx, result, arrivedHops, fullMessageBytes, deliveryHash)
+	commitRedirects, abortRedirects, allHeld := delivery.RedirectHold{
+		Records:      s.backend.rdb,
+		Queue:        s.backend.relayQueue,
+		Notify:       s.notifyRelayWorker,
+		Log:          s,
+		AccountID:    s.AccountID(),
+		DeliveryHash: deliveryHash,
+		From:         s.sender,
+		Owner:        &s.User.Address,
+		MessageBytes: fullMessageBytes,
+		ArrivedHops:  arrivedHops,
+	}.Hold(ctx, result)
 	defer abortRedirects()
 	redirectFailed := !allHeld
 	destinations := result.Destinations(redirectFailed)

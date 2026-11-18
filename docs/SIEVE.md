@@ -470,13 +470,10 @@ a node that stops in between, or a record that cannot be written (logged as a wa
 retry redirects the message again rather than not at all.
 
 If the relay queue cannot take an address, the message is not redirected to that address; it still
-goes to the others. Sora logs a warning with the address (`redirect_to`) and the error:
-
-- LMTP: `sieve redirect could not be queued`, both when the queue refuses the message and when it
-  cannot hand a queued one to the relay worker afterwards.
-- Admin API delivery: `Sieve redirect could not be queued` when the queue refuses the message, and
-  `Sieve redirect could not be handed to the relay` when it cannot hand a queued one to the relay
-  worker afterwards.
+goes to the others. Sora logs the warning `sieve redirect could not be queued` with the address
+(`redirect_to`) and the error, both when the queue refuses the message and when it cannot hand a
+queued one to the relay worker afterwards. LMTP and Admin API delivery share this code and log the
+same lines; the Admin API adds the `account_id`.
 
 The message is still stored wherever `fileinto`, `keep` or `:copy` puts it; when the redirects are
 the only place it goes, it is kept in INBOX instead. When they are and every address is queued, the
@@ -725,9 +722,7 @@ Useful log lines (LMTP session logs carry the session and message fields):
 | `Sieve fileinto "<name>" is unavailable or has no insert right; keeping in INBOX` | warn | `fileinto` named a missing folder, the shared namespace root, or a shared folder without the `i` right. |
 | `sieve set invalid IMAP keywords, dropped` | warn | A flag name was not a valid IMAP keyword. |
 | `mail loop detected via Delivered-To, rejecting` | warn | A redirect loop was refused with 550. |
-| `sieve redirect could not be queued` | warn | LMTP: a redirect did not go out (`redirect_to`, `error`); the relay queue refused it or could not hand it to the relay worker. See [section 7](#7-redirect) for where the message is stored. |
-| `Sieve redirect could not be queued` | warn | Admin API: the relay queue refused a redirect (`account_id`, `redirect_to`, `error`). |
-| `Sieve redirect could not be handed to the relay` | warn | Admin API: the queue took a redirect but could not hand it to the relay worker. |
+| `sieve redirect could not be queued` | warn | A redirect did not go out (`redirect_to`, `error`; the Admin API adds `account_id`): the relay queue refused it or could not hand it to the relay worker. See [section 7](#7-redirect) for where the message is stored. |
 | `Sieve vacation reply could not be queued; the response period is consumed` | warn | The reply was lost for this window. |
 | `[VACATION] suppressed: ...` | debug | Why a reply was not sent. |
 
