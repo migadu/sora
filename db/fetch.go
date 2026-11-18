@@ -3,6 +3,7 @@ package db
 import (
 	"context"
 	"encoding/json"
+	"mime"
 	"strings"
 
 	"github.com/migadu/go-imap"
@@ -45,19 +46,26 @@ func BuildEnvelope(msg *Message) (*imap.Envelope, error) {
 		name = recipient.Name
 		emailAddress = recipient.EmailAddress
 
-		// net/mail unquotes quoted local-parts and rejects '@' in the domain, so the
-		// addr-mailbox / addr-host separator is always the last '@'.
-		at := strings.LastIndexByte(emailAddress, '@')
-		if at <= 0 || at == len(emailAddress)-1 {
-			logger.Warn("Database: malformed email address for recipient", "email", emailAddress, "type", addressType, "uid", msg.UID, "mailbox_id", msg.MailboxID)
-			continue
-		}
-		mailboxPart, hostNamePart := emailAddress[:at], emailAddress[at+1:]
-
-		address := imap.Address{
-			Name:    name,
-			Mailbox: mailboxPart,
-			Host:    hostNamePart,
+		var address imap.Address
+		if recipient.IsGroupMarker() {
+			// RFC 3501 §7.4.2: a group start is an address with a NIL host and the group
+			// name phrase as its mailbox; a group end has both NIL (go-imap writes NIL for
+			// ""). The name is stored decoded; like addr-name (go-imap Q-encodes Name) it
+			// goes out RFC 2047 encoded if it is not ASCII.
+			address.Mailbox = mime.QEncoding.Encode("utf-8", recipient.Group)
+		} else {
+			// net/mail unquotes quoted local-parts and rejects '@' in the domain, so the
+			// addr-mailbox / addr-host separator is always the last '@'.
+			at := strings.LastIndexByte(emailAddress, '@')
+			if at <= 0 || at == len(emailAddress)-1 {
+				logger.Warn("Database: malformed email address for recipient", "email", emailAddress, "type", addressType, "uid", msg.UID, "mailbox_id", msg.MailboxID)
+				continue
+			}
+			address = imap.Address{
+				Name:    name,
+				Mailbox: emailAddress[:at],
+				Host:    emailAddress[at+1:],
+			}
 		}
 
 		switch addressType {
