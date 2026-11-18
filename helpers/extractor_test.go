@@ -64,11 +64,12 @@ func TestExtractRecipientsAddressGroups(t *testing.T) {
 			want:  []Recipient{addr("to", "a@example.com", "Re: x"), addr("to", "b@example.com", "c: d")},
 		},
 		{
-			name:  "an address in two groups is listed once",
+			// The list is the header as written (#2079): each group keeps its members.
+			name:  "an address in two groups is in both",
 			value: "g: a@example.com;, h: a@example.com;",
 			want: []Recipient{
 				groupStart("to", "g"), addr("to", "a@example.com", ""), groupEnd("to"),
-				groupStart("to", "h"), groupEnd("to"),
+				groupStart("to", "h"), addr("to", "a@example.com", ""), groupEnd("to"),
 			},
 		},
 	} {
