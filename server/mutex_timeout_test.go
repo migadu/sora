@@ -5,6 +5,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/pkg/metrics"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 )
 
 // TestAcquireReadLock_CommandContextCancelled verifies that when a command
@@ -183,4 +186,98 @@ func TestAcquireWriteLockForClose_SessionContextCancelledStillWaits(t *testing.T
 		t.Fatal("expected the close to wait for the lock although the session context is cancelled")
 	}
 	release()
+}
+
+// TestAcquireLock_CancelledContextTakesFreeLock: a teardown path that passes an already
+// cancelled context must still get a free lock, and a free lock is not a timeout. Both the
+// lock goroutine and the cancelled context used to be ready at the select, so the helper
+// often reported "not acquired" and counted a lock timeout for a lock nobody held (#2004).
+func TestAcquireLock_CancelledContextTakesFreeLock(t *testing.T) {
+	const iterations = 1000
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for _, mode := range []string{"write", "read"} {
+		t.Run(mode, func(t *testing.T) {
+			var mu sync.RWMutex
+			name := "test-2004-free-" + mode
+			helper := NewMutexTimeoutHelper(&mu, cancelled, name, t.Logf)
+			acquire := helper.AcquireWriteLockWithTimeout
+			if mode == "read" {
+				acquire = helper.AcquireReadLockWithTimeout
+			}
+			timeouts := metrics.SessionLockTimeouts.WithLabelValues(name, mode)
+			before := testutil.ToFloat64(timeouts)
+
+			missed := 0
+			for range iterations {
+				acquired, release := acquire(cancelled)
+				if !acquired {
+					missed++
+				}
+				release()
+			}
+			if missed > 0 {
+				t.Errorf("%d of %d attempts on a free lock with a cancelled context reported not acquired", missed, iterations)
+			}
+			if got := testutil.ToFloat64(timeouts) - before; got != 0 {
+				t.Errorf("lock timeouts metric rose by %v for a free lock, want 0", got)
+			}
+			// No goroutine may still hold the lock after the last release.
+			waitForFreeLock(t, &mu)
+		})
+	}
+}
+
+// TestAcquireLock_CancelledContextHeldLockGivesUp: a cancelled context still gives up on a
+// lock that is held, promptly, counts one timeout, and the attempt left waiting in the
+// background releases the lock once it gets it, so the mutex is free again afterwards.
+func TestAcquireLock_CancelledContextHeldLockGivesUp(t *testing.T) {
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	for _, mode := range []string{"write", "read"} {
+		t.Run(mode, func(t *testing.T) {
+			var mu sync.RWMutex
+			name := "test-2004-held-" + mode
+			helper := NewMutexTimeoutHelper(&mu, cancelled, name, t.Logf)
+			acquire := helper.AcquireWriteLockWithTimeout
+			if mode == "read" {
+				acquire = helper.AcquireReadLockWithTimeout
+			}
+			timeouts := metrics.SessionLockTimeouts.WithLabelValues(name, mode)
+			before := testutil.ToFloat64(timeouts)
+
+			mu.Lock()
+			start := time.Now()
+			acquired, release := acquire(cancelled)
+			elapsed := time.Since(start)
+			release()
+			if acquired {
+				t.Fatal("acquired a lock that another goroutine holds")
+			}
+			if elapsed > 500*time.Millisecond {
+				t.Errorf("gave up after %v, want a prompt return on a cancelled context", elapsed)
+			}
+			if got := testutil.ToFloat64(timeouts) - before; got != 1 {
+				t.Errorf("lock timeouts metric rose by %v, want 1", got)
+			}
+			mu.Unlock()
+			// The abandoned attempt takes the lock when it is released and must drop it.
+			waitForFreeLock(t, &mu)
+		})
+	}
+}
+
+// waitForFreeLock fails the test unless mu becomes free for writing within a second.
+func waitForFreeLock(t *testing.T, mu *sync.RWMutex) {
+	t.Helper()
+	deadline := time.Now().Add(time.Second)
+	for !mu.TryLock() {
+		if time.Now().After(deadline) {
+			t.Fatal("the mutex is still held: an abandoned lock attempt did not release it")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	mu.Unlock()
 }
