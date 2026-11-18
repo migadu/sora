@@ -4,12 +4,20 @@ import (
 	"io/fs"
 	"testing"
 	"testing/fstest"
+
+	"github.com/golang-migrate/migrate/v4/source/iofs"
 )
 
 // previousMigrationVersion returns the version of the migration just below latest
-// among the migration files in fsys.
+// among the migration files in fsys: the version migrate down one step lands on.
+// It asks golang-migrate's own source driver, so it orders the files as Steps does.
 func previousMigrationVersion(fsys fs.FS, latest uint) (uint, error) {
-	return latest - 1, nil
+	src, err := iofs.New(fsys, ".")
+	if err != nil {
+		return 0, err
+	}
+	defer src.Close()
+	return src.Prev(latest)
 }
 
 // Migration numbers need not be consecutive: while two open changes each add a
