@@ -88,9 +88,11 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 	limitedBody := http.MaxBytesReader(w, r.Body, maxBody)
 
 	// The delivery memory budget (limits.delivery_memory_limit) is charged for the
-	// request body as it is read, for the message copy delivered from, and (in
-	// DeliverMessage) for the re-encoded copy of NUL-bearing parts. Everything charged
-	// here is held until the request ends, on every path.
+	// request body as it is read, for the message buffer delivered from, and (in
+	// DeliverMessage) for the re-encoded copy of NUL-bearing parts. Each branch sets
+	// messageBytes itself without a further copy: req.Message is only the decode
+	// target of a JSON body or a form value. Everything charged here is held until the
+	// request ends, on every path.
 	chargedBody := &server.ChargedReader{R: limitedBody, Budget: s.deliveryMemory}
 	r.Body = struct {
 		io.Reader
@@ -132,21 +134,33 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// Get message from form field
+		// Get message from form field: the form's string is converted once, charged
+		// before the conversion. A file upload is read straight into a buffer charged
+		// before it grows, with no further copy.
 		if r.MultipartForm != nil && len(r.MultipartForm.Value["message"]) > 0 {
 			req.Message = r.MultipartForm.Value["message"][0]
+			if !holdCopy(len(req.Message)) {
+				return
+			}
+			messageBytes = []byte(req.Message)
 		} else if r.MultipartForm != nil && len(r.MultipartForm.File["message"]) > 0 {
 			// Try to read from file upload
 			file, err := r.MultipartForm.File["message"][0].Open()
 			if err == nil {
 				defer file.Close()
-				msgBytes, readErr := io.ReadAll(file)
+				var charged int64
+				var readErr error
+				messageBytes, charged, readErr = server.ReadAllCharged(file, s.deliveryMemory)
+				held += charged
+				if errors.Is(readErr, server.ErrMemoryBudgetExhausted) {
+					s.refuseDeliveryMemory(w, readErr)
+					return
+				}
 				if readErr != nil {
 					// A truncated upload must not be delivered as if it were the message.
 					s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Failed to read uploaded message: %v", readErr))
 					return
 				}
-				req.Message = string(msgBytes)
 			}
 		}
 
@@ -159,11 +173,6 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		if r.MultipartForm != nil && len(r.MultipartForm.Value["from"]) > 0 {
 			req.From = r.MultipartForm.Value["from"][0]
 		}
-
-		if !holdCopy(len(req.Message)) {
-			return
-		}
-		messageBytes = []byte(req.Message)
 
 	case mediaType == "message/rfc822" || mediaType == "text/plain":
 		// Raw RFC822 message, read into a buffer charged before it grows.
@@ -178,7 +187,6 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 			s.writeError(w, http.StatusBadRequest, "Failed to read message body")
 			return
 		}
-		req.Message = string(messageBytes)
 
 		// Get recipients from query params or headers
 		if recipientsParam := r.URL.Query().Get("recipients"); recipientsParam != "" {
