@@ -905,15 +905,9 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		filePath, err = s.backend.uploader.StoreLocally(contentHash, s.AccountID(), fullMessageBytes)
 		if err != nil {
 			recordMetrics("failure")
-			if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EROFS) {
-				// The spool disk is full or read-only: RFC 3463 4.3.1 "mail system full" is
-				// the reply MTAs understand as "back off, storage", not a server error.
+			if reply := spoolFullReply(err); reply != nil {
 				s.WarnLog("spool disk cannot take the message", "error", err)
-				return &smtp.SMTPError{
-					Code:         452,
-					EnhancedCode: smtp.EnhancedCode{4, 3, 1},
-					Message:      "Insufficient system storage, please try again later",
-				}
+				return reply
 			}
 			// The error names spool files, and the reply text reaches the sending MTA
 			// (and can end up in a bounce): log it and answer with the cause only.
@@ -1219,8 +1213,27 @@ func (s *LMTPSession) fixedFieldsLog(logFn func(msg string, keysAndValues ...any
 	}
 }
 
+// spoolFullReply is the reply for staging that failed because the spool disk is full or
+// read-only: RFC 3463 4.3.1 "mail system full" is the reply MTAs understand as "back off,
+// storage", not a server error. It is nil for any other error.
+func spoolFullReply(err error) *smtp.SMTPError {
+	if !errors.Is(err, syscall.ENOSPC) && !errors.Is(err, syscall.EROFS) {
+		return nil
+	}
+	return &smtp.SMTPError{
+		Code:         452,
+		EnhancedCode: smtp.EnhancedCode{4, 3, 1},
+		Message:      "Insufficient system storage, please try again later",
+	}
+}
+
 // saveFailedReply is the reply for a message that could not be stored in mailbox.
 func (s *LMTPSession) saveFailedReply(mailbox string, err error) error {
+	// Staging the body for a shared mailbox's owner writes to the same spool disk.
+	if reply := spoolFullReply(err); reply != nil {
+		s.WarnLog("spool disk cannot take the message", "mailbox", mailbox, "error", err)
+		return reply
+	}
 	// The reply text reaches the sender in a delay or bounce notice: the folder the
 	// recipient's script files into and the database error stay in the log.
 	s.WarnLog("failed to save message", "mailbox", mailbox, "error", err)
