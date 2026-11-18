@@ -98,6 +98,7 @@ type POP3Server struct {
 
 	// Auth security
 	insecureAuth bool // Allow PLAIN auth over non-TLS connections
+	strictUTF8   bool // strict_utf8_content: see POP3ServerOptions.StrictUTF8Content and refuseUTF8Content
 
 	// Command timeout and throughput enforcement
 	authIdleTimeout time.Duration    // Idle timeout during authentication phase (pre-auth only, 0 = disabled)
@@ -163,6 +164,7 @@ type POP3ServerOptions struct {
 	AbsoluteSessionTimeout      time.Duration             // Maximum total session duration (0 = no limit; go-pop3 enforces it)
 	MinBytesPerMinute           int64                     // Minimum throughput to prevent slowloris (0 = disabled)
 	InsecureAuth                bool                      // Allow plaintext authentication over non-TLS connections
+	StrictUTF8Content           bool                      // Refuse RETR/TOP of a message with UTF-8 headers with -ERR [UTF8] until the session issues UTF8 (RFC 6856 §2.1)
 	Config                      *config.Config            // Full config for shared settings like connection tracking timeouts
 }
 
@@ -277,6 +279,7 @@ func New(appCtx context.Context, name, hostname, popAddr string, s3 *storage.S3S
 		authIdleTimeout: options.AuthIdleTimeout,
 		commandTimeouts: defaultCommandTimeouts(),
 		insecureAuth:    options.InsecureAuth || !options.TLS, // Auto-enable when TLS not configured; cmd/sora warns on a public address
+		strictUTF8:      options.StrictUTF8Content,
 		maxMessageAge:   maxMessageAge,
 		activeSessions:  make(map[*POP3Session]struct{}),
 	}

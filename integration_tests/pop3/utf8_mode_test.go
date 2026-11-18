@@ -7,7 +7,6 @@ import (
 	"context"
 	"fmt"
 	"net"
-	"reflect"
 	"strings"
 	"testing"
 
@@ -16,18 +15,20 @@ import (
 	"github.com/migadu/sora/server/pop3"
 )
 
-// TestPOP3UTF8ModeChangesNothing pins that the UTF8 command (RFC 6856) does
-// not change what the backend accepts or sends (issue #1911):
+// TestPOP3UTF8ModeChangesNothing pins that, with the default
+// strict_utf8_content = false, the UTF8 command (RFC 6856) does not change
+// what the backend accepts or sends (issue #1911):
 //
 //   - a UTF-8 password is accepted with and without UTF8, and
 //   - RETR and TOP return a message with raw UTF-8 headers (RFC 6532) and an
 //     8bit body byte for byte, with and without UTF8, before or after login.
 //
-// Sora sends stored messages as they are in every mode, and its own reply texts
-// are ASCII. It does not refuse such a message with -ERR [UTF8] or build a
-// surrogate (RFC 6856 §2.1) for a client that did not send UTF8: the POP3 proxy
-// hides UTF8 from CAPA by default (remote_use_utf8, for classic Outlook), so
-// most clients never enable it and would lose those messages; see EnableUTF8.
+// By default Sora sends stored messages as they are in every mode, and its own
+// reply texts are ASCII. It does not refuse such a message with -ERR [UTF8] or
+// build a surrogate (RFC 6856 §2.1) for a client that did not send UTF8: the
+// POP3 proxy hides UTF8 from CAPA by default (remote_use_utf8, for classic
+// Outlook), so most clients never enable it and would lose those messages; see
+// EnableUTF8. The opt-in refusal is TestPOP3StrictUTF8Content.
 func TestPOP3UTF8ModeChangesNothing(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 
@@ -115,13 +116,7 @@ func TestPOP3UTF8ModeChangesNothing(t *testing.T) {
 }
 
 // strictUTF8Content turns on the pop3 strict_utf8_content setting.
-func strictUTF8Content(o *pop3.POP3ServerOptions) {
-	// Set by name so this test compiles before the option exists: a missing
-	// option is ignored, as an unknown config key is.
-	if f := reflect.ValueOf(o).Elem().FieldByName("StrictUTF8Content"); f.IsValid() {
-		f.SetBool(true)
-	}
-}
+func strictUTF8Content(o *pop3.POP3ServerOptions) { o.StrictUTF8Content = true }
 
 // TestPOP3StrictUTF8Content pins the opt-in RFC 6856 section 2.1 refusal
 // (issue #1933). With strict_utf8_content set, a session that has not issued

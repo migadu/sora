@@ -893,9 +893,20 @@ The list is the same before and after login.
   trusted peers (section 7.5).
 - After login: `CAPA`, `STAT`, `LIST`, `UIDL`, `RETR`, `TOP`, `DELE`, `RSET`, `NOOP`, `LANG`, `UTF8`
   and `QUIT`. `UTF8` is also accepted after login, because some clients send it then.
-- `UTF8` (RFC 6856) changes nothing. Addresses and passwords may contain UTF-8 with or without it,
-  and `RETR` and `TOP` send messages as stored either way, also to a client that never sent `UTF8`
-  (no surrogate, no `-ERR [UTF8]`).
+- `UTF8` (RFC 6856) changes nothing by default. Addresses and passwords may contain UTF-8 with or
+  without it, and `RETR` and `TOP` send messages as stored either way, also to a client that never
+  sent `UTF8` (no surrogate, no `-ERR [UTF8]`). This is the default because the POP3 proxy hides
+  `UTF8` from `CAPA` unless `remote_use_utf8 = true`, so most clients can never send it, and classic
+  Outlook stops the whole download at the first `-ERR`.
+- With `strict_utf8_content = true`, a session that has not sent `UTF8` gets
+  `-ERR [UTF8] Message has UTF-8 headers, issue UTF8 to retrieve it` for `RETR` and `TOP` of a
+  message with any byte above 0x7F in its header section (RFC 6856 §2.1 and §5). After `UTF8`,
+  before or after login, the same command returns the message. Messages with ASCII headers are
+  always sent, 8bit bodies included. No surrogate message is built. The server advertises `UTF8` to
+  every client that connects to it directly; behind a `pop3_proxy` the client sees it only when the
+  proxy has `remote_use_utf8 = true`, and the proxy passes a `UTF8` sent before login on only when
+  the `[[pool]]` or `[server.remote_lookup]` that routes the user here has it too. Turn the setting
+  on only then, or the messages cannot be downloaded at all. It is read at startup, not on reload.
 - `APOP` is not supported: `-ERR Unknown command: APOP`. `LAST` gets `-ERR LAST is obsolete (RFC 1939)`.
 - `AUTH` supports only `PLAIN`, with or without an initial response.
 
