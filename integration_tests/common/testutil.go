@@ -956,6 +956,13 @@ func SetupLMTPServerWithOptions(t *testing.T, options lmtp.LMTPServerOptions) (*
 // test that needs database settings of its own (a short query_timeout, say).
 func SetupLMTPServerWithDatabase(t *testing.T, rdb *resilient.ResilientDatabase, options lmtp.LMTPServerOptions) (*TestServer, TestAccount) {
 	t.Helper()
+	return SetupLMTPServerWithContext(t, context.Background(), rdb, options)
+}
+
+// SetupLMTPServerWithContext is SetupLMTPServerWithDatabase under the given application
+// context, for a test that signals a shutdown by cancelling it while a session is open.
+func SetupLMTPServerWithContext(t *testing.T, appCtx context.Context, rdb *resilient.ResilientDatabase, options lmtp.LMTPServerOptions) (*TestServer, TestAccount) {
+	t.Helper()
 	if options.MaintenanceGate == nil {
 		options.MaintenanceGate = soraserver.NewMaintenanceGate(false)
 	}
@@ -996,7 +1003,7 @@ func SetupLMTPServerWithDatabase(t *testing.T, rdb *resilient.ResilientDatabase,
 	}
 
 	server, err := lmtp.New(
-		context.Background(),
+		appCtx,
 		"test",
 		"localhost",
 		address,
