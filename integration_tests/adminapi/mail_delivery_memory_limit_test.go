@@ -38,6 +38,8 @@ func TestAdminAPI_DeliverMail_MemoryLimit(t *testing.T) {
 	nul := message("nul", "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n",
 		strings.Repeat("\x00\x01abcdefghijklmnopqrstuvwxyz\r\n", (28<<10)/30))
 
+	// Its final 64 KiB read buffer fits, but growing to it from 32 KiB does not.
+	growing := message("growing", "", strings.Repeat("0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop\r\n", (40<<10)/64))
 	raw := func(msg string) (int, string) {
 		t.Helper()
 		req, err := http.NewRequest("POST", server.URL+"/admin/mail/deliver?recipients="+email, bytes.NewBufferString(msg))
@@ -72,6 +74,7 @@ func TestAdminAPI_DeliverMail_MemoryLimit(t *testing.T) {
 		{"raw: small message fits", raw, small, http.StatusOK},
 		{"raw: message larger than the budget", raw, large, http.StatusServiceUnavailable},
 		{"raw: body fits but its encoded copy does not", raw, nul, http.StatusServiceUnavailable},
+		{"raw: final buffer fits, old and new buffer during growth do not", raw, growing, http.StatusServiceUnavailable},
 		{"json: message larger than the budget", jsonDeliver, large, http.StatusServiceUnavailable},
 		{"json: small message fits after the refusals", jsonDeliver, small, http.StatusOK},
 	} {

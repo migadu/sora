@@ -34,7 +34,10 @@ func TestLMTP_DeliveryMemoryLimit(t *testing.T) {
 	// NUL-bearing part (about 4/3 of it) does not.
 	nul := message("nul", "Content-Type: application/octet-stream\r\nContent-Transfer-Encoding: binary\r\n",
 		strings.Repeat("\x00\xe4abcdefghijklmnopqrstuvwxyz\r\n", (28<<10)/30))
-	if len(nul) >= 32<<10 || len(large) <= budget {
+	// Its final 64 KiB buffer fits the budget, but growing to it from 32 KiB holds
+	// both buffers (96 KiB) during the copy.
+	growing := message("growing", "", strings.Repeat("0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop\r\n", (40<<10)/64))
+	if len(nul) >= 32<<10 || len(large) <= budget || len(growing) <= 32<<10 || len(growing) >= budget {
 		t.Fatalf("fixtures do not straddle the budget: nul %d, large %d", len(nul), len(large))
 	}
 
@@ -44,6 +47,7 @@ func TestLMTP_DeliveryMemoryLimit(t *testing.T) {
 		{"small message fits", small, "250"},
 		{"message larger than the budget", large, "452 4.3.1"},
 		{"DATA fits but its encoded copy does not", nul, "452 4.3.1"},
+		{"final buffer fits, old and new buffer during growth do not", growing, "452 4.3.1"},
 		{"small message fits after the refusals", small, "250"},
 	} {
 		if reply := deliverLMTPRaw(t, addr, "sender@example.org", account.Email, step.msg); !strings.HasPrefix(reply, step.want) {
