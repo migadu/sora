@@ -80,7 +80,7 @@ func (h *StandardVacationHandler) recipientIsAddressed(ctx context.Context, acco
 		// Every occurrence: a message resent more than once has one set of Resent-*
 		// fields per resending (RFC 5322 §3.6.6), and §4.5 asks for "a" matching line.
 		for _, value := range originalMessage.Header.Values(field) {
-			if list, err := mail.ParseAddressList(value); err == nil {
+			if list, err := helpers.ParseAddressList(value); err == nil {
 				recipients = append(recipients, list...)
 			}
 		}

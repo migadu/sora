@@ -37,7 +37,7 @@ func handleUploaderCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printUploaderUsage()
 	default:
-		fmt.Printf("Unknown uploader subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown uploader subcommand: %s\n\n", subcommand)
 		printUploaderUsage()
 		os.Exit(1)
 	}

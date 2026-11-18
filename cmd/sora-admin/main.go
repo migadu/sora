@@ -346,7 +346,7 @@ func main() {
 	case "sieve":
 		handleSieveCommand(ctx)
 	default:
-		fmt.Printf("Unknown command: %s\n\n", command)
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\n\n", command)
 		printUsage()
 		os.Exit(1)
 	}
