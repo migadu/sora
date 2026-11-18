@@ -111,7 +111,7 @@ func startSharedIMAPServerOnDB(t *testing.T, rdb *resilient.ResilientDatabase, s
 //     emit ESEARCH or STATUS responses for "Shared", even when "Shared" is
 //     subscribed or holds pre-existing messages.
 //   - Hierarchy events (MailboxName and SubscriptionChange) still report
-//     * LIST (\Noselect ...) "/" "Shared".
+//   - LIST (\Noselect ...) "/" "Shared".
 func TestIMAP_SharedNamespaceRootNoSelect_ESearchAndNotify(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 

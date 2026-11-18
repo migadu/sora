@@ -160,4 +160,3 @@ func TestSameMailboxMoveIgnoresStaleOrNilSourceHashesForLegacyContributorRows(t 
 	require.Equal(t, hash, gotHash)
 	require.True(t, gotUploaded)
 }
-
