@@ -75,9 +75,11 @@ func TestHeaderPresenceForwardOnlyMixedPredicatesAndCopies(t *testing.T) {
 		h := header(key, true)
 		require.ElementsMatch(t, []imap.UID{uids[0], uids[1], uids[3], uids[4]}, search(h), key)
 		require.ElementsMatch(t, []imap.UID{uids[2]}, search(imap.SearchCriteria{Not: []imap.SearchCriteria{h}}))
+		// An empty group is an address of the envelope (its group start, RFC 3501 §7.4.2),
+		// so "undisclosed:;" makes the envelope field non-NIL and FROM/TO/CC "" match it.
 		a := header(key, false)
-		require.ElementsMatch(t, []imap.UID{uids[3], uids[4]}, search(a), "envelope "+key)
-		require.ElementsMatch(t, []imap.UID{uids[0], uids[1], uids[2]}, search(imap.SearchCriteria{Not: []imap.SearchCriteria{a}}))
+		require.ElementsMatch(t, []imap.UID{uids[0], uids[3], uids[4]}, search(a), "envelope "+key)
+		require.ElementsMatch(t, []imap.UID{uids[1], uids[2]}, search(imap.SearchCriteria{Not: []imap.SearchCriteria{a}}))
 	}
 	require.ElementsMatch(t, uids, search(imap.SearchCriteria{Or: [][2]imap.SearchCriteria{{header("Cc", true), {Not: []imap.SearchCriteria{header("From", true)}}}}}))
 	require.Empty(t, search(imap.SearchCriteria{Header: header("Cc", true).Header, Not: []imap.SearchCriteria{header("From", true)}}))
