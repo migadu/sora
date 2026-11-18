@@ -9,8 +9,8 @@ import (
 	"github.com/migadu/sora/pkg/resilient"
 )
 
-// handleMailboxRepairUnseen reports the mailboxes whose cached unseen count is above the
-// number of unseen messages they hold and, with --apply, recomputes them.
+// handleMailboxRepairUnseen reports the mailboxes whose cached unseen count differs from
+// the number of unseen messages they hold and, with --apply, recomputes them.
 func handleMailboxRepairUnseen(ctx context.Context) {
 	fs := flag.NewFlagSet("mailbox repair-unseen", flag.ExitOnError)
 	email := fs.String("email", "", "Email address of the account (optional, all accounts if omitted)")
@@ -19,13 +19,15 @@ func handleMailboxRepairUnseen(ctx context.Context) {
 	startAfter := fs.Int64("start-after", 0, "Resume after this mailbox id, as printed by an interrupted run")
 
 	fs.Usage = func() {
-		fmt.Printf(`Find and repair cached unseen counts that are too high
+		fmt.Printf(`Find and repair wrong cached unseen counts
 
 In older builds, a hard delete of an unseen message (failed-upload cleanup,
 uploader resolve, importer rollback) left it counted in the cached unseen count
-of its mailbox, which STATUS, LIST and NOTIFY report. This command compares
-each mailbox's cached unseen count with the number of unseen messages it holds,
-in batches of mailboxes in id order, and reports the mailboxes counted too high.
+of its mailbox, which STATUS, LIST and NOTIFY report; and a message without a
+flag state row (left by older builds) was not counted, although it is unseen.
+This command compares each mailbox's cached unseen count with the number of
+unseen messages it holds, in batches of mailboxes in id order, and reports the
+mailboxes counted wrong.
 With --apply it recomputes each of them in its own short transaction under the
 mailbox lock, like any flag change.
 
@@ -40,7 +42,7 @@ Options:
   --start-after ID    Resume after this mailbox id, as printed by an interrupted run
 
 Examples:
-  # Report the mailboxes counted too high
+  # Report the mailboxes counted wrong
   sora-admin mailbox repair-unseen --config config.toml
 
   # Repair them
@@ -73,33 +75,36 @@ Examples:
 		}
 	}
 
-	if err := repairExcessUnseen(ctx, rdb, accountID, *startAfter, *batchSize, *apply); err != nil {
+	if err := repairDriftedUnseen(ctx, rdb, accountID, *startAfter, *batchSize, *apply); err != nil {
 		fmt.Printf("Error: %v\n", err)
 		os.Exit(1)
 	}
 }
 
-// repairExcessUnseen checks the mailboxes of accountID (of every account when it is 0)
+// repairDriftedUnseen checks the mailboxes of accountID (of every account when it is 0)
 // after mailbox id after, batchSize at a time, and prints those whose cached unseen
-// count is too high. With apply it recomputes each of them (db.RecomputeMailboxUnseen),
+// count is wrong. With apply it recomputes each of them (db.RecomputeMailboxUnseen),
 // one transaction per mailbox: the scan holds no lock, and a repair holds only its own
 // mailbox's row lock, for the time of one count.
-func repairExcessUnseen(ctx context.Context, rdb *resilient.ResilientDatabase, accountID, after int64, batchSize int, apply bool) error {
+func repairDriftedUnseen(ctx context.Context, rdb *resilient.ResilientDatabase, accountID, after int64, batchSize int, apply bool) error {
 	var checked, found, repaired int
 	var total, largest int64
 	for {
-		batch, err := rdb.FindExcessUnseenCountsWithRetry(ctx, accountID, after, batchSize)
+		batch, err := rdb.FindDriftedUnseenCountsWithRetry(ctx, accountID, after, batchSize)
 		if err != nil {
 			return fmt.Errorf("failed to check mailboxes after id %d (resume with --start-after %d): %w", after, after, err)
 		}
 		if batch.Checked == 0 {
 			break
 		}
-		for _, m := range batch.Excess {
+		for _, m := range batch.Drifted {
 			found++
-			excess := m.Cached - m.Actual
-			total += excess
-			largest = max(largest, excess)
+			off := m.Cached - m.Actual
+			if off < 0 {
+				off = -off
+			}
+			total += off
+			largest = max(largest, off)
 			if !apply {
 				fmt.Printf("  WOULD REPAIR mailbox_id=%d account_id=%d %q unseen_count %d -> %d\n",
 					m.MailboxID, m.AccountID, m.Name, m.Cached, m.Actual)
@@ -118,7 +123,7 @@ func repairExcessUnseen(ctx context.Context, rdb *resilient.ResilientDatabase, a
 		fmt.Printf("Checked up to mailbox_id %d (resume with --start-after %d)\n", after, after)
 	}
 
-	fmt.Printf("Checked %d mailbox(es) with positive cached unseen counts: %d mailbox(es) with unseen_count too high, by %d in total (at most %d in one mailbox).\n",
+	fmt.Printf("Checked %d mailbox(es): %d mailbox(es) with a wrong unseen_count, off by %d in total (at most %d in one mailbox).\n",
 		checked, found, total, largest)
 	switch {
 	case apply:

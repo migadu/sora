@@ -840,7 +840,7 @@ until then expunged rows and deleted accounts stay in the database.
 mode; see [ADMIN_CLI.md](ADMIN_CLI.md):
 
 - [`mailbox repair-unseen`](ADMIN_CLI.md#mailbox-repair-unseen) recounts unseen counters that
-  are too high (the cleaner already repairs counters that went below zero);
+  are too high or too low (the cleaner already repairs counters that went below zero);
 - [`mailbox repair-hierarchy`](ADMIN_CLI.md#mailbox-repair-hierarchy) repairs the parent links
   of mailboxes;
 - [`messages repair-references`](ADMIN_CLI.md#messages-repair-references) fills the stored

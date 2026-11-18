@@ -1222,7 +1222,7 @@ Subcommands:
   unsubscribe   Unsubscribe from a mailbox
   fix-utf7      Fix mailbox names with un-decoded Modified UTF-7 encoding
   repair-hierarchy Repair mailboxes whose place in the hierarchy disagrees with their name
-  repair-unseen Find and repair cached unseen counts that are too high
+  repair-unseen Find and repair wrong cached unseen counts
 
 Examples:
   # Create a new mailbox
@@ -1252,7 +1252,7 @@ Examples:
   # List mailboxes whose hierarchy disagrees with their name (dry run)
   sora-admin mailbox repair-hierarchy --config config.toml
 
-  # List mailboxes whose cached unseen count is too high (dry run)
+  # List mailboxes whose cached unseen count is wrong (dry run)
   sora-admin mailbox repair-unseen --config config.toml
 
 For more information on a subcommand, run:
