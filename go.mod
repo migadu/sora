@@ -20,7 +20,7 @@ require (
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/k3a/html2text v1.5.1
 	github.com/klauspost/compress v1.20.4
-	github.com/migadu/go-imap v1.2.12
+	github.com/migadu/go-imap v1.2.13-0.20261118224255-b35b18cd59bc
 	github.com/migadu/go-managesieve v0.1.7
 	github.com/migadu/go-pop3 v0.1.8
 	github.com/migadu/go-sieve v1.5.5
