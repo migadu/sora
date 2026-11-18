@@ -66,13 +66,13 @@ Examples:
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
@@ -82,14 +82,14 @@ Examples:
 		targetIdentifier = *user
 	}
 	if targetIdentifier == "" {
-		fmt.Println("Error: --identifier or --user is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --identifier or --user is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *rights == "" {
-		fmt.Println("Error: --rights is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --rights is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
@@ -149,13 +149,13 @@ Examples:
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
@@ -165,8 +165,8 @@ Examples:
 		targetIdentifier = *user
 	}
 	if targetIdentifier == "" {
-		fmt.Println("Error: --identifier or --user is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --identifier or --user is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
@@ -222,13 +222,13 @@ Examples:
 
 	// Validate required parameters
 	if *email == "" {
-		fmt.Println("Error: --email is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 	if *mailbox == "" {
-		fmt.Println("Error: --mailbox is required")
-		fs.PrintDefaults()
+		fmt.Fprintln(os.Stderr, "Error: --mailbox is required")
+		fs.Usage()
 		os.Exit(1)
 	}
 
