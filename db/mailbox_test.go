@@ -58,7 +58,6 @@ func TestMailboxSummaryStruct(t *testing.T) {
 		NumMessages:       100,
 		TotalSize:         1024000,
 		HighestModSeq:     9876543210,
-		RecentCount:       5,
 		UnseenCount:       15,
 		FirstUnseenSeqNum: 85,
 	}
@@ -67,7 +66,6 @@ func TestMailboxSummaryStruct(t *testing.T) {
 	assert.Equal(t, 100, summary.NumMessages)
 	assert.Equal(t, int64(1024000), summary.TotalSize)
 	assert.Equal(t, uint64(9876543210), summary.HighestModSeq)
-	assert.Equal(t, 5, summary.RecentCount)
 	assert.Equal(t, 15, summary.UnseenCount)
 	assert.Equal(t, uint32(85), summary.FirstUnseenSeqNum)
 }
@@ -80,7 +78,6 @@ func TestMailboxSummaryZeroValues(t *testing.T) {
 	assert.Equal(t, 0, summary.NumMessages)
 	assert.Equal(t, int64(0), summary.TotalSize)
 	assert.Equal(t, uint64(0), summary.HighestModSeq)
-	assert.Equal(t, 0, summary.RecentCount)
 	assert.Equal(t, 0, summary.UnseenCount)
 	assert.Equal(t, uint32(0), summary.FirstUnseenSeqNum)
 }

@@ -6,321 +6,232 @@ package lmtpproxy
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"io"
 	"net"
-	"sync"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/migadu/sora/config"
 )
 
-// TestHungBackendConnection simulates a backend that closes TCP connection
-// without properly sending data, causing Read() to block indefinitely.
-// This reproduces the production issue where 4,093 connections were stuck.
+// TestHungBackendConnection drives a real proxy session into a backend that
+// accepts TCP and then never sends a byte (no greeting, no FIN), with the
+// backend connect timeout (the per-read deadline of readBackendLine) far longer
+// than the absolute session timeout. The absolute session timeout must end the
+// session: its watchdog closes the BACKEND connection too, which is what
+// unblocks the goroutine parked in the backend read. Before that, closing only
+// the client connection left such sessions hung (4,093 stuck connections in
+// production). The connect-timeout deadline on the same read is covered by
+// TestConnectToBackendSilentBackendTimesOut.
 func TestHungBackendConnection(t *testing.T) {
-	// Start a backend server that accepts connections but never responds
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	const (
+		absoluteTimeout = 2 * time.Second
+		connectTimeout  = 30 * time.Second // the read deadline must not be what ends the session
+		bound           = 10 * time.Second
+	)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("Failed to create listener: %v", err)
+		t.Fatal(err)
 	}
-	defer listener.Close()
-
-	backendAddr := listener.Addr().String()
-	t.Logf("Backend listening on %s", backendAddr)
-
-	// Track if goroutine completed
-	var goroutineCompleted bool
-	var mu sync.Mutex
-
-	// Backend that accepts connection but never sends data or FIN
+	t.Cleanup(func() { ln.Close() })
+	accepted := make(chan struct{})
+	backendClosed := make(chan struct{})
 	go func() {
-		conn, err := listener.Accept()
-		if err != nil {
-			return
-		}
-		// Keep connection open but don't send anything
-		// Simulate a hung backend that neither sends data nor closes properly
-		t.Logf("Backend accepted connection from %s", conn.RemoteAddr())
-
-		// Sleep indefinitely to simulate hung connection
-		time.Sleep(10 * time.Minute)
-		conn.Close()
-	}()
-
-	// Simulate the proxy session behavior
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-
-	// Connect to backend
-	clientConn, err := net.Dial("tcp", backendAddr)
-	if err != nil {
-		t.Fatalf("Failed to connect to backend: %v", err)
-	}
-	defer clientConn.Close()
-
-	t.Logf("Connected to backend from %s", clientConn.LocalAddr())
-
-	// Create buffered reader (simulating what LMTP proxy does)
-	backendReader := bufio.NewReader(clientConn)
-
-	// Simulate copyBufferedReaderToConn WITHOUT connection close on context cancel
-	// This reproduces the bug: Read() blocks even after ctx.Done()
-	go func() {
-		defer func() {
-			mu.Lock()
-			goroutineCompleted = true
-			mu.Unlock()
-			t.Logf("Goroutine completed")
-		}()
-
-		buf := make([]byte, 32*1024)
-
-		// The bug: ctx.Done() check happens BEFORE Read(), but once Read() blocks,
-		// we never get back to check ctx.Done() again.
-		// This is exactly what happens in copyBufferedReaderToConn()
-		select {
-		case <-ctx.Done():
-			t.Logf("Context already cancelled before Read()")
-			return
-		default:
-		}
-
-		// This Read() will block indefinitely because:
-		// 1. Backend never sends data
-		// 2. Backend never sends FIN
-		// 3. No context cancellation handler to close the connection
-		// 4. No read deadline set
-		// 5. No TCP keepalive enabled (or keepalive timeout is hours)
-		t.Logf("Calling Read() - this will block forever...")
-		nr, err := backendReader.Read(buf)
-		t.Logf("Read() returned: nr=%d, err=%v", nr, err)
-
-		if err != nil {
-			t.Logf("Read error: %v", err)
-			return
-		}
-
-		// We never get here because Read() never returns
-		t.Logf("Read completed with %d bytes", nr)
-	}()
-
-	// Wait for context timeout (2 seconds)
-	<-ctx.Done()
-	t.Logf("Context timeout reached")
-
-	// Give goroutine a moment to detect cancellation
-	time.Sleep(100 * time.Millisecond)
-
-	// Check if goroutine completed
-	mu.Lock()
-	completed := goroutineCompleted
-	mu.Unlock()
-
-	if !completed {
-		t.Errorf("REPRODUCTION CONFIRMED: Goroutine is still hung in Read() even after context cancellation")
-		t.Errorf("This is the root cause of the 4,093 stuck connections in production")
-	} else {
-		t.Logf("Goroutine completed successfully")
-	}
-
-	// Now test WITH proper context-aware reading
-	t.Logf("\n=== Testing with connection close on context cancellation ===")
-
-	// Reconnect
-	clientConn2, err := net.Dial("tcp", backendAddr)
-	if err != nil {
-		t.Fatalf("Failed to reconnect: %v", err)
-	}
-	defer clientConn2.Close()
-
-	ctx2, cancel2 := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel2()
-
-	var goroutine2Completed bool
-	var mu2 sync.Mutex
-
-	// Start context cancellation handler (like LMTP proxy has)
-	go func() {
-		<-ctx2.Done()
-		t.Logf("Context cancelled - closing connection to unblock Read()")
-		clientConn2.Close()
-	}()
-
-	backendReader2 := bufio.NewReader(clientConn2)
-
-	go func() {
-		defer func() {
-			mu2.Lock()
-			goroutine2Completed = true
-			mu2.Unlock()
-			t.Logf("Goroutine 2 completed")
-		}()
-
-		buf := make([]byte, 32*1024)
-		for {
-			select {
-			case <-ctx2.Done():
-				t.Logf("Context cancelled, goroutine 2 exiting")
-				return
-			default:
-			}
-
-			t.Logf("Goroutine 2 calling Read()...")
-			nr, err := backendReader2.Read(buf)
-			t.Logf("Goroutine 2 Read() returned: nr=%d, err=%v", nr, err)
-
-			if err != nil {
-				t.Logf("Goroutine 2 Read error (expected after connection close): %v", err)
-				return
-			}
-		}
-	}()
-
-	// Wait for context timeout
-	<-ctx2.Done()
-	t.Logf("Context 2 timeout reached")
-
-	// Give goroutine time to detect closed connection
-	time.Sleep(200 * time.Millisecond)
-
-	mu2.Lock()
-	completed2 := goroutine2Completed
-	mu2.Unlock()
-
-	if !completed2 {
-		t.Errorf("FIX FAILED: Goroutine 2 still hung even with connection close")
-	} else {
-		t.Logf("SUCCESS: Goroutine 2 completed after connection close")
-		t.Logf("This confirms that absolute session timeout fix will work")
-	}
-}
-
-// TestReadDeadlineDetectsStaleConnection tests that read deadline
-// can detect a stale backend connection during data transfer
-func TestReadDeadlineDetectsStaleConnection(t *testing.T) {
-	// Start a backend server that accepts connections but never sends data after greeting
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("Failed to create listener: %v", err)
-	}
-	defer listener.Close()
-
-	backendAddr := listener.Addr().String()
-	t.Logf("Backend listening on %s", backendAddr)
-
-	// Backend that accepts connection and sends greeting, but then never sends data
-	go func() {
-		conn, err := listener.Accept()
+		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		defer conn.Close()
-
-		// Send LMTP greeting
-		conn.Write([]byte("220 backend.example.com LMTP Service Ready\r\n"))
-
-		// Now go silent - simulate backend that hangs during data transfer
-		t.Logf("Backend sent greeting, now going silent")
-		time.Sleep(10 * time.Minute) // Stay silent to simulate hung backend
+		close(accepted)
+		// Never write. Reading only observes the proxy closing its side.
+		io.Copy(io.Discard, conn)
+		close(backendClosed)
 	}()
 
-	// Connect to backend
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	backendConn, err := net.Dial("tcp", backendAddr)
+	lookup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"address": r.URL.Query().Get("email")})
+	}))
+	t.Cleanup(lookup.Close)
+	srv, err := New(context.Background(), nil, "test-host", ServerOptions{
+		Name: "hung-backend", RemoteAddrs: []string{ln.Addr().String()}, RemotePort: 24,
+		ConnectTimeout:         connectTimeout,
+		AbsoluteSessionTimeout: absoluteTimeout,
+		RemoteLookup:           &config.RemoteLookupConfig{Enabled: true, URL: lookup.URL + "?email=$email", Timeout: "1s"},
+	})
 	if err != nil {
-		t.Fatalf("Failed to connect to backend: %v", err)
+		t.Fatal(err)
 	}
-	defer backendConn.Close()
+	t.Cleanup(func() { srv.Stop() })
 
-	t.Logf("Connected to backend")
+	front, serverEnd := net.Pipe()
+	sess := newSession(srv, serverEnd, nil)
+	done := make(chan struct{})
+	start := time.Now()
+	go func() { defer close(done); sess.handleConnection() }()
+	t.Cleanup(func() {
+		front.Close()
+		<-done
+	})
+	// Drain the client side so the session never blocks writing a reply.
+	go io.Copy(io.Discard, front)
 
-	// Read greeting
-	backendReader := bufio.NewReader(backendConn)
-	greeting, err := backendReader.ReadString('\n')
-	if err != nil {
-		t.Fatalf("Failed to read greeting: %v", err)
-	}
-	t.Logf("Received greeting: %s", greeting)
-
-	// Simulate copyBufferedReaderToConn WITH read deadline (the fix)
-	copyWithReadDeadline := func() (int64, error) {
-		const readDeadline = 2 * time.Second // Short timeout for test
-		var totalBytes int64
-		buf := make([]byte, 32*1024)
-
-		for {
-			select {
-			case <-ctx.Done():
-				return totalBytes, ctx.Err()
-			default:
-			}
-
-			// THE FIX: Set read deadline on backend connection
-			if err := backendConn.SetReadDeadline(time.Now().Add(readDeadline)); err != nil {
-				t.Logf("Failed to set read deadline: %v", err)
-			}
-
-			t.Logf("Calling Read() with %v deadline...", readDeadline)
-			nr, err := backendReader.Read(buf)
-
-			if nr > 0 {
-				totalBytes += int64(nr)
-				t.Logf("Read %d bytes", nr)
-			}
-
-			if err != nil {
-				// Check if this is a timeout error (stale connection detected!)
-				if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
-					t.Logf("SUCCESS: Read timeout detected stale backend connection after %v", readDeadline)
-					return totalBytes, err
-				}
-				if err != io.EOF {
-					return totalBytes, err
-				}
-				return totalBytes, nil
-			}
+	write := func(cmd string) {
+		t.Helper()
+		front.SetWriteDeadline(time.Now().Add(bound))
+		if _, err := io.WriteString(front, cmd+"\r\n"); err != nil {
+			t.Fatalf("%s: %v", strings.Fields(cmd)[0], err)
 		}
 	}
+	write("LHLO client.example.org")
+	write("MAIL FROM:<sender@example.com>")
+	write("RCPT TO:<user@example.com>") // the proxy dials the backend and waits for its greeting
 
-	// Test the fix
-	startTime := time.Now()
-	_, err = copyWithReadDeadline()
-	elapsed := time.Since(startTime)
+	select {
+	case <-accepted:
+	case <-time.After(bound):
+		t.Fatal("the proxy never connected to the backend")
+	}
+	select {
+	case <-done:
+		t.Fatalf("precondition: the session ended %v after it started, before blocking on the hung backend", time.Since(start))
+	default:
+	}
 
-	if err == nil {
-		t.Errorf("Expected timeout error, got nil")
-	} else if netErr, ok := err.(net.Error); !ok || !netErr.Timeout() {
-		t.Errorf("Expected net.Error timeout, got: %v", err)
-	} else {
-		t.Logf("SUCCESS: Stale connection detected in %v (expected ~2s)", elapsed)
-		if elapsed > 3*time.Second {
-			t.Errorf("Detection took too long: %v (expected ~2s)", elapsed)
-		}
+	select {
+	case <-done:
+	case <-time.After(bound):
+		t.Fatalf("session still blocked on the hung backend %v after start (absolute timeout %v, connect timeout %v)",
+			time.Since(start), absoluteTimeout, connectTimeout)
+	}
+	select {
+	case <-backendClosed:
+	case <-time.After(bound):
+		t.Fatal("the session ended but left the backend connection open")
+	}
+	if elapsed := time.Since(start); elapsed < absoluteTimeout {
+		t.Errorf("session ended after %v, before the absolute timeout %v: something other than the timeout ended it", elapsed, absoluteTimeout)
 	}
 }
 
-// TestTCPKeepaliveDetectsDeadConnection tests that TCP keepalive
-// can detect a truly dead connection (network partition scenario)
-func TestTCPKeepaliveDetectsDeadConnection(t *testing.T) {
-	t.Skip("This test requires actual network partition simulation - run manually if needed")
+// TestReadDeadlineDetectsStaleConnection drives a real session through a whole
+// transaction into a backend that takes the message body and then never sends its
+// end-of-data reply. relayEndOfDataTimeout (shortened here) must end the wait: the
+// session drops the client and the backend connection instead of holding both until
+// the absolute session timeout (none here). The proxy never invents an end-of-data
+// reply, so the client sees its connection closed without one.
+func TestReadDeadlineDetectsStaleConnection(t *testing.T) {
+	const bound = 10 * time.Second
+	saved := relayEndOfDataTimeout
+	relayEndOfDataTimeout = time.Second
+	t.Cleanup(func() { relayEndOfDataTimeout = saved })
 
-	// This would require:
-	// 1. Setting up a connection
-	// 2. Enabling TCP keepalive with very short period (e.g., 1 second)
-	// 3. Using iptables/pf to drop packets (simulate network partition)
-	// 4. Verifying Read() eventually returns error after keepalive probes fail
-	//
-	// TCP keepalive parameters on FreeBSD:
-	// - net.inet.tcp.keepidle: time before first keepalive probe (default 7200s)
-	// - net.inet.tcp.keepintvl: interval between probes (default 75s)
-	// - net.inet.tcp.keepcnt: number of probes before declaring dead (default 8)
-	//
-	// So even with SetKeepAlivePeriod(2 * time.Minute), it takes:
-	// - 2 minutes idle before first probe
-	// - Then 8 probes * 75 seconds = 10 minutes
-	// - Total: ~12 minutes to detect dead connection
-	//
-	// For production, we should consider shorter keepalive settings or
-	// rely on absolute session timeout as the primary safeguard.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	bodyEnded := make(chan struct{})
+	backendClosed := make(chan struct{})
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		defer close(backendClosed)
+		io.WriteString(conn, "220 backend ready\r\n")
+		r := bufio.NewReader(conn)
+		inData := false
+		for {
+			line, err := r.ReadString('\n')
+			if err != nil {
+				return // the proxy closed the connection
+			}
+			if inData {
+				if line == ".\r\n" {
+					close(bodyEnded)
+					inData = false // go silent: no end-of-data reply
+				}
+				continue
+			}
+			switch verb, _, _ := strings.Cut(strings.ToUpper(strings.TrimRight(line, "\r\n")), " "); verb {
+			case "LHLO":
+				io.WriteString(conn, "250-backend\r\n250 PIPELINING\r\n")
+			case "DATA":
+				io.WriteString(conn, "354 go ahead\r\n")
+				inData = true
+			default:
+				io.WriteString(conn, "250 2.0.0 OK\r\n")
+			}
+		}
+	}()
+
+	lookup := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(map[string]any{"address": r.URL.Query().Get("email")})
+	}))
+	t.Cleanup(lookup.Close)
+	srv, err := New(context.Background(), nil, "test-host", ServerOptions{
+		Name: "stale-backend", RemoteAddrs: []string{ln.Addr().String()}, RemotePort: 24, ConnectTimeout: time.Second,
+		RemoteLookup: &config.RemoteLookupConfig{Enabled: true, URL: lookup.URL + "?email=$email", Timeout: "1s"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { srv.Stop() })
+
+	front, serverEnd := net.Pipe()
+	sess := newSession(srv, serverEnd, nil)
+	done := make(chan struct{})
+	go func() { defer close(done); sess.handleConnection() }()
+	t.Cleanup(func() {
+		sess.cancel() // a session still blocked on the backend (the failure) must end too
+		front.Close()
+		<-done
+	})
+	front.SetDeadline(time.Now().Add(bound))
+	reader := bufio.NewReader(front)
+	if greeting := readReply(t, reader); !strings.HasPrefix(greeting, "220 ") {
+		t.Fatalf("greeting = %q", greeting)
+	}
+	for _, step := range []struct{ cmd, want string }{
+		{"LHLO client.example.org", "250 "},
+		{"MAIL FROM:<sender@example.com>", "250 "},
+		{"RCPT TO:<user@example.com>", "250 "},
+		{"DATA", "354 "},
+	} {
+		if _, err := io.WriteString(front, step.cmd+"\r\n"); err != nil {
+			t.Fatal(err)
+		}
+		if got := readReply(t, reader); !strings.HasPrefix(got, step.want) {
+			t.Fatalf("%s: %q, want %q", step.cmd, got, step.want)
+		}
+	}
+	if _, err := io.WriteString(front, "Subject: test\r\n\r\nbody\r\n.\r\n"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-bodyEnded:
+	case <-time.After(bound):
+		t.Fatal("the backend never received the end of the message")
+	}
+	start := time.Now()
+
+	if line, err := reader.ReadString('\n'); err == nil {
+		t.Fatalf("got %q after the end of data; the backend sent no reply, so the proxy must not invent one", line)
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		t.Fatalf("client connection still open %v after the backend went silent (end-of-data timeout %v)", bound, relayEndOfDataTimeout)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("client connection closed %v after the end of data; the end-of-data timeout is %v", elapsed, relayEndOfDataTimeout)
+	}
+	select {
+	case <-backendClosed:
+	case <-time.After(bound):
+		t.Fatal("the session gave up on the backend but left its connection open")
+	}
 }

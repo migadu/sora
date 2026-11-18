@@ -672,7 +672,8 @@ backend recovers, so their client does not jump back and forth.
   the same host.
 - An entry is dropped when its backend is no longer a member of the user's pool, is in maintenance,
   or is marked unhealthy. Unlike hashing and round robin, affinity does not give an unhealthy
-  backend another try after a minute.
+  backend another try after a minute: for affinity it stays unhealthy until a connection to it
+  succeeds, also when hashing or round robin has meanwhile given it its retry.
 - A lookup pin never uses affinity, and the mail proxies do not set it for a pinned user. The User
   API proxy records the pinned backend as the user's `userapi` affinity, which only matters if the
   API later stops pinning that user. It does not set affinity for login and token refresh
@@ -702,7 +703,8 @@ Proxies do not probe backends. They learn from their own connection attempts:
 - After **3 consecutive failures** the member is marked unhealthy. Hashing and round robin skip it.
 - **1 minute** after its last failure, hashing and round robin give it another try. A successful
   connection marks it healthy and resets the count.
-- Affinity does not use that one-minute retry ([section 6.2](#62-affinity)).
+- Affinity does not use that one-minute retry: only a successful connection makes the member
+  usable through affinity again ([section 6.2](#62-affinity)).
 - A pinned `server` that is not one of the proxy's own backends is tracked the same way,
   separately. While a pinned backend (of either kind) is marked unhealthy, logins pinned to it fail
   at once, until its one-minute retry.
@@ -867,10 +869,11 @@ POP3 clients may send `UTF8` before logging in (RFC 6856). The POP3 proxy answer
 `remote_use_utf8` on the route, it repeats the command to the backend before logging in; a backend
 that refuses it is logged and the session continues without UTF-8. The `[[server]]` block's
 `remote_use_utf8` also decides whether the proxy advertises `UTF8 USER` and `LANG` in `CAPA` before
-login. Either way the proxy accepts UTF-8 user names and passwords, and refuses a `USER`/`PASS`
-login whose user name or password is not valid UTF-8 with `-ERR [AUTH] Authentication failed`,
-without looking it up. Some versions of Outlook send `UTF8` after login when it is advertised, and abort if the
-backend does not support it, so keep it off unless every backend is Sora.
+login. Either way the proxy accepts UTF-8 user names and passwords, and refuses a login whose
+user name or password is not valid UTF-8 with `-ERR [AUTH] Authentication failed`, without looking
+it up, as a failed login ([AUTHENTICATION.md](AUTHENTICATION.md#3-how-a-login-name-is-read)). Some
+versions of Outlook send `UTF8` after login when it is advertised, and abort if the backend does
+not support it, so keep it off unless every backend is Sora.
 
 <a id="explicit-suppression-alongside-proxy"></a>
 

@@ -111,6 +111,17 @@ func (s *LMTPSession) ErrorLog(msg string, keysAndValues ...any) {
 	s.Session.ErrorLog(msg, s.withTrace(keysAndValues)...)
 }
 
+// errSessionBusy answers a command that could not take the session lock in time. It is a
+// temporary failure the session carries on after, not 421: a 421 announces that the server
+// closes the connection (RFC 5321 sections 3.8 and 4.2.2), and go-smtp does not close it
+// after a reply of the backend. RFC 5321 section 4.3.2 lists 451 for MAIL, RCPT and the
+// end of DATA.
+var errSessionBusy = &smtp.SMTPError{
+	Code:         451,
+	EnhancedCode: smtp.EnhancedCode{4, 4, 5},
+	Message:      "Server busy, try again later",
+}
+
 func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOptions) error {
 	start := time.Now()
 	recordMetrics := func(status string) {
@@ -148,11 +159,7 @@ func (s *LMTPSession) Mail(ctx context.Context, from string, opts *smtp.MailOpti
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "MAIL")
 		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         421,
-			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
-			Message:      "Server busy, try again later",
-		}
+		return errSessionBusy
 	}
 	defer release()
 
@@ -328,11 +335,7 @@ func (s *LMTPSession) Rcpt(ctx context.Context, to string, opts *smtp.RcptOption
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "RCPT")
 		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         421,
-			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
-			Message:      "Server busy, try again later",
-		}
+		return errSessionBusy
 	}
 	defer release()
 
@@ -416,11 +419,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	if !acquired {
 		s.WarnLog("failed to acquire write lock", "command", "DATA")
 		recordMetrics("failure")
-		return &smtp.SMTPError{
-			Code:         421,
-			EnhancedCode: smtp.EnhancedCode{4, 4, 5},
-			Message:      "Server busy, try again later",
-		}
+		return errSessionBusy
 	}
 	defer release()
 
@@ -937,7 +936,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 	// Flags set by the Sieve script via imap4flags (RFC 5232) belong to one stored
 	// copy, the one its keep or fileinto stores (Destination.Flags). storedFlags
 	// turns them into the flags that copy is stored with, next to the attachment
-	// keyword classified above. Sanitize to drop NIL/empty values and anything
+	// keyword classified above. Sanitize to drop empty values and anything
 	// that is not a valid IMAP flag-keyword -- a Sieve script is the one flag
 	// source that never passes an IMAP parser, so this is where an unencodable
 	// keyword would otherwise enter the system.
@@ -1119,20 +1118,12 @@ func (s *LMTPSession) Logout() error {
 	// go-smtp also logs a session out from Server.Close, on the closing goroutine, while this
 	// connection's goroutine may be inside a command writing the user, the trace id or the
 	// remote address. Those are written under the session lock and read here only with it.
-	var acquired bool
-	release := func() {}
-	if s.ctx.Err() != nil {
-		// Server.Close cancelled the session. Take the lock only if it is free, never wait
-		// for it: go-smtp closes the connections one by one and each socket only after its
-		// Logout, so a DATA still reading the body would hold the lock, and the shutdown,
-		// for the whole MutexTimeout. Without the lock Logout touches only what NewSession
-		// fixed, atomics and the transaction count (under txMu).
-		if acquired = s.mutex.TryLock(); acquired {
-			release = s.mutex.Unlock
-		}
-	} else {
-		acquired, release = s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
-	}
+	// Server.Close cancels the session context first: the helper still takes a free lock,
+	// but gives up at once on a held one rather than wait MutexTimeout, since go-smtp closes
+	// the connections one by one and a DATA still reading the body would stall the shutdown.
+	// Without the lock Logout touches only what NewSession fixed, atomics and the
+	// transaction count (under txMu).
+	acquired, release := s.mutexHelper.AcquireWriteLockWithTimeout(s.ctx)
 	debugLog, infoLog := s.DebugLog, s.InfoLog
 	if acquired {
 		defer release()

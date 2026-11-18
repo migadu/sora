@@ -33,7 +33,7 @@ func handleImportCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printImportUsage()
 	default:
-		fmt.Printf("Unknown import subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown import subcommand: %s\n\n", subcommand)
 		printImportUsage()
 		os.Exit(1)
 	}
@@ -142,24 +142,24 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *maildirPath == "" {
-		fmt.Printf("Error: --maildir-path is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --maildir-path is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *jobs < 1 {
-		fmt.Printf("Error: --jobs must be at least 1\n")
+		fmt.Fprintf(os.Stderr, "Error: --jobs must be at least 1\n")
 		os.Exit(1)
 	}
 
 	if *batchSize < 1 {
-		fmt.Printf("Error: --batch-size must be at least 1\n")
+		fmt.Fprintf(os.Stderr, "Error: --batch-size must be at least 1\n")
 		os.Exit(1)
 	}
 
@@ -168,7 +168,7 @@ Examples:
 	if *startDate != "" {
 		t, err := time.Parse("2006-01-02", *startDate)
 		if err != nil {
-			fmt.Printf("Error: Invalid start date format. Use YYYY-MM-DD\n")
+			fmt.Fprintf(os.Stderr, "Error: Invalid start date format. Use YYYY-MM-DD\n")
 			os.Exit(1)
 		}
 		startDateParsed = &t
@@ -176,7 +176,7 @@ Examples:
 	if *endDate != "" {
 		t, err := time.Parse("2006-01-02", *endDate)
 		if err != nil {
-			fmt.Printf("Error: Invalid end date format. Use YYYY-MM-DD\n")
+			fmt.Fprintf(os.Stderr, "Error: Invalid end date format. Use YYYY-MM-DD\n")
 			os.Exit(1)
 		}
 		// Add 23:59:59 to include the entire end date
@@ -195,7 +195,7 @@ Examples:
 
 	ftsRetentionParsed, err := resolveImportFTSRetention(*ftsRetention)
 	if err != nil {
-		fmt.Printf("Error: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -388,7 +388,7 @@ func handleExportCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printExportUsage()
 	default:
-		fmt.Printf("Unknown export subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown export subcommand: %s\n\n", subcommand)
 		printExportUsage()
 		os.Exit(1)
 	}
@@ -460,19 +460,19 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *maildirPath == "" {
-		fmt.Printf("Error: --maildir-path is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --maildir-path is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *jobs < 1 {
-		fmt.Printf("Error: --jobs must be at least 1\n")
+		fmt.Fprintf(os.Stderr, "Error: --jobs must be at least 1\n")
 		os.Exit(1)
 	}
 
@@ -481,7 +481,7 @@ Examples:
 	if *startDate != "" {
 		t, err := time.Parse("2006-01-02", *startDate)
 		if err != nil {
-			fmt.Printf("Error: Invalid start date format. Use YYYY-MM-DD\n")
+			fmt.Fprintf(os.Stderr, "Error: Invalid start date format. Use YYYY-MM-DD\n")
 			os.Exit(1)
 		}
 		startDateParsed = &t
@@ -489,7 +489,7 @@ Examples:
 	if *endDate != "" {
 		t, err := time.Parse("2006-01-02", *endDate)
 		if err != nil {
-			fmt.Printf("Error: Invalid end date format. Use YYYY-MM-DD\n")
+			fmt.Fprintf(os.Stderr, "Error: Invalid end date format. Use YYYY-MM-DD\n")
 			os.Exit(1)
 		}
 		// Add 23:59:59 to include the entire end date

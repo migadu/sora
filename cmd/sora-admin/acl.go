@@ -29,7 +29,7 @@ func handleACLCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printACLUsage()
 	default:
-		fmt.Printf("Unknown acl subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown acl subcommand: %s\n\n", subcommand)
 		printACLUsage()
 		os.Exit(1)
 	}
@@ -96,7 +96,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -113,7 +113,7 @@ Examples:
 	// Grant ACL (use context with config)
 	err = aclSvc.Grant(ctxWithConfig, *email, *mailbox, targetIdentifier, *rights)
 	if err != nil {
-		fmt.Printf("Failed to grant ACL: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to grant ACL: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -173,7 +173,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -190,7 +190,7 @@ Examples:
 	// Revoke ACL (use context with config)
 	err = aclSvc.Revoke(ctxWithConfig, *email, *mailbox, targetIdentifier)
 	if err != nil {
-		fmt.Printf("Failed to revoke ACL: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to revoke ACL: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -235,7 +235,7 @@ Examples:
 	// Create database connection
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
@@ -252,7 +252,7 @@ Examples:
 	// List ACLs (use context with config)
 	acls, err := aclSvc.List(ctxWithConfig, *email, *mailbox)
 	if err != nil {
-		fmt.Printf("Failed to list ACLs: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to list ACLs: %v\n", err)
 		os.Exit(1)
 	}
 

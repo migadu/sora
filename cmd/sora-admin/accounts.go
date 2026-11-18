@@ -42,7 +42,7 @@ func handleAccountsCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printAccountsUsage()
 	default:
-		fmt.Printf("Unknown accounts subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown accounts subcommand: %s\n\n", subcommand)
 		printAccountsUsage()
 		os.Exit(1)
 	}
@@ -92,26 +92,26 @@ Examples:
 
 	// Validate required arguments
 	if *credentials == "" && *email == "" {
-		fmt.Printf("Error: either --email or --credentials is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: either --email or --credentials is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *credentials != "" && (*email != "" || *password != "" || *passwordHash != "") {
-		fmt.Printf("Error: cannot specify --credentials with --email, --password, or --password-hash\n\n")
+		fmt.Fprintf(os.Stderr, "Error: cannot specify --credentials with --email, --password, or --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *credentials == "" {
 		if *password == "" && *passwordHash == "" {
-			fmt.Printf("Error: either --password or --password-hash is required\n\n")
+			fmt.Fprintf(os.Stderr, "Error: either --password or --password-hash is required\n\n")
 			fs.Usage()
 			os.Exit(1)
 		}
 
 		if *password != "" && *passwordHash != "" {
-			fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
+			fmt.Fprintf(os.Stderr, "Error: cannot specify both --password and --password-hash\n\n")
 			fs.Usage()
 			os.Exit(1)
 		}
@@ -127,7 +127,7 @@ Examples:
 		}
 	}
 	if !hashTypeValid {
-		fmt.Printf("Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
+		fmt.Fprintf(os.Stderr, "Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -182,7 +182,7 @@ Examples:
 
 	// Validate required arguments
 	if *domain == "" {
-		fmt.Printf("Error: --domain is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --domain is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -229,7 +229,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -281,19 +281,19 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *password == "" && *passwordHash == "" && !*makePrimary {
-		fmt.Printf("Error: either --password, --password-hash, or --make-primary must be specified\n\n")
+		fmt.Fprintf(os.Stderr, "Error: either --password, --password-hash, or --make-primary must be specified\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if *password != "" && *passwordHash != "" {
-		fmt.Printf("Error: cannot specify both --password and --password-hash\n\n")
+		fmt.Fprintf(os.Stderr, "Error: cannot specify both --password and --password-hash\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -308,7 +308,7 @@ Examples:
 		}
 	}
 	if !hashTypeValid {
-		fmt.Printf("Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
+		fmt.Fprintf(os.Stderr, "Error: --hash must be one of: %s\n\n", strings.Join(validHashTypes, ", "))
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -374,13 +374,13 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if !*confirm {
-		fmt.Printf("Error: --confirm is required for account deletion\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --confirm is required for account deletion\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -429,7 +429,7 @@ Examples:
 
 	// Validate required arguments
 	if *email == "" {
-		fmt.Printf("Error: --email is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --email is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
@@ -491,13 +491,13 @@ Examples:
 
 	// Validate required arguments
 	if *domain == "" {
-		fmt.Printf("Error: --domain is required\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --domain is required\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}
 
 	if !*confirm {
-		fmt.Printf("Error: --confirm is required for domain purge\n\n")
+		fmt.Fprintf(os.Stderr, "Error: --confirm is required for domain purge\n\n")
 		fs.Usage()
 		os.Exit(1)
 	}

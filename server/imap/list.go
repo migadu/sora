@@ -191,7 +191,7 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 						statusData.UIDNext = imap.UID(summary.UIDNext)
 					}
 					if options.ReturnStatus.NumRecent {
-						num := uint32(summary.RecentCount)
+						num := s.statusNumRecent(readCtx, mbox.ID, summary)
 						statusData.NumRecent = &num
 					}
 					if options.ReturnStatus.NumUnseen {

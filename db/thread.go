@@ -9,6 +9,7 @@ import (
 
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/config"
+	"github.com/migadu/sora/helpers"
 	"github.com/migadu/sora/logger"
 	"github.com/migadu/sora/pkg/metrics"
 )
@@ -24,6 +25,10 @@ type ThreadMessageResult struct {
 	SentDate     time.Time
 	InternalDate time.Time // arrival; THREAD=REFS orders threads by it
 	Seq          uint32
+
+	// ReplyOrForward: the Subject marks a reply or forward (helpers.SubjectIsReplyOrForward),
+	// which the subject merge of REFERENCES goes by (RFC 5256 section 3, step 5).
+	ReplyOrForward bool
 }
 
 // ErrThreadTooManyMessages is returned when a THREAD search matches more than
@@ -62,9 +67,9 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 	whereArgs["mailboxID"] = mailboxID
 	whereArgs["accountID"] = accountID
 
-	subjectSelect := `'' AS subject_sort`
+	subjectSelect := `'' AS subject_sort, '' AS subject`
 	if includeSubject {
-		subjectSelect = subjectCasemapKey("m.subject_sort") + " AS subject_sort"
+		subjectSelect = subjectCasemapKey("m.subject_sort") + " AS subject_sort, m.subject"
 	}
 
 	// The FTS table is joined only for a BODY or TEXT key: one probe per message
@@ -126,10 +131,10 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		// Handle potential NULLs using pgx's implicit pointer handling if necessary.
 		// However, in_reply_to and message_id are usually empty strings rather than NULL in our schema,
 		// but we'll use pointers just in case to be perfectly safe.
-		var msgID, inReplyTo, references, subjectSort *string
+		var msgID, inReplyTo, references, subjectSort, subject *string
 		var sentDate *time.Time
 
-		if err := rows.Scan(&msg.UID, &msgID, &inReplyTo, &references, &subjectSort, &sentDate, &msg.InternalDate, &msg.Seq); err != nil {
+		if err := rows.Scan(&msg.UID, &msgID, &inReplyTo, &references, &subjectSort, &subject, &sentDate, &msg.InternalDate, &msg.Seq); err != nil {
 			return nil, fmt.Errorf("failed to scan thread message: %w", err)
 		}
 
@@ -147,6 +152,9 @@ func (db *Database) GetMessagesForThreading(ctx context.Context, mailboxID, acco
 		}
 		if subjectSort != nil {
 			msg.SubjectSort = *subjectSort
+		}
+		if subject != nil {
+			msg.ReplyOrForward = helpers.SubjectIsReplyOrForward(*subject)
 		}
 		if sentDate != nil {
 			msg.SentDate = *sentDate

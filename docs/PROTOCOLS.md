@@ -237,7 +237,8 @@ new logins and deliveries ([PROXY.md](PROXY.md)). What clients see:
 On shutdown, IMAP sends `* BYE Server shutting down, please reconnect` to every session, POP3 sends
 `-ERR Server shutting down, please reconnect`, and ManageSieve sends
 `BYE (TRYLATER) "Server shutting down, please reconnect"`. Each then waits up to 30 seconds for
-sessions to end. LMTP answers commands in progress with `421 4.2.1 service shutting down`. The full
+sessions to end. LMTP answers commands in progress with `421 4.2.1 service shutting down`, waits up
+to 2 seconds for the transactions under way to be answered, then closes its connections. The full
 shutdown order is in [OPERATIONS.md](OPERATIONS.md).
 
 ---
@@ -481,8 +482,12 @@ A mailbox opened with `EXAMINE` reports an empty `PERMANENTFLAGS` list. `STORE` 
 Sora tracks `\Recent` in memory on each server, per mailbox, from the highest UID at the last
 read-write `SELECT`. It is approximate across several servers and is reset on restart. Within a
 session, the `RECENT` count, `SEARCH RECENT` (and `NEW`, `OLD`) and the `\Recent` flag in `FETCH
-FLAGS` all use the same threshold, so they agree. A client that has enabled IMAP4rev2, where
-`\Recent` is deprecated, sees it on no message.
+FLAGS` all use the same threshold, so they agree. `EXAMINE` and `CLOSE` leave `\Recent` alone.
+`STATUS` and `LIST ... RETURN (STATUS (RECENT))` count, and multimailbox `SEARCH` (`ESEARCH IN`)
+matches `RECENT`, `NEW` and `OLD` against, what an `EXAMINE` would see: the messages above that
+UID, or all of them before the first read-write `SELECT` since the server started; for the
+session's selected mailbox, the session's own `\Recent` messages. A client that has enabled
+IMAP4rev2, where `\Recent` is deprecated, sees it on no message.
 
 **EXPUNGE**
 
@@ -943,7 +948,7 @@ at the moment, gets `-ERR [SYS/TEMP] Session memory limit reached, please try ag
 | Situation | Reply |
 |---|---|
 | Wrong address or password, an address that does not parse, or rate-limited | `-ERR [AUTH] Authentication failed` |
-| `USER`/`PASS` with a user name or password that is not valid UTF-8 | `-ERR [AUTH] Authentication failed` |
+| An empty password, or a user name or password that is not valid UTF-8 | `-ERR [AUTH] Authentication failed` |
 | Login before TLS on a STARTTLS port with `insecure_auth = false` | `-ERR Authentication requires TLS. Use STLS first` |
 | Too many logins waiting in the delay queue | `-ERR [SYS/TEMP] Too many concurrent authentication attempts. Please try again later.` |
 | The database cannot be reached | `-ERR [SYS/TEMP] Service temporarily unavailable, please try again later` |
@@ -959,9 +964,14 @@ not tell a guessed name from a real one.
 User names and passwords are UTF-8, as `UTF8 USER` says, and a client may use them without sending
 `UTF8` first. They are compared as sent: Sora does not apply SASLprep (RFC 4013), which RFC 6856
 §2.2 recommends, because the stored password hashes were made from the passwords as typed. A
-user name or password that is not valid UTF-8 (RFC 3629) is refused, as RFC 6856 §2.2 requires,
-before its credentials are looked up; no stored password can match it, so the attempt is not
-counted by the rate limiter.
+user name or password that is not valid UTF-8 (RFC 3629) is refused, as RFC 6856 §2.2 requires.
+
+An empty password and a user name or password that is not valid UTF-8, with `USER`/`PASS` or
+`AUTH PLAIN` (whose authorization identity must be UTF-8 too, RFC 4616), are credentials no account
+can have. They are refused without being looked up, but otherwise like an address that does not
+parse: after the rate-limit check, and counted as a failed login
+([AUTHENTICATION.md](AUTHENTICATION.md#3-how-a-login-name-is-read)). The POP3 proxy follows the
+same rule.
 
 The library closes a session after 4 errors (failed logins included), with
 `-ERR Too many errors, closing connection`. Each error adds a delay of 3 seconds times the error
@@ -1191,7 +1201,7 @@ Temporary failures, all of which make the MTA retry:
 | `451 4.3.0 Message processing timed out, please try again later` | The DATA timeout ran out. |
 | `452 4.3.1 Insufficient system storage` | The upload spool is over its size limit. |
 | `452 4.3.1 Insufficient system storage, please try again later` | The spool disk is full or read-only. |
-| `421 4.4.5 Server busy, try again later` | A lock could not be taken in time. |
+| `451 4.4.5 Server busy, try again later` | A lock could not be taken in time. |
 | `421 4.4.2 Error reading message data` | The data could not be read from the connection. |
 | `421 4.2.1 service shutting down` | The server is shutting down. |
 | `451 4.3.0 <text>` | Another internal error, for example `failed to save message` or `failed to save message to disk: <cause>`. The text names the cause, never the spool path. |

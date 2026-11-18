@@ -172,11 +172,20 @@ func (s *Session) handleConnection() {
 
 	// Enforce absolute session timeout to prevent hung sessions from leaking
 	if s.settings.absoluteSessionTimeout > 0 {
+		// The timer goroutine only cancels: logging there read the session's
+		// username/account fields while the session goroutine wrote them. The
+		// session goroutine logs it on the way out instead.
+		var timedOut atomic.Bool
 		timeout := time.AfterFunc(s.settings.absoluteSessionTimeout, func() {
-			s.InfoLog("Absolute session timeout reached - force closing", "duration", s.settings.absoluteSessionTimeout)
+			timedOut.Store(true)
 			s.cancel() // Force cancel context to unblock any stuck I/O
 		})
-		defer timeout.Stop()
+		defer func() {
+			if timeout.Stop() || !timedOut.Load() {
+				return // ended before the timeout
+			}
+			s.InfoLog("Absolute session timeout reached - force closed", "duration", s.settings.absoluteSessionTimeout)
+		}()
 	}
 
 	// Log connection at INFO level
@@ -2527,12 +2536,14 @@ const (
 	// backend that stops draining its socket cannot hold the session goroutine and its
 	// connection slot until the absolute session timeout.
 	relayBackendWriteDeadline = 30 * time.Second
-	// relayEndOfDataTimeout bounds the wait for the backend's end-of-data replies. It
-	// must outlive the backend's own DATA processing cap (60 s) by a wide margin: a
-	// proxy that gives up first leaves the backend free to commit a message the MTA is
-	// told nothing about, which the MTA then re-sends.
-	relayEndOfDataTimeout = 5 * time.Minute
 )
+
+// relayEndOfDataTimeout bounds the wait for the backend's end-of-data replies. It
+// must outlive the backend's own DATA processing cap (60 s) by a wide margin: a
+// proxy that gives up first leaves the backend free to commit a message the MTA is
+// told nothing about, which the MTA then re-sends. A variable only so tests can
+// shorten it.
+var relayEndOfDataTimeout = 5 * time.Minute
 
 // relayMessageData relays one DATA body from the client to the backend, then the
 // backend's end-of-data replies — one final reply line per accepted recipient (RFC 2033

@@ -254,7 +254,7 @@ func (db *Database) getAllFlagsForMessage(ctx context.Context, tx pgx.Tx, messag
 	}
 
 	// Convert custom keywords to imap.Flag and sanitize to remove invalid values
-	// that may have been stored before validation was added (e.g., NIL, NULL)
+	// that may have been stored before validation was added (e.g., non-atoms)
 	for _, kw := range customKeywords {
 		allFlags = append(allFlags, imap.Flag(kw))
 	}
@@ -548,7 +548,7 @@ func (db *Database) RemoveMessageFlags(ctx context.Context, tx pgx.Tx, messageUI
 // GetUniqueCustomFlagsForMailbox retrieves a list of unique custom flags
 // (keywords) currently in use for messages within a specific mailbox.
 // It excludes system flags (those starting with '\').
-// Also sanitizes flags to remove invalid values (NIL, NULL, etc.) that may have been stored.
+// Also sanitizes flags to remove invalid values (empty, non-atom) that may have been stored.
 //
 // OPTIMIZATION: Uses the custom_flags_cache column in mailbox_stats (maintained by trigger)
 // instead of scanning all messages with JSONB LATERAL expansion.
@@ -615,7 +615,7 @@ func (db *Database) GetUniqueCustomFlagsForMailbox(ctx context.Context, mailboxI
 		return nil, fmt.Errorf("error iterating unique custom flags for mailbox %d: %w", mailboxID, err)
 	}
 
-	// Sanitize to remove invalid flags (NIL, NULL, etc.) that may have been stored
+	// Sanitize to remove invalid flags (empty, non-atom) that may have been stored
 	sanitizedFlags := helpers.SanitizeFlags(flags)
 
 	// Convert back to []string for return

@@ -8,6 +8,7 @@ import (
 	"net"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	msieve "github.com/migadu/go-managesieve/managesieve"
 	"github.com/migadu/go-managesieve/managesieveserver"
@@ -395,6 +396,18 @@ func (s *ManageSieveSession) AuthenticatePlain(ctx context.Context, authzID, aut
 			}
 		}
 
+		// RFC 4616 section 2: every field of a PLAIN message is UTF-8 ("SAFE = ...
+		// any UTF-8 encoded Unicode character except NUL"). A field that is not names
+		// no account: refused before anything is looked up, but as a failed login,
+		// recorded and counted like a name that does not parse (below).
+		if !utf8.ValidString(authzID) || !utf8.ValidString(authnID) || !utf8.ValidString(password) {
+			s.InfoLog("authentication refused: SASL PLAIN field not valid UTF-8")
+			if s.server.authLimiter != nil {
+				s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+			}
+			return errAuthFailed
+		}
+
 		address, err := server.NewAddress(authnID)
 		if err != nil {
 			s.WarnLog("invalid address format", "error", err)
@@ -543,6 +556,18 @@ func (s *ManageSieveSession) Login(ctx context.Context, username, password strin
 			// state isn't an observable oracle. (security-audit M14)
 			return errAuthFailed
 		}
+	}
+
+	// An empty password is a credential no account can have: refused without a
+	// lookup, but as a failed login, recorded and counted like an address that does
+	// not parse (below). No master password is empty.
+	if password == "" {
+		s.InfoLog("login refused: empty password")
+		if s.server.authLimiter != nil {
+			s.server.authLimiter.RecordAuthAttemptWithProxy(ctx, netConn, proxyInfo, authKey, false)
+		}
+		metrics.AuthenticationAttempts.WithLabelValues("managesieve", s.server.name, s.server.hostname, "failure").Inc()
+		return errAuthFailed
 	}
 
 	address, err := server.NewAddress(username)

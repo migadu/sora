@@ -42,7 +42,7 @@ func handleSieveCommand(ctx context.Context) {
 	case "help", "--help", "-h":
 		printSieveUsage()
 	default:
-		fmt.Printf("Unknown sieve subcommand: %s\n\n", subcommand)
+		fmt.Fprintf(os.Stderr, "Unknown sieve subcommand: %s\n\n", subcommand)
 		printSieveUsage()
 		os.Exit(1)
 	}
@@ -71,27 +71,27 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
 
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
 	scripts, err := rdb.GetUserScriptsWithRetry(ctx, accountID)
 	if err != nil {
-		fmt.Printf("Failed to retrieve Sieve scripts: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to retrieve Sieve scripts: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -143,26 +143,26 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *name == "" {
-		fmt.Println("Error: --name is required")
+		fmt.Fprintln(os.Stderr, "Error: --name is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
 
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -171,7 +171,7 @@ Examples:
 		if errors.Is(err, consts.ErrDBNotFound) {
 			fmt.Printf("Script '%s' not found for account %s\n", *name, *email)
 		} else {
-			fmt.Printf("Failed to retrieve Sieve script: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to retrieve Sieve script: %v\n", err)
 		}
 		os.Exit(1)
 	}
@@ -210,18 +210,18 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *name == "" {
-		fmt.Println("Error: --name is required")
+		fmt.Fprintln(os.Stderr, "Error: --name is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 
 	if err := validateScriptName(*name); err != nil {
-		fmt.Printf("Error: invalid script name '%s': %v\n", *name, err)
+		fmt.Fprintf(os.Stderr, "Error: invalid script name '%s': %v\n", *name, err)
 		os.Exit(1)
 	}
 
@@ -230,45 +230,45 @@ Examples:
 	if *file == "" || *file == "-" {
 		scriptContent, err = io.ReadAll(os.Stdin)
 		if err != nil {
-			fmt.Printf("Failed to read script from stdin: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to read script from stdin: %v\n", err)
 			os.Exit(1)
 		}
 	} else {
 		scriptContent, err = os.ReadFile(*file)
 		if err != nil {
-			fmt.Printf("Failed to read script file: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to read script file: %v\n", err)
 			os.Exit(1)
 		}
 	}
 
 	if len(scriptContent) > maxSieveScriptSize {
-		fmt.Printf("Error: script size exceeds maximum allowed limit of %d bytes (got %d bytes)\n", maxSieveScriptSize, len(scriptContent))
+		fmt.Fprintf(os.Stderr, "Error: script size exceeds maximum allowed limit of %d bytes (got %d bytes)\n", maxSieveScriptSize, len(scriptContent))
 		os.Exit(1)
 	}
 
 	// A script delivery cannot compile is skipped whole, so refuse it here as
 	// ManageSieve would; this needs no database.
 	if err := sieveengine.ValidateScript(string(scriptContent), globalConfig.Sieve.EnabledExtensions); err != nil {
-		fmt.Printf("Script validation failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Script validation failed: %v\n", err)
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
 
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
 	_, _, err = rdb.CreateOrUpdateScriptWithRetry(ctx, accountID, *name, string(scriptContent))
 	if err != nil {
-		fmt.Printf("Failed to save Sieve script: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to save Sieve script: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -300,26 +300,26 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *name == "" {
-		fmt.Println("Error: --name is required")
+		fmt.Fprintln(os.Stderr, "Error: --name is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
 
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -328,7 +328,7 @@ Examples:
 		if errors.Is(err, consts.ErrDBNotFound) {
 			fmt.Printf("Script '%s' not found for account %s\n", *name, *email)
 		} else {
-			fmt.Printf("Failed to delete Sieve script: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to delete Sieve script: %v\n", err)
 		}
 		os.Exit(1)
 	}
@@ -361,26 +361,26 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *name == "" {
-		fmt.Println("Error: --name is required")
+		fmt.Fprintln(os.Stderr, "Error: --name is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
 
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -392,12 +392,12 @@ Examples:
 		if errors.Is(err, consts.ErrDBNotFound) {
 			fmt.Printf("Script '%s' not found for account %s\n", *name, *email)
 		} else {
-			fmt.Printf("Failed to retrieve Sieve script: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to retrieve Sieve script: %v\n", err)
 		}
 		os.Exit(1)
 	}
 	if err := sieveengine.ValidateScript(script.Script, globalConfig.Sieve.EnabledExtensions); err != nil {
-		fmt.Printf("Script '%s' does not compile and was not activated: %v\n", *name, err)
+		fmt.Fprintf(os.Stderr, "Script '%s' does not compile and was not activated: %v\n", *name, err)
 		os.Exit(1)
 	}
 
@@ -406,7 +406,7 @@ Examples:
 		if errors.Is(err, consts.ErrDBNotFound) {
 			fmt.Printf("Script '%s' not found for account %s\n", *name, *email)
 		} else {
-			fmt.Printf("Failed to activate Sieve script: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to activate Sieve script: %v\n", err)
 		}
 		os.Exit(1)
 	}
@@ -437,27 +437,27 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
 
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
 	err = rdb.DeactivateAllScriptsWithRetry(ctx, accountID)
 	if err != nil {
-		fmt.Printf("Failed to deactivate Sieve scripts: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to deactivate Sieve scripts: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -491,36 +491,36 @@ Examples:
 	fs.Parse(os.Args[3:])
 
 	if *email == "" {
-		fmt.Println("Error: --email is required")
+		fmt.Fprintln(os.Stderr, "Error: --email is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *oldName == "" {
-		fmt.Println("Error: --old is required")
+		fmt.Fprintln(os.Stderr, "Error: --old is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 	if *newName == "" {
-		fmt.Println("Error: --new is required")
+		fmt.Fprintln(os.Stderr, "Error: --new is required")
 		fs.PrintDefaults()
 		os.Exit(1)
 	}
 
 	if err := validateScriptName(*newName); err != nil {
-		fmt.Printf("Error: invalid new script name '%s': %v\n", *newName, err)
+		fmt.Fprintf(os.Stderr, "Error: invalid new script name '%s': %v\n", *newName, err)
 		os.Exit(1)
 	}
 
 	rdb, err := newAdminDatabase(ctx, &globalConfig.Database)
 	if err != nil {
-		fmt.Printf("Failed to connect to database: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to connect to database: %v\n", err)
 		os.Exit(1)
 	}
 	defer rdb.Close()
 
 	accountID, err := rdb.GetAccountIDByEmailWithRetry(ctx, *email)
 	if err != nil {
-		fmt.Printf("Failed to find account: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to find account: %v\n", err)
 		os.Exit(1)
 	}
 
@@ -531,7 +531,7 @@ Examples:
 		} else if errors.Is(err, consts.ErrDBUniqueViolation) {
 			fmt.Printf("A script named '%s' already exists for account %s\n", *newName, *email)
 		} else {
-			fmt.Printf("Failed to rename Sieve script: %v\n", err)
+			fmt.Fprintf(os.Stderr, "Failed to rename Sieve script: %v\n", err)
 		}
 		os.Exit(1)
 	}

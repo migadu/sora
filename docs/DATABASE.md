@@ -834,6 +834,23 @@ do not need cron jobs for these. The steps that remove messages, mailboxes and a
 only once message-body deletion is turned on ([STORAGE.md](STORAGE.md#95-how-deletions-are-made-safe));
 until then expunged rows and deleted accounts stay in the database.
 
+### Deleting messages by hand
+
+The `mailbox_stats` counters are kept by triggers on `messages` and `message_state`. A `DELETE` on
+`messages` removes the message's `message_state` row by cascade before either trigger runs, so
+neither can see whether a message that was still live (not expunged) was unseen: the message and
+its size leave the counts, but it stays in the folder's unseen count. Sora therefore never deletes
+a live message directly. Whatever it removes for good, it expunges first, holding the folder's row
+lock (`SELECT 1 FROM mailboxes WHERE id = ... FOR UPDATE`), and then deletes only rows that are
+expunged or in no folder. Deleting a folder works the same way: its messages are expunged before
+their flag rows are detached from it.
+
+Follow the same order in SQL of your own: expunge the messages
+(`UPDATE messages SET expunged_at = now(), expunged_modseq = nextval('messages_modseq') WHERE ...`)
+while holding the folder's lock, and let the cleaner delete them after the grace period, or delete
+them yourself. If live messages were deleted directly, run
+[`mailbox repair-unseen --apply`](ADMIN_CLI.md#mailbox-repair-unseen) to fix the counts.
+
 ### Repair commands
 
 `sora-admin` has commands for data that older releases left inconsistent. Each one has a dry-run

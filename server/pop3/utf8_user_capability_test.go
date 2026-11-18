@@ -74,8 +74,8 @@ func TestCAPAAdvertisesUTF8User(t *testing.T) {
 // TestLoginWithInvalidUTF8IsRefusedBeforeCredentialCheck: RFC 6856 section 2.2:
 // "The server MUST reject UTF-8 usernames or passwords that fail to comply with the
 // formal syntax in UTF-8 [RFC3629]." Such a login is refused with the bad-credential
-// reply before anything looks the credentials up: the auth limiter is never asked
-// and no database is consulted (this server has none). The session stays usable.
+// reply before anything looks the credentials up (this server has no database), as a
+// failed login recorded by the auth limiter (#1987). The session stays usable.
 // (#1934)
 func TestLoginWithInvalidUTF8IsRefusedBeforeCredentialCheck(t *testing.T) {
 	cases := []struct{ name, user, pass string }{
@@ -101,8 +101,8 @@ func TestLoginWithInvalidUTF8IsRefusedBeforeCredentialCheck(t *testing.T) {
 			if got := strings.TrimRight(line, "\r\n"); got != "-ERR [AUTH] Authentication failed" {
 				t.Fatalf("PASS reply = %q, want -ERR [AUTH] Authentication failed", got)
 			}
-			if n := limiter.checks.Load(); n != 0 {
-				t.Errorf("the auth limiter was asked %d times: the malformed credentials reached the credential check", n)
+			if n := limiter.failures.Load(); n != 1 {
+				t.Errorf("the auth limiter recorded %d failed attempts, want 1", n)
 			}
 
 			// The connection is still served.

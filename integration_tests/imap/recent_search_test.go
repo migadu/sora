@@ -114,15 +114,16 @@ func TestIMAP_RecentIsSessionState(t *testing.T) {
 	// (RFC 3501 §6.4.6).
 	assertFetchRecent(t, "UID STORE 1,3 +FLAGS", esearchCmdOK(t, connB, rB, "b3s", `UID STORE 1,3 +FLAGS (\Flagged)`), []int{1, 3}, []int{3})
 
-	// Multimailbox SEARCH: B has seen nothing arrive in Other, so nothing there
-	// is recent, though its UIDs are above INBOX's threshold.
+	// Multimailbox SEARCH: INBOX answers from B's own threshold; Other, which no
+	// session has selected read-write, from what an EXAMINE would see (as
+	// STATUS does): all of it.
 	recent := esearchCmdOK(t, connB, rB, "b4", `ESEARCH IN (personal) RETURN (ALL) RECENT`)
-	if got := esearchMailboxes(t, recent); len(got) != 1 || !strings.HasSuffix(esearchLine(recent, "INBOX"), " ALL 3:4") {
-		t.Errorf("ESEARCH IN (personal) RECENT: want only INBOX 3:4, got %q", recent)
+	if got := esearchMailboxes(t, recent); len(got) != 2 || !strings.HasSuffix(esearchLine(recent, "INBOX"), " ALL 3:4") || !strings.HasSuffix(esearchLine(recent, "Other"), " ALL 1:3") {
+		t.Errorf("ESEARCH IN (personal) RECENT: want INBOX 3:4 and Other 1:3, got %q", recent)
 	}
 	old := esearchCmdOK(t, connB, rB, "b5", `ESEARCH IN (personal) RETURN (ALL) OLD`)
-	if !strings.HasSuffix(esearchLine(old, "INBOX"), " ALL 1:2") || !strings.HasSuffix(esearchLine(old, "Other"), " ALL 1:3") {
-		t.Errorf("ESEARCH IN (personal) OLD: want INBOX 1:2 and Other 1:3, got %q", old)
+	if got := esearchMailboxes(t, old); len(got) != 1 || !strings.HasSuffix(esearchLine(old, "INBOX"), " ALL 1:2") {
+		t.Errorf("ESEARCH IN (personal) OLD: want only INBOX 1:2, got %q", old)
 	}
 
 	// A selects INBOX after B: nothing is \Recent for A. A's flag changes reach
