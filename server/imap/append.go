@@ -202,6 +202,17 @@ func (s *IMAPSession) Append(ctx context.Context, mboxName string, r imap.Litera
 		return nil, imapErr
 	}
 
+	// A part holding NUL (a literal8 APPEND of binary content) is stored base64
+	// encoded: FETCH BODY sends ordinary literals, which cannot carry NUL, and
+	// RFC 3516 §4.4 permits a lossless CTE change. BINARY[] decodes it back.
+	if encoded, ok := helpers.EncodeNULParts(fullMessageBytes); ok {
+		if grow := int64(len(encoded) - len(fullMessageBytes)); s.memTracker != nil && grow > 0 && s.memTracker.Allocate(grow) == nil {
+			defer s.memTracker.Free(grow)
+		}
+		s.DebugLog("re-encoded NUL-bearing body parts as base64", "size", len(fullMessageBytes), "encoded_size", len(encoded))
+		fullMessageBytes = encoded
+	}
+
 	messageContent, err := server.ParseMessage(bytes.NewReader(fullMessageBytes))
 	if err != nil {
 		// ParseMessage can fail for severely malformed MIME (e.g., missing header colons).

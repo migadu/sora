@@ -438,6 +438,12 @@ start a cache warm-up that copies the newest INBOX messages from S3 to the local
 - An empty message is refused: `NO empty message rejected: a message must contain at least headers`.
 - A missing target mailbox gets `NO [TRYCREATE]`.
 - An APPEND without a date-time gets the current time as its INTERNALDATE (RFC 9051 §6.3.12).
+- A body part that holds a NUL octet under an identity Content-Transfer-Encoding (none, `7bit`,
+  `8bit` or `binary`), as a `~{n}` (literal8, RFC 3516) APPEND may send, is stored base64-encoded
+  with its `Content-Transfer-Encoding` field changed to match. `BODY[...]` and `BODYSTRUCTURE`
+  then describe the base64 form, which an ordinary literal can carry, and `BINARY[...]` returns
+  the original octets (RFC 3516 §4.4 allows a lossless CTE change). Every other part, and every
+  message without such a part, is stored exactly as sent. `RFC822.SIZE` is the stored size.
 - When the session memory limit cannot hold the message:
   `NO [UNAVAILABLE] Session memory limit reached, please try again later`.
 - When this node's upload spool is over its size limit:
