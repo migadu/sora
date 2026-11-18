@@ -159,3 +159,28 @@ func TestAcquireReadLock_SessionContextCancelledStillAborts(t *testing.T) {
 		t.Fatalf("lock wait took %v; expected prompt abort on session context cancellation (< 500ms)", elapsed)
 	}
 }
+
+// TestAcquireWriteLockForClose_SessionContextCancelledStillWaits: a teardown runs
+// after shutdown cancelled the session context and must still wait for the command
+// holding the lock, not give up at once (#1947).
+func TestAcquireWriteLockForClose_SessionContextCancelledStillWaits(t *testing.T) {
+	var mu sync.RWMutex
+	sessionCtx, sessionCancel := context.WithCancel(context.Background())
+	sessionCancel()
+
+	helper := NewMutexTimeoutHelper(&mu, sessionCtx, "test", func(format string, args ...any) {
+		t.Logf(format, args...)
+	})
+
+	mu.Lock()
+	go func() {
+		time.Sleep(50 * time.Millisecond)
+		mu.Unlock()
+	}()
+
+	acquired, release := helper.AcquireWriteLockForClose()
+	if !acquired {
+		t.Fatal("expected the close to wait for the lock although the session context is cancelled")
+	}
+	release()
+}

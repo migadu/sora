@@ -85,7 +85,6 @@ func (h *MutexTimeoutHelper) AcquireReadLockWithTimeout(cmdCtx context.Context) 
 // The lock attempt is cancelled by whichever fires first: the command context,
 // the session context (h.ctx), or the MutexTimeout.
 func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout(cmdCtx context.Context) (bool, func()) {
-	start := time.Now()
 	// Merge session and command contexts: cancel on whichever fires first.
 	merged, mergedCancel := context.WithCancel(cmdCtx)
 	go func() {
@@ -95,9 +94,24 @@ func (h *MutexTimeoutHelper) AcquireWriteLockWithTimeout(cmdCtx context.Context)
 		case <-merged.Done():
 		}
 	}()
-	ctx, cancel := context.WithTimeout(merged, MutexTimeout)
-	defer cancel()
 	defer mergedCancel()
+	return h.acquireWriteLock(merged)
+}
+
+// AcquireWriteLockForClose acquires the write lock for a session's teardown. It waits
+// up to MutexTimeout and, unlike AcquireWriteLockWithTimeout, is not cancelled by the
+// session context: a server shutdown cancels that context before the sessions are
+// closed, and the close must still wait for a command that holds the lock rather than
+// clear the state that command is using.
+func (h *MutexTimeoutHelper) AcquireWriteLockForClose() (bool, func()) {
+	return h.acquireWriteLock(context.Background())
+}
+
+// acquireWriteLock waits for the write lock until parent is done or MutexTimeout passes.
+func (h *MutexTimeoutHelper) acquireWriteLock(parent context.Context) (bool, func()) {
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(parent, MutexTimeout)
+	defer cancel()
 
 	lockChan := make(chan struct{}, 1)
 	go func() {
