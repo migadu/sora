@@ -169,6 +169,17 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// The envelope sender the caller named, in its written form (#1970). It is refused
+	// when it does not parse, as LMTP refuses it at MAIL FROM (#1995), rather than
+	// delivered with none; what is checked here is the sender every recipient gets.
+	// "<>" is the null sender. Only the fallback taken from the From: header below may
+	// be dropped.
+	sender, err := explicitSender(req.From)
+	if err != nil {
+		s.writeError(w, http.StatusBadRequest, fmt.Sprintf("Invalid sender: %v", err))
+		return
+	}
+
 	// Validate message
 	if len(messageBytes) == 0 {
 		s.writeError(w, http.StatusBadRequest, "Message body is required")
@@ -197,14 +208,10 @@ func (s *Server) handleDeliverMail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The envelope sender (#1970). A "from" the caller named is in its written form and
-	// is decoded once; one that does not parse is ignored. Without one, the first From:
-	// address is the sender: net/mail has already decoded it, so it is neither trimmed
-	// nor decoded again.
-	var sender *server.Address
-	if req.From != "" {
-		sender, _ = explicitSender(req.From)
-	} else {
+	// Without a "from", the first From: address is the sender (#1970). net/mail has
+	// already decoded it, so it is neither trimmed nor decoded again, and one that does
+	// not parse is ignored: the caller did not name it.
+	if req.From == "" {
 		if fromAddrs, err := helpers.ParseAddressList(messageEntity.Header.Get("From")); err == nil && len(fromAddrs) > 0 {
 			if addr, err := server.NewReversePath(fromAddrs[0].Address); err == nil {
 				sender = &addr
