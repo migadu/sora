@@ -526,6 +526,12 @@ Other rules for FETCH:
   stored by versions before these rules report what they reported before.
 - **BINARY.** A `BINARY` or `BINARY.SIZE` section whose Content-Transfer-Encoding Sora cannot
   decode gets `NO [UNKNOWN-CTE]` (RFC 9051 §7.5.2).
+- **NUL octets in BODY sections.** `BODY[...]` (and `RFC822`, `RFC822.HEADER`, `RFC822.TEXT`) is
+  sent as an ordinary literal, which cannot carry a NUL octet (RFC 9051 §9). If the stored
+  section holds one, each NUL is sent as the octet 0x80, as Dovecot does, so sizes and
+  `<offset.size>` partial fetches are unchanged. `BINARY[...]` sends the stored octets in a
+  `~{n}` literal8. Each such section is logged as a warning with the message UID and counted in
+  `sora_body_section_nul_replaced_total`.
 - **Large sections fetched in pieces.** A client often fetches a large attachment in
   `<offset.size>` chunks. Sora keeps the last section it extracted or decoded for the session, so
   it does not reload the message for every chunk. A section up to 8 MiB is kept in memory; a
