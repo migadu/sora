@@ -45,6 +45,9 @@ func sortColumnsFor(subject string, recipients []helpers.Recipient) (subjectSort
 	}
 	var fromFound, toFound, ccFound bool
 	for _, r := range recipients {
+		if r.IsGroupMarker() {
+			continue
+		}
 		switch r.AddressType {
 		case "from":
 			if fromFound {
@@ -786,6 +789,8 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			Name:         helpers.SanitizeUTF8(r.Name),
 			EmailAddress: helpers.SanitizeUTF8(r.EmailAddress),
 			AddressType:  r.AddressType,
+			Group:        helpers.SanitizeUTF8(r.Group),
+			GroupEnd:     r.GroupEnd,
 		}
 	}
 
@@ -1174,6 +1179,8 @@ func (d *Database) InsertMessageFromImporter(ctx context.Context, tx pgx.Tx, opt
 			Name:         helpers.SanitizeUTF8(r.Name),
 			EmailAddress: helpers.SanitizeUTF8(r.EmailAddress),
 			AddressType:  r.AddressType,
+			Group:        helpers.SanitizeUTF8(r.Group),
+			GroupEnd:     r.GroupEnd,
 		}
 	}
 
@@ -1431,6 +1438,8 @@ func (d *Database) InsertMessagesBatch(
 				Name:         helpers.SanitizeUTF8(r.Name),
 				EmailAddress: helpers.SanitizeUTF8(r.EmailAddress),
 				AddressType:  r.AddressType,
+				Group:        helpers.SanitizeUTF8(r.Group),
+				GroupEnd:     r.GroupEnd,
 			}
 		}
 

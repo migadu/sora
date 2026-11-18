@@ -65,6 +65,9 @@ func (msg *DBMessage) setRecipients(recipientsJSON []byte) {
 		return
 	}
 	for _, r := range recipients {
+		if r.IsGroupMarker() {
+			continue
+		}
 		switch r.AddressType {
 		case "from":
 			if msg.From == "" {
