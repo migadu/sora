@@ -285,10 +285,16 @@ func (s *IMAPSession) threadReferences(numKind imapserver.NumKind, messages []db
 
 	// 4. Order the threads: REFERENCES by the sent date of each thread's first
 	// message, REFS by the latest INTERNALDATE in each thread, so that the thread
-	// that received mail last comes last.
+	// that received mail last comes last. A dummy's children are put in sent-date
+	// order first, so that step 5 finds its first child.
 	if refs {
 		sortByLatestArrival(rootNodes)
 	} else {
+		for _, root := range rootNodes {
+			if root.msg == nil {
+				sortBySentDate(root.children)
+			}
+		}
 		sortByEarliest(rootNodes)
 	}
 
@@ -373,16 +379,18 @@ func (s *IMAPSession) getMessageID(numKind imapserver.NumKind, msg db.ThreadMess
 	return msg.Seq
 }
 
+// getSubject returns the thread subject of RFC 5256 REFERENCES step 5.B.i: "the
+// base subject from either the current message or its first child if the current
+// message is a dummy". Step 4 put a dummy's children in sent-date order, and an
+// empty subject is the thread's, not a reason to look further (5.B.ii).
 func getSubject(node *jwzNode) string {
-	if node.msg != nil {
-		return node.msg.SubjectSort
+	if node.msg == nil && len(node.children) > 0 {
+		node = node.children[0]
 	}
-	for _, child := range node.children {
-		if s := getSubject(child); s != "" {
-			return s
-		}
+	if node.msg == nil {
+		return ""
 	}
-	return ""
+	return node.msg.SubjectSort
 }
 
 func isAncestor(child, parent *jwzNode) bool {
@@ -455,6 +463,20 @@ func sortByEarliest(nodes []*jwzNode) {
 			return dateI.Before(dateJ)
 		}
 		return getEarliestID(nodes[i]) < getEarliestID(nodes[j])
+	})
+}
+
+// sortBySentDate orders message nodes by their own sent date, then by mailbox
+// order (RFC 5256 section 2.2).
+func sortBySentDate(nodes []*jwzNode) {
+	sort.SliceStable(nodes, func(i, j int) bool {
+		if nodes[i].msg == nil || nodes[j].msg == nil {
+			return nodes[i].msg != nil
+		}
+		if dateI, dateJ := nodes[i].msg.SentDate, nodes[j].msg.SentDate; !dateI.Equal(dateJ) {
+			return dateI.Before(dateJ)
+		}
+		return nodes[i].id < nodes[j].id
 	})
 }
 
