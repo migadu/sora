@@ -1447,29 +1447,36 @@ func (s *POP3ProxySession) Login(ctx context.Context, username, password string)
 	return s.doLogin(ctx, username, password)
 }
 
+// loginErrorReply is the reply to a USER/PASS or AUTH login that authenticate refused
+// with err: a backend outage or a temporary failure is -ERR [SYS/TEMP], anything else
+// [AUTH] Authentication failed.
+func loginErrorReply(err error) *pop3server.Error {
+	var rateLimitErr *server.RateLimitError
+	if errors.As(err, &rateLimitErr) {
+		// DELIBERATE: byte-identical to the bad-password reply below —
+		// a distinguishable throttle reply ([LOGIN-DELAY], "too many
+		// attempts") is an oracle that lets credential-stuffers detect
+		// when the limiter engages, pace just under it, and separate
+		// "throttled, untested" from "tested and wrong". RFC 3206 [AUTH]
+		// is the code for rejected auth; [LOGIN-DELAY] would imply valid
+		// credentials. Only Close differs: drop the connection to shed
+		// load, the text must not change.
+		return &pop3server.Error{Code: "AUTH", Message: "Authentication failed", Close: true}
+	}
+	if server.IsTemporaryAuthFailure(err) {
+		return &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later"}
+	}
+	if server.IsBackendError(err) {
+		return &pop3server.Error{Code: "SYS/TEMP", Message: "Backend server temporarily unavailable"}
+	}
+	return &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
+}
+
 func (s *POP3ProxySession) doLogin(ctx context.Context, username, password string) error {
 	authStart := time.Now()
 	s.username = username
 	if err := s.authenticate(username, password); err != nil {
-		var rateLimitErr *server.RateLimitError
-		if errors.As(err, &rateLimitErr) {
-			// DELIBERATE: byte-identical to the bad-password reply below —
-			// a distinguishable throttle reply ([LOGIN-DELAY], "too many
-			// attempts") is an oracle that lets credential-stuffers detect
-			// when the limiter engages, pace just under it, and separate
-			// "throttled, untested" from "tested and wrong". RFC 3206 [AUTH]
-			// is the code for rejected auth; [LOGIN-DELAY] would imply valid
-			// credentials. Only Close differs: drop the connection to shed
-			// load, the text must not change.
-			return &pop3server.Error{Code: "AUTH", Message: "Authentication failed", Close: true}
-		}
-		if server.IsTemporaryAuthFailure(err) {
-			return &pop3server.Error{Code: "SYS/TEMP", Message: "Service temporarily unavailable, please try again later"}
-		}
-		if server.IsBackendError(err) {
-			return &pop3server.Error{Code: "SYS/TEMP", Message: "Backend server temporarily unavailable"}
-		}
-		return &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
+		return loginErrorReply(err)
 	}
 
 	if err := s.registerConnection(); err != nil {
