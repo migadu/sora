@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/migadu/sora/consts"
 	"github.com/migadu/sora/db"
@@ -1444,6 +1445,15 @@ func (s *POP3ProxySession) Login(ctx context.Context, username, password string)
 	// never unquoted.
 	username = server.UnquoteString(username)
 	password = server.UnquoteString(password)
+	// RFC 6856 section 2.2: "The server MUST reject UTF-8 usernames or passwords
+	// that fail to comply with the formal syntax in UTF-8". No stored credential
+	// can match them, so, like an empty password, they are refused before the
+	// lookup with the wrong-password reply. Valid UTF-8 is checked as sent,
+	// without SASLprep.
+	if !utf8.ValidString(username) || !utf8.ValidString(password) {
+		s.InfoLog("login refused: user name or password is not valid UTF-8")
+		return &pop3server.Error{Code: "AUTH", Message: "Authentication failed"}
+	}
 	return s.doLogin(ctx, username, password)
 }
 

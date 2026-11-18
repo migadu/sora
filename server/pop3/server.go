@@ -394,7 +394,11 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 
 	// Build custom capabilities based on config. Ephemeral-storage retention
 	// drives the CAPA EXPIRE value (RFC 2449 §6.7).
-	var caps []pop3.Capability
+	// UTF8 with the USER argument (RFC 6856 section 2.2): login accepts UTF-8
+	// user names and passwords. The library advertises a bare UTF8, so that
+	// line is suppressed and this one takes its place; the name carries the
+	// argument because SuppressedCaps would also hide a "UTF8" Capability.
+	caps := []pop3.Capability{{Name: "UTF8 USER"}}
 	if param := expireParam(s.maxMessageAge); param != "" {
 		caps = append(caps, pop3.Capability{Name: "EXPIRE", Params: []string{param}})
 	}
@@ -425,6 +429,7 @@ func (s *POP3Server) buildLibServer() *pop3server.Server {
 		ErrorDelay:          Pop3ErrorDelay,
 		StrictSessionErrors: true, // Session errors are *pop3server.Error; mask anything else (DB/S3 text must not reach clients)
 		Caps:                caps,
+		SuppressedCaps:      []string{"UTF8"}, // replaced by "UTF8 USER" in caps
 		Greeting:            "Sora-POP3-Server ready",
 		NewSession: func(c *pop3server.Conn) (pop3server.Session, error) {
 			netConn := c.NetConn()

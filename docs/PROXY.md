@@ -192,7 +192,7 @@ carries its own copy and these server keys are not used for pool members (except
 | `remote_use_proxy_protocol` | bool | `false` | all | Send a PROXY protocol v2 header with the client's address at the start of each backend connection. |
 | `remote_use_id_command` | bool | `false` | IMAP | Send an IMAP `ID` command with the client's address before logging in. |
 | `remote_use_xclient` | bool | `false` | POP3, LMTP | Send an `XCLIENT` command with the client's address. |
-| `remote_use_utf8` | bool | `false` | POP3 | Advertise `UTF8` and `LANG` before login, and repeat a client's pre-login `UTF8` to the backend. Turn on only when every backend is Sora. |
+| `remote_use_utf8` | bool | `false` | POP3 | Advertise `UTF8 USER` and `LANG` before login, and repeat a client's pre-login `UTF8` to the backend. Turn on only when every backend is Sora. |
 | `remote_skip_forwarding_with_proxy_protocol` | bool | `false` | IMAP, POP3 | Leave out the `ID` or `XCLIENT` command on a connection that already starts with a PROXY header. See [section 8.8](#88-leaving-out-id-and-xclient-next-to-proxy). |
 
 ### Listener, limits and timeouts
@@ -796,7 +796,7 @@ The backend-leg settings for one connection come from one place:
 | Inside a named pool | that `[[pool]]` block |
 | `remote_addrs` (no pools) | the proxy's `[[server]]` block |
 
-The POP3 proxy's pre-login `UTF8` and `LANG` advertisement always follows the `[[server]]` block's
+The POP3 proxy's pre-login `UTF8 USER` and `LANG` advertisement always follows the `[[server]]` block's
 `remote_use_utf8`, because the route is not known before login.
 
 ### 8.3 TLS
@@ -866,8 +866,10 @@ any other code, and when the backend does not answer that `LHLO` with `250`.
 POP3 clients may send `UTF8` before logging in (RFC 6856). The POP3 proxy answers it itself. With
 `remote_use_utf8` on the route, it repeats the command to the backend before logging in; a backend
 that refuses it is logged and the session continues without UTF-8. The `[[server]]` block's
-`remote_use_utf8` also decides whether the proxy advertises `UTF8` and `LANG` in `CAPA` before
-login. Some versions of Outlook send `UTF8` after login when it is advertised, and abort if the
+`remote_use_utf8` also decides whether the proxy advertises `UTF8 USER` and `LANG` in `CAPA` before
+login. Either way the proxy accepts UTF-8 user names and passwords, and refuses a `USER`/`PASS`
+login whose user name or password is not valid UTF-8 with `-ERR [AUTH] Authentication failed`,
+without looking it up. Some versions of Outlook send `UTF8` after login when it is advertised, and abort if the
 backend does not support it, so keep it off unless every backend is Sora.
 
 <a id="explicit-suppression-alongside-proxy"></a>

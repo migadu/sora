@@ -455,9 +455,16 @@ func (s *POP3ProxyServer) buildLibServer() *pop3server.Server {
 	// (remote_addrs pool AND remote-lookup routes) honors UTF8. The commands
 	// themselves always work pre-auth regardless (answered locally, mirrored
 	// per-route in connectToBackend).
-	var suppressedCaps []string
-	if !s.remoteUseUTF8 {
-		suppressedCaps = []string{"UTF8", "LANG"}
+	// When advertised, UTF8 carries the USER argument (RFC 6856 section 2.2):
+	// the proxy checks the credentials itself and accepts UTF-8 user names and
+	// passwords. The library's bare UTF8 line is suppressed and replaced; the
+	// name carries the argument because SuppressedCaps would also hide a "UTF8"
+	// Capability.
+	suppressedCaps := []string{"UTF8"}
+	if s.remoteUseUTF8 {
+		caps = append([]pop3.Capability{{Name: "UTF8 USER"}}, caps...)
+	} else {
+		suppressedCaps = append(suppressedCaps, "LANG")
 	}
 
 	opts := pop3server.Options{
