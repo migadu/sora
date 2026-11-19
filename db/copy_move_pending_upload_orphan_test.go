@@ -27,13 +27,17 @@ func unuploadedRowsWithoutPendingUpload(t *testing.T, ctx context.Context, db *D
 }
 
 // insertUnuploadedFixture inserts a live, not yet uploaded message with its pending upload.
-func insertUnuploadedFixture(t *testing.T, ctx context.Context, db *Database, accountID, mailboxID, uid int64, hash string, attempts int) {
+func insertUnuploadedFixture(t *testing.T, ctx context.Context, db *Database, accountID, mailboxID, uid int64, hash string, attempts int) PendingUpload {
 	t.Helper()
 	insertRestageFixture(t, ctx, db.GetWritePool(), accountID, mailboxID, uid, hash, false)
 	_, err := db.GetWritePool().Exec(ctx, `UPDATE messages SET uploaded = FALSE WHERE mailbox_id = $1 AND uid = $2`, mailboxID, uid)
 	require.NoError(t, err)
-	_, err = db.GetWritePool().Exec(ctx, `INSERT INTO pending_uploads (account_id, instance_id, content_hash, size, attempts) VALUES ($1, 'other-instance', $2, 100, $3)`, accountID, hash, attempts)
-	require.NoError(t, err)
+	// A dedicated staging instance lets the next pass acquire only this fixture's upload.
+	upload := PendingUpload{AccountID: accountID, ContentHash: hash, InstanceID: fmt.Sprintf("move-test-%d", accountID)}
+	require.NoError(t, db.GetWritePool().QueryRow(ctx, `
+		INSERT INTO pending_uploads (account_id, instance_id, content_hash, size, attempts)
+		VALUES ($1, $2, $3, 100, $4) RETURNING id`, accountID, upload.InstanceID, hash, attempts).Scan(&upload.ID))
+	return upload
 }
 
 // openCopyOrMove runs a same-account COPY or MOVE of uid from inboxID to archiveID and
@@ -128,20 +132,16 @@ func TestUploadFinishingDuringSameAccountCopyOrMoveKeepsThePendingUpload(t *test
 				hash := fmt.Sprintf("upload_finishes_%s_%s_%d", command, finalize, time.Now().UnixNano())
 				key := "domain/part/" + hash
 				const uid, owner = 9901, "worker-1"
-				insertUnuploadedFixture(t, ctx, db, accountID, inboxID, uid, hash, 0)
-				var pendingID int64
+				upload := insertUnuploadedFixture(t, ctx, db, accountID, inboxID, uid, hash, 0)
 				if finalize == "leased" {
-					// The uploader's path: it finalizes under the lease it wrote with.
-					require.NoError(t, db.GetWritePool().QueryRow(ctx, `
-						UPDATE pending_uploads SET lease_owner = $3, lease_until = now() + interval '10 minutes'
-						WHERE account_id = $1 AND content_hash = $2 RETURNING id`, accountID, hash, owner).Scan(&pendingID))
+					leaseRow(t, db, upload.ID, accountID, hash, owner)
 				}
 
 				commit, commandPID, destUID := openCopyOrMove(t, ctx, db, command, accountID, inboxID, archiveID, uid)
 
 				workerPID, finalizeDone := startUploadWorker(t, ctx, db, func(tx pgx.Tx) error {
 					if finalize == "leased" {
-						return db.CompleteLeasedS3Upload(ctx, tx, pendingID, owner, hash, accountID, []string{key})
+						return db.CompleteLeasedS3Upload(ctx, tx, upload.ID, owner, hash, accountID, []string{key})
 					}
 					return db.CompleteS3Upload(ctx, tx, hash, accountID, []string{key})
 				})
@@ -155,13 +155,7 @@ func TestUploadFinishingDuringSameAccountCopyOrMoveKeepsThePendingUpload(t *test
 					"the new row is not uploaded and has no pending upload, although its body is in S3")
 
 				if command == "MOVE" {
-					var exists bool
-					require.NoError(t, db.GetWritePool().QueryRow(ctx, `
-						SELECT EXISTS (SELECT 1 FROM messages
-							WHERE mailbox_id = $1 AND uid = $2 AND account_id = $3
-							  AND content_hash = $4 AND expunged_at IS NULL)`,
-						archiveID, int64(destUID), accountID, hash).Scan(&exists))
-					require.True(t, exists, "MOVE destination UID %d is missing from the archive", destUID)
+					checkNextMoveUpload(t, ctx, db, upload, archiveID, destUID, key)
 					return
 				}
 				// The pending row that was kept gets the copy marked: the next lease finds
@@ -184,6 +178,47 @@ func TestUploadFinishingDuringSameAccountCopyOrMoveKeepsThePendingUpload(t *test
 			})
 		}
 	}
+}
+
+// MOVE expunged the source, so the next pass needs storage confirmation for the
+// destination's key. The first pass already stored the object under storedKey.
+func checkNextMoveUpload(t *testing.T, ctx context.Context, db *Database, original PendingUpload, archiveID int64, destUID imap.UID, storedKey string) {
+	t.Helper()
+	destinationUploaded := func() bool {
+		t.Helper()
+		var uploaded bool
+		require.NoError(t, db.GetWritePool().QueryRow(ctx, `
+			SELECT uploaded FROM messages WHERE mailbox_id = $1 AND uid = $2 AND account_id = $3
+			  AND content_hash = $4 AND expunged_at IS NULL`,
+			archiveID, int64(destUID), original.AccountID, original.ContentHash).Scan(&uploaded),
+			"MOVE destination UID %d is missing from the archive", destUID)
+		return uploaded
+	}
+	require.False(t, destinationUploaded(), "expected the moved message to need a second upload pass")
+
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer tx.Rollback(ctx)
+	queue, err := db.AcquireAndLeasePendingUploads(ctx, tx, original.InstanceID, 1, time.Second, 5)
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit(ctx))
+	require.Len(t, queue, 1, "the next upload pass must find the retained pending row")
+	upload := queue[0]
+	require.Equal(t, original.ID, upload.ID)
+
+	keys, err := db.PendingUploadKeys(ctx, upload.ContentHash, upload.AccountID)
+	require.NoError(t, err)
+	require.Equal(t, []string{storedKey}, keys, "the worker must verify the moved message's object in storage")
+	const nextOwner = "worker-2"
+	leaseRow(t, db, upload.ID, upload.AccountID, upload.ContentHash, nextOwner)
+	require.NoError(t, pgx.BeginFunc(ctx, db.GetWritePool(), func(tx pgx.Tx) error {
+		return db.CompleteLeasedS3Upload(ctx, tx, upload.ID, nextOwner, upload.ContentHash, upload.AccountID, keys)
+	}))
+
+	assert.True(t, destinationUploaded(), "the second upload pass must mark the moved message uploaded")
+	pending, err := db.PendingUploadExists(ctx, original.ContentHash, original.AccountID)
+	require.NoError(t, err)
+	assert.False(t, pending, "the second upload pass must clear the pending row")
 }
 
 // Here the admin tool deletes a parked upload while the command is open. It waits for the
