@@ -260,10 +260,10 @@ func TestRestageFTSHoldsOffTheOrphanSweep(t *testing.T) {
 }
 
 // A same-account MOVE or COPY must take no FTS advisory locks. The shared lock is one entry
-// per distinct body in PostgreSQL's server-wide lock table (about 25,600 entries in
-// production), held until commit, and MOVE is not batched: moving a large folder within one
-// account would otherwise fill the table and fail unrelated transactions with
-// "out of shared memory".
+// per distinct body in PostgreSQL's server-wide lock table, held until commit, and MOVE is
+// not batched: moving a large folder within one account would otherwise fill the table and
+// fail unrelated transactions with "out of shared memory". The S3 body lock has the same
+// rule: TestSameAccountMoveCopyTakeNoS3BodyLocks.
 func TestSameAccountMoveCopyTakeNoFTSLocks(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")

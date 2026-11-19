@@ -152,10 +152,9 @@ const (
 
 var extraAddressesValue = strings.NewReplacer("\t", " ", "\n", " ")
 
-// ErrCopySourceChanged is returned by CopyMessages when a source row owned by another
-// account than the destination no longer has the content hash the caller made its body
-// available for under the destination owner's S3 path. Nothing is written; reading the
-// source again and copying anew can succeed.
+// ErrCopySourceChanged means a selected source disappeared, was expunged, or
+// changed hash after the caller staged its body for another account. The caller
+// rolls back the transaction and can retry with a fresh source selection.
 var ErrCopySourceChanged = errors.New("a source message changed during the copy")
 
 func truncateHash(hash string) string {
@@ -200,9 +199,13 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, err
 	}
 
-	// The caller is responsible for beginning and committing/rolling back the transaction.
+	// MOVE locks its destination before its sources. Follow that order here so
+	// a MOVE into the same mailbox can finish before COPY locks any source.
+	if err := lockMailboxStats(ctx, tx, destMailboxID); err != nil {
+		return nil, nil, err
+	}
 
-	// Get the source message IDs and UIDs
+	// Resolve the UID mapping first. The INSERT rechecks and locks these identities.
 	rows, err := tx.Query(ctx, `SELECT id, uid, account_id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
@@ -239,7 +242,6 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
-	// The highest_uid UPDATE holds the destination's row lock from here on.
 	window := modSeqWindowFor(ctx, destMailboxID)
 	if err := window.begin(ctx, tx); err != nil {
 		return nil, nil, err
@@ -303,10 +305,12 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				d.custom_flags_canon
 			FROM messages m
 			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::text[]) AS d(message_id, new_uid, custom_flags_canon, expected_hash) ON m.id = d.message_id
-			-- A row re-keyed to another account is copied only with the hash whose body the
-			-- caller made available under the owner's key (sourceHashes); a row left out
-			-- here fails the copy below.
-			WHERE m.account_id = $6 OR m.content_hash = d.expected_hash
+			WHERE m.expunged_at IS NULL
+			  AND (m.account_id = $6 OR m.content_hash = d.expected_hash)
+			-- Use the live row versions returned after any lock wait. Acquire
+			-- all source locks in MOVE's UID order and keep them through commit.
+			ORDER BY m.uid
+			FOR SHARE OF m
 		),
 		inserted AS (
 			INSERT INTO messages (
@@ -399,8 +403,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 //
 // keptUIDs are the copies of the owner's own rows. They stage nothing here: the body is
 // wherever the source was delivered, possibly another node, so an existing row is left
-// alone (DO NOTHING) rather than taken over by this one. It is held instead
-// (holdKeptPendingUploads): the copy depends on it until it commits.
+// alone (DO NOTHING) rather than taken over by this one.
 func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, keptUIDs, rekeyedUIDs []int64, instanceID string) error {
 	if len(rekeyedUIDs) > 0 {
 		if _, err := tx.Exec(ctx, `
@@ -415,36 +418,6 @@ func (db *Database) restagePendingUploads(ctx context.Context, tx pgx.Tx, mailbo
 		}
 	}
 	if len(keptUIDs) > 0 {
-		if err := holdKeptPendingUploads(ctx, tx, mailboxID, keptUIDs, instanceID); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-// keptPendingUploadPasses bounds holdKeptPendingUploads. A pass is repeated only when a
-// pending row it found was deleted before it could be locked.
-const keptPendingUploadPasses = 5
-
-// holdKeptPendingUploads makes sure every not-yet-uploaded row among keptUIDs has a
-// pending upload, and holds those pending rows FOR SHARE until tx ends.
-//
-// The new rows are invisible to everyone else until tx commits, and whoever deletes a
-// pending row decides from the rows it can see: an upload that finishes finds no
-// unuploaded row left and drops it (dropFinishedPendingUpload), the admin tool deletes
-// it with the messages it found (DeleteFailedUpload). Without the lock either could do
-// so between this statement and the commit, and the new row would be left not uploaded
-// with no pending upload: nothing would ever mark it, and CleanupFailedUploads would
-// delete the message, although in the first case its body is in S3. FOR SHARE makes
-// them wait for the commit, after which they see the row: it conflicts with the lock
-// each of them takes on the pending row before it decides (the unleased finalize's FOR
-// UPDATE, the leased finalize's UPDATE that ends its lease, the tool's DELETE). Other
-// copies holding the same row do not conflict.
-//
-// A row that is being deleted when this runs makes the INSERT wait and then insert a
-// new one. A row deleted between the INSERT and the lock is why this loops.
-func holdKeptPendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, keptUIDs []int64, instanceID string) error {
-	for pass := 0; pass < keptPendingUploadPasses; pass++ {
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO pending_uploads (instance_id, content_hash, size, created_at, account_id)
 			SELECT $1, m.content_hash, m.size, NOW(), m.account_id
@@ -454,29 +427,8 @@ func holdKeptPendingUploads(ctx context.Context, tx pgx.Tx, mailboxID int64, kep
 			instanceID, mailboxID, keptUIDs); err != nil {
 			return fmt.Errorf("failed to re-stage pending uploads: %w", err)
 		}
-		var needed, held int
-		if err := tx.QueryRow(ctx, `
-			WITH needed AS (
-				SELECT DISTINCT m.content_hash, m.account_id
-				FROM messages m
-				WHERE m.mailbox_id = $1 AND m.uid = ANY($2) AND m.uploaded = FALSE AND m.expunged_at IS NULL
-			),
-			held AS (
-				SELECT pu.id
-				FROM pending_uploads pu
-				JOIN needed n ON n.content_hash = pu.content_hash AND n.account_id = pu.account_id
-				ORDER BY pu.id
-				FOR SHARE OF pu
-			)
-			SELECT (SELECT count(*) FROM needed), (SELECT count(*) FROM held)`,
-			mailboxID, keptUIDs).Scan(&needed, &held); err != nil {
-			return fmt.Errorf("failed to hold pending uploads: %w", err)
-		}
-		if held >= needed {
-			return nil
-		}
 	}
-	return fmt.Errorf("failed to hold pending uploads: they kept being deleted")
+	return nil
 }
 
 // restageFTS ensures every just-inserted message in (mailboxID, rekeyedUIDs) has a

@@ -27,8 +27,8 @@ const SoraVacationClaimLockClassID = int32(0x56414341) // "VACA"
 const SoraMailboxACLLockClassID = int32(0x41434C31) // "ACL1" in hex = 1094929457
 
 // SoraContentRekeyLockClassID is the class ID of the transaction-scoped advisory lock,
-// keyed by hashint8(account_id), that sora-admin import rekey (db.RekeyContentHash) takes
-// exclusively and COPY and MOVE take shared for the accounts whose rows they copy.
+// keyed by hashint8(account_id). COPY and MOVE take it shared for their source
+// accounts. Content rekey and failed-upload deletion take it exclusively.
 const SoraContentRekeyLockClassID = int32(0x524B4559) // "RKEY" in hex = 1380664665
 
 // SoraMetadataLimitLockClassID is the class ID of the transaction-scoped advisory lock,

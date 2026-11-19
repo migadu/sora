@@ -125,7 +125,8 @@ CREATE DATABASE sora_mail_db OWNER sora ENCODING 'UTF8' TEMPLATE template0;
     distinct body it carries, and their search rows, until it commits. Such a command may carry
     at most 1,000 distinct bodies, so it takes at most about 2,000 advisory locks, plus its
     ordinary row locks. A larger command is refused with `NO [LIMIT]` and changes nothing.
-    COPY and MOVE within one account have no such limit.
+    `COPY` and `MOVE` within one account have no such limit and take no advisory lock per body:
+    they hold row locks on their source messages instead, which do not use the lock table.
 
   These numbers are per transaction. Leave room for several of them at once, and for all other
   locks.

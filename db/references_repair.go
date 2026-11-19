@@ -44,10 +44,16 @@ const nullReferencesBatchSQL = `
 // fillNullReferencesSQL writes each value to its row by primary key, only while the row
 // is still live and NULL: a row expunged or filled since the scan is left as it is.
 const fillNullReferencesSQL = `
+	WITH targets AS MATERIALIZED (
+		SELECT m.id, f.refs FROM messages m
+		JOIN unnest($1::bigint[], $2::text[]) AS f(id, refs) ON m.id = f.id
+		WHERE m."references" IS NULL AND m.expunged_at IS NULL
+		` + lockMessageUpdatesInOrder + `
+	)
 	UPDATE messages m
-	SET "references" = f.refs
-	FROM unnest($1::bigint[], $2::text[]) AS f(id, refs)
-	WHERE m.id = f.id AND m."references" IS NULL AND m.expunged_at IS NULL`
+	SET "references" = targets.refs
+	FROM targets
+	WHERE m.id = targets.id`
 
 // ReferencesFill is a row with a NULL "references" and the value another row with the
 // same body holds.
@@ -105,7 +111,7 @@ func (d *Database) FindNullReferences(ctx context.Context, afterID int64, limit 
 
 // FillNullReferences writes the values FindNullReferences found, in one statement, and
 // returns how many rows it filled. A row expunged or filled since the scan is skipped.
-// The write transaction bounds lock waits; its UPDATE determines lock order. No modseq changes:
+// Rows are locked in the same order as COPY and MOVE. No modseq changes:
 // FETCH reads a message's headers from its body, so no client-visible data changes, only
 // what SEARCH HEADER References and THREAD find. The column is in no index, so a fill can
 // be a heap-only update.

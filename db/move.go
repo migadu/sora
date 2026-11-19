@@ -154,6 +154,10 @@ func (db *Database) MoveMessages(ctx context.Context, tx pgx.Tx, ids *[]imap.UID
 	// consistent lock ordering: mailbox_stats row locks → row locks on source rows.
 	// Every unseen-mutating path (MOVE, EXPUNGE, STORE) acquires the mailbox_stats
 	// row first and message rows second, so they cannot deadlock against each other.
+	//
+	// These row locks are also what protects the bodies of a move within one account,
+	// which takes no S3 body lock (lockS3SourceClaims): the sources stay live until the
+	// commit that expunges them and makes their replacements visible.
 	rows, err := tx.Query(ctx, `
 		SELECT id, uid, account_id, content_hash FROM messages
 		WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL
