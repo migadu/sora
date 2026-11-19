@@ -10,15 +10,21 @@ import (
 
 // ParseAddressList parses the value of an address header field (From, To, Cc, ...) and
 // returns its addresses, the members of its groups included, each with its decoded
-// display name. The parsing is go-imap's mailaddr.ParseList, the one parser also behind
-// the ENVELOPE of an attached message: besides what net/mail accepts it reads obsolete
+// display name. The parsing is go-imap's mailaddr, the one parser also behind the
+// ENVELOPE of an attached message: besides what net/mail accepts it reads obsolete
 // source routes (ignored here, RFC 5322 section 4.4) and comments around the "@" of an
-// addr-spec. The value is taken as written, so invalid UTF-8 makes it unparseable, as
-// for net/mail (ExtractRecipients, for stored mail, removes such bytes first). Use it
-// for every address header so search, ENVELOPE, vacation and delivery agree on the
-// addresses.
+// addr-spec. Use it for every address header so search, ENVELOPE, vacation and delivery
+// agree on the addresses.
+//
+// The value is taken as written (mailaddr.ParseList): invalid UTF-8 or a NUL makes it
+// unparseable, as for net/mail; ExtractRecipients, for stored mail, removes such bytes
+// first. One thing is read as ExtractRecipients reads it: a value of text that is cut
+// off inside a comment keeps the complete addresses before the comment.
 func ParseAddressList(value string) ([]*mail.Address, error) {
 	entries, err := mailaddr.ParseList(value)
+	if err != nil && mailaddr.Sanitize(value) == value {
+		entries, err = mailaddr.ParseListLenient(value)
+	}
 	if err != nil {
 		return nil, err
 	}
