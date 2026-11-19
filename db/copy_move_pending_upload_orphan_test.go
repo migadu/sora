@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/migadu/go-imap"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,34 +37,57 @@ func insertUnuploadedFixture(t *testing.T, ctx context.Context, db *Database, ac
 }
 
 // openCopyOrMove runs a same-account COPY or MOVE of uid from inboxID to archiveID and
-// leaves its transaction open. It returns the backend pid of that transaction.
-func openCopyOrMove(t *testing.T, ctx context.Context, db *Database, command string, accountID, inboxID, archiveID, uid int64) (commit func(), pid int) {
+// leaves its transaction open. It returns the commit function, backend PID, and destination UID.
+func openCopyOrMove(t *testing.T, ctx context.Context, db *Database, command string, accountID, inboxID, archiveID, uid int64) (commit func(), pid int, destUID imap.UID) {
 	t.Helper()
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	t.Cleanup(func() { tx.Rollback(context.Background()) })
-	pid = int(tx.Conn().PgConn().PID())
+	require.NoError(t, tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid))
 	uids := []imap.UID{imap.UID(uid)}
+	var uidMap map[imap.UID]imap.UID
 	if command == "COPY" {
-		_, _, err = db.CopyMessages(ctx, tx, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
+		uidMap, _, err = db.CopyMessages(ctx, tx, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
 	} else {
-		_, err = db.MoveMessages(ctx, tx, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
+		uidMap, err = db.MoveMessages(ctx, tx, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
 	}
 	require.NoError(t, err)
-	return func() { require.NoError(t, tx.Commit(ctx)) }, pid
+	destUID = uidMap[imap.UID(uid)]
+	require.NotZero(t, destUID, "%s did not return a destination UID for %d", command, uid)
+	return func() { require.NoError(t, tx.Commit(ctx)) }, pid, destUID
 }
 
-// requireBlockedBy fails the test unless some backend waits for a lock that blockerPID
-// holds before done yields. A worker that finishes without waiting for the open command
-// decided without seeing the command's new row: the race these tests are about.
-func requireBlockedBy(t *testing.T, ctx context.Context, db *Database, blockerPID int, done <-chan error, what string) {
+// startUploadWorker returns the PID of the transaction running work and its commit result.
+func startUploadWorker(t *testing.T, ctx context.Context, db *Database, work func(pgx.Tx) error) (int, <-chan error) {
+	t.Helper()
+	tx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	var pid int
+	if err := tx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		tx.Rollback(context.Background())
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		defer tx.Rollback(context.Background())
+		if err := work(tx); err != nil {
+			done <- err
+			return
+		}
+		done <- tx.Commit(ctx)
+	}()
+	return pid, done
+}
+
+// requireBlockedBy waits for the worker to block on the open command.
+func requireBlockedBy(t *testing.T, ctx context.Context, db *Database, workerPID, commandPID int, done <-chan error, what string) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		var blocked bool
 		require.NoError(t, db.GetWritePool().QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))`,
-			blockerPID).Scan(&blocked))
+			`SELECT $2 = ANY(pg_blocking_pids($1))`,
+			workerPID, commandPID).Scan(&blocked))
 		if blocked {
 			return
 		}
@@ -113,37 +137,31 @@ func TestUploadFinishingDuringSameAccountCopyOrMoveKeepsThePendingUpload(t *test
 						WHERE account_id = $1 AND content_hash = $2 RETURNING id`, accountID, hash, owner).Scan(&pendingID))
 				}
 
-				commit, commandPID := openCopyOrMove(t, ctx, db, command, accountID, inboxID, archiveID, uid)
+				commit, commandPID, destUID := openCopyOrMove(t, ctx, db, command, accountID, inboxID, archiveID, uid)
 
-				finalizeDone := make(chan error, 1)
-				go func() {
-					tx, err := db.GetWritePool().Begin(ctx)
-					if err != nil {
-						finalizeDone <- err
-						return
-					}
-					defer tx.Rollback(context.Background())
+				workerPID, finalizeDone := startUploadWorker(t, ctx, db, func(tx pgx.Tx) error {
 					if finalize == "leased" {
-						err = db.CompleteLeasedS3Upload(ctx, tx, pendingID, owner, hash, accountID, []string{key})
-					} else {
-						err = db.CompleteS3Upload(ctx, tx, hash, accountID, []string{key})
+						return db.CompleteLeasedS3Upload(ctx, tx, pendingID, owner, hash, accountID, []string{key})
 					}
-					if err != nil {
-						finalizeDone <- err
-						return
-					}
-					finalizeDone <- tx.Commit(ctx)
-				}()
+					return db.CompleteS3Upload(ctx, tx, hash, accountID, []string{key})
+				})
 				// The command holds the source row, so the finalize must wait for it and
 				// decide only after the new row is visible.
-				requireBlockedBy(t, ctx, db, commandPID, finalizeDone, "the upload finalize")
+				requireBlockedBy(t, ctx, db, workerPID, commandPID, finalizeDone, "the upload finalize")
 				commit()
 				require.NoError(t, <-finalizeDone)
 
 				assert.Zero(t, unuploadedRowsWithoutPendingUpload(t, ctx, db, accountID, hash),
 					"the new row is not uploaded and has no pending upload, although its body is in S3")
 
-				if command != "COPY" {
+				if command == "MOVE" {
+					var exists bool
+					require.NoError(t, db.GetWritePool().QueryRow(ctx, `
+						SELECT EXISTS (SELECT 1 FROM messages
+							WHERE mailbox_id = $1 AND uid = $2 AND account_id = $3
+							  AND content_hash = $4 AND expunged_at IS NULL)`,
+						archiveID, int64(destUID), accountID, hash).Scan(&exists))
+					require.True(t, exists, "MOVE destination UID %d is missing from the archive", destUID)
 					return
 				}
 				// The pending row that was kept gets the copy marked: the next lease finds
@@ -189,23 +207,13 @@ func TestDeleteFailedUploadDuringSameAccountCopyOrMoveLeavesNoRowBehind(t *testi
 			const uid, maxAttempts = 9911, 5
 			insertUnuploadedFixture(t, ctx, db, accountID, inboxID, uid, hash, maxAttempts)
 
-			commit, commandPID := openCopyOrMove(t, ctx, db, command, accountID, inboxID, archiveID, uid)
+			commit, commandPID, _ := openCopyOrMove(t, ctx, db, command, accountID, inboxID, archiveID, uid)
 
-			deleteDone := make(chan error, 1)
-			go func() {
-				tx, err := db.GetWritePool().Begin(ctx)
-				if err != nil {
-					deleteDone <- err
-					return
-				}
-				defer tx.Rollback(context.Background())
-				if _, err := db.DeleteFailedUpload(ctx, tx, hash, accountID, maxAttempts); err != nil {
-					deleteDone <- err
-					return
-				}
-				deleteDone <- tx.Commit(ctx)
-			}()
-			requireBlockedBy(t, ctx, db, commandPID, deleteDone, "DeleteFailedUpload")
+			workerPID, deleteDone := startUploadWorker(t, ctx, db, func(tx pgx.Tx) error {
+				_, err := db.DeleteFailedUpload(ctx, tx, hash, accountID, maxAttempts)
+				return err
+			})
+			requireBlockedBy(t, ctx, db, workerPID, commandPID, deleteDone, "DeleteFailedUpload")
 			commit()
 			require.NoError(t, <-deleteDone)
 
