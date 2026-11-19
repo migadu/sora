@@ -172,14 +172,19 @@ func (ts *TestServer) WaitForUploads(t interface {
 	Fatalf(string, ...any)
 }) {
 	t.Helper()
-	if ts.uploadWorker == nil {
-		return
-	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	if err := ts.uploadWorker.DrainSync(ctx); err != nil {
+	if err := ts.DrainUploads(ctx); err != nil {
 		t.Fatalf("WaitForUploads: DrainSync failed: %v", err)
 	}
+}
+
+// DrainUploads runs the uploader pass under the caller's context.
+func (ts *TestServer) DrainUploads(ctx context.Context) error {
+	if ts.uploadWorker == nil {
+		return nil
+	}
+	return ts.uploadWorker.DrainSync(ctx)
 }
 
 type TestAccount struct {
@@ -749,12 +754,12 @@ func setupIMAPServerForUploadRace(t *testing.T, s3Storage *storage.S3Storage, up
 	// Keep staged APPENDs out of other workers' queues until the test drains this worker.
 	instanceID := "upload-race-" + account.Email
 	uploadWorker, err := uploader.NewWithS3Interface(
-		tempDir,     // path
-		10,          // batchSize
-		1,           // concurrency
-		3,           // maxAttempts
-		time.Second, // retryInterval
-		0,           // maxStagingSize
+		tempDir,   // path
+		10,        // batchSize
+		1,         // concurrency
+		3,         // maxAttempts
+		time.Hour, // keep a retained row out of the same manual pass
+		0,         // maxStagingSize
 		instanceID,
 		rdb, // database
 		uploadS3,
