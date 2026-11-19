@@ -49,6 +49,10 @@ func TestTopLevelEnvelopeMatchesAttached(t *testing.T) {
 		"<@route\x80.example:user@domain>", "<(route\xff) @route:user@domain>", "<@[route\xe2\x82]:user@domain>",
 		"<@route (route\\\x80):user@domain>", "=?utf-8?q?ab=80c?= <a@example.com>", "=?utf-8?q?te=00am?=: a@example.com;",
 		"\uFFFD <j@example.com>", "\xff", "\x00",
+		// a header cut off inside a comment keeps the complete addresses before it
+		"user@example.com (unterminated", "a@example.com, b@example.com (unclosed", "team: a@example.com; (unterminated",
+		"undisclosed-recipients:; (cut", "<user (c) @ example.com> (unclosed", "a@example.com (open, b@example.com",
+		"team: a@example.com (open;", "Name (open <user@example.com>", "te\xc0am: a@example.com; (cut\x00",
 	} {
 		t.Run(value, func(t *testing.T) {
 			h := mail.HeaderFromMap(map[string][]string{"From": {value}, "To": {value}, "Cc": {value}, "Bcc": {value}})
