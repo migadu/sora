@@ -49,3 +49,60 @@ func TestExtractRecipientsAddressComments(t *testing.T) {
 		})
 	}
 }
+
+// TestExtractRecipientsUnterminatedComment: a header cut off inside a comment keeps the
+// complete addresses, and groups, before it: the unclosed comment and everything after it
+// are dropped. A comment left open before an address is finished leaves no address, as
+// before. ParseAddressList, for the same header as written, gives the same addresses.
+func TestExtractRecipientsUnterminatedComment(t *testing.T) {
+	to := func(email, name string) Recipient {
+		return Recipient{AddressType: "to", EmailAddress: email, Name: name}
+	}
+	for _, tc := range []struct {
+		value string
+		want  []Recipient
+	}{
+		{"user@example.com (unterminated", []Recipient{to("user@example.com", "")}},
+		{"a@example.com, b@example.com (unclosed", []Recipient{to("a@example.com", ""), to("b@example.com", "")}},
+		{"team: a@example.com; (unterminated", []Recipient{
+			{AddressType: "to", Group: "team"}, to("a@example.com", ""), {AddressType: "to", GroupEnd: true}}},
+		{"undisclosed-recipients:; (cut", []Recipient{{AddressType: "to", Group: "undisclosed-recipients"}, {AddressType: "to", GroupEnd: true}}},
+		{"<user (c) @ example.com> (unclosed", []Recipient{to("user@example.com", "")}},
+		{`"user (team)"@example.com (unclosed`, []Recipient{to("user (team)@example.com", "")}},
+		{"a@example.com (open, b@example.com", []Recipient{to("a@example.com", "")}},
+		{"<@route:user@example.com> (open", []Recipient{{AddressType: "to", EmailAddress: "user@example.com", Route: "@route"}}},
+		// A closed comment before the cut is the display name it is in the header without
+		// the cut, "c@example.com (closed)". (Sora's own parser used to drop it here: its
+		// fallback for an unclosed comment removed every comment.)
+		{"A <a@example.com>, team: b@example.com;, c@example.com (closed) (open", []Recipient{
+			to("a@example.com", "A"), {AddressType: "to", Group: "team"}, to("b@example.com", ""), {AddressType: "to", GroupEnd: true},
+			to("c@example.com", "closed")}},
+		// The comment opens before an address is complete.
+		{"team: a@example.com (open;", nil},
+		{"Name (open <user@example.com>", nil},
+		{"<user@example.com (open>", nil},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			var h message.Header
+			h.Set("To", tc.value)
+			got := ExtractRecipients(h)
+			if len(got) != len(tc.want) || (len(got) > 0 && !slices.Equal(got, tc.want)) {
+				t.Errorf("ExtractRecipients(To: %s)\n got %+v\nwant %+v", tc.value, got, tc.want)
+			}
+			var want []string
+			for _, r := range tc.want {
+				if !r.IsGroupMarker() {
+					want = append(want, r.EmailAddress)
+				}
+			}
+			list, _ := ParseAddressList(tc.value)
+			var addresses []string
+			for _, a := range list {
+				addresses = append(addresses, a.Address)
+			}
+			if !slices.Equal(addresses, want) {
+				t.Errorf("ParseAddressList(%s) = %q, want %q", tc.value, addresses, want)
+			}
+		})
+	}
+}
