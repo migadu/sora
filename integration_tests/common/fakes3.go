@@ -32,6 +32,7 @@ type FakeS3 struct {
 	server      *httptest.Server
 	mu          sync.Mutex
 	objects     map[string][]byte
+	heads       map[string]int
 	hangGets    bool                // when set, GET holds the connection open until the client gives up
 	failPuts    bool                // when set, every PutObject is refused with AccessDenied
 	failDeletes bool                // when set, every delete is refused with AccessDenied
@@ -111,10 +112,17 @@ func (f *FakeS3) Keys(prefix string) []string {
 	return keys
 }
 
+// HeadCount reports how many HEAD requests the endpoint has received for key.
+func (f *FakeS3) HeadCount(key string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.heads[key]
+}
+
 // NewFakeS3 starts an in-memory S3 server and returns it. Call Close (or rely on
 // the cleanup wired by SetupIMAPServerWithRealS3) to shut it down.
 func NewFakeS3() *FakeS3 {
-	f := &FakeS3{objects: make(map[string][]byte)}
+	f := &FakeS3{objects: make(map[string][]byte), heads: make(map[string]int)}
 	f.server = httptest.NewServer(http.HandlerFunc(f.handle))
 	return f
 }
@@ -179,6 +187,7 @@ func (f *FakeS3) handle(w http.ResponseWriter, r *http.Request) {
 
 	case http.MethodHead:
 		f.mu.Lock()
+		f.heads[key]++
 		data, ok := f.objects[key]
 		f.mu.Unlock()
 		if !ok {
