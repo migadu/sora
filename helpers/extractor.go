@@ -13,8 +13,10 @@ import (
 // display name. The parsing is go-imap's mailaddr.ParseList, the one parser also behind
 // the ENVELOPE of an attached message: besides what net/mail accepts it reads obsolete
 // source routes (ignored here, RFC 5322 section 4.4) and comments around the "@" of an
-// addr-spec. Use it for every address header so search, ENVELOPE, vacation and delivery
-// agree on the addresses.
+// addr-spec. The value is taken as written, so invalid UTF-8 makes it unparseable, as
+// for net/mail (ExtractRecipients, for stored mail, removes such bytes first). Use it
+// for every address header so search, ENVELOPE, vacation and delivery agree on the
+// addresses.
 func ParseAddressList(value string) ([]*mail.Address, error) {
 	entries, err := mailaddr.ParseList(value)
 	if err != nil {
@@ -56,29 +58,32 @@ func (r Recipient) IsGroupMarker() bool {
 // ExtractRecipients returns the address headers' lists as written, the source of the
 // ENVELOPE (RFC 3501 §7.4.2): an address that repeats, in one group or across groups and
 // headers of one type, is listed each time. DistinctAddresses gives each address once.
-// Every header value is parsed by mailaddr.ParseList, after the bytes PostgreSQL cannot
-// store (invalid UTF-8, NUL) are removed from it; a value that does not parse adds nothing.
+// Every header value is parsed by mailaddr.ParseListLenient, which first removes the
+// bytes that are not text (invalid UTF-8, NUL) and so returns only text PostgreSQL can
+// store. It is the call go-imap makes for the ENVELOPE of an attached message, so a
+// message's two ENVELOPEs are the same parse of the same header. A value that does not
+// parse adds nothing.
 func ExtractRecipients(header message.Header) []Recipient {
 	recipients := make([]Recipient, 0)
 
 	extractAddresses := func(key string) {
 		addressType := strings.ToLower(key)
 		for _, value := range header.Values(key) {
-			entries, err := mailaddr.ParseList(SanitizeUTF8(value))
+			entries, err := mailaddr.ParseListLenient(value)
 			if err != nil {
 				continue
 			}
 			for _, entry := range entries {
 				switch {
 				case entry.IsGroupStart():
-					recipients = append(recipients, Recipient{AddressType: addressType, Group: SanitizeUTF8(entry.Mailbox)})
+					recipients = append(recipients, Recipient{AddressType: addressType, Group: entry.Mailbox})
 				case entry.IsGroupEnd():
 					recipients = append(recipients, Recipient{AddressType: addressType, GroupEnd: true})
 				default:
 					recipients = append(recipients, Recipient{
-						EmailAddress: SanitizeUTF8(entry.Mailbox + "@" + entry.Host),
+						EmailAddress: entry.Mailbox + "@" + entry.Host,
 						AddressType:  addressType,
-						Name:         SanitizeUTF8(entry.Name),
+						Name:         entry.Name,
 						Route:        entry.Route,
 					})
 				}
