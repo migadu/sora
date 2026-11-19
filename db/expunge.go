@@ -40,10 +40,15 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 	var currentModSeq int64
 	var rowsAffected int64
 	err = tx.QueryRow(ctx, `
-		WITH updated AS (
+		WITH targets AS MATERIALIZED (
+			SELECT m.id FROM messages m
+			WHERE m.mailbox_id = $1 AND m.uid = ANY($2::bigint[]) AND m.expunged_at IS NULL
+			`+lockMessageUpdatesInOrder+`
+		), updated AS (
 			UPDATE messages m
 			SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
-			WHERE m.mailbox_id = $1 AND m.uid = ANY($2::bigint[]) AND m.expunged_at IS NULL
+			FROM targets
+			WHERE m.id = targets.id
 			RETURNING expunged_modseq
 		)
 		SELECT COUNT(*), COALESCE(MAX(expunged_modseq), 0)
@@ -118,6 +123,12 @@ func lockMailboxesOfLiveMessages(ctx context.Context, tx pgx.Tx, locking, cond s
 	return ids, nil
 }
 
+// Bulk updates of live messages lock rows in the same UID order as COPY and MOVE.
+// COPY does not hold its source mailbox lock, so the mailbox locks alone cannot
+// serialize an update against it. The ordering applies before the UPDATE, whose
+// planner can otherwise visit the rows in a different order.
+const lockMessageUpdatesInOrder = `ORDER BY m.mailbox_id, m.uid, m.id FOR NO KEY UPDATE OF m`
+
 // expungeLiveMessages expunges the live messages that match cond (as for
 // lockLiveMessageMailboxes) and sit in one of mailboxIDs, the mailboxes the caller
 // locked. A message that was already expunged when the mailboxes were picked and has
@@ -127,11 +138,17 @@ func lockMailboxesOfLiveMessages(ctx context.Context, tx pgx.Tx, locking, cond s
 // it. Returns how many rows were expunged.
 func expungeLiveMessages(ctx context.Context, tx pgx.Tx, mailboxIDs []int64, cond string, args ...any) (int64, error) {
 	tag, err := tx.Exec(ctx, fmt.Sprintf(`
+		WITH targets AS MATERIALIZED (
+			SELECT m.id FROM messages m
+			WHERE m.expunged_at IS NULL
+			  AND (m.mailbox_id = ANY($%d) OR m.mailbox_id IS NULL)
+			  AND (%s)
+			`+lockMessageUpdatesInOrder+`
+		)
 		UPDATE messages m
 		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
-		WHERE m.expunged_at IS NULL
-		  AND (m.mailbox_id = ANY($%d) OR m.mailbox_id IS NULL)
-		  AND (%s)
+		FROM targets
+		WHERE m.id = targets.id
 	`, len(args)+1, cond), append(args[:len(args):len(args)], mailboxIDs)...)
 	if err != nil {
 		return 0, err

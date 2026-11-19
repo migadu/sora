@@ -1093,8 +1093,8 @@ delete is uncertain.
 
 While an intent exists, its hash is quarantined:
 
-- New uploads of that body, marking an upload as done, COPY and MOVE into another account, and
-  restores refuse it. New deliveries can still stage it, to upload later.
+- New uploads of that body, marking an upload as done, COPY and MOVE, and restores refuse it.
+  New deliveries can still stage it, to upload later.
 - Neither time, an expired upload lease nor a restart clears the intent.
 - The cleaner keeps its rows for that body until the intent is resolved.
 

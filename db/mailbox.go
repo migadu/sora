@@ -823,17 +823,18 @@ func (db *Database) PurgeMailboxStep(ctx context.Context, tx pgx.Tx, mailboxID i
 	// Expunge a bounded slice of the messages still live in the mailbox, preserving their
 	// mailbox path as we go. This is crucial for restoring messages later.
 	expunged, err := tx.Exec(ctx, `
+		WITH targets AS MATERIALIZED (
+			SELECT m.id FROM messages m
+			WHERE m.mailbox_id = $1 AND m.expunged_at IS NULL
+			`+lockMessageUpdatesInOrder+`
+			LIMIT $2
+		)
 		UPDATE messages m
 		SET mailbox_path = mb.name,
 		    expunged_at = now(),
 		    expunged_modseq = nextval('messages_modseq')
-		FROM mailboxes mb
-		WHERE m.mailbox_id = mb.id
-		  AND m.id IN (
-			SELECT id FROM messages
-			WHERE mailbox_id = $1 AND expunged_at IS NULL
-			LIMIT $2
-		  )
+		FROM targets, mailboxes mb
+		WHERE m.id = targets.id AND m.mailbox_id = mb.id
 	`, mailboxID, limitArg)
 	if err != nil {
 		logger.Error("Database: failed to set path and mark messages as expunged", "mailbox_id", mailboxID, "err", err)

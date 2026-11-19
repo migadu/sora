@@ -152,10 +152,9 @@ const (
 
 var extraAddressesValue = strings.NewReplacer("\t", " ", "\n", " ")
 
-// ErrCopySourceChanged is returned by CopyMessages when a source row owned by another
-// account than the destination no longer has the content hash the caller made its body
-// available for under the destination owner's S3 path. Nothing is written; reading the
-// source again and copying anew can succeed.
+// ErrCopySourceChanged means a selected source disappeared, was expunged, or
+// changed hash after the caller staged its body for another account. The caller
+// rolls back the transaction and can retry with a fresh source selection.
 var ErrCopySourceChanged = errors.New("a source message changed during the copy")
 
 func truncateHash(hash string) string {
@@ -200,9 +199,13 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, err
 	}
 
-	// The caller is responsible for beginning and committing/rolling back the transaction.
+	// MOVE locks its destination before its sources. Follow that order here so
+	// a MOVE into the same mailbox can finish before COPY locks any source.
+	if err := lockMailboxStats(ctx, tx, destMailboxID); err != nil {
+		return nil, nil, err
+	}
 
-	// Get the source message IDs and UIDs
+	// Resolve the UID mapping first. The INSERT rechecks and locks these identities.
 	rows, err := tx.Query(ctx, `SELECT id, uid, account_id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
@@ -239,7 +242,6 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 	}
-	// The highest_uid UPDATE holds the destination's row lock from here on.
 	window := modSeqWindowFor(ctx, destMailboxID)
 	if err := window.begin(ctx, tx); err != nil {
 		return nil, nil, err
@@ -303,10 +305,12 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				d.custom_flags_canon
 			FROM messages m
 			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::text[]) AS d(message_id, new_uid, custom_flags_canon, expected_hash) ON m.id = d.message_id
-			-- A row re-keyed to another account is copied only with the hash whose body the
-			-- caller made available under the owner's key (sourceHashes); a row left out
-			-- here fails the copy below.
-			WHERE m.account_id = $6 OR m.content_hash = d.expected_hash
+			WHERE m.expunged_at IS NULL
+			  AND (m.account_id = $6 OR m.content_hash = d.expected_hash)
+			-- Use the live row versions returned after any lock wait. Acquire
+			-- all source locks in MOVE's UID order and keep them through commit.
+			ORDER BY m.uid
+			FOR SHARE OF m
 		),
 		inserted AS (
 			INSERT INTO messages (
