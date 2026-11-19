@@ -722,13 +722,17 @@ func StartLMTPServerWithS3(t *testing.T, rdb *resilient.ResilientDatabase, fake 
 // not yet have the object. The IMAP server's S3 is an empty stub, so body reads miss S3.
 func SetupIMAPServerForUploadRace(t *testing.T) (*TestServer, TestAccount) {
 	t.Helper()
-	return SetupIMAPServerForUploadRaceWithS3(t, &storage.S3Storage{})
+	return setupIMAPServerForUploadRace(t, &storage.S3Storage{}, &NoopUploaderS3{}, &NoopUploaderCache{})
 }
 
 // SetupIMAPServerForUploadRaceWithS3 is SetupIMAPServerForUploadRace with a caller-provided
-// S3 backend, letting a test script GET responses (e.g. NoSuchKey then a body via a fake S3
-// endpoint) to exercise the not-yet-uploaded retry/timing path end to end.
+// S3 backend for both IMAP reads and an explicit uploader pass via WaitForUploads.
 func SetupIMAPServerForUploadRaceWithS3(t *testing.T, s3Storage *storage.S3Storage) (*TestServer, TestAccount) {
+	t.Helper()
+	return setupIMAPServerForUploadRace(t, s3Storage, resilient.NewResilientS3Storage(s3Storage), nil)
+}
+
+func setupIMAPServerForUploadRace(t *testing.T, s3Storage *storage.S3Storage, uploadS3 uploader.UploaderS3, uploadCache uploader.UploaderCache) (*TestServer, TestAccount) {
 	t.Helper()
 
 	rdb := SetupTestDatabase(t)
@@ -742,8 +746,8 @@ func SetupIMAPServerForUploadRaceWithS3(t *testing.T, s3Storage *storage.S3Stora
 
 	errCh := make(chan error, 1)
 
-	// instanceID must match the IMAP server hostname ("localhost") so that the
-	// pending_uploads rows are attributable, matching the other setups.
+	// Keep staged APPENDs out of other workers' queues until the test drains this worker.
+	instanceID := "upload-race-" + account.Email
 	uploadWorker, err := uploader.NewWithS3Interface(
 		tempDir,     // path
 		10,          // batchSize
@@ -751,10 +755,10 @@ func SetupIMAPServerForUploadRaceWithS3(t *testing.T, s3Storage *storage.S3Stora
 		3,           // maxAttempts
 		time.Second, // retryInterval
 		0,           // maxStagingSize
-		"localhost", // instanceID — must match imap.New hostname arg
-		rdb,         // database
-		&NoopUploaderS3{},
-		&NoopUploaderCache{},
+		instanceID,
+		rdb, // database
+		uploadS3,
+		uploadCache,
 		errCh,
 	)
 	if err != nil {
@@ -783,6 +787,7 @@ func SetupIMAPServerForUploadRaceWithS3(t *testing.T, s3Storage *storage.S3Stora
 		uploadWorker,
 		nil, // cache.Cache
 		imap.IMAPServerOptions{
+			InstanceID:   instanceID,
 			InsecureAuth: true,
 			Config:       testConfig,
 		},
