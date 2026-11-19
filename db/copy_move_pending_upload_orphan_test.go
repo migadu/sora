@@ -36,12 +36,13 @@ func insertUnuploadedFixture(t *testing.T, ctx context.Context, db *Database, ac
 }
 
 // openCopyOrMove runs a same-account COPY or MOVE of uid from inboxID to archiveID and
-// leaves its transaction open.
-func openCopyOrMove(t *testing.T, ctx context.Context, db *Database, command string, accountID, inboxID, archiveID, uid int64) (commit func()) {
+// leaves its transaction open. It returns the backend pid of that transaction.
+func openCopyOrMove(t *testing.T, ctx context.Context, db *Database, command string, accountID, inboxID, archiveID, uid int64) (commit func(), pid int) {
 	t.Helper()
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	t.Cleanup(func() { tx.Rollback(context.Background()) })
+	pid = int(tx.Conn().PgConn().PID())
 	uids := []imap.UID{imap.UID(uid)}
 	if command == "COPY" {
 		_, _, err = db.CopyMessages(ctx, tx, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
@@ -49,18 +50,43 @@ func openCopyOrMove(t *testing.T, ctx context.Context, db *Database, command str
 		_, err = db.MoveMessages(ctx, tx, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
 	}
 	require.NoError(t, err)
-	return func() { require.NoError(t, tx.Commit(ctx)) }
+	return func() { require.NoError(t, tx.Commit(ctx)) }, pid
+}
+
+// requireBlockedBy fails the test unless some backend waits for a lock that blockerPID
+// holds before done yields. A worker that finishes without waiting for the open command
+// decided without seeing the command's new row: the race these tests are about.
+func requireBlockedBy(t *testing.T, ctx context.Context, db *Database, blockerPID int, done <-chan error, what string) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var blocked bool
+		require.NoError(t, db.GetWritePool().QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid)))`,
+			blockerPID).Scan(&blocked))
+		if blocked {
+			return
+		}
+		select {
+		case err := <-done:
+			t.Fatalf("%s finished without waiting for the open command (err: %v)", what, err)
+		default:
+		}
+		require.False(t, time.Now().After(deadline), "%s never waited for the open command", what)
+		time.Sleep(5 * time.Millisecond)
+	}
 }
 
 // A same-account COPY or MOVE of a message that is not uploaded yet relies on the
 // source's pending upload: its new row is not uploaded either, and restagePendingUploads
 // leaves an existing pending row alone. Whatever deletes that row while the command is
 // open cannot see the new row, and must not leave it behind without one: nothing would
-// ever mark it uploaded, and CleanupFailedUploads would delete the message.
+// ever mark it uploaded, and CleanupFailedUploads would delete the message (#2126).
 //
-// Here the upload finishes while the command is open: the source is marked uploaded and
-// the pending row is dropped because no unuploaded row is left to see. The body is in S3,
-// so losing the new row would lose a message that is stored.
+// Here the upload finishes while the command is open. The command holds the source row
+// (COPY FOR SHARE, MOVE FOR UPDATE), so marking it uploaded waits for the commit; the
+// finalize then sees the new row and keeps the pending upload for it. Had it decided
+// first, it would drop the pending row with the body in S3 and the new row unmarked.
 func TestUploadFinishingDuringSameAccountCopyOrMoveKeepsThePendingUpload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -70,7 +96,7 @@ func TestUploadFinishingDuringSameAccountCopyOrMoveKeepsThePendingUpload(t *test
 		for _, finalize := range []string{"unleased", "leased"} {
 			t.Run(command+"/"+finalize, func(t *testing.T) {
 				db, _, accountID, inboxID := setupCleanerTestDatabase(t)
-				defer db.Close()
+				t.Cleanup(db.Close) // after openCopyOrMove's rollback: Close waits for the open transaction
 
 				ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 				defer cancel()
@@ -87,7 +113,7 @@ func TestUploadFinishingDuringSameAccountCopyOrMoveKeepsThePendingUpload(t *test
 						WHERE account_id = $1 AND content_hash = $2 RETURNING id`, accountID, hash, owner).Scan(&pendingID))
 				}
 
-				commit := openCopyOrMove(t, ctx, db, command, accountID, inboxID, archiveID, uid)
+				commit, commandPID := openCopyOrMove(t, ctx, db, command, accountID, inboxID, archiveID, uid)
 
 				finalizeDone := make(chan error, 1)
 				go func() {
@@ -108,15 +134,11 @@ func TestUploadFinishingDuringSameAccountCopyOrMoveKeepsThePendingUpload(t *test
 					}
 					finalizeDone <- tx.Commit(ctx)
 				}()
-				// The finalize either ends before the command commits or waits for it.
-				select {
-				case err := <-finalizeDone:
-					require.NoError(t, err)
-					commit()
-				case <-time.After(500 * time.Millisecond):
-					commit()
-					require.NoError(t, <-finalizeDone)
-				}
+				// The command holds the source row, so the finalize must wait for it and
+				// decide only after the new row is visible.
+				requireBlockedBy(t, ctx, db, commandPID, finalizeDone, "the upload finalize")
+				commit()
+				require.NoError(t, <-finalizeDone)
 
 				assert.Zero(t, unuploadedRowsWithoutPendingUpload(t, ctx, db, accountID, hash),
 					"the new row is not uploaded and has no pending upload, although its body is in S3")
@@ -146,8 +168,10 @@ func TestUploadFinishingDuringSameAccountCopyOrMoveKeepsThePendingUpload(t *test
 	}
 }
 
-// Here the admin tool deletes a parked upload while the command is open: the pending row
-// and the source go, the new row stays.
+// Here the admin tool deletes a parked upload while the command is open. It waits for the
+// command at the account guard (lockAccountAgainstCopies) before it picks the mailboxes
+// and rows to delete, so it takes the new row with the rest instead of leaving it
+// behind without a pending upload.
 func TestDeleteFailedUploadDuringSameAccountCopyOrMoveLeavesNoRowBehind(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -156,7 +180,7 @@ func TestDeleteFailedUploadDuringSameAccountCopyOrMoveLeavesNoRowBehind(t *testi
 	for _, command := range []string{"COPY", "MOVE"} {
 		t.Run(command, func(t *testing.T) {
 			db, _, accountID, inboxID := setupCleanerTestDatabase(t)
-			defer db.Close()
+			t.Cleanup(db.Close) // after openCopyOrMove's rollback: Close waits for the open transaction
 
 			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 			defer cancel()
@@ -165,7 +189,7 @@ func TestDeleteFailedUploadDuringSameAccountCopyOrMoveLeavesNoRowBehind(t *testi
 			const uid, maxAttempts = 9911, 5
 			insertUnuploadedFixture(t, ctx, db, accountID, inboxID, uid, hash, maxAttempts)
 
-			commit := openCopyOrMove(t, ctx, db, command, accountID, inboxID, archiveID, uid)
+			commit, commandPID := openCopyOrMove(t, ctx, db, command, accountID, inboxID, archiveID, uid)
 
 			deleteDone := make(chan error, 1)
 			go func() {
@@ -181,14 +205,9 @@ func TestDeleteFailedUploadDuringSameAccountCopyOrMoveLeavesNoRowBehind(t *testi
 				}
 				deleteDone <- tx.Commit(ctx)
 			}()
-			select {
-			case err := <-deleteDone:
-				require.NoError(t, err)
-				commit()
-			case <-time.After(500 * time.Millisecond):
-				commit()
-				require.NoError(t, <-deleteDone)
-			}
+			requireBlockedBy(t, ctx, db, commandPID, deleteDone, "DeleteFailedUpload")
+			commit()
+			require.NoError(t, <-deleteDone)
 
 			assert.Zero(t, unuploadedRowsWithoutPendingUpload(t, ctx, db, accountID, hash),
 				"the new row is not uploaded and has no pending upload")
