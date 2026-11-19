@@ -272,8 +272,9 @@ func markS3Uploaded(ctx context.Context, tx pgx.Tx, contentHash string, accountI
 // marked.
 //
 // The caller must already hold the row's lock, so that this statement's snapshot is taken
-// after any delivery or copy that re-armed the row (InsertMessage, restagePendingUploads)
-// has committed together with the message it staged. Otherwise the DELETE waits for that
+// after any delivery or copy that re-armed the row (InsertMessage, restagePendingUploads),
+// and any copy within the account that only holds it (holdKeptPendingUploads), has
+// committed together with the message it staged. Otherwise the DELETE waits for that
 // lock and, under READ COMMITTED, re-checks the row but judges "nothing left to write"
 // from a snapshot without that message: the re-armed row would go, and the new message
 // would stay uploaded = FALSE with no pending upload until CleanupFailedUploads reaps it.
@@ -743,28 +744,88 @@ func (db *Database) GetStrandedUploadInstances(ctx context.Context, maxAttempts 
 // The message rows may be live in several mailboxes. Those are locked before the pending
 // row, the order a delivery takes them in, and the rows are expunged before they are
 // deleted, so that they leave unseen_count (see notLiveInMailbox).
+//
+// A same-account COPY or MOVE of one of the messages can be open meanwhile. Its new row is
+// invisible until it commits, in a mailbox this did not lock, and it holds the pending row
+// (holdKeptPendingUploads), so the DELETE of that row waits for it. If a live unuploaded
+// row then sits outside the locked mailboxes, everything done so far is undone and done
+// again with the mailboxes of the rows visible now: deleting the pending row without that
+// message would leave it not uploaded with no pending upload.
 func (d *Database) DeleteFailedUpload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, maxAttempts int) (int64, error) {
-	const lost = `m.content_hash = $1 AND m.account_id = $2 AND m.uploaded = FALSE`
-	locked, err := lockLiveMessageMailboxes(ctx, tx, lost, contentHash, accountID)
-	if err != nil {
-		return 0, fmt.Errorf("failed to delete failed upload (hash=%s, account=%d): %w", contentHash, accountID, err)
+	for pass := 0; pass < deleteFailedUploadPasses; pass++ {
+		deleted, again, err := deleteFailedUploadOnce(ctx, tx, contentHash, accountID, maxAttempts)
+		if err != nil {
+			return 0, fmt.Errorf("failed to delete failed upload (hash=%s, account=%d): %w", contentHash, accountID, err)
+		}
+		if !again {
+			return deleted, nil
+		}
 	}
-	tag, err := tx.Exec(ctx, `
+	return 0, fmt.Errorf("failed to delete failed upload (hash=%s, account=%d): its messages kept being copied or moved; run it again", contentHash, accountID)
+}
+
+// deleteFailedUploadPasses bounds DeleteFailedUpload. Each pass after the first needs a
+// COPY or MOVE of the message that was open during the one before it.
+const deleteFailedUploadPasses = 4
+
+// deleteFailedUploadOnce is one pass of DeleteFailedUpload, in a savepoint. It reports
+// again when it rolled back because a live unuploaded message sat in a mailbox it had not
+// locked; the rollback releases its mailbox locks, so the next pass takes them in
+// ascending order again.
+func deleteFailedUploadOnce(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, maxAttempts int) (deleted int64, again bool, err error) {
+	const lost = `m.content_hash = $1 AND m.account_id = $2 AND m.uploaded = FALSE`
+	sp, err := tx.Begin(ctx)
+	if err != nil {
+		return 0, false, err
+	}
+	done := false
+	defer func() {
+		if !done {
+			if rbErr := sp.Rollback(ctx); rbErr != nil && err == nil {
+				err = rbErr
+			}
+		}
+	}()
+
+	locked, err := lockLiveMessageMailboxes(ctx, sp, lost, contentHash, accountID)
+	if err != nil {
+		return 0, false, err
+	}
+	if locked == nil {
+		locked = []int64{} // = ANY(NULL) would be NULL, not false
+	}
+	tag, err := sp.Exec(ctx, `
 		DELETE FROM pending_uploads
 		WHERE content_hash = $1 AND account_id = $2 AND attempts >= $3
 		  AND (lease_until IS NULL OR lease_until < now())
 	`, contentHash, accountID, maxAttempts)
 	if err != nil {
-		return 0, fmt.Errorf("failed to delete failed upload (hash=%s, account=%d): %w", contentHash, accountID, err)
+		return 0, false, err
 	}
 	if tag.RowsAffected() == 0 {
-		return 0, nil
+		return 0, false, nil
 	}
-	deleted, err := hardDeleteMessages(ctx, tx, locked, lost, contentHash, accountID)
+	var outside bool
+	if err := sp.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1 FROM messages m
+			WHERE `+lost+` AND m.expunged_at IS NULL
+			  AND m.mailbox_id IS NOT NULL AND NOT (m.mailbox_id = ANY($3))
+		)`, contentHash, accountID, locked).Scan(&outside); err != nil {
+		return 0, false, err
+	}
+	if outside {
+		return 0, true, nil
+	}
+	deleted, err = hardDeleteMessages(ctx, sp, locked, lost, contentHash, accountID)
 	if err != nil {
-		return 0, fmt.Errorf("failed to delete failed upload (hash=%s, account=%d): %w", contentHash, accountID, err)
+		return 0, false, err
 	}
-	return deleted, nil
+	if err := sp.Commit(ctx); err != nil {
+		return 0, false, err
+	}
+	done = true
+	return deleted, false, nil
 }
 
 // PendingUploadExists checks if a pending upload record exists for the given content hash and account.

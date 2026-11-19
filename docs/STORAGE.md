@@ -306,6 +306,11 @@ MOVE of a body that is still staged on this node does the same for the owner's r
 the staged file under the owner's account ID and queues or re-arms the owner's upload under
 this node's instance ID.
 
+A COPY or MOVE within one account of a body that is not uploaded yet leaves the row as it is:
+the file is wherever the message was delivered. The command holds the row until it commits, so
+the upload cannot finish and the row cannot be deleted in between. Whoever does either
+afterwards sees the new message, which then gets marked uploaded or deleted with the rest.
+
 ### 6.3 The worker loop
 
 Each storage node runs one upload worker. It works through the queue at startup, every 10
