@@ -104,9 +104,8 @@ func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID in
 		return 0, ErrRekeyUploadPending
 	}
 
-	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
-		consts.SoraContentRekeyLockClassID, accountID); err != nil {
-		return 0, fmt.Errorf("failed to lock the account against copies: %w", err)
+	if err := lockAccountAgainstCopies(ctx, tx, accountID); err != nil {
+		return 0, err
 	}
 	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1, hashtext($2))",
 		consts.SoraFTSOrphanSweepLockClassID, obj.ContentHash); err != nil {
@@ -159,6 +158,15 @@ func (d *Database) RekeyContentHash(ctx context.Context, tx pgx.Tx, accountID in
 	}
 
 	return tag.RowsAffected(), nil
+}
+
+// lockAccountAgainstCopies is the exclusive counterpart to lockRekeySources.
+func lockAccountAgainstCopies(ctx context.Context, tx pgx.Tx, accountID int64) error {
+	if _, err := tx.Exec(ctx, "SELECT pg_advisory_xact_lock($1::int4, hashint8($2::int8))",
+		consts.SoraContentRekeyLockClassID, accountID); err != nil {
+		return fmt.Errorf("failed to lock the account against copies: %w", err)
+	}
+	return nil
 }
 
 // lockRekeySources takes, in shared mode, the rekey lock of every account that owns one of

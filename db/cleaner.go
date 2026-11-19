@@ -354,12 +354,16 @@ func (d *Database) ExpungeOldMessages(ctx context.Context, tx pgx.Tx, olderThan 
 	// is left to the next batch, which locks its new mailbox; grabbing that mailbox now
 	// would take locks out of ascending id order and could deadlock.
 	if _, err := tx.Exec(ctx, `
+		WITH targets AS MATERIALIZED (
+			SELECT m.id FROM messages m
+			JOIN unnest($1::bigint[], $2::bigint[]) AS c(id, mailbox_id) ON m.id = c.id
+			WHERE m.expunged_at IS NULL AND m.mailbox_id IS NOT DISTINCT FROM c.mailbox_id
+			`+lockMessageUpdatesInOrder+`
+		)
 		UPDATE messages m
 		SET expunged_at = NOW(), expunged_modseq = nextval('messages_modseq')
-		FROM unnest($1::bigint[], $2::bigint[]) AS c(id, mailbox_id)
-		WHERE m.id = c.id
-		  AND m.expunged_at IS NULL
-		  AND m.mailbox_id IS NOT DISTINCT FROM c.mailbox_id
+		FROM targets
+		WHERE m.id = targets.id
 	`, messageIDs, candidateMailboxIDs); err != nil {
 		return 0, fmt.Errorf("failed to expunge old messages: %w", err)
 	}
@@ -1146,9 +1150,15 @@ func (d *Database) HardDeleteAccounts(ctx context.Context, tx pgx.Tx, accountIDs
 	// Expunging first means the SET NULL pass only touches already-expunged rows, which the
 	// trigger ignores. This also signals the next cleanup phase to remove the S3 objects.
 	_, err := tx.Exec(ctx, `
-		UPDATE messages
+		WITH targets AS MATERIALIZED (
+			SELECT m.id FROM messages m
+			WHERE m.account_id = ANY($1) AND m.expunged_at IS NULL
+			`+lockMessageUpdatesInOrder+`
+		)
+		UPDATE messages m
 		SET expunged_at = now(), expunged_modseq = nextval('messages_modseq')
-		WHERE account_id = ANY($1) AND expunged_at IS NULL
+		FROM targets
+		WHERE m.id = targets.id
 	`, accountIDs)
 	if err != nil {
 		return fmt.Errorf("failed to expunge messages for batch deletion: %w", err)

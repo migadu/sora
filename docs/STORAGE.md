@@ -703,7 +703,13 @@ A COPY or MOVE within one account is not limited and takes no body lock. Its new
 same object as the rows they are copied from, and the cleaner never removes a body while its
 account has a live message with it. So the command keeps its source messages locked until it
 commits: a MOVE replaces them in the same transaction, and a COPY holds them so that none can
-be expunged first. The account therefore has a live message for the body the whole time.
+be expunged first. If a selected source disappears before COPY locks it, COPY rolls back
+and the client can retry. Removing a parked upload with `sora-admin` waits for COPY and MOVE
+transactions using that source account, so the cleanup also sees their destination rows.
+
+When rolling out this row-locking behavior, upgrade `sora-admin` before the mail servers.
+The updated `verify s3 --fix-missing` rechecks rows committed by concurrent COPY and MOVE,
+and failed-upload removal uses the account lock before deciding which messages to delete.
 
 **Deletion intents.** Before a deleter sends a DELETE to S3, it commits a row in the
 `s3_body_delete_intents` table: the content hash, the object keys, an operation ID and the

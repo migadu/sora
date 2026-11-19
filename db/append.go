@@ -152,10 +152,9 @@ const (
 
 var extraAddressesValue = strings.NewReplacer("\t", " ", "\n", " ")
 
-// ErrCopySourceChanged is returned by CopyMessages when a source row owned by another
-// account than the destination no longer has the content hash the caller made its body
-// available for under the destination owner's S3 path. Nothing is written; reading the
-// source again and copying anew can succeed.
+// ErrCopySourceChanged means a selected source disappeared, was expunged, or
+// changed hash after the caller staged its body for another account. The caller
+// rolls back the transaction and can retry with a fresh source selection.
 var ErrCopySourceChanged = errors.New("a source message changed during the copy")
 
 func truncateHash(hash string) string {
@@ -200,51 +199,13 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, err
 	}
 
-	// The caller is responsible for beginning and committing/rolling back the transaction.
-
-	// Lock the destination's mailbox row before any message row, the order MOVE takes
-	// them in: source rows are locked next, and a MOVE into this mailbox holds this row
-	// while it waits for them. The source's mailbox row is not locked: the copy only reads
-	// that mailbox, and holding its row would make every flag change and expunge there
-	// wait for the copy, and the copy for them.
+	// MOVE locks its destination before its sources. Follow that order here so
+	// a MOVE into the same mailbox can finish before COPY locks any source.
 	if err := lockMailboxStats(ctx, tx, destMailboxID); err != nil {
 		return nil, nil, err
 	}
 
-	// Hold the uploaded source rows live until the commit. A copy within one account takes
-	// no S3 body lock (lockS3SourceClaims): the body of a copy marked uploaded stands
-	// because the source row it is copied from stays live, and FOR SHARE keeps an expunge
-	// or a delete of that row from committing before the copy does. Locked in UID order,
-	// as MOVE locks them.
-	//
-	// Only uploaded rows are held, and a copy is marked uploaded only while its source is
-	// held: here (heldSources below), or after the insert for a source whose upload has
-	// finished since (markCopiesOfLateUploadedSources). A row that is not uploaded has no
-	// object for a deleter to take: its copy starts not uploaded, with a pending upload
-	// (restagePendingUploads). Leaving those rows unlocked keeps the copy out of the way
-	// of the failed-upload cleanup, which deletes the pending upload row first and the
-	// unuploaded message rows second, while the copy takes them the other way round
-	// (DeleteFailedUpload).
-	heldSources := make(map[int64]struct{})
-	heldRows, err := tx.Query(ctx, `SELECT id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL AND uploaded ORDER BY uid FOR SHARE`, srcMailboxID, uids)
-	if err != nil {
-		return nil, nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
-	}
-	for heldRows.Next() {
-		var id int64
-		if err := heldRows.Scan(&id); err != nil {
-			heldRows.Close()
-			return nil, nil, fmt.Errorf("failed to scan held source message: %w", err)
-		}
-		heldSources[id] = struct{}{}
-	}
-	heldRows.Close()
-	if err := heldRows.Err(); err != nil {
-		return nil, nil, fmt.Errorf("failed to hold the uploaded source messages: %w", err)
-	}
-
-	// Get the source message IDs and UIDs, from a snapshot taken after the wait for those
-	// row locks: a source expunged meanwhile is not copied.
+	// Resolve the UID mapping first. The INSERT rechecks and locks these identities.
 	rows, err := tx.Query(ctx, `SELECT id, uid, account_id FROM messages WHERE mailbox_id = $1 AND uid = ANY($2) AND expunged_at IS NULL ORDER BY uid`, srcMailboxID, uids)
 	if err != nil {
 		return nil, nil, fmt.Errorf("%w: %w", consts.ErrInternalError, err)
@@ -255,15 +216,12 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 	var sourceUIDsForMap []imap.UID
 	var expectedHashes []string // per message: sourceHashes, checked for re-keyed rows only
 	var rekeyed []bool          // per message: owned by another account than destAccountID
-	var held []bool             // per message: uploaded and locked above (heldSources)
 	for rows.Next() {
 		var messageID, sourceAccountID int64
 		var sourceUID imap.UID
 		if err := rows.Scan(&messageID, &sourceUID, &sourceAccountID); err != nil {
 			return nil, nil, fmt.Errorf("failed to scan message ID and UID: %w", err)
 		}
-		_, isHeld := heldSources[messageID]
-		held = append(held, isHeld)
 		messageIDs = append(messageIDs, messageID)
 		sourceUIDsForMap = append(sourceUIDsForMap, sourceUID)
 		expectedHashes = append(expectedHashes, sourceHashes[sourceUID])
@@ -336,10 +294,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		WITH src_data AS (
 			SELECT
 				m.content_hash,
-				-- A copy within the account is uploaded here only if its source was uploaded
-				-- and locked before it was read (held). One whose upload has finished since
-				-- is marked below, under a lock of its own (markCopiesOfLateUploadedSources).
-				CASE WHEN m.account_id = $6 THEN m.uploaded AND d.held ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
+				CASE WHEN m.account_id = $6 THEN m.uploaded ELSE m.content_hash = ANY($10::text[]) END AS uploaded,
 				m.message_id, m.in_reply_to, m."references",
 				m.subject, m.sent_date, m.sent_utc_offset, m.sent_date_unknown, m.internal_date, m.size,
 				m.body_structure, m.recipients_json,
@@ -349,11 +304,13 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 				d.new_uid,
 				d.custom_flags_canon
 			FROM messages m
-			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::text[], $11::boolean[]) AS d(message_id, new_uid, custom_flags_canon, expected_hash, held) ON m.id = d.message_id
-			-- A row re-keyed to another account is copied only with the hash whose body the
-			-- caller made available under the owner's key (sourceHashes); a row left out
-			-- here fails the copy below.
-			WHERE m.account_id = $6 OR m.content_hash = d.expected_hash
+			JOIN unnest($3::bigint[], $4::bigint[], $5::jsonb[], $9::text[]) AS d(message_id, new_uid, custom_flags_canon, expected_hash) ON m.id = d.message_id
+			WHERE m.expunged_at IS NULL
+			  AND (m.account_id = $6 OR m.content_hash = d.expected_hash)
+			-- Use the live row versions returned after any lock wait. Acquire
+			-- all source locks in MOVE's UID order and keep them through commit.
+			ORDER BY m.uid
+			FOR SHARE OF m
 		),
 		inserted AS (
 			INSERT INTO messages (
@@ -391,7 +348,7 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 			RETURNING message_id
 		)
 		SELECT id FROM inserted ORDER BY uid
-	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, expectedHashes, destObjects, held)
+	`, destMailboxID, destMailboxName, messageIDs, newUIDs, customFlagsCanon, destAccountID, destS3Domain, destS3Localpart, expectedHashes, destObjects)
 	if err != nil {
 		return nil, nil, fmt.Errorf("failed to batch copy messages: %w", err)
 	}
@@ -412,20 +369,6 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, fmt.Errorf("%w: copied %d of %d messages", ErrCopySourceChanged, len(newMessageIDs), len(messageIDs))
 	}
 
-	// A source of the account that was not uploaded when the copy held its rows may be
-	// uploaded by now. Mark its copy uploaded under a lock on it, before the re-stage
-	// below would otherwise queue an upload for it.
-	var lateSources, lateCopies []int64
-	for i := range messageIDs {
-		if !held[i] && !rekeyed[i] {
-			lateSources = append(lateSources, messageIDs[i])
-			lateCopies = append(lateCopies, newUIDs[i])
-		}
-	}
-	if err := markCopiesOfLateUploadedSources(ctx, tx, destMailboxID, lateSources, lateCopies); err != nil {
-		return nil, nil, err
-	}
-
 	// Re-stage uploads for any copied rows whose body is not yet in S3, so the
 	// background uploader writes the body under the destination owner's S3 path
 	// (s3_domain/s3_localpart) and marks the new row uploaded. Without this, a
@@ -442,44 +385,6 @@ func (db *Database) CopyMessages(ctx context.Context, tx pgx.Tx, uids *[]imap.UI
 		return nil, nil, err
 	}
 	return messageUIDMap, newMessageIDs, nil
-}
-
-// markCopiesOfLateUploadedSources marks uploaded the copies (by their UIDs in
-// destMailboxID) of the source rows sourceIDs that are uploaded now, and holds those
-// sources FOR SHARE until tx ends, as CopyMessages holds the sources it found uploaded:
-// the copy relies on the source row to keep the body from its deleters
-// (lockS3SourceClaims). The lock and the decision are one statement, so no upload or
-// expunge can come between them: a source being expunged is waited for and then left
-// out, and so is one whose upload is being finalized right now, which leaves its copy to
-// the pending upload.
-//
-// Without this a copy of a body whose upload finished in the instant between the hold
-// and the insert would start not uploaded, with a pending upload on the copying node
-// that has no file for it. The uploader resolves that from the source row, but if the
-// node went away first, CleanupFailedUploads would delete the copy although its body is
-// in S3.
-//
-// Only uploaded rows are locked, so this never waits for the failed-upload cleanup,
-// which locks only unuploaded ones.
-func markCopiesOfLateUploadedSources(ctx context.Context, tx pgx.Tx, destMailboxID int64, sourceIDs, copyUIDs []int64) error {
-	if len(sourceIDs) == 0 {
-		return nil
-	}
-	if _, err := tx.Exec(ctx, `
-		WITH late AS (
-			SELECT s.id FROM messages s
-			WHERE s.id = ANY($2::bigint[]) AND s.uploaded AND s.expunged_at IS NULL
-			ORDER BY s.uid
-			FOR SHARE
-		)
-		UPDATE messages c SET uploaded = TRUE
-		FROM unnest($2::bigint[], $3::bigint[]) AS d(source_id, copy_uid)
-		JOIN late ON late.id = d.source_id
-		WHERE c.mailbox_id = $1 AND c.uid = d.copy_uid AND c.expunged_at IS NULL AND NOT c.uploaded`,
-		destMailboxID, sourceIDs, copyUIDs); err != nil {
-		return fmt.Errorf("failed to mark copies of sources uploaded since: %w", err)
-	}
-	return nil
 }
 
 // restagePendingUploads ensures every just-inserted, not-yet-uploaded message in

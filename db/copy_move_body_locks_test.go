@@ -386,24 +386,9 @@ func waitUntilBlocked(t *testing.T, ctx context.Context, db *Database, pid int, 
 	}
 }
 
-// liveRowsWithoutUpload counts the live rows of (accountID, hash) that are not uploaded and
-// have no pending upload: rows nothing will ever upload.
-func liveRowsWithoutUpload(t *testing.T, ctx context.Context, db *Database, accountID int64, hash string) int {
-	t.Helper()
-	var n int
-	require.NoError(t, db.GetWritePool().QueryRow(ctx, `
-		SELECT count(*) FROM messages m
-		WHERE m.account_id = $1 AND m.content_hash = $2 AND m.expunged_at IS NULL AND NOT m.uploaded
-		  AND NOT EXISTS (SELECT 1 FROM pending_uploads pu WHERE pu.account_id = m.account_id AND pu.content_hash = m.content_hash)`,
-		accountID, hash).Scan(&n))
-	return n
-}
-
-// The failed-upload cleanup deletes the pending upload row and then expunges the
-// unuploaded message rows; a COPY re-stages the pending upload row after it has read its
-// sources. If the copy held an unuploaded source row, the two would wait for each other:
-// the copy for the deleted pending row, the cleanup for the message row. The copy holds
-// only uploaded source rows (CopyMessages), so the cleanup never waits for it.
+// DeleteFailedUpload waits for COPY before locking any mailboxes or the pending row.
+// This keeps the cleanup from deadlocking with COPY's re-stage and lets it see both
+// messages once COPY commits.
 func TestCopyOfUnuploadedSourceDoesNotDeadlockWithDeleteFailedUpload(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -443,31 +428,46 @@ func TestCopyOfUnuploadedSourceDoesNotDeadlockWithDeleteFailedUpload(t *testing.
 		t.Fatal(ctx.Err())
 	}
 
-	// The cleanup runs to its end while the copy is open.
+	// Cleanup must wait on the account guard while COPY is open. Waiting on a mailbox
+	// or message would be too late to guarantee that cleanup sees the new copy.
 	deleteTx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer deleteTx.Rollback(context.Background())
-	_, err = deleteTx.Exec(ctx, `SET LOCAL lock_timeout = '2s'`)
-	require.NoError(t, err)
-	_, err = db.DeleteFailedUpload(ctx, deleteTx, hash, accountID, maxAttempts)
-	require.NoError(t, err, "DeleteFailedUpload waited for an open copy of the message it deletes")
-	require.NoError(t, deleteTx.Commit(ctx))
+	var deletePID int
+	require.NoError(t, deleteTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&deletePID))
+	var removed int64
+	deleteDone := make(chan error, 1)
+	go func() {
+		var err error
+		removed, err = db.DeleteFailedUpload(ctx, deleteTx, hash, accountID, maxAttempts)
+		deleteDone <- err
+	}()
+	require.True(t, waitUntilBlocked(t, ctx, db, deletePID, deleteDone), "DeleteFailedUpload did not wait for COPY")
+	var waitingOnAccount bool
+	require.NoError(t, db.GetWritePool().QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM pg_locks WHERE pid = $1 AND locktype = 'advisory' AND NOT granted)
+	`, deletePID).Scan(&waitingOnAccount))
+	require.True(t, waitingOnAccount, "DeleteFailedUpload took row locks before waiting for COPY")
 
 	close(paused.resume)
 	require.NoError(t, <-copyDone)
 	require.NoError(t, copyTx.Commit(ctx))
+	require.NoError(t, <-deleteDone)
+	require.NoError(t, deleteTx.Commit(ctx))
+	assert.EqualValues(t, 2, removed, "cleanup should remove the source and committed copy")
 
-	var sources int
-	require.NoError(t, db.GetWritePool().QueryRow(ctx, `SELECT count(*) FROM messages WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid).Scan(&sources))
-	assert.Zero(t, sources, "DeleteFailedUpload left the source message")
-	// The copy the cleanup could not see has a pending upload of its own.
-	assert.Zero(t, liveRowsWithoutUpload(t, ctx, db, accountID, hash), "the copy is not uploaded and has no pending upload")
+	var messages, pending int
+	require.NoError(t, db.GetWritePool().QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM messages WHERE account_id = $1 AND content_hash = $2),
+		       (SELECT count(*) FROM pending_uploads WHERE account_id = $1 AND content_hash = $2)
+	`, accountID, hash).Scan(&messages, &pending))
+	assert.Zero(t, messages, "cleanup left a message whose body was lost")
+	assert.Zero(t, pending, "cleanup left the parked pending upload")
 }
 
-// A source that is not uploaded when the copy holds its rows is not held, so its upload
-// can finish before the copy inserts. Its copy must then be marked uploaded under a lock
-// on the source, not taken as uploaded from an unlocked read, and not left to a pending
-// upload on the copying node, which has no file for it (markCopiesOfLateUploadedSources).
+// If an upload finishes before COPY inserts the destination, the COPY must carry the
+// uploaded flag while holding the source live. The copying node has no staged file it
+// could upload again.
 func TestCopyOfSourceUploadedAfterItWasReadIsMarkedUnderLock(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
@@ -541,10 +541,9 @@ func TestCopyOfSourceUploadedAfterItWasReadIsMarkedUnderLock(t *testing.T) {
 	assert.Zero(t, pending, "the copy queued an upload for a body that is in S3")
 }
 
-// A source being expunged while the copy marks late-uploaded sources is waited for and
-// then left out: the copy of a source that is gone by its commit must not claim the
-// object through it.
-func TestCopyDoesNotMarkCopyOfSourceExpungedMeanwhile(t *testing.T) {
+// If the last live source finishes uploading and is expunged before COPY can hold it,
+// COPY must not report success for a destination with no dependable body.
+func TestCopyOfLateUploadedSourceExpungedBeforeInsert(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
 	}
@@ -560,57 +559,66 @@ func TestCopyDoesNotMarkCopyOfSourceExpungedMeanwhile(t *testing.T) {
 	insertRestageFixture(t, ctx, db.GetWritePool(), accountID, inboxID, uid, hash, false)
 	_, err := db.GetWritePool().Exec(ctx, `UPDATE messages SET uploaded = FALSE WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid)
 	require.NoError(t, err)
+	_, err = db.GetWritePool().Exec(ctx, `
+		INSERT INTO pending_uploads (account_id, content_hash, instance_id, size)
+		VALUES ($1, $2, 'uploading-node', 100)
+	`, accountID, hash)
+	require.NoError(t, err)
 
 	copyTx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer copyTx.Rollback(context.Background())
-	var copyPID int
-	require.NoError(t, copyTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&copyPID))
-	paused := newPauseTx(copyTx, "WITH late AS")
-	type copyResult struct {
-		uids map[imap.UID]imap.UID
-		err  error
-	}
-	copyDone := make(chan copyResult, 1)
+	paused := newPauseTx(copyTx, "WITH src_data")
+	copyDone := make(chan error, 1)
 	go func() {
+		defer close(copyDone)
 		uids := []imap.UID{uid}
-		copied, _, err := db.CopyMessages(ctx, paused, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
-		copyDone <- copyResult{copied, err}
+		_, _, err := db.CopyMessages(ctx, paused, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
+		copyDone <- err
+	}()
+	defer func() {
+		cancel()
+		<-copyDone
 	}()
 	select {
 	case <-paused.reached:
-	case res := <-copyDone:
-		t.Fatalf("CopyMessages finished without marking late sources: %v", res.err)
+	case err := <-copyDone:
+		t.Fatalf("COPY returned before its insert: %v", err)
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
 
-	// The upload finishes, and an expunge of the source is still open when the copy marks
-	// its late sources.
-	other, err := db.GetWritePool().Begin(ctx)
+	// Finalize the upload before the insert snapshot. Leave EXPUNGE open so the
+	// snapshot sees an uploaded source and COPY has to recheck it after waiting.
+	upload, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
-	defer other.Rollback(context.Background())
-	_, err = other.Exec(ctx, `UPDATE messages SET uploaded = TRUE WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid)
-	require.NoError(t, err)
-	require.NoError(t, other.Commit(ctx))
+	defer upload.Rollback(context.Background())
+	require.NoError(t, db.CompleteS3Upload(ctx, upload, hash, accountID, []string{"domain/part/" + hash}))
+	require.NoError(t, upload.Commit(ctx))
 	expunge, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer expunge.Rollback(context.Background())
-	_, err = expunge.Exec(ctx, `UPDATE messages SET expunged_at = now(), expunged_modseq = nextval('messages_modseq') WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid)
+	_, err = db.ExpungeMessageUIDs(ctx, expunge, inboxID, uid)
 	require.NoError(t, err)
 
+	copyPID := int(copyTx.Conn().PgConn().PID())
 	close(paused.resume)
-	require.True(t, waitUntilBlocked(t, ctx, db, copyPID, make(chan error)), "the copy did not wait for the expunge of its source")
+	require.True(t, waitUntilBlocked(t, ctx, db, copyPID, copyDone))
 	require.NoError(t, expunge.Commit(ctx))
+	err = <-copyDone
 
-	res := <-copyDone
-	require.NoError(t, res.err)
-	require.NoError(t, copyTx.Commit(ctx))
-
-	var uploaded bool
-	require.NoError(t, db.GetWritePool().QueryRow(ctx, `SELECT uploaded FROM messages WHERE mailbox_id = $1 AND uid = $2`, archiveID, res.uids[uid]).Scan(&uploaded))
-	assert.False(t, uploaded, "the copy claims the object through a source expunged before the copy committed")
-	assert.Zero(t, liveRowsWithoutUpload(t, ctx, db, accountID, hash), "the copy is not uploaded and has no pending upload")
+	// The zero-grace cleaner could now remove the only body. Its callback
+	// declines deletion. COPY must refuse the vanished source and roll back.
+	assert.Equal(t, 1, reapableBodies(t, ctx, db, accountID, hash))
+	require.ErrorIs(t, err, ErrCopySourceChanged)
+	require.NoError(t, copyTx.Rollback(ctx))
+	var copies, pending int
+	require.NoError(t, db.GetWritePool().QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM messages WHERE mailbox_id = $1 AND content_hash = $2),
+		       (SELECT count(*) FROM pending_uploads WHERE account_id = $3 AND content_hash = $2)
+	`, archiveID, hash, accountID).Scan(&copies, &pending))
+	assert.Zero(t, copies)
+	assert.Zero(t, pending)
 }
 
 // The missing-object repair marks the rows of a key not uploaded under the exclusive body

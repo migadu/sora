@@ -225,10 +225,8 @@ func (s *IMAPSession) Copy(ctx context.Context, numSet imap.NumSet, mboxName str
 		case errors.Is(err, db.ErrCrossAccountBodyLimit):
 			return nil, s.crossAccountBodyLimitError("COPY")
 		case errors.Is(err, db.ErrCopySourceChanged):
-			// A source body was renamed (sora-admin import rekey) after it was made
-			// available above, under the old hash. Nothing was written; a new COPY reads the
-			// new hash. RFC 5530 §3: INUSE, "The operation may succeed if the client tries
-			// again later."
+			// A selected source was removed or rekeyed. The transaction rolled
+			// back. A fresh command can resolve the surviving UIDs and hashes.
 			s.InfoLog("COPY source changed during the copy; answering retryable NO", "error", err)
 			return nil, &imap.Error{
 				Type: imap.StatusResponseTypeNo,

@@ -242,27 +242,35 @@ func lockS3ObjectForFinalizeInTx(ctx context.Context, tx pgx.Tx, accountID int64
 }
 
 // markS3Uploaded marks the account's rows of contentHash uploaded whose key now has an
-// object; see CompleteS3Upload.
+// object; see CompleteS3Upload. Lock the rows in the same UID order as COPY and MOVE
+// within each mailbox so a finalization updating several messages can wait for those
+// operations without holding their next source row.
 func markS3Uploaded(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, writtenKeys []string) error {
 	if writtenKeys == nil {
 		writtenKeys = []string{}
 	}
 	_, err := tx.Exec(ctx, `
+		WITH targets AS MATERIALIZED (
+			SELECT m.id FROM messages m
+			WHERE m.content_hash = $1 AND m.account_id = $2 AND m.uploaded = FALSE
+			  AND (
+				(m.s3_domain || '/' || m.s3_localpart || '/' || m.content_hash) = ANY($3::text[])
+				OR EXISTS (
+					SELECT 1 FROM messages u
+					WHERE u.content_hash = m.content_hash
+					  AND u.account_id = m.account_id
+					  AND u.s3_domain = m.s3_domain
+					  AND u.s3_localpart = m.s3_localpart
+					  AND u.uploaded = TRUE
+					  AND u.expunged_at IS NULL
+				)
+			  )
+			`+lockMessageUpdatesInOrder+`
+		)
 		UPDATE messages m
 		SET uploaded = TRUE
-		WHERE m.content_hash = $1 AND m.account_id = $2 AND m.uploaded = FALSE
-		  AND (
-			(m.s3_domain || '/' || m.s3_localpart || '/' || m.content_hash) = ANY($3::text[])
-			OR EXISTS (
-				SELECT 1 FROM messages u
-				WHERE u.content_hash = m.content_hash
-				  AND u.account_id = m.account_id
-				  AND u.s3_domain = m.s3_domain
-				  AND u.s3_localpart = m.s3_localpart
-				  AND u.uploaded = TRUE
-				  AND u.expunged_at IS NULL
-			)
-		  )
+		FROM targets
+		WHERE m.id = targets.id
 	`, contentHash, accountID, writtenKeys)
 	return err
 }
@@ -744,6 +752,12 @@ func (db *Database) GetStrandedUploadInstances(ctx context.Context, maxAttempts 
 // row, the order a delivery takes them in, and the rows are expunged before they are
 // deleted, so that they leave unseen_count (see notLiveInMailbox).
 func (d *Database) DeleteFailedUpload(ctx context.Context, tx pgx.Tx, contentHash string, accountID int64, maxAttempts int) (int64, error) {
+	// A COPY can hold a source message while re-staging its pending upload.
+	// Wait for copies and moves before locking mailboxes or deleting the pending
+	// row, so this cleanup sees their destinations and cannot wait in reverse order.
+	if err := lockAccountAgainstCopies(ctx, tx, accountID); err != nil {
+		return 0, err
+	}
 	const lost = `m.content_hash = $1 AND m.account_id = $2 AND m.uploaded = FALSE`
 	locked, err := lockLiveMessageMailboxes(ctx, tx, lost, contentHash, accountID)
 	if err != nil {

@@ -582,7 +582,7 @@ func (d *Database) MarkMessagesAsNotUploadedIfAbsent(ctx context.Context, obj Co
 		return 0, err
 	}
 	// A COPY or MOVE within one account holds no body lock (lockS3SourceClaims), so one
-	// can be open now. The UPDATE waits for its source row, but with the snapshot it
+	// can be open now. The repair waits for its source row, but with the snapshot it
 	// started with: it cannot see the row that command commits meanwhile, which stays
 	// marked uploaded, and a moved source is expunged by then and matches nothing. So
 	// read again after each pass, until a fresh snapshot shows no uploaded row of the
@@ -635,10 +635,20 @@ const markedUploadedForKeys = `
 		)`
 
 func markMessagesAsNotUploadedInTx(ctx context.Context, tx pgx.Tx, domains, localparts, hashes []string) (int64, error) {
+	// COPY and MOVE hold source rows in UID order. Lock the matching rows in the
+	// same order within each mailbox before updating them. Under READ COMMITTED,
+	// PostgreSQL rechecks the row predicates after a wait, so a source expunged
+	// by a concurrent MOVE does not get updated.
 	query := `
+		WITH targets AS MATERIALIZED (
+			SELECT m.id FROM messages m
+			WHERE ` + markedUploadedForKeys + `
+			` + lockMessageUpdatesInOrder + `
+		)
 		UPDATE messages m
 		SET uploaded = FALSE
-		WHERE ` + markedUploadedForKeys + `
+		FROM targets
+		WHERE m.id = targets.id
 	`
 
 	result, err := tx.Exec(ctx, query, domains, localparts, hashes)
