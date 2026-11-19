@@ -323,20 +323,21 @@ func TestProcessSingleUpload_S3ExistsButLocalFileMissing_SelfHeals(t *testing.T)
 
 	// DB: messages are NOT yet marked as uploaded (CompleteS3Upload never ran), so the
 	// key they recorded is still waiting for its object.
+	key := helpers.NewS3Key("somedomain.com", "user", contentHash)
 	mockDB.On("PendingUploadKeys", mock.Anything, contentHash, accountID).
-		Return([]string{helpers.NewS3Key("somedomain.com", "user", contentHash)}, nil)
+		Return([]string{key}, nil)
 
 	// Nothing is deleting the body, and the pending row still stands.
 	mockDB.On("PassS3WriteGateWithRetry", mock.Anything, int64(6257780), accountID, contentHash, mock.AnythingOfType("string"), uploadLeaseTTL).
 		Return(db.S3WriteOpen, nil)
 
 	// S3: object already exists (the first uploader attempt PUT it there).
-	mockS3.On("ExistsWithRetry", mock.Anything, mock.AnythingOfType("string")).
-		Return(true, nil)
+	head := mockS3.On("ExistsWithRetry", mock.Anything, key).Return(true, nil).Once()
 
 	// We expect the self-heal path to call CompleteS3UploadWithRetry, NOT MarkUploadAttemptWithRetry.
 	var completeCalled bool
-	mockDB.On("CompleteLeasedS3UploadWithRetry", mock.Anything, int64(6257780), mock.AnythingOfType("string"), contentHash, accountID, mock.Anything).
+	mockDB.On("CompleteLeasedS3UploadWithRetry", mock.Anything, int64(6257780), mock.AnythingOfType("string"), contentHash, accountID, []string{key}).
+		NotBefore(head).
 		Run(func(args mock.Arguments) { completeCalled = true }).
 		Return(nil)
 
