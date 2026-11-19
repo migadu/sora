@@ -148,8 +148,9 @@ func (db *Database) CheckCopyMoveBodyBudget(ctx context.Context, tx pgx.Tx, srcM
 //     and the new row from it.
 //   - CopyMessages locks its uploaded source rows FOR SHARE until the commit, so no
 //     expunge or delete of one can commit in between, and marks a copy uploaded only if
-//     its source was among them. Every other copy starts not uploaded, with a pending
-//     upload: it claims no object.
+//     its source was among them, or is locked the same way when it is marked after the
+//     insert (markCopiesOfLateUploadedSources). Every other copy starts not uploaded,
+//     with a pending upload: it claims no object.
 //
 // Row locks are kept in the rows and take no lock-table entry. A rekey is held off by
 // the account guard; a deleter working for another account that shares the key counts

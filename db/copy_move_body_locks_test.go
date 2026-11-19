@@ -464,11 +464,11 @@ func TestCopyOfUnuploadedSourceDoesNotDeadlockWithDeleteFailedUpload(t *testing.
 	assert.Zero(t, liveRowsWithoutUpload(t, ctx, db, accountID, hash), "the copy is not uploaded and has no pending upload")
 }
 
-// A copy is marked uploaded only if its source row was uploaded when the copy locked it.
-// A source whose upload finishes after that is not held by the copy, so its copy must not
-// claim the object: it starts not uploaded, with a pending upload, and the uploader marks
-// it from its sibling.
-func TestCopyOfSourceUploadedAfterItWasReadStartsNotUploaded(t *testing.T) {
+// A source that is not uploaded when the copy holds its rows is not held, so its upload
+// can finish before the copy inserts. Its copy must then be marked uploaded under a lock
+// on the source, not taken as uploaded from an unlocked read, and not left to a pending
+// upload on the copying node, which has no file for it (markCopiesOfLateUploadedSources).
+func TestCopyOfSourceUploadedAfterItWasReadIsMarkedUnderLock(t *testing.T) {
 	if testing.Short() {
 		t.Skip("Skipping database integration test in short mode")
 	}
@@ -507,7 +507,7 @@ func TestCopyOfSourceUploadedAfterItWasReadStartsNotUploaded(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 
-	// The upload finishes: the source is not held, so this does not wait for the copy.
+	// The upload finishes: the source is not held yet, so this does not wait for the copy.
 	tx, err := db.GetWritePool().Begin(ctx)
 	require.NoError(t, err)
 	defer tx.Rollback(context.Background())
@@ -520,11 +520,96 @@ func TestCopyOfSourceUploadedAfterItWasReadStartsNotUploaded(t *testing.T) {
 	close(paused.resume)
 	res := <-copyDone
 	require.NoError(t, res.err)
+
+	// Before the commit: the copy claims the object, so its source is held live.
+	probe, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	_, err = probe.Exec(ctx, `SET LOCAL lock_timeout = '300ms'`)
+	require.NoError(t, err)
+	_, err = probe.Exec(ctx, `UPDATE messages SET expunged_at = now(), expunged_modseq = nextval('messages_modseq') WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid)
+	require.NoError(t, probe.Rollback(ctx))
+	require.True(t, lockNotAvailable(err), "the source of a copy marked uploaded could be expunged while the copy was open: %v", err)
+	assert.Zero(t, reapableBodies(t, ctx, db, accountID, hash), "the cleaner found the body retirable while a copy of it was open")
+
 	require.NoError(t, copyTx.Commit(ctx))
 
 	var uploaded bool
 	require.NoError(t, db.GetWritePool().QueryRow(ctx, `SELECT uploaded FROM messages WHERE mailbox_id = $1 AND uid = $2`, archiveID, res.uids[uid]).Scan(&uploaded))
-	assert.False(t, uploaded, "the copy claims an object through a source row the copy did not hold")
+	assert.True(t, uploaded, "the copy of a source uploaded before the insert was not marked uploaded")
+	var pending int
+	require.NoError(t, db.GetWritePool().QueryRow(ctx, `SELECT count(*) FROM pending_uploads WHERE account_id = $1 AND content_hash = $2`, accountID, hash).Scan(&pending))
+	assert.Zero(t, pending, "the copy queued an upload for a body that is in S3")
+}
+
+// A source being expunged while the copy marks late-uploaded sources is waited for and
+// then left out: the copy of a source that is gone by its commit must not claim the
+// object through it.
+func TestCopyDoesNotMarkCopyOfSourceExpungedMeanwhile(t *testing.T) {
+	if testing.Short() {
+		t.Skip("Skipping database integration test in short mode")
+	}
+
+	db, _, accountID, inboxID := setupCleanerTestDatabase(t)
+	defer db.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	archiveID := createRestageMailbox(t, ctx, db, accountID, "Archive")
+	hash := fmt.Sprintf("copy_source_expunged_%d", time.Now().UnixNano())
+	const uid = 9871
+	insertRestageFixture(t, ctx, db.GetWritePool(), accountID, inboxID, uid, hash, false)
+	_, err := db.GetWritePool().Exec(ctx, `UPDATE messages SET uploaded = FALSE WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid)
+	require.NoError(t, err)
+
+	copyTx, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer copyTx.Rollback(context.Background())
+	var copyPID int
+	require.NoError(t, copyTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&copyPID))
+	paused := newPauseTx(copyTx, "WITH late AS")
+	type copyResult struct {
+		uids map[imap.UID]imap.UID
+		err  error
+	}
+	copyDone := make(chan copyResult, 1)
+	go func() {
+		uids := []imap.UID{uid}
+		copied, _, err := db.CopyMessages(ctx, paused, &uids, inboxID, archiveID, accountID, "domain", "part", "test-instance", nil, nil)
+		copyDone <- copyResult{copied, err}
+	}()
+	select {
+	case <-paused.reached:
+	case res := <-copyDone:
+		t.Fatalf("CopyMessages finished without marking late sources: %v", res.err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+
+	// The upload finishes, and an expunge of the source is still open when the copy marks
+	// its late sources.
+	other, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer other.Rollback(context.Background())
+	_, err = other.Exec(ctx, `UPDATE messages SET uploaded = TRUE WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid)
+	require.NoError(t, err)
+	require.NoError(t, other.Commit(ctx))
+	expunge, err := db.GetWritePool().Begin(ctx)
+	require.NoError(t, err)
+	defer expunge.Rollback(context.Background())
+	_, err = expunge.Exec(ctx, `UPDATE messages SET expunged_at = now(), expunged_modseq = nextval('messages_modseq') WHERE mailbox_id = $1 AND uid = $2`, inboxID, uid)
+	require.NoError(t, err)
+
+	close(paused.resume)
+	require.True(t, waitUntilBlocked(t, ctx, db, copyPID, make(chan error)), "the copy did not wait for the expunge of its source")
+	require.NoError(t, expunge.Commit(ctx))
+
+	res := <-copyDone
+	require.NoError(t, res.err)
+	require.NoError(t, copyTx.Commit(ctx))
+
+	var uploaded bool
+	require.NoError(t, db.GetWritePool().QueryRow(ctx, `SELECT uploaded FROM messages WHERE mailbox_id = $1 AND uid = $2`, archiveID, res.uids[uid]).Scan(&uploaded))
+	assert.False(t, uploaded, "the copy claims the object through a source expunged before the copy committed")
 	assert.Zero(t, liveRowsWithoutUpload(t, ctx, db, accountID, hash), "the copy is not uploaded and has no pending upload")
 }
 
