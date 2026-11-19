@@ -15,7 +15,8 @@ import (
 // recipients Sora stores (helpers.ExtractRecipients, BuildEnvelope); its ENVELOPE as a
 // message/rfc822 attachment is built by go-imap (imapserver.ExtractEnvelope). Both are
 // the same parse of the same headers, so every address list must come out equal: the
-// same addresses, routes, display names and group records, in the same order (#2124).
+// same addresses, routes, display names and group records, in the same order (#2124),
+// also for a header with bytes that are not text.
 func TestTopLevelEnvelopeMatchesAttached(t *testing.T) {
 	for _, value := range []string{
 		// plain lists and display names
@@ -41,6 +42,13 @@ func TestTopLevelEnvelopeMatchesAttached(t *testing.T) {
 		// internationalized route hops
 		"<@bücher.example:user@domain>", "<@routé.example, @例え.example:user@domain>", "<@[例え:route]:user@domain>",
 		"team: <@routé.example:user@domain>, plain@domain;, after@domain", "<@bücher.example:user@bücher.example>",
+		// bytes that are not text: invalid UTF-8 and NUL are removed before parsing, on
+		// both sides by the same function (mailaddr.ParseListLenient)
+		"caf\xe9@example.com", "Na\x80me <user@example.com>, pl\xffain@example.com", "Na\x00me <us\x00er@example.com>",
+		"J\xc3 <j@example.com>", "te\xc0am: a@example.com;", "\x96: a@example.com;", "te\x00am:;",
+		"<@route\x80.example:user@domain>", "<(route\xff) @route:user@domain>", "<@[route\xe2\x82]:user@domain>",
+		"<@route (route\\\x80):user@domain>", "=?utf-8?q?ab=80c?= <a@example.com>", "=?utf-8?q?te=00am?=: a@example.com;",
+		"\uFFFD <j@example.com>", "\xff", "\x00",
 	} {
 		t.Run(value, func(t *testing.T) {
 			h := mail.HeaderFromMap(map[string][]string{"From": {value}, "To": {value}, "Cc": {value}, "Bcc": {value}})

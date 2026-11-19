@@ -80,10 +80,23 @@ func TestMalformedUTF8SourceRouteIsNotAnAddress(t *testing.T) {
 			})
 		}
 	}
-	// Invalid bytes outside a route are removed and the address kept, as before.
-	h := mail.HeaderFromMap(map[string][]string{"To": {"Na\x80me <@route:user@domain>, pl\xffain@domain"}})
-	want := []Recipient{{AddressType: "to", Name: "Name", EmailAddress: "user@domain", Route: "@route"}, {AddressType: "to", EmailAddress: "plain@domain"}}
-	if got := ExtractRecipients(h.Header); !slices.Equal(got, want) {
-		t.Errorf("invalid bytes outside the route: %+v, want %+v", got, want)
+	// A stored header is read without its invalid bytes, in a route as anywhere else,
+	// and its addresses are kept, as before.
+	for _, tc := range []struct {
+		value string
+		want  []Recipient
+	}{
+		{"Na\x80me <@route:user@domain>, pl\xffain@domain", []Recipient{
+			{AddressType: "to", Name: "Name", EmailAddress: "user@domain", Route: "@route"}, {AddressType: "to", EmailAddress: "plain@domain"}}},
+		{"<@route\x80.example:user@domain>", []Recipient{{AddressType: "to", EmailAddress: "user@domain", Route: "@route.example"}}},
+		{"<(route\xff) @route:user@domain>", []Recipient{{AddressType: "to", EmailAddress: "user@domain", Route: "@route"}}},
+		{"caf\xe9@example.com", []Recipient{{AddressType: "to", EmailAddress: "caf@example.com"}}},
+		{"Na\x00me <us\x00er@example.com>", []Recipient{{AddressType: "to", Name: "Name", EmailAddress: "user@example.com"}}},
+		{"te\xc0am: a@example.com;", []Recipient{{AddressType: "to", Group: "team"}, {AddressType: "to", EmailAddress: "a@example.com"}, {AddressType: "to", GroupEnd: true}}},
+	} {
+		h := mail.HeaderFromMap(map[string][]string{"To": {tc.value}})
+		if got := ExtractRecipients(h.Header); !slices.Equal(got, tc.want) {
+			t.Errorf("ExtractRecipients(%q) = %+v, want %+v", tc.value, got, tc.want)
+		}
 	}
 }
