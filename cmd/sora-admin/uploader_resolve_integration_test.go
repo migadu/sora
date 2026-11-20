@@ -41,6 +41,12 @@ func TestResolveKeepsParkedUploadWithoutTheSpool(t *testing.T) {
 			if _, err := os.Stat(config.DefaultUploaderPath); err == nil {
 				t.Skipf("the server's default spool %s exists on this host", config.DefaultUploaderPath)
 			}
+			// A /tmp/sora/uploads left by a local server of an earlier release makes
+			// resolve refuse (TestResolveRefusesWhileLegacySpoolHoldsBodies): point the
+			// legacy check at a directory that does not exist.
+			saved := legacyUploaderPath
+			legacyUploaderPath = filepath.Join(t.TempDir(), "legacy-uploads")
+			t.Cleanup(func() { legacyUploaderPath = saved })
 			return ""
 		}, false, kept},
 		{"uploader path not on this host", func(t *testing.T) string {
