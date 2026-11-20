@@ -6,7 +6,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"testing"
@@ -16,6 +15,7 @@ import (
 	"github.com/migadu/go-imap"
 	"github.com/migadu/sora/db"
 	"github.com/migadu/sora/pkg/resilient"
+	"github.com/migadu/sora/storage"
 	"github.com/stretchr/testify/require"
 )
 
@@ -104,12 +104,16 @@ func TestAccountPurgeFailureLeavesAccountRetryable(t *testing.T) {
 }
 
 // failingDeleteStorage refuses every delete, like a provider rejecting the credentials.
+// The refusal is the typed error the S3 client returns: only a proven refusal releases
+// the deletion intent, while an error of unknown outcome keeps the body quarantined
+// until `sora-admin verify body-deletions` settles it, and the second run below could
+// not finish.
 type failingDeleteStorage struct {
 	objectStorage
 }
 
 func (f *failingDeleteStorage) Delete(key string) error {
-	return errors.New("403 AccessDenied")
+	return &storage.DeleteObjectError{Code: "AccessDenied", Message: "Access Denied"}
 }
 
 // insertPurgeTestMessage adds one INBOX message with a plaintext body (so it is staged for
