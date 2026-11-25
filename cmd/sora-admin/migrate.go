@@ -186,11 +186,9 @@ Examples:
 
 // downTarget returns the version that `migrate down` leaves applied when current is
 // applied: limit migrations earlier, or with all the first migration. versions are
-// the migrations in ascending order. It refuses to go past the first migration. That
-// migration's down file is a deliberate no-op (000001_initial_schema.down.sql), so
-// reverting it would record no version while the initial tables stay, and the next
-// `migrate up`, or a sora start, would fail creating them again and leave the first
-// version dirty. To tear the schema down, drop and recreate the database.
+// the migrations in ascending order. It refuses to go past the first migration, the
+// baseline that creates the whole schema: it has no down file. To tear the schema
+// down, drop and recreate the database.
 func downTarget(versions []uint, current uint, limit int, all bool) (uint, error) {
 	i := slices.Index(versions, current)
 	if i < 0 {

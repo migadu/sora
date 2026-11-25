@@ -855,8 +855,8 @@ minute is raised to 1 minute. In order, one cycle:
    longer. Until then a retried delivery is not redirected again
    ([SIEVE.md](SIEVE.md#7-redirect)). A rate-limit entry is also kept until the
    `redirect_rate_window` of the server that charged it has passed, so the limit counts every
-   redirect inside its window whichever node runs the cleanup (an entry written by a version
-   before migration 75 has no window of its own and goes by the first rule alone).
+   redirect inside its window whichever node runs the cleanup (an entry written by an earlier
+   version has no window of its own and goes by the first rule alone).
 7. **Health status.** Deletes health status rows not updated for `health_status_retention`
    (default 30 days; `0` keeps them).
 8. **Mailbox counters.** Repairs unseen counters that have drifted below zero.

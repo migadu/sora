@@ -735,24 +735,27 @@ Sora uses [golang-migrate](https://github.com/golang-migrate/migrate). The migra
 embedded into both binaries with `//go:embed migrations/*.sql` in [`db/db.go`](../db/db.go). There
 is no list to register them in: a file in `db/migrations` is part of the next build.
 
+The first file, `000001_baseline.up.sql`, creates the complete schema; it is `pg_dump` output of a
+live database and has no `down` file. Never edit it: a database that already applied it would not
+get the change. Every schema change is a new numbered migration after it.
+
 ### 9.1 Naming and numbering
 
 Each migration is two files with the same six-digit number and name:
 
 ```text
-db/migrations/000074_add_example_column.up.sql
-db/migrations/000074_add_example_column.down.sql
+db/migrations/000002_add_example_column.up.sql
+db/migrations/000002_add_example_column.down.sql
 ```
 
 - Use the next number after the highest one in `db/migrations`. Find it with
   `ls db/migrations | tail -2`.
-- Every migration on `main` has both an `up` and a `down` file. Keep it that way:
+- Every migration after the baseline has both an `up` and a `down` file. Keep it that way:
   `sora-admin migrate down` needs the `down` file.
 - The `down` file must undo the `up` file, so that a rollback leaves the schema as it was.
 
-`main` has no migration `000032` and no `000063`: the files go from `000031` to `000033`, and from
-`000062` to `000064`. A gap by itself is harmless, because golang-migrate moves on to the next file
-it finds.
+A gap in the numbers is harmless by itself, because golang-migrate moves on to the next file it
+finds.
 
 ### 9.2 What goes wrong with numbers
 
@@ -760,17 +763,19 @@ golang-migrate reads the database's current version from `schema_migrations`, th
 version among the files. If the version is not there, it stops, and the error contains:
 
 ```text
-failed to run migrations: no migration found for version 59
+failed to run migrations: no migration found for version 3
 ```
 
 This happens when two branches each add a migration and a database has been migrated by the other
-branch. For example: another branch adds `000059` and migrates the shared test database to 59.
-Your branch adds `000060` and has no `000059`. Every test that connects with migrations on now
-fails, because version 59 is not a file in your tree.
+branch. For example: another branch adds `000003` and migrates the shared test database to 3.
+Your branch adds `000004` and has no `000003`. Every test that connects with migrations on now
+fails, because version 3 is not a file in your tree.
 
-The other direction is quieter. If the database is ahead of your tree (at 60 while your newest
-file is 58), Sora treats it as up to date and starts. Your code then runs against a schema with
-changes it does not know about.
+The other direction is quieter. If the database is ahead of your tree (at 4 while your newest
+file is 3), Sora treats it as up to date and starts, with a warning in the log. Your code then
+runs against a schema with changes it does not know about. A test database from before the
+baseline is the same case: it is at version 77, so no migration is ever applied to it. Recreate
+it with `make reset-test-db`.
 
 So:
 
@@ -814,18 +819,17 @@ migrator holds it, they stop at once with
   file rolls back and the version is left marked dirty.
 - **Statements that refuse transactions must stand alone.** `CREATE INDEX CONCURRENTLY` cannot run
   in a transaction, so it works only as the only statement in its file (comments are fine).
-  `000028_optimize_expunge_lookup.up.sql` is an example.
 - **Make it re-runnable.** Use `IF NOT EXISTS` and `IF EXISTS`. Operators can then run an
   expensive step by hand before the upgrade, and the migration becomes a no-op.
 - **Think about big tables.** A plain `CREATE INDEX` or a table rewrite on `messages` blocks
   delivery for as long as it runs. For such changes, write the operator steps into the comment at
   the top of the migration: what to run out of band (for example the `CONCURRENTLY` form), in
-  which order relative to the application deploy, and how to check it. `000052` is an example.
+  which order relative to the application deploy, and how to check it.
 - **Mixed versions.** During a rolling upgrade, old binaries run against the new schema. Prefer
   changes the old code can live with: add a nullable column before you write it, stop reading a
   column before you drop it. See [OPERATIONS.md](OPERATIONS.md).
 - **Extensions.** Migrations create the extensions they need with `CREATE EXTENSION IF NOT
-  EXISTS` (`pg_trgm` in `000001`, `btree_gin` in `000050`).
+  EXISTS` (the baseline creates `pg_trgm` and `btree_gin`).
 
 ### 9.5 Testing a migration
 
@@ -835,8 +839,8 @@ migrator holds it, they stop at once with
   first with `createdb`. See [TESTING.md](TESTING.md#6-the-test-database).
 - Test the `down` file too: apply it with `sora-admin --config <file> migrate down` against a
   throwaway database, then `migrate up` again.
-- Tests that need a specific old version, like `db/concurrent_migration_test.go`, use a database of
-  their own (`<test db>_migrations`), never the shared one.
+- Tests that empty the schema, like `db/concurrent_migration_test.go`, use a database of their own
+  (`<test db>_migrations`), never the shared one.
 
 ---
 

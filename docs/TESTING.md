@@ -336,7 +336,7 @@ suffix, and create it when it does not exist. `<test db>` below is `sora_test_db
 
 | Database | Used by | Why |
 |---|---|---|
-| `<test db>_migrations` | `db/concurrent_migration_test.go` | Drops the schema and rolls the migrations back to version 11. |
+| `<test db>_migrations` | `db/concurrent_migration_test.go` | Drops the schema, so that the next connection has to apply the migrations. |
 | `<test db>_uploader` | `db/upload_worker_test.go` | Truncates the tables before each test. |
 | `<test db>_admin` | the `cmd/sora-admin` integration tests | Several drop the whole schema. |
 | `<test db>_<name>` | other `db` tests (`_references`, `_stranded`, `_ftsqueue`, `_identity_...`, `_feed_...`), `server/credchanges`, `cmd/sora`, `pkg/resilient` (`_failover`), `scripts/reset-test-db` (`_reset`) and `integration_tests/delivery` (`_replica`) | They empty tables, run migrations, or query rows database-wide, so other tests' rows would disturb them. |

@@ -93,4 +93,5 @@ WHERE octet_length(m.subject) > 600 OR octet_length(m.subject_sort) > 600
 -- DROP TABLE sora_oversized_header_rows;
 -- DROP FUNCTION sora_trunc_utf8(text, int);
 
--- 5. Build the index per the runbook in db/migrations/000052_messages_mailbox_headers_index.up.sql.
+-- 5. Build the header covering index with CREATE INDEX CONCURRENTLY, using the definition of
+--    idx_messages_mailbox_headers_v3 in db/migrations/000001_baseline.up.sql.

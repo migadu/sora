@@ -507,7 +507,7 @@ file of the same name and layout in its target directory ([section 15](#15-expor
 
 ### The database identity
 
-Migration 000068 stores the database's identity, a UUID, in `public.database_identity`.
+The database's identity, a UUID, is stored in `public.database_identity`.
 Restarts, a backup restored as the same database, and a replica failover keep it; a host name,
 connection string or server process is not the identity.
 

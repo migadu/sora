@@ -102,12 +102,6 @@ func TestCleanupFailedUploadsInstanceLiveness(t *testing.T) {
 		hashes[c.name] = hash
 
 		_, err := tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-			VALUES ($1, 'body', to_tsvector('english', 'body'))
-		`, hash)
-		require.NoError(t, err)
-
-		_, err = tx.Exec(ctx, `
 			WITH inserted AS (
 				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date,
 				                      size, uploaded, s3_domain, s3_localpart, message_id, body_structure,

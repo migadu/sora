@@ -786,14 +786,14 @@ with `database is in a dirty migration state (version N). Manual intervention re
 does not start. To fix it:
 
 1. Stop every Sora process.
-2. Read the log for the error, and the file `db/migrations/0000NN_*.up.sql` for that version. Most
-   files run as one transaction, so nothing of a failed one stays; a file with its own
-   `BEGIN`/`COMMIT` or a `CREATE INDEX CONCURRENTLY` can leave part of its work behind. Check in
-   PostgreSQL which of its statements took effect.
+2. Read the log for the error, and the file `db/migrations/0000NN_*.up.sql` for that version. A
+   file runs as one transaction, so nothing of a failed one stays; a file with its own
+   `BEGIN`/`COMMIT` can leave part of its work behind. Check in PostgreSQL which of its
+   statements took effect.
 3. Fix the cause. Then either finish the migration by hand and run
    `sora-admin --config PATH migrate force N`, or undo what it did and run `migrate force` with the
-   number of the migration before it. The numbers have a gap (there is no `000032`), so use the
-   previous file that exists.
+   number of the migration before it. If the numbers have a gap, use the previous file that
+   exists.
 4. Start Sora. After forcing the previous version, it applies migration N again.
 
 [DATABASE.md](DATABASE.md) has more on failed and long migrations.
@@ -810,8 +810,8 @@ host and port rules as `sora`:
 | `down [--limit N \| --all]` | Reverts migrations, one by default. | Yes |
 | `force N` | Sets the version to N and clears the dirty flag. Runs no SQL. | Yes |
 
-`migrate down` never reverts the first migration (the initial schema): `--all` stops at
-version 1, and a `--limit` that would go past it is refused.
+`migrate down` never reverts the first migration (the baseline, which creates the whole schema):
+`--all` stops at version 1, and a `--limit` that would go past it is refused.
 
 `sora-admin` does not apply migrations on its own: on a new database, start `sora` once or run
 `migrate up` before other `sora-admin` commands.
@@ -821,9 +821,8 @@ Notes:
 - Migrations create the `pg_trgm` and `btree_gin` extensions themselves. The database owner can do
   that without superuser rights on current PostgreSQL versions, because both extensions are trusted
   ([DATABASE.md](DATABASE.md)).
-- Down migrations can delete data. For example, reverting `000055` drops the `backend_maintenance`
-  table, and reverting `000057` deletes vacation records the older schema cannot hold. Read the
-  `.down.sql` files before you run `migrate down`.
+- Down migrations can delete data: reverting a migration that added a table drops the table with
+  its rows. Read the `.down.sql` files before you run `migrate down`.
 
 ---
 
@@ -1086,7 +1085,7 @@ deletion while old work or old write credentials can still arrive.
 ### Body deletions that stay quarantined
 
 Before the cleaner sends a DELETE for a body to S3, it commits a deletion intent in PostgreSQL
-(the `s3_body_delete_intents` table, migration `000072`). The intent names the content hash, the
+(the `s3_body_delete_intents` table). The intent names the content hash, the
 object keys and an operation ID. When the outcome is uncertain, the intent stays. That happens
 when the process holding the lock dies, a storage request times out, or the commit after the
 delete is uncertain.
@@ -1133,8 +1132,7 @@ To resolve a quarantined body:
    storage request or a failed commit leaves the intent in place, and the command exits with
    status 1.
 
-Never delete intent rows by hand. Migration `000072` cannot be reverted while intents remain:
-its down migration refuses.
+Never delete intent rows by hand.
 
 A PUT that stalls and loses its upload lease cannot mark its message as uploaded afterwards. If
 the provider still accepts that PUT later, it leaves an object that nothing references, which

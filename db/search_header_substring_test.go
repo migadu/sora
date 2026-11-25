@@ -161,34 +161,45 @@ func TestSortColumnsAreBounded(t *testing.T) {
 		"extra_addresses must keep a useful minimum when every sort column is at its bound")
 }
 
-// headerIndex parses the name, INCLUDE list, key column and predicate column of the header
-// covering index from the newest migration that creates it (000059's
-// idx_messages_mailbox_headers_v2 replaced 000052's idx_messages_mailbox_headers), so the
-// guards below follow the migrations rather than a copy of them.
-func headerIndex(t *testing.T) (name string, cols map[string]bool) {
+// migrationStatements returns the SQL of every migration, oldest first, without comment lines
+// (runbooks quote DDL in comments; only statements count) and with the spellings pg_dump
+// adds in the baseline removed, so one pattern matches a hand-written migration and the
+// baseline alike.
+func migrationStatements(t *testing.T) []string {
 	t.Helper()
 	files, err := filepath.Glob("migrations/*.up.sql")
 	require.NoError(t, err)
+	require.NotEmpty(t, files)
 	sort.Strings(files)
-	def := regexp.MustCompile(`(?s)CREATE INDEX (\w+) ON messages \((\w+)\)\s*INCLUDE \(([^)]*)\)\s*WHERE (\w+) IS NULL`)
-	var m []string
-	var from string
+	plain := strings.NewReplacer("IF NOT EXISTS ", "", "CONCURRENTLY ", "", "public.", "", " USING btree", "")
+	var out []string
 	for _, f := range files {
 		src, err := os.ReadFile(f)
 		require.NoError(t, err)
-		// Runbooks quote the DDL in comments; only statements count.
 		var code []string
 		for _, line := range strings.Split(string(src), "\n") {
 			if !strings.HasPrefix(strings.TrimSpace(line), "--") {
 				code = append(code, line)
 			}
 		}
-		if found := def.FindStringSubmatch(strings.ReplaceAll(strings.Join(code, "\n"), "IF NOT EXISTS ", "")); found != nil {
-			m, from = found, f
+		out = append(out, plain.Replace(strings.Join(code, "\n")))
+	}
+	return out
+}
+
+// headerIndex parses the name, INCLUDE list, key column and predicate column of the header
+// covering index from the newest migration that creates it, so the guards below follow the
+// migrations rather than a copy of them.
+func headerIndex(t *testing.T) (name string, cols map[string]bool) {
+	t.Helper()
+	def := regexp.MustCompile(`(?s)CREATE INDEX (idx_messages_mailbox_headers\w*) ON messages \((\w+)\)\s*INCLUDE \(([^)]*)\)\s*WHERE \(?(\w+) IS NULL\)?`)
+	var m []string
+	for _, code := range migrationStatements(t) {
+		if found := def.FindStringSubmatch(code); found != nil {
+			m = found
 		}
 	}
 	require.NotNil(t, m, "no migration creates the header covering index")
-	require.Equal(t, "migrations/000070_messages_header_presence.up.sql", from, "harness check: the newest definition is migration70")
 	cols = map[string]bool{m[2]: true, m[4]: true}
 	for _, c := range strings.Split(m[3], ",") {
 		cols[strings.TrimSpace(c)] = true
@@ -282,17 +293,14 @@ func TestHeaderIndexCoversLightweightSearch(t *testing.T) {
 		assert.False(t, indexed["message_id_raw"],
 			"unbounded message_id_raw must stay out of %s so large folded Message-ID headers remain TOAST-safe", indexName)
 
-		mig73, err := os.ReadFile("migrations/000073_messages_message_id_raw.up.sql")
-		require.NoError(t, err)
-		var mig73Code []string
-		for _, line := range strings.Split(string(mig73), "\n") {
-			if !strings.HasPrefix(strings.TrimSpace(line), "--") {
-				mig73Code = append(mig73Code, line)
+		rawIdxDef := regexp.MustCompile(`(?s)CREATE INDEX idx_messages_mailbox_message_id_raw\s+ON messages \(([^)]+)\)\s*(?:INCLUDE \(([^)]*)\)\s*)?WHERE ([^;]+);`)
+		var rawMatch []string
+		for _, code := range migrationStatements(t) {
+			if found := rawIdxDef.FindStringSubmatch(code); found != nil {
+				rawMatch = found
 			}
 		}
-		rawIdxDef := regexp.MustCompile(`(?s)CREATE INDEX idx_messages_mailbox_message_id_raw\s+ON messages \(([^)]+)\)\s*(?:INCLUDE \(([^)]*)\)\s*)?WHERE ([^;]+);`)
-		rawMatch := rawIdxDef.FindStringSubmatch(strings.ReplaceAll(strings.Join(mig73Code, "\n"), "IF NOT EXISTS ", ""))
-		require.NotNil(t, rawMatch, "000073 must define idx_messages_mailbox_message_id_raw")
+		require.NotNil(t, rawMatch, "a migration must define idx_messages_mailbox_message_id_raw")
 		rawBtreeCols := map[string]bool{}
 		for _, part := range []string{rawMatch[1], rawMatch[2]} {
 			for _, c := range strings.Split(part, ",") {

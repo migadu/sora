@@ -3,8 +3,6 @@ package db
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -21,7 +19,7 @@ import (
 //   - no query on messages may filter on m.account_id (mailbox_id already scopes it), or
 //     such messages vanish from THREAD, TEXT and seqnum searches while SEARCH ALL still
 //     lists them;
-//   - their FTS rows must be keyed on the mailbox owner, by the backfill and by the sweep's
+//   - their FTS rows must be keyed on the mailbox owner, by the sweep's
 //     notion of "still referenced", or body search can never find them.
 func TestLegacySharedMailboxMessagesStaySearchable(t *testing.T) {
 	if testing.Short() {
@@ -59,7 +57,7 @@ func TestLegacySharedMailboxMessagesStaySearchable(t *testing.T) {
 		`, accountID, mailboxID, uid, hash, subject, fmt.Sprintf("<%s@example.com>", hash)).Scan(&id))
 		return id
 	}
-	legacyID := insert(appenderID, 9301, legacyHash, "Legacy haystack")
+	insert(appenderID, 9301, legacyHash, "Legacy haystack")
 	insert(ownerID, 9302, ownerHash, "Owner haystack")
 
 	for hash, word := range map[string]string{legacyHash: "legacyneedle", ownerHash: "ownerneedle"} {
@@ -71,7 +69,6 @@ func TestLegacySharedMailboxMessagesStaySearchable(t *testing.T) {
 	t.Cleanup(func() {
 		c := context.Background()
 		db.GetWritePool().Exec(c, `DELETE FROM messages_fts_v2 WHERE content_hash = ANY($1)`, []string{legacyHash, ownerHash})
-		db.GetWritePool().Exec(c, `DELETE FROM messages_fts WHERE content_hash = ANY($1)`, []string{legacyHash, ownerHash})
 	})
 
 	uids := func(msgs []SearchMessageResult) map[imap.UID]bool {
@@ -131,29 +128,5 @@ func TestLegacySharedMailboxMessagesStaySearchable(t *testing.T) {
 		n, err := db.DeleteMessagesFTSByKeyBatch(ctx, tx, []FTSKey{{ContentHash: legacyHash, AccountID: ownerID}})
 		require.NoError(t, err)
 		assert.Equal(t, int64(0), n, "the sweep deleted the owner-keyed FTS row of a live legacy message")
-	})
-
-	t.Run("backfill catch-up keys on the mailbox owner", func(t *testing.T) {
-		script, err := os.ReadFile(filepath.Join(moduleRoot(t), "scripts", "fts_v2_backfill.sql"))
-		require.NoError(t, err)
-		_, err = db.GetWritePool().Exec(ctx, string(script))
-		require.NoError(t, err)
-
-		_, err = db.GetWritePool().Exec(ctx, `DELETE FROM messages_fts_v2 WHERE content_hash = $1`, legacyHash)
-		require.NoError(t, err)
-		_, err = db.GetWritePool().Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body_tsv, sent_date)
-			VALUES ($1, to_tsvector('simple', 'legacyneedle'), now())`, legacyHash)
-		require.NoError(t, err)
-
-		_, err = db.GetWritePool().Exec(ctx, `CALL fts_v2_catchup($1, 20000, 0)`, legacyID-1)
-		require.NoError(t, err)
-
-		var owner, appender int
-		require.NoError(t, db.GetWritePool().QueryRow(ctx, `
-			SELECT count(*) FILTER (WHERE account_id = $2), count(*) FILTER (WHERE account_id = $3)
-			FROM messages_fts_v2 WHERE content_hash = $1`, legacyHash, ownerID, appenderID).Scan(&owner, &appender))
-		assert.Equal(t, 1, owner, "catch-up must create the FTS row under the mailbox owner")
-		assert.Equal(t, 0, appender, "catch-up must not key the row on the legacy appender")
 	})
 }

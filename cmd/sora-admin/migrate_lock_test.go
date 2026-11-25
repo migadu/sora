@@ -116,6 +116,14 @@ func TestMigrateCommands_DownForceUpRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatalf("migrations subdirectory: %v", err)
 	}
+	versions, err := db.MigrationVersions()
+	if err != nil {
+		t.Fatalf("reading the migrations: %v", err)
+	}
+	if len(versions) < 2 {
+		// The baseline has no down file and is never reverted (see downTarget).
+		t.Skip("only the baseline migration is embedded: there is no step to take down and up again")
+	}
 	prev, err := previousMigrationVersion(migrations, latest)
 	if err != nil {
 		t.Fatalf("version below %d: %v", latest, err)

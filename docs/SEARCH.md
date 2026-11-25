@@ -232,7 +232,7 @@ See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md).
 
 ### The table
 
-`messages_fts_v2` (migration 000050) has one row per body per account:
+`messages_fts_v2` has one row per body per account:
 
 | Column | Meaning |
 |---|---|
@@ -692,29 +692,19 @@ See [METRICS.md](METRICS.md) for the full list.
 - If a node logs many search timeouts, look at `sora_db_query_duration_seconds` by `operation`
   before you raise the timeouts.
 
-### Upgrades that change search
+### Mail stored by earlier releases
 
-Several migrations change the search tables or the header index. On a large database they need
-work by hand before you upgrade, on the primary over a direct connection. Each migration file
-describes the steps in its header comment. The ones that build an index refuse to build it
-themselves on more than 25,000 messages.
+Several of the columns that header search uses were added while Sora was already in use:
+`extra_addresses`, `sent_utc_offset`, `sent_date_unknown`, `header_presence` and
+`message_id_raw`. None of them is filled in from the stored bodies. Messages stored before a
+column existed keep the search behaviour they had, as described in
+[section 2](#2-header-search); the table of those columns is in
+[DATABASE.md](DATABASE.md#rows-stored-by-earlier-releases).
+[scripts/backfill_extra_addresses.sql](../scripts/backfill_extra_addresses.sql) can fill
+`extra_addresses` for older rows; until then they match by their first address only.
 
-| Migration | What it adds | Before upgrading a large database |
-|---|---|---|
-| 000050 | `messages_fts_v2`. It copies the older table `messages_fts` itself only when that table has at most 25,000 rows. | Run the out-of-band backfill in [scripts/fts_v2_backfill.sql](../scripts/fts_v2_backfill.sql). |
-| 000052 | `idx_messages_mailbox_headers`, the first covering index for header search. | Fix over-long rows with [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql), then build the index concurrently. |
-| 000059 | `extra_addresses`, so FROM, TO and CC match every address, and the `_v2` covering index. | Add the column, build the new index concurrently and drop the old one. Optionally, once every node runs the new version, fill older rows with [scripts/backfill_extra_addresses.sql](../scripts/backfill_extra_addresses.sql); until then older messages match by their first address only. |
-| 000060, 000061 | `sent_utc_offset` and `sent_date_unknown`, for the SENT* date rules and the `NIL` ENVELOPE date. | Add the columns with a short lock timeout. |
-| 000062 | `idx_messages_mailbox_sent_date_unknown`. | Build the index concurrently. |
-| 000070 | `header_presence` and the `_v3` covering index, which replaces `_v2`. | Add the column and build `_v3` concurrently. A database not yet at 000059 can skip `_v2` and build `_v3` directly. |
-| 000073 | `message_id_raw` and its partial index. | Add the column and build the index concurrently. |
-
-None of these fills in old rows from the stored bodies. Messages stored before an upgrade keep
-the search behaviour they had, as described in [section 2](#2-header-search). The general steps
-are in [DATABASE.md](DATABASE.md#9-migrations).
-
-The older tables `messages_fts` and `message_contents` are still in the schema. Sora does not read
-or write them.
+A migration that changes a search table or the header index on a large database needs work by
+hand before the upgrade. The general steps are in [DATABASE.md](DATABASE.md#large-databases).
 
 ---
 
@@ -734,4 +724,4 @@ or write them.
 | FTS worker | [server/fts/worker.go](../server/fts/worker.go), `ProcessFTSBatch` in [db/fts.go](../db/fts.go) |
 | Retention and orphan cleanup | `PruneOldMessageVectors`, `GetUnusedFTSKeys` in [db/cleaner.go](../db/cleaner.go), [server/cleaner/worker.go](../server/cleaner/worker.go) |
 | User API search | `SearchMessagesInMailbox` in [db/user_operations.go](../db/user_operations.go) |
-| Schema | [db/migrations/000050_messages_fts_v2.up.sql](../db/migrations/000050_messages_fts_v2.up.sql), [db/migrations/000052_messages_mailbox_headers_index.up.sql](../db/migrations/000052_messages_mailbox_headers_index.up.sql), [000059](../db/migrations/000059_messages_extra_addresses.up.sql), [000070](../db/migrations/000070_messages_header_presence.up.sql), [000073](../db/migrations/000073_messages_message_id_raw.up.sql) |
+| Schema | [db/migrations/000001_baseline.up.sql](../db/migrations/000001_baseline.up.sql) (`messages_fts_v2`, `idx_messages_mailbox_headers_v3`, `idx_messages_mailbox_message_id_raw`) |

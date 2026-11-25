@@ -605,7 +605,7 @@ mailbox list) differs from the number of unseen messages they hold, and with `--
 recomputes it. Older builds left counts too high when the failed-upload cleanup,
 `uploader resolve` or an importer rollback hard-deleted an unseen message, and counts too low
 in mailboxes holding messages without a flag state row: such a message has no flags, so it is
-unseen, but builds before migration 000076 did not count it. A count that has gone negative is
+unseen, but earlier builds did not count it. A count that has gone negative is
 repaired by the server itself.
 
 ```sh
@@ -692,7 +692,7 @@ sora-admin --config config.toml messages restore --email user@example.com --ids 
 
 Fills in the stored References of messages that have none. `SEARCH HEADER References` and
 THREAD read the References chain from a column of the message row
-([SEARCH.md](SEARCH.md)). Messages stored before the column was added (migration 000036), and
+([SEARCH.md](SEARCH.md)). Messages stored before the column was added, and
 messages copied or moved by older builds, have no value in it (NULL). Search does not find them
 by References, and THREAD links them by In-Reply-To only. A message without a References header
 is stored with an empty value, not NULL.
@@ -1372,7 +1372,7 @@ upgrades.
 | Subcommand | Flags | What it does |
 |---|---|---|
 | `up` | | Applies every pending migration. |
-| `down` | `--limit N` (default `1`, at least 1), `--all` | Reverts the last N migrations, or with `--all` every migration after 000001. 000001, the initial schema, is never reverted: a `--limit` that reaches it is refused. Refuses a dirty database. No prompt. |
+| `down` | `--limit N` (default `1`, at least 1), `--all` | Reverts the last N migrations, or with `--all` every migration after the baseline. The baseline (000001), which creates the whole schema, is never reverted: a `--limit` that reaches it is refused. Refuses a dirty database. No prompt. |
 | `version` | | Prints the current version and whether it is dirty. Safe while servers run: a plain read of `schema_migrations`, no lock. |
 | `force VERSION` | | Records VERSION as the current version and clears the dirty flag, without running anything. |
 

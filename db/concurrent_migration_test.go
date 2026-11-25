@@ -21,15 +21,12 @@ import (
 	"context"
 	"database/sql"
 	"errors"
-	"io/fs"
 	"os"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/golang-migrate/migrate/v4"
 	_ "github.com/golang-migrate/migrate/v4/database/postgres"
-	"github.com/golang-migrate/migrate/v4/source/iofs"
 	"github.com/jackc/pgx/v5"
 	_ "github.com/jackc/pgx/v5/stdlib" // pgx driver for database/sql
 	"github.com/migadu/sora/config"
@@ -38,12 +35,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// resetMigrationState rolls the test DB back to the given version so the
-// concurrent-migration tests always start from a clean, known state.
-// It drops the schema objects added by migrations above targetVersion
-// (all DROP statements use IF EXISTS so they are idempotent) and resets
-// schema_migrations to the requested version.
-func resetMigrationState(t *testing.T, targetVersion int) {
+// resetMigrationState empties the test database so the concurrent-migration tests
+// always start from the one state in which a migration is needed: no schema at all.
+// The next NewDatabaseFromConfig(..., true) then has to apply the baseline.
+func resetMigrationState(t *testing.T) {
 	t.Helper()
 	ctx := context.Background()
 
@@ -57,46 +52,14 @@ func resetMigrationState(t *testing.T, targetVersion int) {
 	if err != nil {
 		t.Fatalf("resetMigrationState: connect to DB: %v", err)
 	}
+	defer database.Close()
 
-	// Drop and recreate the public schema to ensure a completely clean slate,
-	// wiping away any "dirty" migration state or conflicting left-over data
-	// from previous test failures. This makes the downgrade rock solid.
+	// Drop and recreate the public schema: this also wipes a "dirty" migration
+	// state and anything a failed earlier run left behind.
 	_, err = database.WritePool.Exec(ctx, "DROP SCHEMA public CASCADE; CREATE SCHEMA public;")
 	if err != nil {
 		t.Fatalf("resetMigrationState: failed to clear schema: %v", err)
 	}
-
-	migrations, err := fs.Sub(MigrationsFS, "migrations")
-	if err != nil {
-		t.Fatalf("failed to get migrations directory: %v", err)
-	}
-
-	sourceDriver, err := iofs.New(migrations, ".")
-	if err != nil {
-		t.Fatalf("failed to create migration source driver: %v", err)
-	}
-
-	// We open a direct sql.DB here since migrate.NewWithInstance takes sqlDB
-	// but the driver name is pgx. Actually, we can just use the target
-	// URL directly.
-	m, err := migrate.NewWithSourceInstance("iofs", sourceDriver, migrationTestConnStr(t))
-	if err != nil {
-		t.Fatalf("failed to create migrate instance: %v", err)
-	}
-
-	// First ensure we are at the latest!
-	err = m.Up()
-	if err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		t.Fatalf("failed to ensure latest migration state: %v", err)
-	}
-
-	// Then gracefully downgrade to target version. This runs all .down.sql scripts cleanly!
-	err = m.Migrate(uint(targetVersion))
-	if err != nil && !errors.Is(err, migrate.ErrNoChange) {
-		t.Fatalf("failed to rollback to target version %d: %v", targetVersion, err)
-	}
-
-	database.Close()
 }
 
 // TestMigrationAdvisoryLockSingleConn directly exercises the root cause and
@@ -414,8 +377,8 @@ func TestMigrateTimeoutCoversWithInstance(t *testing.T) {
 	// resetMigrationState → setupTestDatabase → NewDatabaseFromConfig which
 	// calls pg_try_advisory_lock internally. If we hold the lock
 	// first, setup blocks instead of the db.migrate() call we want to test.
-	resetMigrationState(t, 11)
-	t.Cleanup(func() { resetMigrationState(t, 11) })
+	resetMigrationState(t)
+	t.Cleanup(func() { resetMigrationState(t) })
 
 	db, err := NewDatabaseFromConfig(ctx, makeTestDBConfig(t), false)
 	require.NoError(t, err)
@@ -463,7 +426,7 @@ func TestMigrateTimeoutCoversWithInstance(t *testing.T) {
 	}
 }
 
-// These tests drop the whole public schema and leave the database at migration 11,
+// These tests drop the whole public schema and leave the database empty,
 // so they run in a database of their own, never the shared test database: there
 // they rolled every other package's schema back mid-run and left it behind for the
 // next run. PostgreSQL advisory locks are per-database too, so the migration lock
@@ -537,8 +500,8 @@ func TestNewDatabaseFromConfigConcurrentIdempotent(t *testing.T) {
 	const N = 4
 	const deadline = 20 * time.Second
 
-	resetMigrationState(t, 11)
-	t.Cleanup(func() { resetMigrationState(t, 11) })
+	resetMigrationState(t)
+	t.Cleanup(func() { resetMigrationState(t) })
 
 	type result struct {
 		db  *Database
