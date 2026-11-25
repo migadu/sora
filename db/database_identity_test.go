@@ -2,7 +2,6 @@ package db
 
 import (
 	"context"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -13,7 +12,17 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestDatabaseIdentityPersistsAcrossConnectionsAndMigrationReapply(t *testing.T) {
+// databaseIdentityDDL creates the identity table and its one row as the baseline does.
+// Running it again keeps an existing identity; after a DROP TABLE it generates a new one.
+const databaseIdentityDDL = `
+CREATE TABLE IF NOT EXISTS public.database_identity (
+    singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+    identity UUID NOT NULL DEFAULT gen_random_uuid()
+);
+INSERT INTO public.database_identity (singleton) VALUES (TRUE)
+ON CONFLICT (singleton) DO NOTHING;`
+
+func TestDatabaseIdentityPersistsAcrossConnectionsAndReappliedDDL(t *testing.T) {
 	d := setupTestDatabaseWithSuffix(t, "_identity_persist")
 	ctx := context.Background()
 	identity, err := d.GetDatabaseIdentity(ctx)
@@ -51,14 +60,12 @@ func TestDatabaseIdentityPersistsAcrossConnectionsAndMigrationReapply(t *testing
 	got, err = d.GetDatabaseIdentity(ctx)
 	require.NoError(t, err)
 	require.Equal(t, identity, got)
-	up, err := os.ReadFile("migrations/000068_database_identity.up.sql")
-	require.NoError(t, err)
 	for range 2 {
-		_, err = d.GetWritePool().Exec(ctx, string(up))
+		_, err = d.GetWritePool().Exec(ctx, databaseIdentityDDL)
 		require.NoError(t, err)
 		got, err = d.GetDatabaseIdentity(ctx)
 		require.NoError(t, err)
-		require.Equal(t, identity, got, "idempotent Up must retain the logical identity")
+		require.Equal(t, identity, got, "creating the table again must retain the logical identity")
 	}
 }
 
@@ -104,12 +111,10 @@ func TestDatabaseIdentityFailsClosedWithoutValidSingleton(t *testing.T) {
 	d := setupTestDatabaseWithSuffix(t, "_identity_invalid")
 	defer d.Close()
 	ctx := context.Background()
-	up, err := os.ReadFile("migrations/000068_database_identity.up.sql")
-	require.NoError(t, err)
 	reset := func(t *testing.T) {
 		_, err := d.GetWritePool().Exec(ctx, "DROP TABLE IF EXISTS public.database_identity")
 		require.NoError(t, err)
-		_, err = d.GetWritePool().Exec(ctx, string(up))
+		_, err = d.GetWritePool().Exec(ctx, databaseIdentityDDL)
 		require.NoError(t, err)
 	}
 	defer reset(t)
@@ -138,7 +143,7 @@ func TestDatabaseIdentityFailsClosedWithoutValidSingleton(t *testing.T) {
 		})
 	}
 	reset(t)
-	_, err = d.GetWritePool().Exec(ctx, "DROP TABLE public.database_identity")
+	_, err := d.GetWritePool().Exec(ctx, "DROP TABLE public.database_identity")
 	require.NoError(t, err)
 	got, err := d.GetDatabaseIdentity(ctx)
 	require.Error(t, err)
@@ -146,30 +151,23 @@ func TestDatabaseIdentityFailsClosedWithoutValidSingleton(t *testing.T) {
 	reset(t)
 }
 
-func TestDatabaseIdentityMigrationDownUpRotatesAndCancellationFailsClosed(t *testing.T) {
+func TestDatabaseIdentityRecreatedTableRotatesAndCancellationFailsClosed(t *testing.T) {
 	d := setupTestDatabaseWithSuffix(t, "_identity_rotate")
 	defer d.Close()
 	ctx := context.Background()
 	before, err := d.GetDatabaseIdentity(ctx)
 	require.NoError(t, err)
-	up, err := os.ReadFile("migrations/000068_database_identity.up.sql")
-	require.NoError(t, err)
-	down, err := os.ReadFile("migrations/000068_database_identity.down.sql")
-	require.NoError(t, err)
 	for range 2 {
-		_, err = d.GetWritePool().Exec(ctx, string(down))
+		_, err = d.GetWritePool().Exec(ctx, "DROP TABLE IF EXISTS public.database_identity")
 		require.NoError(t, err)
 	}
 	_, err = d.GetDatabaseIdentity(ctx)
 	require.Error(t, err)
-	_, err = d.GetWritePool().Exec(ctx, string(up))
+	_, err = d.GetWritePool().Exec(ctx, databaseIdentityDDL)
 	require.NoError(t, err)
 	after, err := d.GetDatabaseIdentity(ctx)
 	require.NoError(t, err)
 	require.NotEqual(t, before, after, "recreating the table starts a new destination namespace")
-	versions, err := MigrationVersions()
-	require.NoError(t, err)
-	require.Contains(t, versions, uint(68))
 
 	block, err := d.GetWritePool().Begin(ctx)
 	require.NoError(t, err)

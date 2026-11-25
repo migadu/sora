@@ -12,12 +12,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// The hash-keyed messages_fts table is retired: nothing reads or writes it, and a later migration
-// drops it. Application code that still names it would fail with "relation does not
-// exist" once the table is gone -- on every delivery, MOVE, COPY or worker batch that
-// reached it. This guard catches such a reference before it ships.
+// The hash-keyed messages_fts table is retired: the baseline schema does not have it.
+// Application code that still names it would fail with "relation does not exist" -- on
+// every delivery, MOVE, COPY or worker batch that reached it. This guard catches such a
+// reference before it ships.
 //
-// scripts/ is excluded on purpose: reset-test-db truncates the table while it still exists.
+// scripts/ is excluded on purpose: operator scripts are not application code.
 func TestNoApplicationCodeReferencesRetiredFTSTable(t *testing.T) {
 	root := moduleRoot(t)
 	v1 := regexp.MustCompile(`\bmessages_fts([^_a-zA-Z0-9]|$)`)

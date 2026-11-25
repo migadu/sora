@@ -138,12 +138,6 @@ func TestExpungeOldMessages(t *testing.T) {
 	oldCreatedAt := time.Now().Add(-72 * time.Hour) // 3 days old
 	oldHash := fmt.Sprintf("old_expunge_%d", testTimestamp)
 	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-		VALUES ($1, 'old message', to_tsvector('english', 'old message'))
-	`, oldHash)
-	require.NoError(t, err)
-
-	_, err = tx.Exec(ctx, `
 		WITH inserted AS (
 				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
 		VALUES ($1, $2, 100, $3, $4, $4, 100, TRUE, 'domain', 'part', 'msgid100', 'body', '[]', 100, $5)
@@ -157,12 +151,6 @@ func TestExpungeOldMessages(t *testing.T) {
 	// Create recent message (should NOT be expunged)
 	recentCreatedAt := time.Now().Add(-12 * time.Hour) // 12 hours old
 	recentHash := fmt.Sprintf("recent_expunge_%d", testTimestamp)
-	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-		VALUES ($1, 'recent message', to_tsvector('english', 'recent message'))
-	`, recentHash)
-	require.NoError(t, err)
-
 	_, err = tx.Exec(ctx, `
 		WITH inserted AS (
 				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
@@ -274,12 +262,6 @@ func TestCleanupFailedUploads(t *testing.T) {
 		t.Helper()
 
 		_, err := tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-			VALUES ($1, 'failed upload content', to_tsvector('english', 'failed upload content'))
-		`, hash)
-		require.NoError(t, err)
-
-		_, err = tx.Exec(ctx, `
 			WITH inserted AS (
 					INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, created_at)
 			VALUES ($1, $2, $3, $4, $5, $5, 100, FALSE, 'domain', 'part', $6, 'body', '[]', $3, $7)
@@ -398,12 +380,6 @@ func TestGetUserScopedObjectsForCleanup(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	cleanupHash := fmt.Sprintf("cleanup_ready_%d", testTimestamp)
-	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-		VALUES ($1, 'cleanup ready content', to_tsvector('english', 'cleanup ready content'))
-	`, cleanupHash)
-	require.NoError(t, err)
-
 	expungedAt := time.Now().Add(-25 * time.Hour) // 25 hours ago
 	_, err = tx.Exec(ctx, `
 		WITH inserted AS (
@@ -460,12 +436,6 @@ func TestDeleteExpungedMessagesByS3KeyPartsBatch(t *testing.T) {
 	var candidates []UserScopedObjectForCleanup
 	for i := 0; i < 3; i++ {
 		hash := fmt.Sprintf("batch_delete_%d_%d", testTimestamp, i)
-		_, err = tx.Exec(ctx, `
-			INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-			VALUES ($1, $2, to_tsvector('english', $2))
-		`, hash, fmt.Sprintf("batch delete content %d", i))
-		require.NoError(t, err)
-
 		_, err = tx.Exec(ctx, `
 			WITH inserted AS (
 				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq, expunged_at)
@@ -529,12 +499,6 @@ func TestDeleteMessageByHashAndMailbox(t *testing.T) {
 	defer tx.Rollback(ctx)
 
 	deleteHash := fmt.Sprintf("delete_msg_%d", testTimestamp)
-	_, err = tx.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-		VALUES ($1, 'message to delete', to_tsvector('english', 'message to delete'))
-	`, deleteHash)
-	require.NoError(t, err)
-
 	_, err = tx.Exec(ctx, `
 		WITH inserted AS (
 				INSERT INTO messages (account_id, mailbox_id, uid, content_hash, sent_date, internal_date, size, uploaded, s3_domain, s3_localpart, message_id, body_structure, recipients_json, created_modseq)
@@ -615,13 +579,6 @@ func TestGetUserScopedObjectsForCleanup_LiveMessagePreventsCleanup(t *testing.T)
 	defer tx2.Rollback(ctx)
 
 	sharedContentHash := fmt.Sprintf("shared_content_%d", testTimestamp)
-
-	// Create message content (shared by both messages)
-	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-		VALUES ($1, 'shared message body', to_tsvector('english', 'shared message body'))
-	`, sharedContentHash)
-	require.NoError(t, err)
 
 	// Create EXPUNGED message in INBOX (old, past grace period)
 	expungedAt := time.Now().Add(-25 * time.Hour) // 25 hours ago (past 24h grace)
@@ -717,13 +674,6 @@ func TestGetUserScopedObjectsForCleanup_AllExpungedAllowsCleanup(t *testing.T) {
 	defer tx2.Rollback(ctx)
 
 	allExpungedHash := fmt.Sprintf("all_expunged_%d", testTimestamp)
-
-	// Create message content
-	_, err = tx2.Exec(ctx, `
-		INSERT INTO messages_fts (content_hash, text_body, text_body_tsv)
-		VALUES ($1, 'all expunged content', to_tsvector('english', 'all expunged content'))
-	`, allExpungedHash)
-	require.NoError(t, err)
 
 	expungedAt := time.Now().Add(-25 * time.Hour) // 25 hours ago
 

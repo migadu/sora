@@ -66,8 +66,6 @@ func seedAgeTestAccount(t *testing.T, database *Database, tag string, mailboxes 
 	t.Cleanup(func() {
 		cctx := context.Background()
 		_, _ = database.GetWritePool().Exec(cctx, `DELETE FROM messages WHERE account_id = $1`, accountID)
-		_, _ = database.GetWritePool().Exec(cctx,
-			`DELETE FROM messages_fts WHERE content_hash LIKE 'age1_' || $1 || '_%'`, tag)
 		_, _ = database.GetWritePool().Exec(cctx, `DELETE FROM mailboxes WHERE account_id = $1`, accountID)
 		_, _ = database.GetWritePool().Exec(cctx, `DELETE FROM credentials WHERE account_id = $1`, accountID)
 		_, _ = database.GetWritePool().Exec(cctx, `DELETE FROM accounts WHERE id = $1`, accountID)

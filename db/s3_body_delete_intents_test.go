@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"testing"
 	"time"
 
@@ -115,22 +114,6 @@ func TestS3BodyReconcileExactIntentAndReferenceLifecycle(t *testing.T) {
 	}))
 	require.NoError(t, d.GetWritePool().QueryRow(ctx, `SELECT count(*) FROM s3_body_delete_intents WHERE content_hash=$1`, hash).Scan(&count))
 	require.Zero(t, count)
-}
-
-func TestS3BodyIntentMigrationRefusesUnknownOutcomeDowngrade(t *testing.T) {
-	d := setupTestDatabase(t)
-	defer d.Close()
-	ctx := context.Background()
-	hash := fmt.Sprintf("down-intent-%d", time.Now().UnixNano())
-	_, err := d.GetWritePool().Exec(ctx, `INSERT INTO s3_body_delete_intents(content_hash,operation_id,object_keys,retire_snapshot) VALUES($1,$2,ARRAY[$3],'[]')`, hash, uuid.NewString(), "example.com/down/"+hash)
-	require.NoError(t, err)
-	down, err := os.ReadFile("migrations/000072_s3_body_delete_intents.down.sql")
-	require.NoError(t, err)
-	_, err = d.GetWritePool().Exec(ctx, string(down))
-	require.ErrorContains(t, err, "reconcile")
-	var count int
-	require.NoError(t, d.GetWritePool().QueryRow(ctx, `SELECT count(*) FROM s3_body_delete_intents WHERE content_hash=$1`, hash).Scan(&count))
-	require.Equal(t, 1, count)
 }
 
 func TestS3BodyIntentBlocksRestore(t *testing.T) {

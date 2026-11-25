@@ -432,7 +432,7 @@ allow_anyone_identifier = false
 |---|---|
 | `[shared_mailboxes]` and the namespace test (`InNamespace`) | [config/config.go](../config/config.go) |
 | ACL storage, grant and revoke rules, the same-domain checks | [db/acl.go](../db/acl.go) |
-| The `has_mailbox_right` SQL function | [db/migrations/000001_initial_schema.up.sql](../db/migrations/000001_initial_schema.up.sql) |
+| The `has_mailbox_right` SQL function | [db/migrations/000001_baseline.up.sql](../db/migrations/000001_baseline.up.sql) |
 | Creating shared folders, ACL inheritance, `default_rights` | [db/mailbox.go](../db/mailbox.go) (`CreateMailbox`) |
 | Which folders a user sees | [db/mailbox.go](../db/mailbox.go) (`GetMailboxes`, `GetMailboxByName`) |
 | Serving other owners' mailboxes only with sharing on (`SetSharedMailboxAccess`) | [db/shared_access.go](../db/shared_access.go) |

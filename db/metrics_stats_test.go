@@ -12,12 +12,11 @@ import (
 // growingRelations are tables whose row count grows with the size of the
 // installation, so scanning them costs more on every node as tenants are added.
 var growingRelations = map[string]bool{
-	"accounts":         true,
-	"credentials":      true,
-	"mailboxes":        true,
-	"mailbox_stats":    true,
-	"messages":         true,
-	"message_contents": true,
+	"accounts":      true,
+	"credentials":   true,
+	"mailboxes":     true,
+	"mailbox_stats": true,
+	"messages":      true,
 }
 
 // TestMetricsStatsQueriesDoNotScanGrowingTables ensures the gauges the metrics

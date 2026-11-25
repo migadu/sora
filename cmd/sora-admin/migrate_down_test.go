@@ -83,8 +83,8 @@ func embeddedMigrationVersions(t *testing.T) []uint64 {
 		}
 		versions = append(versions, version)
 	}
-	if len(versions) < 2 {
-		t.Fatalf("found %d embedded migrations, want at least 2", len(versions))
+	if len(versions) < 1 {
+		t.Fatal("found no embedded migrations")
 	}
 	slices.Sort(versions)
 	return versions
@@ -104,8 +104,8 @@ func checkSchemaVersion(t *testing.T, conn *pgx.Conn, step string, want uint64) 
 // TestMigrateDownAll_KeepsInitialMigrationSoUpSucceeds: `migrate down --all` reverts
 // every migration after the first. #1600: it passed the version number to
 // golang-migrate as the step count, ran out of migrations (the numbers have gaps) and
-// exited 1 after a complete revert. #1667: it also ran the down file of 000001, which
-// is deliberately empty, so the initial tables stayed while no version was recorded,
+// exited 1 after a complete revert. #1667: it also ran the down file of the first
+// migration, which was deliberately empty, so the initial tables stayed while no version was recorded,
 // and the next `migrate up` (or sora's startup migration) failed creating them again
 // and left version 1 dirty. It must leave the first migration applied, so that
 // `migrate up` succeeds afterwards, and a second run with nothing to revert must
@@ -124,8 +124,13 @@ func TestMigrateDownAll_KeepsInitialMigrationSoUpSucceeds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("migrate down --all: exit code %d, want 0:\n%s", code, out)
 	}
-	if !strings.Contains(out, "Migrations reverted successfully") {
-		t.Errorf("migrate down --all did not report success:\n%s", out)
+	// With only the baseline embedded there is nothing after the first migration.
+	wantReport := "Migrations reverted successfully"
+	if first == latest {
+		wantReport = "No migrations to revert"
+	}
+	if !strings.Contains(out, wantReport) {
+		t.Errorf("migrate down --all did not report %q:\n%s", wantReport, out)
 	}
 	checkSchemaVersion(t, conn, "migrate down --all", first)
 
@@ -200,6 +205,9 @@ func TestMigrateDownLimit_RefusesToRevertInitialMigration(t *testing.T) {
 	}
 	checkSchemaVersion(t, conn, "a refused migrate down --limit "+all, latest)
 
+	if len(versions) == 1 {
+		return // only the baseline: no limit stops at the first migration
+	}
 	allButFirst := strconv.Itoa(len(versions) - 1)
 	out, code = runAdminMain(t, "--config", configPath, "migrate", "down", "--limit", allButFirst)
 	if code != 0 {

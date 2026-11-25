@@ -60,9 +60,6 @@ by their BLAKE3 hash.
 | `cache_metrics` | Hit and miss counts of each node's local cache. |
 | `schema_migrations` | The schema version and its dirty flag ([section 9](#9-migrations)). |
 
-Two older tables, `messages_fts` and `message_contents`, are still in the schema. Sora does not
-read or write them.
-
 The schema is defined by the migration files in [db/migrations/](../db/migrations/). They are the
 authoritative description of every table, index, trigger and function.
 
@@ -85,8 +82,8 @@ The migrations need two extensions from PostgreSQL's contrib package:
 
 | Extension | Created by | Used for |
 |---|---|---|
-| `pg_trgm` | migration 000001 | Trigram indexes the schema creates on header columns. |
-| `btree_gin` | migration 000050 | The search index on `(account_id, text_body_tsv)`, which scopes a body search to one account. |
+| `pg_trgm` | the baseline | Trigram indexes the schema creates on header columns. |
+| `btree_gin` | the baseline | The search index on `(account_id, text_body_tsv)`, which scopes a body search to one account. |
 
 The migrations run `CREATE EXTENSION IF NOT EXISTS` as Sora's database user. Both extensions are
 "trusted", so a user with the `CREATE` privilege on the database (for example its owner) can
@@ -524,12 +521,22 @@ which every session fails with `out of shared memory` (SQLSTATE `53200`). Use `A
 
 ## 9. Migrations
 
-The schema is changed by numbered migration files in [db/migrations/](../db/migrations/), each
-with an `up` and a `down` file. They are built into both binaries. The applied version is stored
-in `schema_migrations`, which also has a `dirty` flag that is set while a migration runs.
+The schema lives in [db/migrations/](../db/migrations/), built into both binaries:
+
+- **The baseline**, `000001_baseline.up.sql`, creates the complete schema in one step. A new
+  installation applies only this file.
+- **Numbered migrations after it** (`000002_...` onwards) change the schema, each with an `up`
+  and a `down` file. The baseline has no `down` file and is never reverted.
+
+The applied version is stored in `schema_migrations`, which also has a `dirty` flag that is set
+while a migration runs.
 
 A migration file with several statements runs as one transaction. If it fails, none of its
 changes stay, but `schema_migrations` is left at that version with `dirty` set.
+
+The baseline replaced the 75 migrations (000001 to 000077) of earlier releases. A database
+built by those is moved to the baseline once, by hand:
+[Moving a database to the baseline](#moving-a-database-to-the-baseline).
 
 ### How migrations are applied
 
@@ -568,7 +575,8 @@ sequenceDiagram
   dirty migration state (version N). Manual intervention required`.
 
 A node does not refuse to start when the schema is **newer** than its binary. An older node keeps
-running after a newer node migrated the database.
+running after a newer node migrated the database, and logs `Database: schema version is newer than
+this binary's migrations; none will be applied` when it starts.
 
 ### sora-admin migrate
 
@@ -576,14 +584,14 @@ running after a newer node migrated the database.
 sora-admin migrate version --config /etc/sora/config.toml
 sora-admin migrate up      --config /etc/sora/config.toml
 sora-admin migrate down    --config /etc/sora/config.toml --limit 1
-sora-admin migrate force   --config /etc/sora/config.toml 49
+sora-admin migrate force   --config /etc/sora/config.toml 3
 ```
 
 | Subcommand | What it does |
 |---|---|
 | `version` | Prints the current version and whether it is dirty (`Dirty state: no`). A plain read: safe while Sora runs. |
 | `up` | Applies every pending migration. |
-| `down` | Reverts the last migration, or `--limit N` of them, or with `--all` every one after 000001. It never reverts 000001 ([Rolling back](#rolling-back)). |
+| `down` | Reverts the last migration, or `--limit N` of them, or with `--all` every one after the baseline. It never reverts the baseline ([Rolling back](#rolling-back)). |
 | `force VERSION` | Sets the version and clears the dirty flag, without running anything. |
 
 The tool's help asks you to stop Sora before `up`, `down` and `force`. `migrate` connects through
@@ -624,8 +632,9 @@ file's changes were rolled back as a whole:
    out-of-band preparation that is not finished ([Large databases](#large-databases)).
 2. Fix the cause.
 3. Set the version back to the last migration that completed: `sora-admin migrate force <N-1>`,
-   where N is the version shown as dirty. The numbering has gaps (there is no 000032 and no
-   000063), so use the number of the previous file that exists.
+   where N is the version shown as dirty. If the numbering has a gap, use the number of the
+   previous file that exists. If the baseline itself failed on a new, empty database, drop and
+   recreate the database instead.
 4. Start Sora again, or run `sora-admin migrate up`.
 
 A failed **down** migration is recorded the other way round: reverting N leaves the version at
@@ -639,162 +648,108 @@ run inside a transaction, check by hand what was applied before you force a vers
 ### Rolling back
 
 `sora-admin migrate down` runs the `down` files. They drop the tables, columns and indexes the
-`up` files created, with their data. For example, reverting 000050 drops `messages_fts_v2`, the
-only copy of body search data. Restore from a backup instead when you can, and never run
-`down --all` on a live system: it reverts every migration after 000001 and deletes their data.
-`migrate down` never reverts 000001: `--all` stops after it, and a `--limit` that would reach it
-is refused. To tear down a database completely, drop and recreate it.
+`up` files created, with their data. Restore from a backup instead when you can, and never run
+`down --all` on a live system: it reverts every migration after the baseline and deletes their
+data. `migrate down` never reverts the baseline: `--all` stops after it, and a `--limit` that
+would reach it is refused. To tear down a database completely, drop and recreate it.
 
-Stop every binary that uses what a migration added before you revert it. Some down files need
-care:
-
-| Migration | Reverting it |
-|---|---|
-| 000059, 000070, 000073 | On more than 25,000 messages, refuses until you have done its work by hand (rebuild the previous index, drop the new one and the column), as the down file's comment describes. |
-| 000062 | Drops its index with an exclusive lock on `messages`. On a large database run `DROP INDEX CONCURRENTLY IF EXISTS idx_messages_mailbox_sent_date_unknown;` first. |
-| 000064, 000065 | Changes nothing. The folded or deleted METADATA entries cannot be brought back. |
-| 000067 | Drops `restored_at`. Expunged rows of restored messages are listed as deleted messages again until the cleaner removes them. |
-| 000068 | Drops the database identity. Applying 000068 again creates a **new** one, so imports cannot resume into this database as the same destination. |
-| 000069 | Drops the credential change feed. Nodes then learn of changed logins only through the cluster or on the node that made the change. |
-| 000071 | Drops `message_state.initial_modseq`. Applying it again leaves existing rows unknown. |
-| 000072 | Refuses while any deletion intent remains. Resolve them first ([OPERATIONS.md](OPERATIONS.md#body-deletions-that-stay-quarantined)). |
+Stop every binary that uses what a migration added before you revert it, and read the `down`
+file first: its header comment says what reverting loses and whether it needs preparation.
 
 ### Large databases
 
 A migration runs inside one transaction under the leader lock. A plain `CREATE INDEX` on a large
 table holds a lock that blocks writes (or reads and writes) for the whole build, and
-`CREATE INDEX CONCURRENTLY` cannot run inside a migration. So for large tables the migration files
-describe an out-of-band procedure in their header comment. Their statements are written with
-`IF NOT EXISTS` and `IF EXISTS`, so once you have done the work by hand, the migration finds
-nothing left to do.
+`CREATE INDEX CONCURRENTLY` cannot run inside a migration. So a migration that builds an index
+on a large table, or adds a column to one, describes an out-of-band procedure in its header
+comment, and is written so that once you have done the work by hand, it finds nothing left to
+do.
 
 Do the out-of-band work on the primary, over a direct connection (not through a transaction
-pooler), off-peak. The migrations on `main` that need it on a large database:
+pooler), off-peak:
 
-| Migration | Change | What to do first |
-|---|---|---|
-| 000041 | Folder names unique regardless of case. | It stops if one account has two folders whose names differ only in case. Find them with `SELECT account_id, lower(name), count(*) FROM mailboxes GROUP BY 1, 2 HAVING count(*) > 1;` and rename or merge them. |
-| 000047 | `messages.delivery_hash` and its index. | The column is added under an exclusive lock held across the index build. Run both statements from the file's comment first (`ALTER TABLE messages ADD COLUMN IF NOT EXISTS delivery_hash VARCHAR(64);` then `CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_messages_mailbox_delivery_hash ...`). |
-| 000050 | `messages_fts_v2`, the per-account search table, and `btree_gin`. | See [Migration 000050](#migration-000050) below. |
-| 000051 | Replaces seven indexes on `messages` with `idx_messages_mailbox_active`. | Create the new index with `CREATE INDEX CONCURRENTLY`, then drop the seven old ones with `DROP INDEX CONCURRENTLY`, one at a time. |
-| 000052 | `idx_messages_mailbox_headers`, the covering index for header search. | Fix over-long rows with [scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql), then build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file. |
-| 000059 | `messages.extra_addresses` and the covering header index `idx_messages_mailbox_headers_v2`, which replaces `idx_messages_mailbox_headers`. | Add the column with a short `lock_timeout`, build the new index with `CREATE INDEX CONCURRENTLY`, check that it is valid, then drop the old index with `DROP INDEX CONCURRENTLY`. If the same upgrade also applies 000070, build `idx_messages_mailbox_headers_v3` instead of v2 (add `header_presence` first): 000059 accepts a valid v3. Optionally fill old rows afterwards with [scripts/backfill_extra_addresses.sql](../scripts/backfill_extra_addresses.sql). |
-| 000060, 000061, 000067 | New nullable columns on `messages`: `sent_utc_offset`, `sent_date_unknown`, `restored_at`. | Adding a column needs a brief exclusive lock on `messages`. Add each one first with `SET lock_timeout = '3s'` and the `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` from the file, and retry on a lock timeout. |
-| 000062 | `idx_messages_mailbox_sent_date_unknown`, the messages without a usable `Date:` header, which SENTBEFORE, SENTON and SENTSINCE leave out. | Build the index with `CREATE INDEX CONCURRENTLY`, using exactly the definition in the file, and check that it is valid. |
-| 000070 | `messages.header_presence` and the covering header index `idx_messages_mailbox_headers_v3`, which replaces v2. | Add the column with a short `lock_timeout`, build v3 with `CREATE INDEX CONCURRENTLY`, check that it is valid and ready, then drop v2 with `DROP INDEX CONCURRENTLY`. Both indexes exist during the change: plan for the extra disk space and write load. |
-| 000073 | `messages.message_id_raw` and the partial index `idx_messages_mailbox_message_id_raw`. | Add the column with a short `lock_timeout`, then build the index with `CREATE INDEX CONCURRENTLY` and check that it is valid. |
-
-On more than 25,000 messages, 000059, 000062, 000070 and 000073 refuse to do this work
-themselves, and always refuse an index that is invalid. Startup then stops with the version
-dirty, although nothing was changed: finish the preparation, `migrate force` the previous version,
-and start again ([A failed migration](#a-failed-migration)). Once the work is done, these
-migrations only look at the catalog and take no lock on `messages`.
-
-Older migrations (for example 000008, 000010, 000012, 000014, 000038 and 000039) carry the same
-kind of note. Copy index definitions exactly from the migration file: the migration only checks
-the name, and a different definition would be kept silently (000050 is the exception: it checks
-the shape and stops if it is wrong).
+- **Columns:** `SET lock_timeout = '3s'`, then the `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`
+  from the file. Adding a nullable column needs only a brief exclusive lock; retry on a lock
+  timeout.
+- **Indexes:** `CREATE INDEX CONCURRENTLY`, with exactly the definition in the file. A migration
+  recognises a prepared index by its name, so a different definition would be kept silently.
+- **Replaced indexes:** drop the old one with `DROP INDEX CONCURRENTLY` only after the new one is
+  valid.
 
 When a `CREATE INDEX CONCURRENTLY` fails, it leaves an invalid index behind. Check with
 `SELECT indisvalid FROM pg_index WHERE indexrelid = 'index_name'::regclass;` and drop it with
 `DROP INDEX CONCURRENTLY` before you try again.
 
-#### Migration 000050
+A migration that refuses to do blocking work on a large table stops startup with the version
+dirty, although nothing was changed: finish the preparation, `migrate force` the previous
+version, and start again ([A failed migration](#a-failed-migration)).
 
-000050 creates `messages_fts_v2` and fills it from the older table `messages_fts`:
+### Rows stored by earlier releases
 
-- If `messages_fts` has **at most 25,000 rows**, the migration copies them itself. Nothing to do.
-- If it has **more**, the migration stops with `messages_fts has more than 25000 rows and the
-  out-of-band backfill has not completed` unless
-  [scripts/fts_v2_backfill.sql](../scripts/fts_v2_backfill.sql) has recorded its completion.
-  Applying it without the copy would leave existing mail unsearchable by body.
+Several columns were added while Sora was already in use. They are **forward-only**: new mail
+fills them, and Sora never fills them for mail stored before. Nothing reads the bodies in S3
+again to fill them, and there is no command to do so. A database that has always run the
+baseline has no such rows.
 
-The procedure, on the primary, over a direct connection:
+| Column | What it holds | A row stored before the column existed |
+|---|---|---|
+| `messages.extra_addresses` | Every further From, To and Cc name and address, so that FROM, TO and CC searches match all of them ([SEARCH.md](SEARCH.md)). | NULL: only the first address of each field matches. [scripts/backfill_extra_addresses.sql](../scripts/backfill_extra_addresses.sql) can fill it. |
+| `messages.sent_utc_offset` | The time zone of the `Date:` header, so that SENTBEFORE, SENTON and SENTSINCE match the day the header names ([SEARCH.md](SEARCH.md)). | NULL: searched by the UTC day. |
+| `messages.sent_date_unknown` | TRUE for a message without a `Date:` header that parses. Its ENVELOPE date is NIL ([PROTOCOLS.md](PROTOCOLS.md)), and date searches leave it out. | NULL: the stored date is reported. |
+| `messages.restored_at` | Marks the expunged row of a restored message ([STORAGE.md](STORAGE.md#92-removal-after-the-grace-period)). | NULL. |
+| `messages.header_presence` | Which searchable header fields a message has, so that a search for an empty header value is exact ([SEARCH.md](SEARCH.md)). | NULL: searched without it. COPY, MOVE and restore keep NULL. |
+| `messages.message_id_raw` | The full `Message-ID:` field when it is not one plain `<id@domain>`, for exact `HEADER Message-ID` searches. | NULL: searched by the normalised ID. |
+| `message_state.initial_modseq` | Set by a trigger on every new flag row, so that a client is not told twice of the flags of a message it has just learnt of. | NULL: handled as before. |
 
-1. `CREATE EXTENSION IF NOT EXISTS btree_gin;`
-2. Create the table with the `CREATE TABLE` statement from the migration file, and only its
-   `idx_messages_fts_v2_queue` and `idx_messages_fts_v2_sent_date` indexes. Do not create the
-   search index yet: loading first and indexing afterwards is much faster.
-3. Load the script with `psql -f scripts/fts_v2_backfill.sql`, then run its procedures, **each
-   `CALL` as a separate statement** (the procedures commit between batches):
+**Flag rows.** Every message Sora stores gets its `message_state` row, including copies, moves,
+restores and imports. A message stored by an early release may have none; it reads as having no
+flags. An IMAP `STORE` or a User API flag change on such a message creates its row first. Reads
+and background work do not create missing rows.
+
+### Moving a database to the baseline
+
+This applies once, to a database created by a release that still had migrations 000001 to
+000077. The baseline is the schema those migrations produce, without objects nothing uses any
+more, under version 1.
+
+Sora cannot tell the two numberings apart, so the order matters:
+
+- A baseline binary on a database at version 77 starts normally and changes nothing.
+- A binary from before the baseline, on a database at version 1, takes it for a database that
+  is behind and runs its old migrations 2 onwards against the live schema. Never start one
+  after step 4 without setting the version back to 77 first.
+
+1. **Reach version 77 with the last release that has the old migrations.** That is the commit
+   before `db/migrations/000001_baseline.up.sql` was added. `sora-admin migrate version` must
+   show `77` and `Dirty state: no`. A database below 77 must not be given version 1: it lacks
+   part of the schema.
+2. **Remove what the baseline does not have.** The old migrations leave two unused tables and
+   two unused indexes behind. Drop them once nothing older than the last release runs:
 
    ```sql
-   CALL fts_v2_backfill_recent(interval '24 months', 5000, 200);  -- newest mail first
-   CALL fts_v2_backfill_rest(5000, 200);                          -- everything older
-   CALL fts_v2_catchup(0);                                        -- mail that arrived meanwhile
+   DROP TABLE IF EXISTS messages_fts, message_contents;
+   DROP INDEX CONCURRENTLY IF EXISTS idx_messages_mailbox_common_search;
+   DROP INDEX CONCURRENTLY IF EXISTS idx_messages_mailbox_modseqs;
    ```
 
-   `5000, 200` are the batch size and the milliseconds to sleep between batches. The first
-   argument of `fts_v2_backfill_recent` is how far back to start, and that of `fts_v2_catchup` is
-   the message id to start from. Watch replica lag and raise the sleep if it grows. Every
-   procedure can be stopped and run again; it continues where it stopped.
-   `SELECT * FROM fts_v2_verification();` shows progress.
-4. Raise `maintenance_work_mem` in your session, then create `idx_messages_fts_v2_account_tsv`
-   and `idx_messages_fts_v2_account_id` exactly as in the migration file, without
-   `CONCURRENTLY` (nothing uses the table yet), and set
-   `ALTER INDEX idx_messages_fts_v2_account_tsv SET (fastupdate = off);` as the migration does.
-5. `ANALYZE messages_fts_v2;` This is not optional: without statistics the planner may choose
-   the slow plan the new index exists to avoid.
-6. Check that the replicas have the table and index, then upgrade the nodes. The migration finds
-   the work done and checks the table's primary key and index definition.
-7. Nodes still running a release from before 000050 write new mail only to `messages_fts`.
-   Keep running `CALL fts_v2_catchup(<id>);` during the rolling upgrade, starting from the id
-   the previous pass printed, until it reports 0 rows twice in a row.
+   `messages_fts` and `message_contents` held body-search data of releases before per-account
+   search (`messages_fts_v2`). Drop them only if that data was carried over or is not wanted.
+3. **Compare the schema with the baseline.** Create an empty database, let the new
+   `sora-admin migrate up` build it, and compare `pg_dump --schema-only --no-owner
+   --no-privileges` of both. They should differ only in what you added yourself, such as
+   storage options on `messages`, and in spelling that does not change behaviour: the order of
+   columns in `mailboxes` and `mailbox_acls`, a comment inside `has_mailbox_right`, and the
+   way the `health_status` check is printed. Anything else needs a decision before step 4.
+4. **Upgrade every node to the baseline release**, then set the version, on the primary:
 
-If you decide to copy only recent mail and accept that older mail is not searchable by body,
-record that decision instead of running `fts_v2_backfill_rest`:
+   ```sql
+   UPDATE schema_migrations SET version = 1 WHERE version = 77 AND NOT dirty;
+   ```
 
-```sql
-INSERT INTO fts_v2_backfill_state (step) VALUES ('accept_partial');
-```
+   It must report `UPDATE 1`. Remove older `sora` binaries that a rollback procedure could
+   start.
 
-If the migration already stopped and left the version dirty at 50, do the work above, then
-`sora-admin migrate force 49` and start Sora again.
-
-#### Migration 000052
-
-[scripts/fix_oversized_header_columns.sql](../scripts/fix_oversized_header_columns.sql) prepares
-the header index. A B-tree index entry cannot exceed 2704 bytes, so the build fails on the first
-row whose subject or address columns are longer than the bounds Sora applies to new mail (600
-bytes for the subject, 200 bytes for each address column). The script lists those rows in a work
-table with one full scan, cuts their values to the bounds without splitting a UTF-8 character,
-and checks the result. Run it with `psql`, not through a transaction pooler. Then build the index
-with `CREATE INDEX CONCURRENTLY`, using the definition from the migration file. The migration's
-header comment lists the session settings that help a large build (`maintenance_work_mem`,
-`temp_file_limit`, `statement_timeout`).
-
-#### Migrations 000060 to 000073
-
-What each of these changes, and what it means for existing data. Most of them are
-**forward-only**: they add a column that new mail fills in, and Sora never fills it for mail
-stored before. Nothing reads the bodies in S3 again to fill them, and there is no command to do
-so. Rows written before the migration, or by older binaries during a rolling upgrade, keep the
-behaviour they had.
-
-| Migration | Change | Existing rows |
-|---|---|---|
-| 000060 | `messages.sent_utc_offset`: the time zone of the `Date:` header, so that SENTBEFORE, SENTON and SENTSINCE match the day the header names ([SEARCH.md](SEARCH.md)). | NULL: searched by the UTC day, as before. |
-| 000061 | `messages.sent_date_unknown`: TRUE for a message without a `Date:` header that parses. Its ENVELOPE date is NIL ([PROTOCOLS.md](PROTOCOLS.md)). | NULL: the stored date is reported, as before. |
-| 000062 | The index of the messages marked by 000061, which date searches leave out. | Only new rows can be marked. |
-| 000064 | Folds METADATA entry names to lower case, keeping the newest entry where two fold to one name. | Rewritten. Cannot be undone. |
-| 000065 | Deletes METADATA entries named `/private/` or `/shared/`, which no command can read or delete. | Deleted. Cannot be undone. |
-| 000066 | Replaces a trigger function: a restored message raises its mailbox's highest MODSEQ. | Nothing rewritten. |
-| 000067 | `messages.restored_at`: marks the expunged row of a restored message ([STORAGE.md](STORAGE.md#92-removal-after-the-grace-period)). | NULL. |
-| 000068 | `database_identity`, a random UUID for this database. | One row is created. |
-| 000069 | `credential_changes` and the triggers on `credentials` and `accounts` that fill it ([AUTHENTICATION.md](AUTHENTICATION.md#121-the-credential-change-feed)). | None needed. |
-| 000070 | `messages.header_presence`: which searchable header fields a message has, so that a search for an empty header value is exact ([SEARCH.md](SEARCH.md)). Replaces the header index with v3. | NULL: searched as before. COPY, MOVE and restore keep NULL. |
-| 000071 | `message_state.initial_modseq`, set by a trigger on every new flag row, so that a client is not told twice of the flags of a message it has just learnt of. | NULL: handled as before. |
-| 000072 | `s3_body_delete_intents` ([STORAGE.md](STORAGE.md#95-how-deletions-are-made-safe)). | Empty table. |
-| 000073 | `messages.message_id_raw`: the full `Message-ID:` field when it is not one plain `<id@domain>`, for exact `HEADER Message-ID` searches. | NULL: searched by the normalised ID, as before. |
-
-000060, 000061, 000067 and 000071 only add a column: on a small database they apply in
-moments. 000071 alters the partitioned `message_state` table directly, with a brief exclusive
-lock; it has no out-of-band step. 000064 locks the `metadata` table against writes while it runs.
-
-**Flag rows.** Every message Sora stores now gets its `message_state` row, including copies,
-moves, restores and imports. A message stored by an older release may have none; it reads as
-having no flags. An IMAP `STORE` or a User API flag change on such a message creates its row
-first. Reads and background work do not create missing rows.
+Test and development databases are simply recreated: `make reset-test-db`.
 
 ---
 

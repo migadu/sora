@@ -301,6 +301,12 @@ func (db *Database) migrate(ctx context.Context, migrationTimeout time.Duration)
 
 			// Fast exit if already up-to-date
 			if currentVersion >= latestVersion && !dirty {
+				if currentVersion > latestVersion {
+					// Expected on a node older than the schema during a rolling upgrade or
+					// after a rollback. It is also what a database from before the baseline
+					// looks like (version 77): no migration of this binary is applied to it.
+					logger.Warn("Database: schema version is newer than this binary's migrations; none will be applied", "current", currentVersion, "latest", latestVersion)
+				}
 				logger.Info("Database: migrations are up to date. Skipping migration infrastructure setup", "current", currentVersion, "latest", latestVersion)
 				return nil
 			}

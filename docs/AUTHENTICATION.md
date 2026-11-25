@@ -799,7 +799,7 @@ this with a **credential change feed** in PostgreSQL.
 
 ### 12.1 The credential change feed
 
-The table `credential_changes` (migration 69) gets a row, from database triggers, whenever:
+The table `credential_changes` gets a row, from database triggers, whenever:
 
 - a credential's password, address or account changes;
 - a credential is removed (also by an account purge);
@@ -937,6 +937,6 @@ Per-address detail is in the logs and, for blocks, in `GET /admin/auth/blocked` 
 | [server/auth_delay_helper.go](../server/auth_delay_helper.go) | Progressive delays and the per-IP limit on waiting logins. |
 | [server/master_sasl_gate.go](../server/master_sasl_gate.go) | `master_sasl_allowed_networks`. |
 | [db/password_hash.go](../db/password_hash.go) | Parsing stored hashes: schemes, encodings, the check of a supplied hash. |
-| [db/migrations/000069_credential_changes.up.sql](../db/migrations/000069_credential_changes.up.sql) | The credential change feed and its triggers. |
+| [db/migrations/000001_baseline.up.sql](../db/migrations/000001_baseline.up.sql) | The credential change feed and its triggers (`credential_changes`, `record_credential_change`). |
 | [server/credchanges/watcher.go](../server/credchanges/watcher.go), [cmd/sora/credential_changes.go](../cmd/sora/credential_changes.go) | Reading the feed, dropping cached logins, suspending the caches. |
 | [config/config.go](../config/config.go) | `AuthRateLimiterConfig`, its defaults and the merge of defaults; `GetBcryptCost`; master credential validation. |

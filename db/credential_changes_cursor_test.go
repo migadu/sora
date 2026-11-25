@@ -135,13 +135,14 @@ func preparedCredentialFeedDatabase(t *testing.T) *Database {
 	var name string
 	require.NoError(t, pool.QueryRow(context.Background(), "SELECT current_database()").Scan(&name))
 	require.True(t, strings.HasPrefix(name, "sora_credfeed_prepared_"), "opt-in DSN must name a dedicated test database")
-	_, err = pool.Exec(context.Background(), `CREATE TABLE IF NOT EXISTS accounts(id bigint PRIMARY KEY,deleted_at timestamptz);
- CREATE TABLE IF NOT EXISTS credentials(id bigserial PRIMARY KEY,account_id bigint REFERENCES accounts(id) ON DELETE CASCADE,address text,password text)`)
-	require.NoError(t, err)
-	up, err := os.ReadFile("migrations/000069_credential_changes.up.sql")
-	require.NoError(t, err)
-	_, err = pool.Exec(context.Background(), string(up))
-	require.NoError(t, err)
+	var hasFeed bool
+	require.NoError(t, pool.QueryRow(context.Background(), "SELECT to_regclass('credential_changes') IS NOT NULL").Scan(&hasFeed))
+	if !hasFeed {
+		baseline, err := os.ReadFile("migrations/000001_baseline.up.sql")
+		require.NoError(t, err)
+		_, err = pool.Exec(context.Background(), string(baseline))
+		require.NoError(t, err)
+	}
 	return &Database{WritePool: pool, ReadPool: pool}
 }
 
