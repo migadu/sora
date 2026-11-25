@@ -167,7 +167,7 @@ func (s *IMAPSession) GetCapabilities() imap.CapSet {
 		if fingerprint, err := s.ja4Conn.GetJA4Fingerprint(); err == nil && fingerprint != "" {
 			s.ja4Fingerprint = fingerprint
 			s.ja4Conn = nil
-			s.InfoLog("JA4 fingerprint captured during lazy evaluation", "fingerprint", s.ja4Fingerprint)
+			s.DebugLog("JA4 fingerprint captured during lazy evaluation", "fingerprint", s.ja4Fingerprint)
 
 			// Re-initialize capabilities from server defaults
 			caps := make(imap.CapSet)
@@ -526,7 +526,7 @@ func (s *IMAPSession) Close() error {
 		peak := s.memTracker.Peak()
 		metrics.SessionMemoryPeakBytes.WithLabelValues("imap", s.server.name, s.server.hostname).Observe(float64(peak))
 		if peak > 0 {
-			s.InfoLog("session memory peak", "bytes", server.FormatBytes(peak))
+			s.DebugLog("session memory peak", "bytes", server.FormatBytes(peak))
 		}
 	}
 
@@ -552,7 +552,7 @@ func (s *IMAPSession) Close() error {
 	if s.IMAPUser != nil {
 		s.server.authenticatedConnections.Add(-1)
 		metrics.AuthenticatedConnectionsCurrent.WithLabelValues("imap", s.server.name, s.server.hostname).Dec()
-		s.InfoLog("closing session")
+		s.DebugLog("closing session")
 
 		// Unregister connection from tracker
 		s.unregisterConnection()

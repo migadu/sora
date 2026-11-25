@@ -758,7 +758,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 
 	// If user has an active script, run it and let it override the resultAction
 	if err == nil && activeScript != nil {
-		s.InfoLog("using user sieve script", "name", activeScript.Name, "script_id", activeScript.ID, "updated_at", activeScript.UpdatedAt.Format(time.RFC3339))
+		s.DebugLog("using user sieve script", "name", activeScript.Name, "script_id", activeScript.ID, "updated_at", activeScript.UpdatedAt.Format(time.RFC3339))
 		// Reuse the compiled script if this version has been parsed before; the executor
 		// binding it to this account and its oracles is cheap and must not be shared.
 		compiled, userScriptErr := sieveengine.SharedScriptCache().GetOrCompile(activeScript.Script, s.backend.sieveExtensions)
@@ -785,7 +785,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 				var keptDefault bool
 				result, keptDefault = delivery.MergeSieveResults(result, userResult)
 				if keptDefault {
-					s.InfoLog("user sieve keep - merging with default script result", "default_action", result.Action, "vacation", result.Vacation != nil)
+					s.DebugLog("user sieve keep - merging with default script result", "default_action", result.Action, "vacation", result.Vacation != nil)
 				} else {
 					s.logSieveAction("user", result)
 				}
@@ -933,7 +933,7 @@ func (s *LMTPSession) Data(ctx context.Context, r io.Reader) error {
 		return s.InternalError("failed to check file existence: %v", helpers.FileErrorCause(err))
 	}
 
-	s.InfoLog("executing sieve action", "action", result.Action)
+	s.DebugLog("executing sieve action", "action", result.Action)
 
 	// Extract header, recipient, body, and MIME metadata once from the final message
 	// (after any Sieve editheader changes, RFC 5293 §7) and reuse across destinations.
@@ -1122,7 +1122,7 @@ func (s *LMTPSession) logSieveAction(source string, result sieveengine.Result) {
 			s.InfoLog(source + " sieve discard")
 		}
 	case sieveengine.ActionKeep:
-		s.InfoLog(source + " sieve keep")
+		s.DebugLog(source + " sieve keep")
 	}
 	if result.Vacation != nil {
 		s.InfoLog(source + " sieve vacation response triggered")

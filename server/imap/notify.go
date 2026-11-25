@@ -824,7 +824,7 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 		s.notifyMutex.Lock()
 		s.notifyWatch = nil
 		s.notifyMutex.Unlock()
-		s.InfoLog("NOTIFY watch cleared")
+		s.DebugLog("NOTIFY watch cleared")
 		return nil
 	}
 
@@ -941,7 +941,7 @@ func (s *IMAPSession) SetNotify(ctx context.Context, options *imap.NotifyOptions
 	s.notifyWatch = watch
 	s.notifyMutex.Unlock()
 
-	s.InfoLog("NOTIFY watch installed",
+	s.DebugLog("NOTIFY watch installed",
 		"groups", len(options.Items),
 		"status", options.Status,
 		"selected_events", watch.hasSelectedMessageEvents(),

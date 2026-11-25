@@ -65,6 +65,8 @@ type POP3ProxySession struct {
 	isRemoteLookupAccount bool
 	routingInfo           *proxy.UserRoutingInfo
 	routingMethod         string // Routing method used: remotelookup, affinity, consistent_hash, roundrobin
+	authMethod            string // How the login authenticated (cache, remotelookup, main_db, master), for the "authentication complete" line
+	authCached            bool   // Whether that login was answered from the lookup or auth cache
 	serverAddr            string
 	sessionID             string // Proxy session ID for end-to-end tracing (also forwarded to the backend)
 	authenticated         bool
@@ -294,7 +296,8 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 					}
 
 					// Single consolidated log for authentication success (AFTER backend connection succeeds)
-					s.InfoLog("authentication successful", "cached", true, "method", "cache")
+					s.authMethod, s.authCached = "cache", true
+					s.DebugLog("authentication successful", "cached", true, "method", "cache")
 
 					return nil
 				} else {
@@ -474,7 +477,8 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 				if masterAuthValidated {
 					method = "master"
 				}
-				s.InfoLog("authentication successful", "cached", false, "method", method)
+				s.authMethod, s.authCached = method, false
+				s.DebugLog("authentication successful", "cached", false, "method", method)
 
 				// Connect to backend
 				if err := s.connectToBackend(); err != nil {
@@ -650,7 +654,8 @@ func (s *POP3ProxySession) authenticate(username, password string) error {
 	if masterAuthValidated {
 		method = "master"
 	}
-	s.InfoLog("authentication successful", "cached", false, "method", method)
+	s.authMethod, s.authCached = method, false
+	s.DebugLog("authentication successful", "cached", false, "method", method)
 
 	// Cache successful authentication (main DB)
 	if s.server.lookupCache != nil {
@@ -1519,6 +1524,8 @@ func (s *POP3ProxySession) doLogin(ctx context.Context, username, password strin
 		"address", s.username,
 		"backend", s.serverAddr,
 		"routing", s.routingMethod,
+		"method", s.authMethod,
+		"cached", s.authCached,
 		"duration", fmt.Sprintf("%.3fs", time.Since(authStart).Seconds()))
 
 	// Clear the read deadline before moving to the proxying phase, which sets its own.

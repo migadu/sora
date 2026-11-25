@@ -48,6 +48,8 @@ type Session struct {
 	isRemoteLookupAccount bool
 	routingInfo           *proxy.UserRoutingInfo
 	routingMethod         string // Routing method used: remotelookup, affinity, consistent_hash, roundrobin
+	authMethod            string // How the login authenticated (cache, remotelookup, main_db, master), for the "authentication complete" line
+	authCached            bool   // Whether that login was answered from the lookup or auth cache
 	serverAddr            string
 	sessionID             string                    // Proxy session ID for end-to-end tracing
 	clientAddr            string                    // Cached client address to avoid touching closed connection
@@ -1371,7 +1373,8 @@ func (s *Session) authenticateCredentials(authzID, username, password string, sa
 				}
 
 				// Single consolidated log for authentication success
-				s.InfoLog("authentication successful", "cached", true, "method", "cache")
+				s.authMethod, s.authCached = "cache", true
+				s.DebugLog("authentication successful", "cached", true, "method", "cache")
 
 				// NOTE: the backend connection is established by
 				// postAuthenticationSetup (the single owner of connectToBackend).
@@ -1552,7 +1555,8 @@ func (s *Session) authenticateCredentials(authzID, username, password string, sa
 				}
 
 				// Single consolidated log for authentication success
-				s.InfoLog("authentication successful", "cached", false, "method", method)
+				s.authMethod, s.authCached = method, false
+				s.DebugLog("authentication successful", "cached", false, "method", method)
 
 				return nil // Authentication complete
 
@@ -1764,7 +1768,8 @@ func (s *Session) authenticateCredentials(authzID, username, password string, sa
 	metrics.TrackUserActivity("imap_proxy", resolvedEmail, "connection", 1)
 
 	// Single consolidated log for authentication success
-	s.InfoLog("authentication successful", "cached", false, "method", method)
+	s.authMethod, s.authCached = method, false
+	s.DebugLog("authentication successful", "cached", false, "method", method)
 
 	return nil
 }
@@ -2143,6 +2148,8 @@ func (s *Session) postAuthenticationSetup(clientTag string, authStart time.Time)
 		"address", s.username,
 		"backend", s.serverAddr,
 		"routing", s.routingMethod,
+		"method", s.authMethod,
+		"cached", s.authCached,
 		"duration", fmt.Sprintf("%.3fs", duration.Seconds()))
 
 	// Forward the backend's success response, replacing the client's tag.

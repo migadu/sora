@@ -584,14 +584,14 @@ func (am *AffinityManager) handleAffinitySet(event AffinityEvent) {
 	if exists {
 		// Only apply if event is newer than our local state
 		if existing.AssignedAt.After(event.Timestamp) {
-			logger.Info("Affinity: Ignoring older SET", "user", event.Username, "node", event.NodeID,
+			logger.Debug("Affinity: Ignoring older SET", "user", event.Username, "node", event.NodeID,
 				"existing_backend", existing.Backend, "existing_node", existing.NodeID, "event_backend", event.Backend)
 			return
 		}
 		if existing.Backend == event.Backend && existing.AssignedAt.Equal(event.Timestamp) {
 			return // Already applied; nothing to write through
 		}
-		logger.Info("Affinity: Overwriting existing affinity", "user", event.Username,
+		logger.Debug("Affinity: Overwriting existing affinity", "user", event.Username,
 			"old_backend", existing.Backend, "new_backend", event.Backend,
 			"old_node", existing.NodeID, "new_node", event.NodeID)
 	}
@@ -605,7 +605,7 @@ func (am *AffinityManager) handleAffinitySet(event AffinityEvent) {
 		NodeID:     event.NodeID,
 	}
 
-	logger.Info("Affinity: Applied cluster affinity", "user", event.Username,
+	logger.Debug("Affinity: Applied cluster affinity", "user", event.Username,
 		"backend", event.Backend, "node", event.NodeID)
 
 	// Persist cluster event to disk
@@ -638,10 +638,10 @@ func (am *AffinityManager) handleAffinityUpdate(event AffinityEvent) {
 			return // Already applied; nothing to write through
 		}
 
-		logger.Info("Affinity: Received cluster update", "user", event.Username,
+		logger.Debug("Affinity: Received cluster update", "user", event.Username,
 			"old_backend", existing.Backend, "new_backend", event.Backend, "node", event.NodeID)
 	} else {
-		logger.Info("Affinity: Received cluster affinity", "user", event.Username,
+		logger.Debug("Affinity: Received cluster affinity", "user", event.Username,
 			"backend", event.Backend, "node", event.NodeID)
 	}
 

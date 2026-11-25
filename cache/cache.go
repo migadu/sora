@@ -430,7 +430,7 @@ func (c *Cache) MoveIn(sourcePath string, contentHash string) error {
 	shard := c.getShard(contentHash)
 
 	if _, err := os.Stat(targetPath); err == nil {
-		logger.Info("Cache: File already exists in cache - removing source", "target", targetPath, "source", sourcePath)
+		logger.Debug("Cache: File already exists in cache - removing source", "target", targetPath, "source", sourcePath)
 		_ = os.Remove(sourcePath)
 		return c.trackPlaced(shard, targetPath)
 	}
@@ -664,7 +664,7 @@ func (c *Cache) StartPurgeLoop(ctx context.Context) {
 }
 
 func (c *Cache) runPurgeCycle(ctx context.Context, staleShardIdx *int) {
-	logger.Info("Cache: running cache purge cycle")
+	logger.Debug("Cache: running cache purge cycle")
 
 	// The shard's sweep comes first, so this cycle's capacity purge covers what it indexed.
 	shard := c.shards[*staleShardIdx]

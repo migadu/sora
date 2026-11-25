@@ -196,12 +196,12 @@ func (w *Worker) run(ctx context.Context) {
 			logger.Info("Relay: worker stopped due to stop signal")
 			return
 		case <-ticker.C:
-			logger.Info("Relay: timer tick")
+			logger.Debug("Relay: timer tick")
 			if err := w.processQueue(ctx); err != nil {
 				w.reportError(err)
 			}
 		case <-cleanupTicker.C:
-			logger.Info("Relay: cleanup tick")
+			logger.Debug("Relay: cleanup tick")
 			w.runCleanup()
 		case <-cbCheckTicker.C:
 			// Check if circuit breaker is in HALF-OPEN state (ready for recovery attempts)
@@ -213,7 +213,7 @@ func (w *Worker) run(ctx context.Context) {
 				}
 			}
 		case <-w.notifyCh:
-			logger.Info("Relay: worker notified")
+			logger.Debug("Relay: worker notified")
 			_ = w.processQueue(ctx)
 		}
 	}
@@ -241,7 +241,7 @@ func (w *Worker) processQueue(ctx context.Context) error {
 	// Check circuit breaker state for proactive recovery
 	hasCircuitBreaker, cbState := w.getCircuitBreakerState()
 	if hasCircuitBreaker {
-		logger.Info("Relay: Processing queue", "circuit_breaker_state", cbState)
+		logger.Debug("Relay: Processing queue", "circuit_breaker_state", cbState)
 		if cbState == circuitbreaker.StateOpen {
 			logger.Warn("Relay: Circuit breaker is OPEN - messages will be released back to queue")
 		} else if cbState == circuitbreaker.StateHalfOpen {

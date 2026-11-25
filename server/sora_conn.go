@@ -638,7 +638,7 @@ func (c *SoraConn) SuspendThroughputChecking() {
 	c.bytesRead = 0 // Reset counters as well
 	c.bytesWritten = 0
 	c.mu.Unlock()
-	logger.Info("Throughput checking suspended", "proto", c.protocol, "remote", c.remoteAddr)
+	logger.Debug("Throughput checking suspended", "proto", c.protocol, "remote", c.remoteAddr)
 }
 
 // ResumeThroughputChecking re-enables slowloris throughput checks
@@ -651,7 +651,7 @@ func (c *SoraConn) ResumeThroughputChecking() {
 	c.lastThroughputCheck = time.Now() // Reset timing
 	c.consecutiveStalledWindows = 0    // Clear stall counter
 	c.mu.Unlock()
-	logger.Info("Throughput checking resumed", "proto", c.protocol, "remote", c.remoteAddr)
+	logger.Debug("Throughput checking resumed", "proto", c.protocol, "remote", c.remoteAddr)
 }
 
 // SetUsername sets the authenticated username (for logging)

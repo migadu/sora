@@ -2360,7 +2360,7 @@ func DetermineRoute(params RouteParams) (RouteResult, error) {
 		if backend := cm.hashInPool(pool, params.Username); backend != "" {
 			result.PreferredAddr = backend
 			result.RoutingMethod = "consistent_hash"
-			logger.Info("Using consistent hash", "proxy", params.ProxyName, "user", params.Username, "pool", pool.name, "backend", result.PreferredAddr)
+			logger.Debug("Using consistent hash", "proxy", params.ProxyName, "user", params.Username, "pool", pool.name, "backend", result.PreferredAddr)
 		} else {
 			// All backends unhealthy in consistent hash, fall back to round-robin
 			result.RoutingMethod = "roundrobin"
@@ -2487,10 +2487,10 @@ func resolveAffinityRoute(params RouteParams, pool *backendPool, affinityMgr Aff
 		// Check if resolved backend is healthy (without auto-recovery for sticky failover)
 		if cm.IsBackendHealthyForAffinity(targetAddr) {
 			if foundProtocol == params.Protocol {
-				logger.Info("Using cluster affinity", "proxy", params.ProxyName, "user", params.Username, "backend", targetAddr)
+				logger.Debug("Using cluster affinity", "proxy", params.ProxyName, "user", params.Username, "backend", targetAddr)
 				return targetAddr, "affinity"
 			}
-			logger.Info("Using cross-protocol affinity for cache locality", "proxy", params.ProxyName, "user", params.Username, "backend", targetAddr, "from_protocol", foundProtocol, "to_protocol", params.Protocol)
+			logger.Debug("Using cross-protocol affinity for cache locality", "proxy", params.ProxyName, "user", params.Username, "backend", targetAddr, "from_protocol", foundProtocol, "to_protocol", params.Protocol)
 			return targetAddr, "affinity_cross_protocol"
 		}
 
@@ -2563,7 +2563,7 @@ func UpdateAffinityAfterConnection(params RouteParams, connectedBackend string, 
 		if wasAffinityRoute {
 			logger.Info("Updated affinity after failover", "proxy", params.ProxyName, "user", params.Username, "old", currentBackend, "new", connectedBackend)
 		} else {
-			logger.Info("Updated affinity to match connected backend", "proxy", params.ProxyName, "user", params.Username, "old", currentBackend, "new", connectedBackend)
+			logger.Debug("Updated affinity to match connected backend", "proxy", params.ProxyName, "user", params.Username, "old", currentBackend, "new", connectedBackend)
 		}
 	}
 	// else: connected backend matches existing affinity — nothing to do

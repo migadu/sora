@@ -221,7 +221,7 @@ func (w *CleanupWorker) run(ctx context.Context) {
 			logger.Info("Cleanup: worker stopped due to stop signal")
 			return
 		case <-ticker.C:
-			logger.Info("Cleanup: running S3 cleanup")
+			logger.Debug("Cleanup: running S3 cleanup")
 			if err := w.runOnce(ctx); err != nil {
 				w.reportError(err)
 			}
@@ -577,7 +577,7 @@ func (w *CleanupWorker) runOnce(ctx context.Context) error {
 
 			if len(candidates) == 0 {
 				if s3DeletedCount == 0 {
-					logger.Info("Cleanup: no user-scoped objects to clean up")
+					logger.Debug("Cleanup: no user-scoped objects to clean up")
 				}
 				break
 			}
