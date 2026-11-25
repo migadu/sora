@@ -1285,7 +1285,9 @@ Notes:
 
 ### Log lines worth knowing
 
-- `Using consistent hash`, `Using cluster affinity`, `Using cross-protocol affinity for cache locality`: the route chosen.
+- `Using consistent hash`, `Using cluster affinity`, `Using cross-protocol affinity for cache locality`
+  (DEBUG): the route chosen. At INFO, `authentication complete` names the backend and `routing`;
+  on the LMTP proxy, `routing to backend` does, once per delivery.
 - `ConnectionManager: Backend marked unhealthy after consecutive failures`: a backend reached 3 failures.
 - `No backend pool for route - refusing to route elsewhere`: an unknown pool or no default pool.
 - `Lookup answer names a pool but this proxy has no [[pool]] blocks - using remote_addrs`.

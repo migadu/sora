@@ -103,7 +103,7 @@ func (w *Worker) processBatch(ctx context.Context) {
 		}
 
 		metrics.FTSRowsIndexed.Add(float64(processed))
-		logger.Info("FTS Worker: generated vectors for messages batch", "count", processed)
+		logger.Debug("FTS Worker: generated vectors for messages batch", "count", processed)
 
 		// Keep looping immediately if we processed a full batch,
 		// but pause briefly to avoid WAL starvation.

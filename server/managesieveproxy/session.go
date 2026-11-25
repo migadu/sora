@@ -47,6 +47,8 @@ type Session struct {
 	isRemoteLookupAccount bool
 	routingInfo           *proxy.UserRoutingInfo
 	routingMethod         string // Routing method used: remotelookup, affinity, consistent_hash, roundrobin
+	authMethod            string // How the login authenticated (cache, remotelookup, main_db, master), for the "authentication complete" line
+	authCached            bool   // Whether that login was answered from the lookup or auth cache
 	serverAddr            string
 	sessionID             string // Proxy session ID for end-to-end tracing
 	clientAddr            string // Cached client address to avoid race with connection close
@@ -158,6 +160,8 @@ func (s *Session) AuthenticatePlain(_ context.Context, authzID, username, passwo
 		"address", s.username,
 		"backend", s.serverAddr,
 		"routing", s.routingMethod,
+		"method", s.authMethod,
+		"cached", s.authCached,
 		"duration", fmt.Sprintf("%.3fs", backendDuration.Seconds()))
 
 	// Clear the read deadline before the relay phase, which sets its own.
@@ -436,7 +440,8 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 
 					// Single consolidated log for authentication success
 					duration := time.Since(authStart)
-					s.InfoLog("authentication successful",
+					s.authMethod, s.authCached = "cache", true
+					s.DebugLog("authentication successful",
 						"address", s.username,
 						"backend", "none", // Cache hit - no backend yet
 						"method", "cache",
@@ -622,7 +627,8 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 
 				// Single consolidated log for authentication success
 				duration := time.Since(authStart)
-				s.InfoLog("authentication successful",
+				s.authMethod, s.authCached = method, false
+				s.DebugLog("authentication successful",
 					"address", s.username,
 					"backend", "none", // Backend not connected yet at this point
 					"method", method,
@@ -825,7 +831,8 @@ func (s *Session) authenticateUserWithAuthzID(authzID, username, password string
 
 	// Single consolidated log for authentication success
 	duration := time.Since(authStart)
-	s.InfoLog("authentication successful",
+	s.authMethod, s.authCached = method, false
+	s.DebugLog("authentication successful",
 		"address", s.username,
 		"backend", "none", // Backend not connected yet at this point
 		"method", method,

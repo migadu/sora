@@ -188,8 +188,8 @@ func (s *Session) handleConnection() {
 		}()
 	}
 
-	// Log connection at INFO level
-	s.InfoLog("connected", "absolute_timeout", s.settings.absoluteSessionTimeout, "auth_idle_timeout", s.server.authIdleTimeout)
+	// One delivery per connection: "routing to backend" is the INFO line for it.
+	s.DebugLog("connected", "absolute_timeout", s.settings.absoluteSessionTimeout, "auth_idle_timeout", s.server.authIdleTimeout)
 
 	// Register this session for graceful shutdown tracking
 	s.server.registerSession(s)
@@ -1326,7 +1326,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			// Single consolidated log for lookup success
 			duration := time.Since(lookupStart)
-			s.InfoLog("account lookup successful",
+			s.DebugLog("account lookup successful",
 				"address", s.username,
 				"cached", true,
 				"method", "cache",
@@ -1408,7 +1408,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 			// Single consolidated log for lookup success
 			duration := time.Since(lookupStart)
-			s.InfoLog("account lookup successful",
+			s.DebugLog("account lookup successful",
 				"address", s.username,
 				"cached", false,
 				"method", "remotelookup",
@@ -1550,7 +1550,7 @@ func (s *Session) handleRecipient(to string, lookupStart time.Time) error {
 
 	// Single consolidated log for lookup success
 	duration := time.Since(lookupStart)
-	s.InfoLog("account lookup successful",
+	s.DebugLog("account lookup successful",
 		"address", s.username,
 		"cached", false,
 		"method", "main_db",
@@ -2034,7 +2034,7 @@ func (s *Session) forwardRCPT(command string) bool {
 		return false
 	}
 
-	// Log routing decision at INFO level with sender, recipient, and routing method
+	// The INFO line for a delivery: sender, recipient, backend and routing method.
 	s.InfoLog("routing to backend", "backend", s.serverAddr, "method", s.routingMethod, "from", s.sender, "to", s.to)
 	return true
 }
@@ -2053,9 +2053,9 @@ func (s *Session) close() {
 		s.InfoLog("connection kicked", "kicked_account_id", kicked)
 	}
 
-	// Log disconnection at INFO level
+	// "routing to backend" (or the recipient rejection) already said what this connection did.
 	duration := time.Since(s.startTime).Round(time.Second)
-	s.InfoLog("disconnected", "from", s.sender, "to", s.to, "duration", duration, "backend", s.serverAddr)
+	s.DebugLog("disconnected", "from", s.sender, "to", s.to, "duration", duration, "backend", s.serverAddr)
 
 	// Unregister connection SYNCHRONOUSLY to prevent leak
 	// CRITICAL: Must be synchronous to ensure unregister completes before session goroutine exits

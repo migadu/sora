@@ -24,11 +24,11 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 	}()
 
 	if len(uids) == 0 {
-		logger.Info("Database: no UIDs to expunge", "mailbox_id", mailboxID)
+		logger.Debug("Database: no UIDs to expunge", "mailbox_id", mailboxID)
 		return 0, nil
 	}
 
-	logger.Info("Database: expunging messages", "count", len(uids), "mailbox_id", mailboxID, "uids", uids)
+	logger.Debug("Database: expunging messages", "count", len(uids), "mailbox_id", mailboxID, "uids", uids)
 
 	// Serialize unseen_count maintenance per mailbox so the expunge trigger and a
 	// concurrent flag-change trigger can't race their cross-table reads and drift
@@ -60,7 +60,7 @@ func (db *Database) ExpungeMessageUIDs(ctx context.Context, tx pgx.Tx, mailboxID
 		return 0, err
 	}
 
-	logger.Info("Database: successfully expunged messages", "count", rowsAffected, "mailbox_id", mailboxID, "modseq", currentModSeq)
+	logger.Debug("Database: successfully expunged messages", "count", rowsAffected, "mailbox_id", mailboxID, "modseq", currentModSeq)
 	return currentModSeq, nil
 }
 

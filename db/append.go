@@ -1026,7 +1026,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			logger.Error("Database: failed to mark message as uploaded (dedup)", "content_hash", upload.ContentHash, "err", err)
 			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBUpdateFailed, err)
 		}
-		logger.Info("Database: message marked as uploaded via content deduplication",
+		logger.Debug("Database: message marked as uploaded via content deduplication",
 			"content_hash", truncateHash(options.ContentHash), "account_id", upload.AccountID)
 	} else {
 		// Content not yet uploaded - create pending_upload.
@@ -1054,7 +1054,7 @@ func (d *Database) InsertMessage(ctx context.Context, tx pgx.Tx, options *Insert
 			logger.Error("Database: failed to insert into pending_uploads", "content_hash", upload.ContentHash, "err", err)
 			return 0, 0, fmt.Errorf("%w: %w", consts.ErrDBInsertFailed, err) // Transaction will rollback
 		}
-		logger.Info("Database: pending_upload created",
+		logger.Debug("Database: pending_upload created",
 			"content_hash", truncateHash(options.ContentHash), "account_id", upload.AccountID)
 	}
 

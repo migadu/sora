@@ -711,9 +711,9 @@ Useful log lines (LMTP session logs carry the session and message fields):
 
 | Log line | Level | Meaning |
 |---|---|---|
-| `using user sieve script` | info | The account's active script runs (name, id, last update). |
+| `using user sieve script` | debug | The account's active script runs (name, id, last update). |
 | `default sieve fileinto` / `user sieve fileinto` | info | The script filed the message (`mailbox`, `copy`, `create`). |
-| `user sieve keep - merging with default script result` | info | The user script kept; the default action stands. |
+| `user sieve keep - merging with default script result` | debug | The user script kept; the default action stands. |
 | `user sieve redirect` | info | The script redirected (`redirect_to`, `copy`). |
 | `user sieve reject, discarded without a bounce` | info | A `reject` or `ereject`, handled as discard. |
 | `user sieve vacation response triggered` | info | The script decided to send a reply (it may still be suppressed later). |

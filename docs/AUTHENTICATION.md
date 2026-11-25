@@ -497,7 +497,8 @@ master_sasl_allowed_networks = ["10.20.0.5", "10.20.0.6"]
   reloaded on backends, and `master_sasl_username` and `master_sasl_password` on the IMAP, POP3 and
   ManageSieve proxies. `master_username` and `master_password` need a restart. See
   [OPERATIONS.md](OPERATIONS.md).
-- A master login logs `authentication successful ... method=master`.
+- A master login logs `authentication successful ... method=master` on a backend and
+  `authentication complete ... method=master` on a proxy.
 
 ---
 
@@ -884,7 +885,8 @@ Log lines (INFO unless noted), with the session's fields:
 
 | Message | Meaning |
 |---|---|
-| `authentication successful` | A login succeeded. `method` is `main_db`, `cache`, `master` or `remotelookup`; `cached` says whether a cache answered. |
+| `authentication successful` | On a backend: a login succeeded. `method` is `main_db`, `cache`, `master` or `remotelookup`; `cached` says whether a cache answered. On a proxy this line is DEBUG. |
+| `authentication complete` | On the IMAP, POP3 or ManageSieve proxy: a login succeeded and reached its backend. The one INFO line per proxy login, with `method`, `cached`, `backend`, `routing` and `duration`. |
 | `authentication failed` | A login failed. `reason` is `user_not_found`, `invalid_password` or `transient_error`. |
 | WARN `authentication unavailable` | The password could not be checked, so the client got a temporary failure and the attempt was not counted. `reason` is `transient_error` (the database could not be asked) or `unverifiable_hash` (the stored hash cannot be checked, for example an unknown scheme). |
 | `authorization failed` | On a backend: the password was right, but the client asked to act as another user (`authzid`) without master credentials (section 8.2). On the IMAP or ManageSieve proxy: the password was right, but the `authzid` names another user than the one the login reaches (section 7). |

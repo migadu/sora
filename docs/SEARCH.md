@@ -300,7 +300,8 @@ Every node that runs IMAP, POP3 or LMTP backends starts one FTS worker
 
 Between batches the worker pauses for one second. After an error it logs `FTS Worker: failed to
 process batch, backing off briefly`, waits five seconds and stops until the next 30-second tick.
-Each successful batch logs `FTS Worker: generated vectors for messages batch` with the count.
+Each successful batch logs `FTS Worker: generated vectors for messages batch` with the count, at
+debug level.
 
 A body that PostgreSQL cannot parse (an invalid byte sequence, or text too long for a `tsvector`)
 gets an empty vector, so that the queue keeps moving. Sora logs `FTS: failed to index
@@ -672,7 +673,7 @@ See [METRICS.md](METRICS.md) for the full list.
 | Line | Meaning |
 |---|---|
 | `FTS Background Worker starting...` | The worker started on this node. |
-| `FTS Worker: generated vectors for messages batch` | A batch committed. |
+| `FTS Worker: generated vectors for messages batch` | DEBUG: a batch committed. |
 | `FTS: batch time budget spent, committing partial progress` | A batch ran out of time and committed part of its work. |
 | `FTS Worker: failed to process batch, backing off briefly` | A batch failed; the worker waits for the next tick. |
 | `FTS: a body in this chunk cannot be tokenised, isolating it` | A group of bodies failed together; the worker retries them one by one to find the bad one. |

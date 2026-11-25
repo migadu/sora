@@ -494,24 +494,24 @@ func (w *UploadWorker) run(ctx context.Context) {
 			logger.Info("Uploader: worker stopped due to stop signal")
 			return
 		case <-ticker.C:
-			logger.Info("Uploader: timer tick")
+			logger.Debug("Uploader: timer tick")
 			if err := w.processQueue(ctx); err != nil {
 				w.reportError(err)
 			}
 		case <-monitorTicker.C:
-			logger.Info("Uploader: monitor tick")
+			logger.Debug("Uploader: monitor tick")
 			if err := w.monitorStuckUploads(ctx); err != nil {
 				logger.Error("Uploader: Monitor error", "error", err)
 			}
 		case <-cleanupTicker.C:
-			logger.Info("Uploader: cleanup tick")
+			logger.Debug("Uploader: cleanup tick")
 			if err := w.cleanupOrphanedFiles(ctx); err != nil {
 				logger.Error("Uploader: Cleanup error", "error", err)
 			}
 		case <-heartbeatTicker.C:
 			w.recordHeartbeat(ctx)
 		case <-w.notifyCh:
-			logger.Info("Uploader: worker notified")
+			logger.Debug("Uploader: worker notified")
 			_ = w.processQueue(ctx)
 		}
 	}
@@ -707,7 +707,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		return uploadContentProblem
 	}
 
-	logger.Info("Uploader: Uploading hash", "hash", upload.ContentHash, "account_id", upload.AccountID)
+	logger.Debug("Uploader: Uploading hash", "hash", upload.ContentHash, "account_id", upload.AccountID)
 
 	// The keys come from the message rows, not from the account's current primary
 	// address: readers build their GET key from the s3_domain/s3_localpart each row
@@ -756,7 +756,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	w.countOnDisk(filePath)
 
 	if len(keys) == 0 {
-		logger.Info("Uploader: Content hash already uploaded - skipping S3 upload", "hash", upload.ContentHash, "account_id", upload.AccountID)
+		logger.Debug("Uploader: Content hash already uploaded - skipping S3 upload", "hash", upload.ContentHash, "account_id", upload.AccountID)
 		// Every key these rows point at already holds the content, so finalizing only
 		// clears the leftover pending_uploads record.
 		// Nothing was written here: every remaining unuploaded row has a live sibling
@@ -772,7 +772,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 		}
 		finalized = true
 		// Only delete after successful DB update
-		logger.Info("Uploader: Upload completed (already uploaded hash)", "hash", upload.ContentHash, "account_id", upload.AccountID)
+		logger.Debug("Uploader: Upload completed (already uploaded hash)", "hash", upload.ContentHash, "account_id", upload.AccountID)
 
 		// The local file is unique to this upload task, so it can be safely removed.
 		if err := w.RemoveLocalFile(filePath); err != nil {
@@ -974,7 +974,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 				// Log is inside RemoveLocalFile
 			}
 		} else {
-			logger.Info("Uploader: Moved hash to cache after upload", "hash", upload.ContentHash)
+			logger.Debug("Uploader: Moved hash to cache after upload", "hash", upload.ContentHash)
 		}
 	} else {
 		// No cache configured — remove the local file after successful DB update.
@@ -988,7 +988,7 @@ func (w *UploadWorker) processSingleUpload(ctx context.Context, upload db.Pendin
 	metrics.S3UploadAttempts.WithLabelValues("success").Inc()
 	metrics.UploadWorkerDuration.Observe(time.Since(start).Seconds())
 
-	logger.Info("Uploader: Upload completed", "hash", upload.ContentHash, "account_id", upload.AccountID)
+	logger.Debug("Uploader: Upload completed", "hash", upload.ContentHash, "account_id", upload.AccountID)
 	return uploadDone
 }
 
