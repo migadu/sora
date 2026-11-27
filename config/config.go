@@ -1907,6 +1907,38 @@ func (c SharedMailboxesConfig) Validate() error {
 	return nil
 }
 
+// QuotaConfig is [quota]: the limits a new account is created with. Each account then
+// keeps its own limit (accounts.storage_quota), which the Admin API changes; changing
+// the default here never touches existing accounts.
+type QuotaConfig struct {
+	// DefaultStorageQuota is the storage limit of a new account, as a size ("10gb").
+	// Empty is unlimited, the default. IMAP QUOTA (RFC 9208) reports it as STORAGE.
+	DefaultStorageQuota string `toml:"default_storage_quota"`
+}
+
+// DefaultStorage returns the storage limit in bytes for a new account, or nil for
+// unlimited.
+func (c QuotaConfig) DefaultStorage() (*int64, error) {
+	if strings.TrimSpace(c.DefaultStorageQuota) == "" {
+		return nil, nil
+	}
+	n, err := helpers.ParseSize(c.DefaultStorageQuota)
+	if err != nil {
+		return nil, fmt.Errorf("default_storage_quota: %w", err)
+	}
+	// Zero would be a limit nothing fits in, which is never what an empty default meant.
+	if n <= 0 {
+		return nil, fmt.Errorf("default_storage_quota %q must be more than 0, or empty for unlimited", c.DefaultStorageQuota)
+	}
+	return &n, nil
+}
+
+// Validate checks that default_storage_quota parses.
+func (c QuotaConfig) Validate() error {
+	_, err := c.DefaultStorage()
+	return err
+}
+
 // AdminCLIConfig holds configuration for sora-admin CLI tool
 type AdminCLIConfig struct {
 	Addr               string `toml:"addr"`                  // HTTP Admin API endpoint address
@@ -2081,6 +2113,7 @@ type Config struct {
 	Uploader         UploaderConfig         `toml:"uploader"`
 	Metadata         MetadataConfig         `toml:"metadata"`
 	SharedMailboxes  SharedMailboxesConfig  `toml:"shared_mailboxes"`
+	Quota            QuotaConfig            `toml:"quota"` // Limits new accounts are created with
 	Sieve            SieveConfig            `toml:"sieve"`
 	Relay            RelayConfig            `toml:"relay"`
 	SpamTraining     SpamTrainingConfig     `toml:"spam_training"`     // Spam filter training configuration
@@ -3879,6 +3912,7 @@ func (c *Config) Validate() []Problem {
 	// One malformed trusted_networks entry would leave LMTP admission with no peers.
 	add("trusted_networks", c.ValidateTrustedNetworks())
 	add("[shared_mailboxes]", c.SharedMailboxes.Validate())
+	add("[quota]", c.Quota.Validate())
 	add("[timeout_scheduler]", c.TimeoutScheduler.Validate())
 
 	// Fail closed: a listener that accepts PROXY protocol with an empty trusted_networks

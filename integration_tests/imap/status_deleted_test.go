@@ -20,9 +20,8 @@ import (
 //
 //   - STATUS INBOX (MESSAGES 3x9 NO [SERVERBUG] Internal server error
 //
-// DELETED-STORAGE belongs to QUOTA=RES-STORAGE (RFC 9208 §10), which sora does
-// not advertise, so it is refused like any other unknown argument ("BAD -
-// command unknown or arguments invalid", RFC 9051 §6.3.11).
+// DELETED-STORAGE belongs to QUOTA=RES-STORAGE (RFC 9208 §4.1.4): the size of the
+// \Deleted messages, which Sora gives as the sum of their RFC822.SIZE.
 func TestIMAP_StatusDeleted(t *testing.T) {
 	common.SkipIfDatabaseUnavailable(t)
 	c := dialDisabledCaps(t, nil, false)
@@ -37,7 +36,13 @@ func TestIMAP_StatusDeleted(t *testing.T) {
 	c.mustOK(`STORE 1 +FLAGS.SILENT (\Deleted)`)
 	c.mustOK("EXPUNGE")
 	c.mustOK(`STORE 1:2 +FLAGS.SILENT (\Deleted \Seen)`)
+	// The test messages are all the same size.
+	var size int
+	if _, err := fmt.Sscanf(c.mustOK("FETCH 1 (RFC822.SIZE)"), "* 1 FETCH (RFC822.SIZE %d)", &size); err != nil || size == 0 {
+		t.Fatalf("FETCH 1 (RFC822.SIZE): %v (size %d)", err, size)
+	}
 	c.mustOK("UNSELECT")
+	deletedStorage := fmt.Sprintf("DELETED-STORAGE %d)\r\n", 2*size)
 
 	for cmd, want := range map[string][]string{
 		"STATUS INBOX (MESSAGES DELETED)":                       {"* STATUS INBOX (MESSAGES 3 DELETED 2)\r\n"},
@@ -47,6 +52,11 @@ func TestIMAP_StatusDeleted(t *testing.T) {
 		`LIST "" "*" RETURN (STATUS (DELETED))`:                 {"* STATUS INBOX (DELETED 2)\r\n", "* STATUS \"Empty\" (DELETED 0)\r\n"},
 		`LIST "" "Empty" RETURN (STATUS (MESSAGES DELETED))`:    {"* STATUS \"Empty\" (MESSAGES 0 DELETED 0)\r\n"},
 		`LIST "" "INBOX" RETURN (STATUS (UIDVALIDITY DELETED))`: {" DELETED 2)\r\n"},
+		"STATUS INBOX (DELETED-STORAGE)":                        {"* STATUS INBOX (" + deletedStorage},
+		"STATUS INBOX (MESSAGES DELETED-STORAGE)":               {"* STATUS INBOX (MESSAGES 3 " + deletedStorage},
+		"STATUS Empty (DELETED-STORAGE)":                        {"* STATUS \"Empty\" (DELETED-STORAGE 0)\r\n"},
+		`LIST "" "INBOX" RETURN (STATUS (DELETED-STORAGE))`:     {"* STATUS INBOX (" + deletedStorage},
+		`LIST "" "*" RETURN (STATUS (DELETED DELETED-STORAGE))`: {"* STATUS INBOX (DELETED 2 " + deletedStorage, "* STATUS \"Empty\" (DELETED 0 DELETED-STORAGE 0)\r\n"},
 	} {
 		resp, tagged := statusDeletedDo(c, cmd)
 		if !strings.Contains(tagged, " OK ") || !strings.HasPrefix(tagged, "x") {
@@ -59,6 +69,19 @@ func TestIMAP_StatusDeleted(t *testing.T) {
 			}
 		}
 	}
+
+}
+
+// TestIMAP_StatusDeletedStorageNeedsQuota: without QUOTA (here withdrawn by
+// disabled_caps) DELETED-STORAGE is refused like any other unknown argument ("BAD -
+// command unknown or arguments invalid", RFC 9051 §6.3.11), before any of the
+// STATUS line is written (#1063).
+func TestIMAP_StatusDeletedStorageNeedsQuota(t *testing.T) {
+	common.SkipIfDatabaseUnavailable(t)
+	c := dialDisabledCaps(t, func(o *imapserver.IMAPServerOptions) {
+		o.DisabledCaps = []string{"QUOTA"}
+	}, false)
+	c.appendMessage()
 
 	for _, cmd := range []string{
 		"STATUS INBOX (DELETED-STORAGE)",

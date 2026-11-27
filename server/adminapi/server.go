@@ -89,6 +89,7 @@ type Server struct {
 	maxRedirectHops    int                                         // Max redirect hops per message (mail-loop backstop)
 	sieveExtensions    []string                                    // [sieve] enabled_extensions, shared with the LMTP path
 	sharedMailboxes    config.SharedMailboxesConfig                // [shared_mailboxes], which ACL grants honour
+	defaultStorage     *int64                                      // [quota] default_storage_quota in bytes; nil is unlimited
 
 	// Mail deliveries in flight, reported as this server's drain sessions, admitted by the
 	// maintenance gate, which refuses new ones while this backend is in maintenance.
@@ -146,6 +147,7 @@ type ServerOptions struct {
 	MaxRedirectHops    int
 	SieveExtensions    []string                     // [sieve] enabled_extensions (empty = default set)
 	SharedMailboxes    config.SharedMailboxesConfig // [shared_mailboxes]; allow_anyone_identifier gates ACL grants to "anyone"
+	Quota              config.QuotaConfig           // [quota]: the storage limit accounts are created with
 
 	// PROXY protocol for incoming connections (from HAProxy, nginx, etc.)
 	ProxyProtocol               bool     // Enable PROXY protocol support for incoming connections
@@ -309,6 +311,11 @@ func New(rdb *resilient.ResilientDatabase, options ServerOptions) (*Server, erro
 		sieveExtensions:    sieveengine.EffectiveExtensions(options.SieveExtensions),
 		sharedMailboxes:    options.SharedMailboxes,
 	}
+	defaultStorage, err := options.Quota.DefaultStorage()
+	if err != nil {
+		return nil, fmt.Errorf("[quota]: %w", err)
+	}
+	s.defaultStorage = defaultStorage
 	if s.uploadMaxAttempts <= 0 {
 		s.uploadMaxAttempts = config.DefaultUploaderMaxAttempts
 	}
@@ -524,6 +531,10 @@ func (s *Server) setupRoutes() http.Handler {
 		"DELETE": s.handleDeleteAccount,
 	}))
 	mux.HandleFunc("/admin/accounts/{email}/exists", s.routeHandler("GET", s.handleAccountExists))
+	mux.HandleFunc("/admin/accounts/{email}/quota", s.multiMethodHandler(map[string]http.HandlerFunc{
+		"GET": s.handleGetAccountQuota,
+		"PUT": s.handleSetAccountQuota,
+	}))
 	mux.HandleFunc("/admin/accounts/{email}/restore", s.routeHandler("POST", s.handleRestoreAccount))
 	mux.HandleFunc("/admin/accounts/{email}/credentials", s.multiMethodHandler(map[string]http.HandlerFunc{
 		"GET":  s.handleListCredentials,
@@ -756,6 +767,40 @@ type CreateAccountRequest struct {
 	Password     string                 `json:"password"`
 	PasswordHash string                 `json:"password_hash"`
 	Credentials  []CreateCredentialSpec `json:"credentials,omitempty"`
+	// StorageQuota is the account's storage limit in bytes. Left out, the account gets
+	// [quota] default_storage_quota; null makes it unlimited.
+	StorageQuota storageQuotaField `json:"storage_quota,omitzero"`
+}
+
+// storageQuotaField is a storage_quota JSON member, which has three states: left out
+// (Set false), null (Set, Bytes nil: unlimited) or a number of bytes.
+type storageQuotaField struct {
+	Set   bool
+	Bytes *int64
+}
+
+// MarshalJSON writes the member as null or the number; omitzero leaves it out unset.
+func (f storageQuotaField) MarshalJSON() ([]byte, error) {
+	return json.Marshal(f.Bytes)
+}
+
+func (f *storageQuotaField) UnmarshalJSON(b []byte) error {
+	f.Set = true
+	if string(b) == "null" {
+		f.Bytes = nil
+		return nil
+	}
+	var n int64
+	if err := json.Unmarshal(b, &n); err != nil {
+		return fmt.Errorf("storage_quota must be a whole number of bytes or null")
+	}
+	f.Bytes = &n
+	return nil
+}
+
+// StorageQuotaRequest is the body of PUT /admin/accounts/{email}/quota.
+type StorageQuotaRequest struct {
+	StorageQuota storageQuotaField `json:"storage_quota,omitzero"`
 }
 
 type CreateCredentialSpec struct {
@@ -812,6 +857,15 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 	ctx := r.Context()
 
+	storageQuota := s.defaultStorage
+	if req.StorageQuota.Set {
+		storageQuota = req.StorageQuota.Bytes
+	}
+	if err := db.ValidateStorageQuota(storageQuota); err != nil {
+		s.writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
 	// Check if credentials array is provided for multi-credential creation
 	if len(req.Credentials) > 0 {
 		// Multi-credential creation
@@ -858,7 +912,8 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 
 		// Create account with multiple credentials
 		createReq := db.CreateAccountWithCredentialsRequest{
-			Credentials: dbCredentials,
+			Credentials:  dbCredentials,
+			StorageQuota: storageQuota,
 		}
 
 		accountID, err := s.rdb.CreateAccountWithCredentialsWithRetry(ctx, createReq)
@@ -911,6 +966,7 @@ func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
 			PasswordHash: req.PasswordHash,
 			IsPrimary:    true,
 			HashType:     "bcrypt",
+			StorageQuota: storageQuota,
 		}
 
 		accountID, err := s.rdb.CreateAccountWithRetry(ctx, createReq)
@@ -1051,6 +1107,64 @@ func (s *Server) handleGetAccount(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.writeJSON(w, http.StatusOK, accountDetails)
+}
+
+// handleGetAccountQuota answers the account's storage limit (null: unlimited) and
+// usage, both in bytes, as IMAP QUOTA reports them.
+func (s *Server) handleGetAccountQuota(w http.ResponseWriter, r *http.Request) {
+	email := r.PathValue("email")
+	quota, err := s.rdb.GetAccountQuotaByEmailWithRetry(r.Context(), email)
+	if err != nil {
+		switch {
+		case errors.Is(err, server.ErrInvalidAddress):
+			s.writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, consts.ErrUserNotFound):
+			s.writeError(w, http.StatusNotFound, "Account not found")
+		default:
+			logger.Warn("HTTP API: Error getting account quota", "name", s.name, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to get account quota")
+		}
+		return
+	}
+	s.writeJSON(w, http.StatusOK, quota)
+}
+
+// handleSetAccountQuota sets the account's storage limit: {"storage_quota": bytes},
+// or null for unlimited. The member is required, so an empty body cannot clear a
+// limit by accident.
+func (s *Server) handleSetAccountQuota(w http.ResponseWriter, r *http.Request) {
+	defer r.Body.Close()
+	email := r.PathValue("email")
+
+	var req StorageQuotaRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.writeError(w, http.StatusBadRequest, "Invalid JSON body: "+err.Error())
+		return
+	}
+	if !req.StorageQuota.Set {
+		s.writeError(w, http.StatusBadRequest, "storage_quota is required: a number of bytes, or null for unlimited")
+		return
+	}
+
+	err := s.rdb.SetAccountStorageQuotaWithRetry(r.Context(), email, req.StorageQuota.Bytes)
+	if err != nil {
+		switch {
+		case errors.Is(err, consts.ErrUserNotFound):
+			s.writeError(w, http.StatusNotFound, "Account not found")
+		case errors.Is(err, db.ErrInvalidAccountRequest):
+			s.writeError(w, http.StatusBadRequest, err.Error())
+		default:
+			logger.Warn("HTTP API: Error setting account quota", "name", s.name, "error", err)
+			s.writeError(w, http.StatusInternalServerError, "Failed to set account quota")
+		}
+		return
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"email":         email,
+		"storage_quota": req.StorageQuota.Bytes,
+		"message":       "Storage quota updated successfully",
+	})
 }
 
 func (s *Server) handleUpdateAccount(w http.ResponseWriter, r *http.Request) {
@@ -2333,6 +2447,8 @@ func (s *Server) handleConfigInfo(w http.ResponseWriter, r *http.Request) {
 				"DELETE /admin/accounts/{email} (soft delete; ?purge=true requests permanent deletion now)",
 				"POST /admin/accounts/{email}/restore",
 				"GET /admin/accounts/{email}/exists",
+				"GET /admin/accounts/{email}/quota",
+				"PUT /admin/accounts/{email}/quota (storage limit in bytes; null = unlimited)",
 				"POST /admin/accounts/{email}/credentials",
 				"GET /admin/accounts/{email}/credentials",
 			},

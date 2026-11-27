@@ -61,6 +61,7 @@ func IMAPServerCaps(preview bool) imap.CapSet {
 		imap.CapID:                        {},
 		imap.CapNamespace:                 {},
 		imap.CapMetadata:                  {},
+		imap.CapQuota:                     {}, // STORAGE only (server/imap/quota.go)
 		imap.Cap("THREAD=REFERENCES"):     {},
 		imap.Cap("THREAD=REFS"):           {},
 		imap.Cap("THREAD=ORDEREDSUBJECT"): {},

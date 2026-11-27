@@ -21,7 +21,7 @@ import (
 	"github.com/migadu/sora/storage"
 )
 
-func dialWireSharedServer(t *testing.T, shared config.SharedMailboxesConfig) *wireListClient {
+func dialWireSharedServer(t *testing.T, shared config.SharedMailboxesConfig, disabledCaps ...string) *wireListClient {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -39,6 +39,7 @@ func dialWireSharedServer(t *testing.T, shared config.SharedMailboxesConfig) *wi
 			AppendLimit:    DefaultAppendLimit,
 			MaxConnections: 10,
 			Config:         &config.Config{SharedMailboxes: shared},
+			DisabledCaps:   disabledCaps,
 		},
 	)
 	if err != nil {
@@ -188,10 +189,11 @@ func TestStatus_SharedNamespaceRootRefused(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
+			// Without QUOTA, DELETED-STORAGE is an item the session does not offer.
 			c := dialWireSharedServer(t, config.SharedMailboxesConfig{
 				Enabled:         true,
 				NamespacePrefix: tc.prefix,
-			})
+			}, "QUOTA")
 
 			// Argument/capability checks must still run before mailbox refusal.
 			c.mustBad(`STATUS "Shared" (DELETED-STORAGE)`)

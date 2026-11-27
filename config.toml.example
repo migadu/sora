@@ -834,6 +834,19 @@ default_rights = "lrswipkxtea"   # Default ACL rights for shared mailbox creator
                                 # Rights: l=lookup, r=read, s=seen, w=write, i=insert, p=post, k=create, x=delete, t=delete-msg, e=expunge, a=admin
 
 # =============================================================================
+# QUOTA
+# =============================================================================
+# Every account has its own storage limit, which IMAP reports through QUOTA
+# (RFC 9208) as the STORAGE resource, and which the Admin API sets:
+#   PUT /admin/accounts/{email}/quota  {"storage_quota": 10737418240}  (bytes; null = unlimited)
+# This section only gives the limit an account is created with (Admin API or
+# sora-admin accounts create). Changing it never changes existing accounts.
+# The limit is reported, not enforced: IMAP does not refuse APPEND/COPY/MOVE over it.
+
+[quota]
+default_storage_quota = ""       # Limit of a new account, e.g. "10gb" (b, kb, mb, gb, tb; powers of 1024). Empty = unlimited (default)
+
+# =============================================================================
 # SIEVE EXTENSIONS (Global Configuration)
 # =============================================================================
 # Configure which SIEVE extensions are enabled globally for both:

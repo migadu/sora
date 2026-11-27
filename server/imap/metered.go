@@ -61,6 +61,8 @@ var (
 	_ imapserver.SessionID              = (*meteredSession)(nil)
 	_ imapserver.SessionNotify          = (*meteredSession)(nil)
 	_ imapserver.SessionSearchRes       = (*meteredSession)(nil)
+	// Without it the library drops QUOTA from CAPABILITY and refuses its commands.
+	_ imapserver.SessionQuota = (*meteredSession)(nil)
 	// Without it the first CONDSTORE enabling command with a mailbox selected
 	// silently stops returning HIGHESTMODSEQ (RFC 7162 §3.1).
 	_ imapserver.SessionHighestModSeq = (*meteredSession)(nil)
@@ -323,5 +325,19 @@ func (m *meteredSession) MyRights(ctx context.Context, mailbox string) (*imap.My
 	start := time.Now()
 	data, err := m.IMAPSession.MyRights(ctx, mailbox)
 	m.recordCommand("MYRIGHTS", start, err)
+	return data, err
+}
+
+func (m *meteredSession) GetQuota(ctx context.Context, root string) (*imap.QuotaData, error) {
+	start := time.Now()
+	data, err := m.IMAPSession.GetQuota(ctx, root)
+	m.recordCommand("GETQUOTA", start, err)
+	return data, err
+}
+
+func (m *meteredSession) GetQuotaRoot(ctx context.Context, mailbox string) ([]imap.QuotaData, error) {
+	start := time.Now()
+	data, err := m.IMAPSession.GetQuotaRoot(ctx, mailbox)
+	m.recordCommand("GETQUOTAROOT", start, err)
 	return data, err
 }

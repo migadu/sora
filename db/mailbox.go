@@ -1215,14 +1215,20 @@ func (d *Database) GetMailboxSummariesBatch(ctx context.Context, mailboxIDs []in
 	return result, nil
 }
 
-// CountDeletedMessages returns, per mailbox, how many of its messages that are
-// not expunged have the \Deleted flag set: the DELETED status data item (RFC
-// 9051 §6.3.11). A mailbox without any is left out of the map. mailbox_stats
-// keeps no such count, so this reads the mailboxes' message_state rows; STATUS
-// runs it only when a client asks for DELETED.
-func (d *Database) CountDeletedMessages(ctx context.Context, mailboxIDs []int64) (map[int64]uint32, error) {
+// DeletedMessages is what a mailbox's \Deleted, not expunged messages add up to.
+type DeletedMessages struct {
+	Count uint32 // the DELETED status data item (RFC 9051 §6.3.11, RFC 9208 §4.1.4)
+	Size  int64  // sum of their RFC822.SIZE in octets: DELETED-STORAGE (RFC 9208 §4.1.4)
+}
+
+// CountDeletedMessages returns, per mailbox, how many of its messages that are not
+// expunged have the \Deleted flag set, and their total size. A mailbox without any
+// is left out of the map. mailbox_stats keeps no such count, so this reads the
+// mailboxes' message_state rows; STATUS runs it only when a client asks for DELETED
+// or DELETED-STORAGE.
+func (d *Database) CountDeletedMessages(ctx context.Context, mailboxIDs []int64) (map[int64]DeletedMessages, error) {
 	if len(mailboxIDs) == 0 {
-		return map[int64]uint32{}, nil
+		return map[int64]DeletedMessages{}, nil
 	}
 
 	start := time.Now()
@@ -1237,7 +1243,7 @@ func (d *Database) CountDeletedMessages(ctx context.Context, mailboxIDs []int64)
 	}()
 
 	rows, err := d.GetReadPoolWithContext(ctx).Query(ctx, `
-		SELECT mst.mailbox_id, COUNT(*)
+		SELECT mst.mailbox_id, COUNT(*), COALESCE(SUM(m.size), 0)
 		FROM message_state mst
 		JOIN messages m ON m.id = mst.message_id AND m.mailbox_id = mst.mailbox_id
 		WHERE mst.mailbox_id = ANY($1) AND (mst.flags & $2) <> 0 AND m.expunged_at IS NULL
@@ -1248,13 +1254,13 @@ func (d *Database) CountDeletedMessages(ctx context.Context, mailboxIDs []int64)
 	}
 	defer rows.Close()
 
-	result := make(map[int64]uint32, len(mailboxIDs))
+	result := make(map[int64]DeletedMessages, len(mailboxIDs))
 	for rows.Next() {
-		var mailboxID, count int64
-		if err = rows.Scan(&mailboxID, &count); err != nil {
+		var mailboxID, count, size int64
+		if err = rows.Scan(&mailboxID, &count, &size); err != nil {
 			return nil, fmt.Errorf("failed to scan deleted message count: %w", err)
 		}
-		result[mailboxID] = uint32(count)
+		result[mailboxID] = DeletedMessages{Count: uint32(count), Size: size}
 	}
 	if err = rows.Err(); err != nil {
 		return nil, fmt.Errorf("error iterating deleted message counts: %w", err)

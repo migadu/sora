@@ -236,6 +236,8 @@ not used by it.
 | GET | `/admin/accounts/{email}/exists` | 7.7 | Does an address exist, and is its account deleted. |
 | GET | `/admin/domains/{domain}/accounts` | 7.8 | Accounts whose primary address is in a domain. |
 | GET | `/admin/usage/accounts` | 7.9 | Every account with its usage, page by page. |
+| GET | `/admin/accounts/{email}/quota` | 7.10 | An account's storage limit and usage. |
+| PUT | `/admin/accounts/{email}/quota` | 7.10 | Set or clear an account's storage limit. |
 | POST | `/admin/accounts/{email}/credentials` | 8.1 | Add an address (alias) to an account. |
 | GET | `/admin/accounts/{email}/credentials` | 8.2 | List an account's addresses. |
 | GET | `/admin/credentials/{email}` | 8.3 | Details of one address and its account. |
@@ -336,6 +338,7 @@ With one address:
 | `email` | string | The address, which becomes the primary identity. Required. |
 | `password` | string | Hashed with bcrypt at the server's `bcrypt_cost`. bcrypt reads at most 72 bytes, so a longer password is refused with `400`. |
 | `password_hash` | string | A ready hash, stored as given once Sora has checked that it is in a scheme Sora verifies ([AUTHENTICATION.md](AUTHENTICATION.md#4-password-schemes)). A hash Sora could not check is refused with `400`, so no credential is stored that no password signs in to. |
+| `storage_quota` | integer or null | The storage limit in bytes (7.10). Left out, the account gets `[quota] default_storage_quota`, which is unlimited unless configured; `null` makes it unlimited. Also accepted next to `credentials`. |
 
 Give exactly one of `password` and `password_hash`.
 
@@ -386,7 +389,7 @@ Errors:
 | 400 | `Cannot specify both password and password_hash` | Both given. |
 | 400 | `Cannot specify email, password, or password_hash when using credentials array` | Both forms mixed. |
 | 400 | `Credential N: email is required` (and the same two password messages, prefixed) | A bad entry in `credentials`. |
-| 400 | The reason | An invalid address, an address held by an account in its deletion grace period, no or several `is_primary`, duplicate addresses in the request, a `hash_type` other than `bcrypt` or `ssha512`. |
+| 400 | The reason | An invalid address, an address held by an account in its deletion grace period, no or several `is_primary`, duplicate addresses in the request, a `hash_type` other than `bcrypt` or `ssha512`, a `storage_quota` of 0 or less. |
 | 409 | `Account already exists` / `One or more email addresses already exist` | An address already exists. |
 | 500 | `Failed to create account` / `Failed to create account with credentials` | A server-side failure. The server log has the reason. |
 
@@ -410,7 +413,8 @@ Response `200`:
   ],
   "mailbox_count": 6,
   "message_count": 4211,
-  "storage_used": 1834201991
+  "storage_used": 1834201991,
+  "storage_quota": 10737418240
 }
 ```
 
@@ -422,6 +426,7 @@ Response `200`:
 | `credentials` | Primary first, then by address. |
 | `mailbox_count` | Mailboxes not deleted. |
 | `message_count`, `storage_used` | Counted live from the messages table: messages not expunged, in mailboxes not deleted. `storage_used` is bytes. |
+| `storage_quota` | The storage limit in bytes, `null` when unlimited (7.10). |
 
 Soft-deleted accounts are returned too. `404 {"error":"Account not found"}` when no
 credential has that address.
@@ -580,6 +585,48 @@ an account created during a walk may or may not appear.
 
 Errors: `400 after must be an account id (0 or more)`, `400 limit must be between 1 and
 10000`, `500 Error listing accounts`.
+
+### 7.10 Storage quota
+
+Each account has a storage limit in bytes, or none (unlimited). IMAP reports it through QUOTA
+(RFC 9208) as the `STORAGE` resource of the account's quota root `""`, in KiB: the usage rounded
+up, the limit rounded down. The limit is reported, not enforced: IMAP does not refuse APPEND,
+COPY or MOVE over it. A new account gets `[quota] default_storage_quota`
+([CONFIGURATION.md](CONFIGURATION.md#820-account-quota-quota)) unless the create request names a
+limit (7.1). The listings in 7.8 and 7.9 and the details in 7.2 carry `storage_quota` too.
+
+`GET /admin/accounts/{email}/quota`, by any address of the account. Response `200`:
+
+```json
+{"storage_quota": 10737418240, "storage_used": 1834201991}
+```
+
+`storage_used` is what IMAP reports: the per-mailbox statistics, as in 7.8, not the live count
+of 7.2.
+
+`PUT /admin/accounts/{email}/quota` sets the limit:
+
+```json
+{"storage_quota": 10737418240}
+```
+
+`{"storage_quota": null}` makes the account unlimited. The member is required, so a body
+without it cannot clear a limit by accident. Clients see the new limit at their next GETQUOTA or
+GETQUOTAROOT. Response `200`:
+
+```json
+{"email": "alice@example.com", "storage_quota": 10737418240, "message": "Storage quota updated successfully"}
+```
+
+Errors:
+
+| Status | Body `error` | When |
+|---|---|---|
+| 400 | `Invalid JSON body: <reason>` | The body is not JSON, or `storage_quota` is not a whole number or `null`. |
+| 400 | `storage_quota is required: a number of bytes, or null for unlimited` | The member is missing. |
+| 400 | The reason | A limit of 0 or less, or an invalid address. |
+| 404 | `Account not found` | No account has that address. |
+| 500 | `Failed to get account quota` / `Failed to set account quota` | A server-side failure. The server log has the reason. |
 
 ---
 

@@ -363,9 +363,10 @@ list depends on the connection state:
 | `MULTISEARCH` | RFC 7377 | Search across several mailboxes. |
 | `ACL`, `RIGHTS=kxte` | RFC 4314 | Always present, whether or not shared mailboxes are enabled. See [SHARED_MAILBOXES.md](SHARED_MAILBOXES.md). |
 | `APPENDLIMIT=<bytes>` | RFC 7889 | The `append_limit` value in bytes, e.g. `APPENDLIMIT=26214400` for the default. |
+| `QUOTA`, `QUOTA=RES-STORAGE` | RFC 9208 | Storage limits, reported, not enforced. Section 5.15. |
 | `additional_caps` | | If configured. |
 
-Not supported: `QUOTA`, `COMPRESS`, `CATENATE`, `WITHIN`, `UNAUTHENTICATE`, `METADATA-SERVER`,
+Not supported: `QUOTASET`, `COMPRESS`, `CATENATE`, `WITHIN`, `UNAUTHENTICATE`, `METADATA-SERVER`,
 `LIST-METADATA`, `OBJECTID`, `SAVEDATE`, `UIDONLY`, `MULTIAPPEND`, `LIST-MYRIGHTS`, `REPLACE`,
 `URLAUTH`.
 
@@ -738,8 +739,8 @@ These come from `github.com/migadu/go-imap` and cannot be configured:
 ### 5.14 Other replies
 
 `STATUS` items: `DELETED` is answered when IMAP4rev2 is advertised (it is an IMAP4rev2 item);
-`DELETED-STORAGE` gets `BAD [CLIENTBUG] STATUS DELETED-STORAGE is not supported`, because Sora has
-no QUOTA; `RECENT` gets `BAD Unknown STATUS data item` from a client that has enabled IMAP4rev2,
+`DELETED-STORAGE` is answered when QUOTA is advertised (section 5.15), and otherwise gets
+`BAD [CLIENTBUG] STATUS DELETED-STORAGE is not supported`; `RECENT` gets `BAD Unknown STATUS data item` from a client that has enabled IMAP4rev2,
 also in `LIST ... RETURN (STATUS (RECENT))`. `CHECK` is accepted only with a mailbox selected.
 
 | Reply | Meaning |
@@ -747,6 +748,39 @@ also in `LIST ... RETURN (STATUS (RECENT))`. `CHECK` is accepted only with a mai
 | `NO [UNAVAILABLE] Service temporarily unavailable, please try again later` | A temporary failure: database or S3 unavailable, a lock wait or a command timeout. The client should retry later. |
 | `NO [SERVERBUG] <text>` | An unexpected server error. The text describes it; the log has the details. |
 | `NO Command aborted` | The client disconnected while the command ran. |
+
+### 5.15 QUOTA
+
+Sora implements RFC 9208 with one quota root per account, the empty name `""`, over all of the
+account's own mailboxes, and one resource, `STORAGE`:
+
+```
+C: a1 GETQUOTAROOT INBOX
+S: * QUOTAROOT INBOX ""
+S: * QUOTA "" (STORAGE 1791213 10485760)
+S: a1 OK GETQUOTAROOT completed
+```
+
+- `STORAGE` is in units of 1024 octets: the usage is the size of the messages in the account's
+  mailboxes (from the per-mailbox statistics), rounded up; the limit is the account's
+  `storage_quota`, rounded down. The Admin API sets the limit
+  ([ADMIN_API.md](ADMIN_API.md#710-storage-quota)); new accounts get `[quota]
+  default_storage_quota` ([CONFIGURATION.md](CONFIGURATION.md#820-account-quota-quota)).
+- An unlimited account has the root with no resources: `* QUOTA "" ()`.
+- GETQUOTAROOT names the root for any mailbox of the user's own, also one that does not exist yet
+  (RFC 9208 §4.1.2). A mailbox another account owns, seen through sharing, gets no root
+  (`* QUOTAROOT "Shared/Team"`): its messages count against its owner. A name in the shared
+  namespace that does not exist answers the same.
+- GETQUOTA for any root other than `""` gets `NO [NONEXISTENT] No such quota root`.
+- SETQUOTA gets `NO [NOPERM] Quota limits cannot be changed`, and `QUOTASET` is not advertised:
+  limits belong to the Admin API.
+- `STATUS ... (DELETED-STORAGE)` is the size in octets of the mailbox's `\Deleted` messages, the
+  sum of their RFC822.SIZE, as RFC 9208 §4.1.4 allows. `MESSAGE` is not a reported resource, so
+  `DELETED` stays an IMAP4rev2 item.
+- Limits are reported, not enforced: APPEND, COPY and MOVE are never refused with `OVERQUOTA`.
+
+`disabled_caps = ["QUOTA"]`, or a `client_filters` entry, withdraws QUOTA, its commands and
+`DELETED-STORAGE` (section 6).
 
 ---
 

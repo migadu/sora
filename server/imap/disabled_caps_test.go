@@ -446,13 +446,13 @@ func TestList_RefusesReturnMetadataWithoutListMetadata(t *testing.T) {
 	assertRefusedAsBad(t, "without LIST-METADATA", "LIST RETURN (METADATA)", err)
 }
 
-// DELETED-STORAGE is QUOTA=RES-STORAGE's status data item (RFC 9208 §4.1.4),
-// which sora does not offer. go-imap parses it whatever the capabilities, and
-// left unset it ended the STATUS line half-written before a tagged NO (#1063).
-// STATUS answers invalid arguments with "BAD - command unknown or arguments
-// invalid" (RFC 9051 §6.3.11).
+// DELETED-STORAGE is QUOTA=RES-STORAGE's status data item (RFC 9208 §4.1.4).
+// go-imap parses it whatever the capabilities, and left unset it ended the STATUS
+// line half-written before a tagged NO (#1063), so a session that does not offer
+// QUOTA (here withdrawn by disabled_caps) refuses it itself. STATUS answers invalid
+// arguments with "BAD - command unknown or arguments invalid" (RFC 9051 §6.3.11).
 func TestStatus_RefusesDeletedStorage(t *testing.T) {
-	srv := newDisabledCapsTestServer(t, IMAPServerOptions{})
+	srv := newDisabledCapsTestServer(t, IMAPServerOptions{DisabledCaps: []string{"QUOTA"}})
 	s := newDisabledCapsTestSession(srv)
 	for _, tc := range []struct {
 		name string

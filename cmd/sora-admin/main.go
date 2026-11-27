@@ -37,7 +37,8 @@ type AdminConfig struct {
 	Uploader                  config.UploaderConfig        `toml:"uploader"`
 	Cleanup                   config.CleanupConfig         `toml:"cleanup"`
 	SharedMailboxes           config.SharedMailboxesConfig `toml:"shared_mailboxes"`
-	TLS                       config.TLSConfig             `toml:"tls"` // TLS configuration for accessing Let's Encrypt S3 bucket
+	Quota                     config.QuotaConfig           `toml:"quota"` // default_storage_quota stamped on accounts created here
+	TLS                       config.TLSConfig             `toml:"tls"`   // TLS configuration for accessing Let's Encrypt S3 bucket
 	AdminCLI                  config.AdminCLIConfig        `toml:"admin_cli"`
 	DynamicServers            []config.ServerConfig        // Populated from full config
 	Server                    []map[string]any             `toml:"server"` // Ignore server config array, not needed for admin commands
@@ -127,6 +128,10 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	if err := fullCfg.SharedMailboxes.Validate(); err != nil {
 		return fmt.Errorf("[shared_mailboxes]: %w", err)
 	}
+	// `accounts create` stamps [quota] default_storage_quota on the accounts it creates.
+	if err := fullCfg.Quota.Validate(); err != nil {
+		return fmt.Errorf("[quota]: %w", err)
+	}
 	// Imports index mail by [cleanup] fts_retention, as delivery does. The server refuses
 	// the other [cleanup] values Validate rejects too.
 	if err := fullCfg.Cleanup.Validate(); err != nil {
@@ -148,6 +153,7 @@ func loadAdminConfig(configPath string, cfg *AdminConfig) error {
 	cfg.Uploader = fullCfg.Uploader
 	cfg.Cleanup = fullCfg.Cleanup
 	cfg.SharedMailboxes = fullCfg.SharedMailboxes
+	cfg.Quota = fullCfg.Quota
 	cfg.TLS = fullCfg.TLS
 	cfg.AdminCLI = fullCfg.AdminCLI
 	cfg.DynamicServers = fullCfg.DynamicServers

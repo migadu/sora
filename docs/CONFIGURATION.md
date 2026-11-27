@@ -61,7 +61,7 @@ default. After parsing, Sora trims leading and trailing spaces from every string
 
 `sora-admin` reads the same file with the same loader (see [ADMIN_CLI.md](ADMIN_CLI.md)). It uses
 only some sections (`[database]`, `[s3]`, `[local_cache]`, `[uploader]`, `[cleanup]`,
-`[shared_mailboxes]`, `[tls]`, `[admin_cli]`, `[relay]`, `[sieve]`, `[cluster]` and the
+`[shared_mailboxes]`, `[quota]`, `[tls]`, `[admin_cli]`, `[relay]`, `[sieve]`, `[cluster]` and the
 `[[server]]` blocks), and it starts from the same built-in defaults.
 
 ### Unknown keys
@@ -245,6 +245,7 @@ that cannot be read or parsed has no `[logging]` to follow: that error goes to s
 | `[cluster]` and `[cluster.affinity]` are enabled and `[cluster.affinity] cleanup_interval` is negative | `[cluster.affinity]: cleanup_interval must not be negative, got "<value>"` |
 | `[shared_mailboxes] enabled = true` and `namespace_prefix` is not a mailbox name followed by `/` (for example `""`, `"Shared"` or `"Shared//"`), or is `INBOX/` in any letter case | `[shared_mailboxes]: namespace_prefix "<value>" must be a mailbox name followed by the hierarchy delimiter "/", such as "Shared/"` or `[shared_mailboxes]: namespace_prefix "<value>" conflicts with the reserved personal INBOX` |
 | `[timeout_scheduler] shard_count` is below -1 | `[timeout_scheduler]: shard_count must be >= -1, got <n>` |
+| `[quota] default_storage_quota` is not a size, or is `0` | `[quota]: default_storage_quota: <reason>` or `[quota]: default_storage_quota "<value>" must be more than 0, or empty for unlimited` |
 
 The address check compares the strings, so `":143"` and `"0.0.0.0:143"` pass it and fail later when
 the second listener cannot bind.
@@ -478,6 +479,7 @@ How to send the signal, and how shutdown works, is in [OPERATIONS.md](OPERATIONS
 | `[auth_cache]` | Persistent login cache for proxies | [8.15](#815-persistent-auth-cache-auth_cache), [PROXY.md](PROXY.md) |
 | `[backend_maintenance]` | How proxies drain backends in maintenance | [8.16](#816-backend-maintenance-backend_maintenance), [PROXY.md](PROXY.md) |
 | `[servers]` | `trusted_networks` | [8.17](#817-trusted-networks-servers), [SECURITY.md](SECURITY.md) |
+| `[quota]` | Storage limit new accounts are created with | [8.20](#820-account-quota-quota), [ADMIN_API.md](ADMIN_API.md#710-storage-quota) |
 | `[timeout_scheduler]` | Connection timeout checker | [8.18](#818-timeout-scheduler-timeout_scheduler) |
 | `[admin_cli]` | How `sora-admin` reaches the admin API | [8.19](#819-admin-tool-admin_cli), [ADMIN_CLI.md](ADMIN_CLI.md) |
 | `[[server]]` | One block per listener | [section 9](#9-keys-of-a-server-block) |
@@ -840,6 +842,19 @@ Read by `sora-admin`, not by `sora`. See [ADMIN_CLI.md](ADMIN_CLI.md).
 | `api_key` | string | none | Key of that API. |
 | `insecure_skip_verify` | bool | `true` for a loopback address, else `false` | Skip TLS certificate checks towards the admin API. |
 | `import_message_limit` | size | the `append_limit` of the first `imap` server in the file (`25mb` if it sets none); `50mb` with no `imap` server | Largest message the import commands accept. |
+
+### 8.20 Account quota (`[quota]`)
+
+Every account has its own storage limit, which IMAP reports through QUOTA (RFC 9208) and
+which the Admin API sets ([ADMIN_API.md](ADMIN_API.md#710-storage-quota)). This section gives
+only the limit an account gets when it is created, through the Admin API or `sora-admin accounts
+create`. Changing it never changes existing accounts. It is read at startup.
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `default_storage_quota` | size | `""` (unlimited) | Storage limit of a new account, such as `"10gb"`. Empty is unlimited. `0` is refused. |
+
+The limit is reported, not enforced: IMAP does not refuse APPEND, COPY or MOVE over it.
 
 ---
 

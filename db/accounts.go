@@ -20,6 +20,9 @@ type CreateAccountRequest struct {
 	PasswordHash string // If provided, Password is ignored and this hash is used directly
 	IsPrimary    bool
 	HashType     string
+	// StorageQuota is the account's storage limit in bytes; nil is unlimited. Callers
+	// pass [quota] default_storage_quota unless they were given a limit.
+	StorageQuota *int64
 }
 
 // CreateAccount creates a new account with the specified email and password
@@ -31,6 +34,10 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 	}
 
 	normalizedEmail := address.FullAddress()
+
+	if err := ValidateStorageQuota(req.StorageQuota); err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
+	}
 
 	// Check if there's an existing credential with this email (including soft-deleted accounts)
 	var existingAccountID int64
@@ -83,7 +90,7 @@ func (db *Database) CreateAccount(ctx context.Context, tx pgx.Tx, req CreateAcco
 
 	// Create account
 	var accountID int64
-	err = tx.QueryRow(ctx, "INSERT INTO accounts (created_at) VALUES (now()) RETURNING id").Scan(&accountID)
+	err = tx.QueryRow(ctx, "INSERT INTO accounts (created_at, storage_quota) VALUES (now(), $1) RETURNING id", req.StorageQuota).Scan(&accountID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create account: %w", err)
 	}
@@ -798,6 +805,7 @@ type AccountDetails struct {
 	MailboxCount     int64                      `json:"mailbox_count"`
 	MessageCount     int64                      `json:"message_count"`
 	StorageUsed      int64                      `json:"storage_used"`
+	StorageQuota     *int64                     `json:"storage_quota"` // bytes; null is unlimited
 }
 
 // GetAccountDetails retrieves comprehensive details for an account by any associated email.
@@ -812,7 +820,7 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 	// This combines fetching the account and its statistics in one query.
 	var details AccountDetails
 	err = db.GetReadPool().QueryRow(ctx, `
-		SELECT a.id, a.created_at, a.deleted_at, a.purge_requested_at,
+		SELECT a.id, a.created_at, a.deleted_at, a.purge_requested_at, a.storage_quota,
 			   (SELECT COUNT(*) FROM mailboxes WHERE account_id = a.id AND deleted_at IS NULL) AS mailbox_count,
 			   -- Live count/size (not the mailbox_stats cache) so per-account quota is always correct.
 			   -- Join mailboxes so messages in a soft-deleted (but not-yet-purged) mailbox are
@@ -824,7 +832,7 @@ func (db *Database) GetAccountDetails(ctx context.Context, email string) (*Accou
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id
 		WHERE LOWER(c.address) = $1
-	`, normalizedEmail).Scan(&details.ID, &details.CreatedAt, &details.DeletedAt, &details.PurgeRequestedAt, &details.MailboxCount, &details.MessageCount, &details.StorageUsed)
+	`, normalizedEmail).Scan(&details.ID, &details.CreatedAt, &details.DeletedAt, &details.PurgeRequestedAt, &details.StorageQuota, &details.MailboxCount, &details.MessageCount, &details.StorageUsed)
 
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -871,7 +879,8 @@ type AccountSummary struct {
 	CredentialCount int    `json:"credential_count"`
 	MailboxCount    int    `json:"mailbox_count"`
 	MessageCount    int64  `json:"message_count"`
-	StorageUsed     int64  `json:"storage_used"` // Total storage in bytes
+	StorageUsed     int64  `json:"storage_used"`  // Total storage in bytes
+	StorageQuota    *int64 `json:"storage_quota"` // Storage limit in bytes; null is unlimited
 	CreatedAt       string `json:"created_at"`
 }
 
@@ -888,7 +897,8 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 			   c.address as primary_email,
 			   0 as credential_count,
 			   0 as mailbox_count,
-			   0 as message_count
+			   0 as message_count,
+			   a.storage_quota
 		FROM accounts a
 		JOIN credentials c ON a.id = c.account_id AND c.primary_identity = TRUE
 		WHERE c.domain = LOWER($1)
@@ -912,6 +922,7 @@ func (db *Database) GetAccountsByDomain(ctx context.Context, domain string) ([]A
 			&account.CredentialCount,
 			&account.MailboxCount,
 			&account.MessageCount,
+			&account.StorageQuota,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan account summary: %w", err)
 		}
@@ -983,7 +994,8 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS credential_count,
 			   COALESCE(s.mailbox_count, 0),
 			   COALESCE(s.message_count, 0),
-			   COALESCE(s.storage_used, 0)
+			   COALESCE(s.storage_used, 0),
+			   a.storage_quota
 		FROM accounts a
 		LEFT JOIN credentials pc ON a.id = pc.account_id AND pc.primary_identity = TRUE
 		LEFT JOIN account_stats s ON a.id = s.account_id
@@ -1002,7 +1014,7 @@ func (db *Database) ListAccounts(ctx context.Context) ([]AccountSummary, error) 
 		var createdAt any
 		err := rows.Scan(&account.AccountID, &createdAt, &account.PrimaryEmail,
 			&account.CredentialCount, &account.MailboxCount, &account.MessageCount,
-			&account.StorageUsed)
+			&account.StorageUsed, &account.StorageQuota)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan account: %w", err)
 		}
@@ -1042,7 +1054,8 @@ func (db *Database) ListAccountsByDomain(ctx context.Context, domain string) ([]
 			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS credential_count,
 			   s.mailbox_count,
 			   s.message_count,
-			   s.storage_used
+			   s.storage_used,
+			   a.storage_quota
 		FROM credentials pc
 		JOIN accounts a ON a.id = pc.account_id` + accountUsage + `
 		WHERE pc.primary_identity = TRUE
@@ -1076,8 +1089,9 @@ func (db *Database) ListAccountsPage(ctx context.Context, afterID int64, limit i
 			   (SELECT COUNT(*) FROM credentials WHERE account_id = a.id) AS credential_count,
 			   s.mailbox_count,
 			   s.message_count,
-			   s.storage_used
-		FROM (SELECT id, created_at FROM accounts
+			   s.storage_used,
+			   a.storage_quota
+		FROM (SELECT id, created_at, storage_quota FROM accounts
 			  WHERE deleted_at IS NULL AND id > $1
 			  ORDER BY id LIMIT $2) a
 		LEFT JOIN credentials pc ON pc.account_id = a.id AND pc.primary_identity = TRUE` + accountUsage + `
@@ -1099,7 +1113,7 @@ func scanAccountSummaries(rows pgx.Rows) ([]AccountSummary, error) {
 		var createdAt any
 		err := rows.Scan(&account.AccountID, &createdAt, &account.PrimaryEmail,
 			&account.CredentialCount, &account.MailboxCount, &account.MessageCount,
-			&account.StorageUsed)
+			&account.StorageUsed, &account.StorageQuota)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan account: %w", err)
 		}
@@ -1124,12 +1138,18 @@ type CredentialSpec struct {
 // CreateAccountWithCredentialsRequest represents the parameters for creating a new account with multiple credentials
 type CreateAccountWithCredentialsRequest struct {
 	Credentials []CredentialSpec
+	// StorageQuota is the account's storage limit in bytes; nil is unlimited, as in
+	// CreateAccountRequest.
+	StorageQuota *int64
 }
 
 // CreateAccountWithCredentials creates a new account with multiple credentials atomically
 func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx, req CreateAccountWithCredentialsRequest) (int64, error) {
 	if len(req.Credentials) == 0 {
 		return 0, fmt.Errorf("%w: at least one credential must be provided", ErrInvalidAccountRequest)
+	}
+	if err := ValidateStorageQuota(req.StorageQuota); err != nil {
+		return 0, fmt.Errorf("%w: %w", ErrInvalidAccountRequest, err)
 	}
 
 	// Validate credentials and ensure exactly one primary
@@ -1212,7 +1232,7 @@ func (db *Database) CreateAccountWithCredentials(ctx context.Context, tx pgx.Tx,
 
 	// Create account
 	var accountID int64
-	err := tx.QueryRow(ctx, "INSERT INTO accounts (created_at) VALUES (now()) RETURNING id").Scan(&accountID)
+	err := tx.QueryRow(ctx, "INSERT INTO accounts (created_at, storage_quota) VALUES (now(), $1) RETURNING id", req.StorageQuota).Scan(&accountID)
 	if err != nil {
 		return 0, fmt.Errorf("failed to create account: %w", err)
 	}
