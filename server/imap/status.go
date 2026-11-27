@@ -30,20 +30,18 @@ func (s *IMAPSession) checkStatusItems(options *imap.StatusOptions) error {
 		}
 	}
 	// DELETED is IMAP4rev2's (RFC 9051 §6.3.11); RFC 3501 has no such item.
-	// QUOTA=RES-MESSAGE would offer it too (RFC 9208 §4.1.4), but sora offers no
-	// QUOTA.
+	// QUOTA=RES-MESSAGE would offer it too (RFC 9208 §4.1.4), but sora's QUOTA
+	// reports STORAGE only.
 	if options.NumDeleted {
 		if err := s.requireCapability(imap.CapIMAP4rev2, "STATUS DELETED"); err != nil {
 			return err
 		}
 	}
-	// DELETED-STORAGE is QUOTA=RES-STORAGE's (RFC 9208 §4.1.4), which sora does
-	// not offer, so sora does not compute it either.
+	// DELETED-STORAGE comes with QUOTA=RES-STORAGE (RFC 9208 §4.1.4, §5.1), which
+	// sora advertises whenever it advertises QUOTA.
 	if options.DeletedStorage {
-		return &imap.Error{
-			Type: imap.StatusResponseTypeBad,
-			Code: imap.ResponseCodeClientBug,
-			Text: "STATUS DELETED-STORAGE is not supported",
+		if err := s.requireCapability(imap.CapQuota, "STATUS DELETED-STORAGE"); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -155,13 +153,12 @@ func (s *IMAPSession) Status(ctx context.Context, mboxName string, options *imap
 		limit := s.AppendLimit()
 		statusData.AppendLimit = &limit
 	}
-	if options.NumDeleted {
+	if options.NumDeleted || options.DeletedStorage {
 		deleted, err := s.server.rdb.CountDeletedMessagesWithRetry(ctx, []int64{mailbox.ID})
 		if err != nil {
 			return nil, s.internalError("failed to count deleted messages in '%s': %v", mboxName, err)
 		}
-		num := deleted[mailbox.ID]
-		statusData.NumDeleted = &num
+		setDeletedStatus(statusData, options, deleted[mailbox.ID])
 	}
 	if options.Size {
 		// RFC 8438: SIZE is the sum of RFC822.SIZE of all messages in the

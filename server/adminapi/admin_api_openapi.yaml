@@ -102,6 +102,13 @@ components:
           type: string
           description: "Pre-computed password hash: a bare bcrypt hash ($2a$, $2b$, $2y$), or Dovecot's {BLF-CRYPT}, {CRYPT} with a bcrypt hash, {SSHA512} or {SHA512}, with the scheme and a .b64, .base64 or .hex suffix in any case. A value sora cannot verify is refused with 400. Cannot be used together with password."
           example: "$2a$12$LQv3c1yqBWVHxkd0LHAkCOYz6TtxMQJqhN8/LewtsJh.2gUOhvY66"
+        storage_quota:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 1
+          description: "Storage limit in bytes, which IMAP QUOTA reports. Left out, the account gets [quota] default_storage_quota (unlimited unless configured); null makes it unlimited. Also accepted next to a credentials array."
+          example: 10737418240
       required:
         - email
       anyOf:
@@ -248,6 +255,27 @@ components:
           format: int64
           example: 52428800
           description: "Total storage used in bytes (excludes expunged messages)"
+        storage_quota:
+          type: integer
+          format: int64
+          nullable: true
+          example: 10737418240
+          description: "Storage limit in bytes; null is unlimited. Set with PUT /accounts/{email}/quota."
+
+    AccountQuota:
+      type: object
+      properties:
+        storage_quota:
+          type: integer
+          format: int64
+          nullable: true
+          example: 10737418240
+          description: "Storage limit in bytes; null is unlimited."
+        storage_used:
+          type: integer
+          format: int64
+          example: 52428800
+          description: "Bytes of the messages in the account's mailboxes, from the mailbox statistics, as IMAP QUOTA reports it (rounded up to KiB there)."
 
     AccountExists:
       type: object
@@ -981,6 +1009,12 @@ paths:
                           format: int64
                           example: 52428800
                           description: "Total storage used in bytes (excludes expunged messages)"
+                        storage_quota:
+                          type: integer
+                          format: int64
+                          nullable: true
+                          example: 10737418240
+                          description: "Storage limit in bytes; null is unlimited"
                         created_at:
                           type: string
                           example: "2023-01-01 12:00:00"
@@ -1096,6 +1130,12 @@ paths:
                           format: int64
                           example: 1834201991
                           description: "Bytes of the messages in the account's mailboxes (excludes expunged messages and deleted mailboxes)"
+                        storage_quota:
+                          type: integer
+                          format: int64
+                          nullable: true
+                          example: 10737418240
+                          description: "Storage limit in bytes; null is unlimited"
                         created_at:
                           type: string
                   next_after:
@@ -1525,6 +1565,116 @@ paths:
           $ref: '#/components/responses/Unauthorized'
         '403':
           $ref: '#/components/responses/Forbidden'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /accounts/{email}/quota:
+    get:
+      tags:
+        - Account Management
+      summary: Get an account's storage quota
+      description: The storage limit and usage that IMAP QUOTA (RFC 9208) reports for the account owning the address.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+      responses:
+        '200':
+          description: The account's limit and usage.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AccountQuota'
+        '400':
+          description: The address does not parse.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No account has this address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '500':
+          description: Internal server error.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    put:
+      tags:
+        - Account Management
+      summary: Set an account's storage quota
+      description: Sets the storage limit of the account owning the address. It is reported, not enforced. storage_quota is required, so a body without it cannot clear a limit by accident.
+      parameters:
+        - name: email
+          in: path
+          required: true
+          schema:
+            type: string
+            format: email
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - storage_quota
+              properties:
+                storage_quota:
+                  type: integer
+                  format: int64
+                  nullable: true
+                  minimum: 1
+                  description: "Storage limit in bytes; null for unlimited."
+                  example: 10737418240
+      responses:
+        '200':
+          description: The limit was set.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  email:
+                    type: string
+                    format: email
+                  storage_quota:
+                    type: integer
+                    format: int64
+                    nullable: true
+                  message:
+                    type: string
+        '400':
+          description: The body is not valid JSON, storage_quota is missing, or it is neither null nor more than 0.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          description: No account has this address.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '500':
           description: Internal server error.
           content:

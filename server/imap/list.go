@@ -160,8 +160,8 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 		if len(mailboxIDs) > 0 {
 			// Single batch query replaces N * 3 individual queries
 			summaries, err := s.server.rdb.GetMailboxSummariesBatchWithRetry(readCtx, mailboxIDs)
-			var deleted map[int64]uint32
-			if err == nil && options.ReturnStatus.NumDeleted {
+			var deleted map[int64]db.DeletedMessages
+			if err == nil && (options.ReturnStatus.NumDeleted || options.ReturnStatus.DeletedStorage) {
 				deleted, err = s.server.rdb.CountDeletedMessagesWithRetry(readCtx, mailboxIDs)
 			}
 			if err != nil {
@@ -219,10 +219,7 @@ func (s *IMAPSession) List(ctx context.Context, w *imapserver.ListWriter, ref st
 						limit := s.AppendLimit()
 						statusData.AppendLimit = &limit
 					}
-					if options.ReturnStatus.NumDeleted {
-						num := deleted[mbox.ID]
-						statusData.NumDeleted = &num
-					}
+					setDeletedStatus(statusData, options.ReturnStatus, deleted[mbox.ID])
 					if options.ReturnStatus.Size {
 						size := summary.TotalSize
 						statusData.Size = &size

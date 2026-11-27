@@ -2513,6 +2513,7 @@ func buildAdminAPIServerOptions(deps *serverDependencies, serverConfig config.Se
 		MaxRedirectHops:    serverConfig.GetMaxRedirectHops(),
 		SieveExtensions:    deps.config.Sieve.EnabledExtensions,
 		SharedMailboxes:    deps.config.SharedMailboxes,
+		Quota:              deps.config.Quota,
 		// Incoming PROXY headers, accepted only from trusted_networks.
 		ProxyProtocol:        serverConfig.ProxyProtocol,
 		ProxyProtocolTimeout: serverConfig.GetProxyProtocolTimeoutWithDefault(),

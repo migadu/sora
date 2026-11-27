@@ -277,7 +277,7 @@ Description:
     reporting every problem they find. What the node does not run is not
     checked:
       [[server]] blocks (at least one; no duplicate names or addresses),
-        [[pool]], [relay], trusted_networks, [shared_mailboxes] and
+        [[pool]], [relay], trusted_networks, [shared_mailboxes], [quota] and
         [timeout_scheduler]
       [relay.queue] when [relay] is configured
       [uploader], [cleanup] and [local_cache] when a mail backend (imap, lmtp,

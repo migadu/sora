@@ -312,7 +312,7 @@ func (rd *ResilientDatabase) GetMailboxSummariesBatchWithRetry(ctx context.Conte
 	return result.(map[int64]*db.MailboxSummary), nil
 }
 
-func (rd *ResilientDatabase) CountDeletedMessagesWithRetry(ctx context.Context, mailboxIDs []int64) (map[int64]uint32, error) {
+func (rd *ResilientDatabase) CountDeletedMessagesWithRetry(ctx context.Context, mailboxIDs []int64) (map[int64]db.DeletedMessages, error) {
 	op := func(ctx context.Context) (any, error) {
 		return rd.getOperationalDatabaseForOperation(ctx, false).CountDeletedMessages(ctx, mailboxIDs)
 	}
@@ -320,7 +320,7 @@ func (rd *ResilientDatabase) CountDeletedMessagesWithRetry(ctx context.Context, 
 	if err != nil {
 		return nil, err
 	}
-	return result.(map[int64]uint32), nil
+	return result.(map[int64]db.DeletedMessages), nil
 }
 
 func (rd *ResilientDatabase) GetMailboxesWithRetry(ctx context.Context, AccountID int64, subscribed bool) ([]*db.DBMailbox, error) {

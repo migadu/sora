@@ -540,6 +540,10 @@ Use 'sora-admin accounts <subcommand> --help' for detailed help.
 }
 
 func createAccount(ctx context.Context, cfg AdminConfig, email, password, passwordHash string, isPrimary bool, hashType string) error {
+	storageQuota, err := cfg.Quota.DefaultStorage()
+	if err != nil {
+		return fmt.Errorf("[quota]: %w", err)
+	}
 
 	// Connect to resilient database (skip read replicas for CLI)
 	rdb, err := newAdminDatabase(ctx, &cfg.Database)
@@ -555,6 +559,7 @@ func createAccount(ctx context.Context, cfg AdminConfig, email, password, passwo
 		PasswordHash: passwordHash,
 		IsPrimary:    isPrimary,
 		HashType:     hashType,
+		StorageQuota: storageQuota,
 	}
 
 	if _, err := rdb.CreateAccountWithRetry(ctx, req); err != nil {
@@ -574,6 +579,11 @@ func createAccountWithCredentials(ctx context.Context, cfg AdminConfig, credenti
 
 	if len(credentialInputs) == 0 {
 		return fmt.Errorf("at least one credential must be provided")
+	}
+
+	storageQuota, err := cfg.Quota.DefaultStorage()
+	if err != nil {
+		return fmt.Errorf("[quota]: %w", err)
 	}
 
 	// Convert to db.CredentialSpec
@@ -603,7 +613,8 @@ func createAccountWithCredentials(ctx context.Context, cfg AdminConfig, credenti
 
 	// Create account with multiple credentials
 	req := db.CreateAccountWithCredentialsRequest{
-		Credentials: credentials,
+		Credentials:  credentials,
+		StorageQuota: storageQuota,
 	}
 
 	accountID, err := rdb.CreateAccountWithCredentialsWithRetry(ctx, req)
